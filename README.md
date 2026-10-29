@@ -2,7 +2,7 @@
 
 Native per-window remote control for Windows 11 x64 and macOS 14.2+ on Apple silicon. Frames is an independent Rust application with Win32/D3D11 and AppKit/Metal frontends.
 
-**Development build, not a production release.** Windows direct capture, Mac AppKit/Metal presentation, codec roundtrips on both machines, and Windows-client/Mac-host LAN transfers have passed development checks. Live Mac capture/control and the reverse GUI connection still require macOS permission approval. See [release gates](docs/VALIDATION.md) for measured results and pending checks.
+**Development build, not a production release.** Live Mac capture/control, Windows-to-Mac AppKit/Metal video, native menu projection, desktop/window switching, codec roundtrips, and bidirectional LAN transfers have passed development checks. Resume latency and the full acceptance matrix still need work. See [release gates](docs/VALIDATION.md) for measurements and remaining checks.
 
 ## Build and run on Windows
 
@@ -52,7 +52,7 @@ open dist/macos/Frames.app
 
 Xcode command-line tools and FFmpeg are required. Set `FRAMES_SIGN_IDENTITY` to your signing identity when building; `-` selects ad-hoc signing for local development. Signing/notarization must be completed before distribution. Development signatures, executable paths, and responsible-process identity affect macOS permissions.
 
-Open the installed app in the logged-in desktop session and allow **Local Network**, **Screen Recording**, and **Accessibility** in System Settings → Privacy & Security. Local Network is needed for outbound LAN connections on newer macOS versions. A connection timeout or `No route to host` can indicate this permission is missing; check the address and routing too. Apple documents the permission model in [TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy).
+Open the installed app in the logged-in desktop session and allow **Local Network**, **Screen Recording**, and **Accessibility** in System Settings → Privacy & Security. On macOS 27, Accessibility is named **Device Control and Data Access**. Local Network is needed for outbound LAN connections on newer macOS versions. A connection timeout or `No route to host` can indicate this permission is missing; check the address and routing too. Apple documents the network permission model in [TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy).
 
 `Frames.app/Contents/MacOS/frames permissions` reports capture/input permissions; add `--request` to show the normal OS prompts. The login Keychain may be unavailable to a process launched directly over SSH, so run host/client through the app's GUI session. Permissions are not granted by the test scripts.
 
@@ -126,6 +126,10 @@ python scripts/cross_transfer_smoke.py dist/windows/Frames.exe --mac-address MAC
 ```
 
 It uses SSH host `macmini` by default, the Mac app at `~/Applications/Frames.app`, fresh protected test identities, generated files, and dedicated ports 47991/47992. It compares both pairing codes before approving and records checksums/results under `dist/cross-platform`. It leaves generated test files for inspection.
+
+For live capture/control, run `bash native/macos/build_fixture.sh` on the Mac and open `dist/QAWindowFixture.app`. Build the production-session probe on Windows with `cargo build -p frames --example control_probe`, then add `--control-probe PATH_TO_CONTROL_PROBE` to the LAN command above. The probe only controls the generated **Frames QA source** window. It checks occluded capture, restore timing, native menus, resizing, Unicode text, desktop/window switching, and close reconciliation.
+
+For the native Mac client, build `cargo build -p frames-native --example window_fixture` on Windows and pass `--native-ui --window-fixture PATH_TO_WINDOW_FIXTURE`. Add `--hold-ui 600` for direct interaction on the Mac. The optional `--desktop-bridge` shows the Mac desktop back on Windows; using that nested view to control the Windows fixture can feed injected input back into the same desktop, so use direct Mac input for this check.
 
 On the Mac, build `cargo build -p frames-native --example menu_preview --target aarch64-apple-darwin`, then run `python3 scripts/mac_native_smoke.py` to check the Rust/Swift bridge, native menu installation, AppKit window, and Metal GPU completion with generated pixels. `FRAMES_NATIVE_DIAGNOSTICS=1` emits native client metadata to stderr without recording titles, pixels, clipboard contents, or text input. These checks do not measure display latency.
 

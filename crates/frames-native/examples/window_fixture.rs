@@ -117,7 +117,12 @@ fn main() -> anyhow::Result<()> {
             )?;
             let _ = UpdateWindow(cover);
         }
-        let end = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        let seconds = std::env::var("FRAMES_QA_SECONDS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(300)
+            .clamp(30, 900);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
         let mut msg = MSG::default();
         while std::time::Instant::now() < end {
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {

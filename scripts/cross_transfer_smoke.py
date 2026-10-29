@@ -33,6 +33,8 @@ def main():
                         help="Windows window_fixture executable, required with --native-ui")
     parser.add_argument("--hold-ui", type=int, default=0,
                         help="Keep native clients open for this many seconds; write stop-ui in the report folder to end early")
+    parser.add_argument("--desktop-bridge", action="store_true",
+                        help="Also show the Mac desktop on Windows; avoid controlling the Windows fixture through this nested view")
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -69,6 +71,8 @@ def main():
                    FRAMES_NO_DISCOVERY="1", FRAMES_DOWNLOAD_DIR=str(root / "downloaded"))
         if os.environ.get("FRAMES_CROSS_RUST_LOG"):
             env["RUST_LOG"] = os.environ["FRAMES_CROSS_RUST_LOG"]
+        if role == "fixture":
+            env["FRAMES_QA_SECONDS"] = str(min(max(args.hold_ui + 60, 300), 900))
         return env
 
     def windows(role, arguments, executable=None):
@@ -210,7 +214,8 @@ def main():
             until(lambda: '"remote_top_level_items":1' in read_remote(native_folder + "/err.log"), 15)
             passed("Live Windows application menu installed in Mac native menu bar")
             if args.hold_ui:
-                windows("windows-client", ["connect", args.mac_address + ":47991", "--view", "desktop", "--no-clipboard"])
+                if args.desktop_bridge:
+                    windows("windows-client", ["connect", args.mac_address + ":47991", "--view", "desktop", "--no-clipboard"])
                 print("UI READY: " + str(root), flush=True)
                 end = time.monotonic() + min(args.hold_ui, 600)
                 while time.monotonic() < end and not (root / "stop-ui").exists():
