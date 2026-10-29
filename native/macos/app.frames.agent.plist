@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>app.frames.agent</string>
+<key>BundleProgram</key><string>Contents/MacOS/frames</string>
+<key>ProgramArguments</key><array><string>frames</string><string>host</string><string>--unattended</string></array>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+<key>LimitLoadToSessionType</key><array><string>Aqua</string></array>
+<key>ProcessType</key><string>Interactive</string>
+</dict></plist>

@@ -1,0 +1,118 @@
+# Frames
+
+Native per-window remote control for Windows 11 x64 and macOS 14.2+ on Apple silicon. Frames is an independent Rust application with Win32/D3D11 and AppKit/Metal frontends.
+
+**Development build, not a production release.** Direct Windows capture and local codec roundtrips have been exercised on Windows. The macOS sources need an Apple SDK build and hardware verification. See [release gates](docs/VALIDATION.md) for the exact limits and pending checks.
+
+## Build and run on Windows
+
+Install Rust and either Visual Studio C++ Build Tools or an existing MSYS2 UCRT64 toolchain. Install FFmpeg with H.264/HEVC hardware encoders, libvpx, libaom, and libopus support; Frames probes actual working encoders and decoders rather than assuming GPU capabilities.
+
+```powershell
+.\scripts\build.ps1
+.\dist\windows\Frames.exe
+```
+
+Launching without arguments opens the native connection/sharing window. Enter a numeric IP address and port, or use **Nearby devices** to discover hosts. Both devices must explicitly approve the same pairing code. Stop sessions from the launcher before closing it.
+
+CLI equivalents:
+
+```powershell
+# Host, with attended pairing enabled
+Frames.exe host --pair
+# Allow devices approved during this run to reconnect without further approval
+Frames.exe host --pair --unattended
+# Client
+Frames.exe connect 192.168.1.10:47990 --audio
+# Optional manual codec: auto, h264, hevc, av1, vp9
+Frames.exe connect 192.168.1.10:47990 --codec vp9
+Frames.exe doctor
+Frames.exe discover
+Frames.exe peers
+Frames.exe revoke CERTIFICATE_FINGERPRINT
+```
+
+The default UDP port is **47990**. Allow Frames through the firewall on the intended private network. LAN/VPN connectivity is direct; this build has no cloud account, relay, or NAT traversal service.
+
+Use the native **Frames** menu to choose sizing, input profiles, file fetching, and view mode. On macOS it lives in the system menu bar; on Windows it lives below the local title bar. The source application's exposed menus appear alongside it: Accessibility menus for macOS hosts and standard Win32 menus for Windows hosts. Focus a window to refresh its menus, or choose **Refresh application menus**. Disabled items and check marks are preserved. Custom-drawn menus remain usable in the captured image. Windows title-bar system-menu commands are also retained. **Ctrl+Alt+F12** releases remote input and minimizes the client window.
+
+**Frames → Full desktop view / Per-window view** switches an active session. Desktop view captures the host's primary display, including its menu bar, taskbar/Dock, and any excluded applications visible on that display. Per-window mode continues to use direct window capture. The switch releases held input and tears down old video streams while preserving pairing, audio settings, and transfers; host applications keep running. Closing a desktop-view client window disconnects the session. The Windows notification-area Frames icon keeps view controls available even when no application windows are open.
+
+Select **Open full desktop view** in the launcher, or start directly with `Frames.exe connect IP:47990 --view desktop`. Use matching builds on both devices: this update uses protocol **2**. Display selection and restoring client placements across mode switches remain pending.
+
+Choose **Toggle physical keys (terminal)** for applications that need raw key positions and literal Control shortcuts. This profile bypasses Control/Command swapping and local Unicode composition; the host keyboard layout interprets the keys. The default profile composes text locally for Unicode/IME input. Preferences are remembered per host/application. Switching profiles releases held remote input.
+
+## Build on macOS
+
+```bash
+rustup target add aarch64-apple-darwin
+bash native/macos/build.sh
+open dist/macos/Frames.app
+```
+
+Xcode command-line tools and FFmpeg are required. Grant the signed application Screen Recording and Accessibility permissions. Development signatures, executable paths, and responsible-process identity affect macOS permissions; signing/notarization must be completed before distribution.
+
+`FRAMES_MAC_HELPER` can select a development helper. `FRAMES_FFMPEG` can select an FFmpeg executable when it is not on the process's PATH. The launcher offers a per-user sharing login item. **Prelogin/FileVault access is not validated or enabled by this login item.**
+
+## Phones and developer devices
+
+This build adds an optional **Android ADB server bridge**, disabled on each new session. Plug the Android phone into the **client** computer, start its existing ADB server (`adb start-server`), and approve that computer on the phone. In Frames choose **Devices → Android ADB bridge**. On the **host**, run:
+
+```sh
+adb -H 127.0.0.1 -P 15037 devices
+adb -H 127.0.0.1 -P 15037 -s PHONE_SERIAL shell
+```
+
+The host's loopback port **15037** forwards to the client's loopback ADB server on **5037** over the pinned QUIC session. It shares every device and command exposed by that ADB server. Use the same Android platform-tools version on both computers; IDEs may need a custom ADB server configuration and restart. Frames does not start/replace an ADB server, take over port 5037, or expose a LAN listener. Disable the menu item or disconnect to close the listener and active streams. The privileged Windows login agent disallows this feature.
+
+This is development-tool forwarding, **not generic USB passthrough**. Fastboot, DFU, iOS/usbmux, USB storage, license dongles, cameras, and isochronous USB devices are not implemented. Generic support needs device claiming/export on the physical-device computer and a virtual USB controller/device stack on the consuming computer, with device-specific validation. Windows provides a [UDE driver architecture](https://learn.microsoft.com/en-us/windows-hardware/drivers/usbcon/usb-emulated-device--ude--architecture); macOS controller simulation requires an [Apple-managed entitlement](https://developer.apple.com/forums/thread/802495). No driver installation or entitlement request is performed by this build. ADB's custom server arguments are documented in the [AOSP manual](https://android.googlesource.com/platform/packages/modules/adb/+/refs/heads/main/docs/user/adb.1.md).
+
+## Files and clipboard
+
+Text and PNG clipboard synchronization is enabled by default; use `--no-clipboard` to turn it off. Images up to 2 MiB compressed are supported. Standard Windows DIB images are converted to PNG. Recognized concealed macOS clipboard images are excluded.
+
+Drag regular files from the local desktop into a remote proxy to upload them and request a native copy-only drop into the host app. App-specific drop behavior requires validation; a rejected drop leaves the verified file in the receive folder. **Fetch remote file** downloads a path inside the host user's home folder. Received files appear in a native shelf and can be dragged into local apps; macOS uses file promises. Arbitrary dragging directly out of pixels in a captured Finder/Explorer window is not implemented. Folder trees/custom drag formats are not supported yet.
+
+Standalone transfers:
+
+```powershell
+Frames.exe send 192.168.1.10:47990 .\report.pdf
+Frames.exe get 192.168.1.10:47990 Downloads/report.pdf
+```
+
+The default receive directory is `~/Downloads/Frames`. Host `--receive-dir PATH` changes it. Interrupted uploads preserve partial data and resume when the same unchanged file is offered again. Checksums are verified before publishing completed files. Existing files are never overwritten.
+
+## Optional Windows service
+
+First pair a device with `host --pair --unattended`, then stop the ordinary host. In an Administrator terminal:
+
+```powershell
+Frames.exe service install
+Frames.exe service uninstall
+```
+
+The installer creates protected Program Files/ProgramData directories, copies the executable and your local FFmpeg, and migrates identity/trust to a machine-scoped DPAPI store. It refuses existing installation directories. The broker supervises one interactive-console agent. Ordinary windows use WGC; privileged login/elevation views use Desktop Duplication. Normal application surfaces are removed during secure-desktop transitions. Installation and secure-desktop behavior are **not locally runtime-verified**.
+
+The privileged login agent intentionally disables file operations; use a normal user-session host for transfers. This keeps file access outside the SYSTEM agent. Uninstallation retains binaries and trust records. Service trust is separate from per-user trust; use `FRAMES_CONFIG_DIR=C:\ProgramData\Frames` in an Administrator terminal when inspecting or revoking service peers. macOS prelogin service integration remains a release gate.
+
+## Architecture
+
+- `frames-core`: protocol, ordered window graph, input state, codec probing/process adapters, QUIC, certificate trust, protected identity storage, media fragmentation/recovery, transfer integrity, C ABI.
+- `frames-native`: direct WGC capture, Win32 proxies and D3D11 presentation, native clipboard/input/drag APIs, WASAPI loopback/CoreAudio playback, macOS helper bridge.
+- `frames`: host/client orchestration, separate low-priority QUIC file streams, discovery, native launcher integration, optional Windows service.
+- `native/macos`: ScreenCaptureKit/Accessibility host, AppKit/Metal client, Dock helpers, file promises, system audio, login item.
+
+Seamless windows are **never desktop crops**. Explicit desktop mode uses WGC monitor capture or ScreenCaptureKit display capture. The privileged Windows secure-screen path separately uses Desktop Duplication. Host and client positions are independent. Hiding a client unsubscribes its video stream, drops its capture/encoder, and preserves metadata; audio remains independently enabled. Capture and codec I/O currently use CPU readback/FFmpeg pipes. GPU presentation is implemented; end-to-end zero-copy is not.
+
+## Verification
+
+```powershell
+cargo test --workspace
+cargo test -p frames-core --test media_roundtrip -- --ignored --nocapture
+cargo test -p frames-native -- --ignored --nocapture
+python scripts/smoke_transfer.py target/debug/frames.exe
+```
+
+The last command opens short-lived fixture windows on an interactive Windows desktop. It verifies that WGC captures the source even while another window covers it. GNU toolchains require `--target x86_64-pc-windows-gnu` and GCC on PATH. CI includes Windows builds and a macOS compile gate; CI has not been run from this local workspace.
+
+RustDesk and TwinDesk were studied as behavior/architecture references. Their implementations are not vendored. FFmpeg is an external runtime dependency and is not included in build artifacts. Review dependency and codec distribution obligations before packaging a public release.

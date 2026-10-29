@@ -1,0 +1,8 @@
+/target/
+/dist/
+/native/macos/.build/
+*.log
+*.partial
+__pycache__/
+*.pyc
+.DS_Store
