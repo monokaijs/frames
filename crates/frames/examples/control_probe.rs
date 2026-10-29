@@ -142,12 +142,22 @@ fn main() -> anyhow::Result<()> {
                             stage = "desktop_frame";
                         }
                     } else if stage == "back_to_windows"
-                        && windows
-                            .iter()
-                            .any(|w| Some(w.key) == target.as_ref().map(|w| w.key))
+                        && windows.iter().any(|w| {
+                            w.app_id == target.as_ref().unwrap().app_id
+                                && w.title == "Frames QA source text: Frames Việt ✓"
+                        })
                         && windows.iter().all(|w| w.role != WindowRole::Desktop)
                     {
                         passed.push("desktop -> per-window snapshot reconciled".into());
+                        // Switching capture modes reconciles a fresh graph and may
+                        // assign a new generation to the same underlying OS window.
+                        target = windows
+                            .iter()
+                            .find(|w| {
+                                w.app_id == target.as_ref().unwrap().app_id
+                                    && w.title == "Frames QA source text: Frames Việt ✓"
+                            })
+                            .cloned();
                         send(ClientEvent::Action {
                             window: target.as_ref().unwrap().key,
                             action: WindowAction::Close,
@@ -285,7 +295,7 @@ fn main() -> anyhow::Result<()> {
                 _ => {}
             }
         }
-        anyhow::bail!("fixture test timed out")
+        anyhow::bail!("fixture test timed out at stage {stage}")
     })();
     let _ = events.send(ClientEvent::ReleaseInput);
     let _ = events.send(ClientEvent::Disconnected);

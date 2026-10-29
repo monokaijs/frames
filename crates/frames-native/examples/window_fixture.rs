@@ -104,17 +104,19 @@ fn main() -> anyhow::Result<()> {
             Some(instance.into()),
             None,
         )?;
-        let _ = ShowWindow(cover, SW_SHOWNOACTIVATE);
-        SetWindowPos(
-            cover,
-            Some(HWND_TOPMOST),
-            140,
-            140,
-            480,
-            360,
-            SWP_NOACTIVATE,
-        )?;
-        let _ = UpdateWindow(cover);
+        if !std::env::args().any(|arg| arg == "--no-cover") {
+            let _ = ShowWindow(cover, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                cover,
+                Some(HWND_TOPMOST),
+                140,
+                140,
+                480,
+                360,
+                SWP_NOACTIVATE,
+            )?;
+            let _ = UpdateWindow(cover);
+        }
         let end = std::time::Instant::now() + std::time::Duration::from_secs(300);
         let mut msg = MSG::default();
         while std::time::Instant::now() < end {

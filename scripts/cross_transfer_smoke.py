@@ -27,6 +27,12 @@ def main():
     parser.add_argument("--control-probe", type=Path,
                         help="Optional production-session fixture client; requires Frames QA source on the Mac")
     parser.add_argument("--capture-only", action="store_true")
+    parser.add_argument("--native-ui", action="store_true",
+                        help="Present the Windows QA fixture through the real Mac AppKit/Metal client")
+    parser.add_argument("--window-fixture", type=Path,
+                        help="Windows window_fixture executable, required with --native-ui")
+    parser.add_argument("--hold-ui", type=int, default=0,
+                        help="Keep native clients open for this many seconds; write stop-ui in the report folder to end early")
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -82,17 +88,22 @@ def main():
     def read_remote(path):
         return ssh(f"if test -f {q(path)}; then cat {q(path)}; fi")
 
-    def mac(role, arguments):
+    def mac(role, arguments, config_role=None):
         folder = mac_root + "/" + role
         ssh(f"mkdir -p {q(folder)}\nmkfifo -m 600 {q(folder + '/input')}")
-        writer = subprocess.Popen(["ssh", "-o", "BatchMode=yes", args.mac_ssh,
-                                   "cat > " + q(folder + "/input")], stdin=subprocess.PIPE,
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        # Keep both FIFO ends open before LaunchServices starts the app. Without
+        # this barrier a fast, already-authorized client can see stdin EOF before
+        # the second SSH connection has opened its writer, rejecting pairing.
+        writer = subprocess.Popen(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", args.mac_ssh,
+                                   "exec 3<> " + q(folder + "/input") + "; printf 'READY\\n' >&2; /bin/cat >&3"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                   text=True, encoding="utf-8", creationflags=creationflags)
         children.append(writer)
+        assert writer.stderr.readline().strip() == "READY", "Mac pairing FIFO writer failed to start"
         command = ["open", "-n", "-a", mac_app,
-                   "--env", "FRAMES_CONFIG_DIR=" + folder,
+                   "--env", "FRAMES_CONFIG_DIR=" + (mac_root + "/" + config_role if config_role else folder),
                    "--env", "FRAMES_PAIRING_CONSOLE=1", "--env", "FRAMES_NO_DISCOVERY=1",
+                   "--env", "FRAMES_NATIVE_DIAGNOSTICS=1",
                    "--env", "FRAMES_FFMPEG=/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
                    "--stdin", folder + "/input", "--stdout", folder + "/out.log",
                    "--stderr", folder + "/err.log", "--args", *arguments]
@@ -168,15 +179,42 @@ def main():
             assert probe.returncode == 0, probe_log["err"] + probe_log["out"]
             passed("Mac host live fixture capture/control probe")
 
+        excluded = []
+        if args.native_ui:
+            assert args.window_fixture, "Pass --window-fixture with --native-ui"
+            windows("fixture", ["--no-cover"], args.window_fixture.resolve(strict=True))
+            time.sleep(0.5)
+            listing = subprocess.run([str(binary), "windows"], capture_output=True, text=True,
+                                     encoding="utf-8", check=True, creationflags=creationflags)
+            windows_list = json.loads(listing.stdout)
+            assert any(w["title"] == "Frames QA source" for w in windows_list), "Start window_fixture --no-cover first"
+            excluded = [arg for app_id in sorted({w["app_id"] for w in windows_list
+                                                if Path(w["app_id"]).stem != "window_fixture"})
+                        for arg in ("--exclude", app_id)]
+            # Computer Use can create its cursor-overlay window after this
+            # snapshot. Keep test automation infrastructure out of the mirror.
+            excluded += ["--exclude", "codex-computer-use"]
         win_host, win_host_log = windows("windows-host", ["host", "--listen", "0.0.0.0:47992", "--pair",
                                                         "--unattended", "--no-clipboard", "--receive-dir",
-                                                        str(root / "received-windows")])
+                                                        str(root / "received-windows"), *excluded])
         until(lambda: "Frames host listening" in win_host_log["err"])
         mac_sender, sender_folder = mac("mac-client", ["send", args.windows_address + ":47992", mac_source])
         pair(win_host, win_host_log, mac_sender, sender_folder)
         until(lambda: "Transferred " in read_remote(sender_folder + "/out.log"), 30)
         assert (root / "received-windows" / "Frames Mac Unicode.bin").read_bytes() == payload
         passed("Mac client -> Windows host: GUI Keychain identity, matching-code pairing, upload integrity")
+        if args.native_ui:
+            _, native_folder = mac("mac-client-native", ["connect", args.windows_address + ":47992", "--no-clipboard"], "mac-client")
+            until(lambda: '"native_event":"metal_present_completed"' in read_remote(native_folder + "/err.log"), 45)
+            passed("Windows WGC -> QUIC -> Mac decoder -> native AppKit/Metal presentation")
+            until(lambda: '"remote_top_level_items":1' in read_remote(native_folder + "/err.log"), 15)
+            passed("Live Windows application menu installed in Mac native menu bar")
+            if args.hold_ui:
+                windows("windows-client", ["connect", args.mac_address + ":47991", "--view", "desktop", "--no-clipboard"])
+                print("UI READY: " + str(root), flush=True)
+                end = time.monotonic() + min(args.hold_ui, 600)
+                while time.monotonic() < end and not (root / "stop-ui").exists():
+                    time.sleep(0.5)
     except Exception as error:
         failure = str(error)
         raise
@@ -193,6 +231,10 @@ def main():
             pattern = "^" + re.escape(mac_app + "/Contents/MacOS/frames host --listen " + address)
             ssh(f"pgrep -f {q(pattern)} | while read -r pid; do "
                 f"if ps -p \"$pid\" -o command= | grep -Fq {q(mac_root)}; then kill \"$pid\"; fi; done")
+        if args.native_ui:
+            pattern = "^" + re.escape(mac_app + "/Contents/MacOS/frames connect " + args.windows_address + ":47992")
+            ssh(f"pgrep -f {q(pattern)} | while read -r pid; do "
+                f"if ps e -p \"$pid\" -o command= | grep -Fq {q(mac_root)}; then kill \"$pid\"; fi; done")
         (root / "results.json").write_text(json.dumps({"passed": results, "failure": failure,
                                                        "mac_address": args.mac_address,
                                                        "windows_address": args.windows_address,

@@ -500,8 +500,6 @@ pub async fn decode(codec: Codec, width: u32, height: u32) -> anyhow::Result<Dec
         width > 0 && height > 0 && width <= 8192 && height <= 8192,
         "invalid decode size"
     );
-    let padded_width = width.div_ceil(2) * 2;
-    let padded_height = height.div_ceil(2) * 2;
     let mut child = command()
         .args([
             "-hide_banner",
@@ -519,7 +517,9 @@ pub async fn decode(codec: Codec, width: u32, height: u32) -> anyhow::Result<Dec
             "pipe:0",
             "-an",
             "-vf",
-            &format!("crop={width}:{height}:0:0"),
+            // Remove encoder padding exactly. Chroma-aligned rounding would
+            // shorten odd-sized raw frames and desynchronize read_exact below.
+            &format!("crop={width}:{height}:0:0:exact=1"),
             "-f",
             "rawvideo",
             "-pix_fmt",
@@ -541,7 +541,6 @@ pub async fn decode(codec: Codec, width: u32, height: u32) -> anyhow::Result<Dec
         }
     });
     let (sender, output) = watch::channel(None);
-    let _ = (padded_width, padded_height);
     tokio::spawn(async move {
         loop {
             let mut bgra = vec![0; width as usize * height as usize * 4];
