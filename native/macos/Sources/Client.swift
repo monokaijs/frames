@@ -201,7 +201,7 @@ final class DockEventReader: @unchecked Sendable {
     }
 }
 
-@MainActor final class RemoteView: NSView, NSTextInputClient {
+@MainActor final class RemoteView: NSView, @preconcurrency NSTextInputClient {
     weak var proxy: RemoteProxy?
     var renderer: MetalPicture?
     var picture = CGSize(width:1,height:1)
@@ -235,7 +235,12 @@ final class DockEventReader: @unchecked Sendable {
         guard let usage=usageToMac.first(where:{$0.value==event.keyCode})?.key else{return}
         if event.keyCode==111,event.modifierFlags.contains([.control,.option]){proxy?.send("release");window?.miniaturize(nil);return}
         let printable=(4...39).contains(usage)||(44...56).contains(usage)
-        if proxy?.physical == true || event.modifierFlags.contains(.command)||event.modifierFlags.contains(.control)|| !printable{forwarded.insert(usage);key(usage,down:true)}else{interpretKeyEvents([event])}
+        if proxy?.physical == true || event.modifierFlags.contains(.command) || event.modifierFlags.contains(.control) || !printable {
+            forwarded.insert(usage)
+            key(usage,down:true)
+        } else {
+            interpretKeyEvents([event])
+        }
     }
     override func keyUp(with event:NSEvent){if let usage=usageToMac.first(where:{$0.value==event.keyCode})?.key,forwarded.remove(usage) != nil{key(usage,down:false)}}
     override func flagsChanged(with event:NSEvent){guard let usage=usageToMac.first(where:{$0.value==event.keyCode})?.key else{return};let flag:NSEvent.ModifierFlags;switch usage{case 0xe0,0xe4:flag = .control;case 0xe1,0xe5:flag = .shift;case 0xe2,0xe6:flag = .option;default:flag = .command};key(usage,down:event.modifierFlags.contains(flag))}

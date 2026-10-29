@@ -158,7 +158,7 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
         let result: AXError
         switch action["kind"] as? String {
         case "focus":
-            if let pid = window.owningApplication?.processID { NSRunningApplication(processIdentifier: pid)?.activate(options: .activateIgnoringOtherApps) }
+            if let pid = window.owningApplication?.processID { NSRunningApplication(processIdentifier: pid)?.activate(options: []) }
             result = AXUIElementPerformAction(ax, kAXRaiseAction as CFString)
         case "restore": result = AXUIElementSetAttributeValue(ax, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
         case "close":
@@ -181,7 +181,7 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
 
     func menu(_ id:CGWindowID)throws -> [[String:Any]] {
         guard AXIsProcessTrusted(),let window=windows[id],let pid=window.owningApplication?.processID else { throw Wire.failure("Accessibility permission required for remote menus") }
-        NSRunningApplication(processIdentifier:pid)?.activate(options:.activateIgnoringOtherApps)
+        NSRunningApplication(processIdentifier:pid)?.activate(options:[])
         let application=AXUIElementCreateApplication(pid)
         guard let value=attribute(application,kAXMenuBarAttribute),CFGetTypeID(value)==AXUIElementGetTypeID() else { throw Wire.failure("Application does not expose its menu bar") }
         var actions:[String:AXUIElement]=[:]

@@ -9,4 +9,6 @@
 <key>LSMinimumSystemVersion</key><string>14.2</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSScreenCaptureUsageDescription</key><string>Frames shares your application windows with devices you approve.</string>
+<key>NSLocalNetworkUsageDescription</key><string>Frames connects to devices you approve on your local network for remote windows, audio, and file transfer.</string>
+<key>NSBonjourServices</key><array><string>_frames._udp</string></array>
 </dict></plist>
