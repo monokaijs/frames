@@ -13,6 +13,38 @@ fn main() -> anyhow::Result<()> {
     };
     unsafe extern "system" fn proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         unsafe {
+            if message == WM_PAINT {
+                let mut paint = PAINTSTRUCT::default();
+                let dc = BeginPaint(hwnd, &mut paint);
+                let mut rect = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rect);
+                let mut class = [0u16; 64];
+                let n = GetClassNameW(hwnd, &mut class);
+                let is_cover =
+                    String::from_utf16_lossy(&class[..n.max(0) as usize]).ends_with("Cover");
+                let brush = CreateSolidBrush(COLORREF(if is_cover { 0xd90d0d } else { 0x0d0dd9 }));
+                FillRect(dc, &rect, brush);
+                let _ = DeleteObject(brush.into());
+                let pen = CreatePen(PS_SOLID, 2, COLORREF(0xffffff));
+                let old = SelectObject(dc, pen.into());
+                let (x, y) = (rect.right / 2, rect.bottom / 2);
+                let _ = MoveToEx(dc, x - 12, y, None);
+                let _ = LineTo(dc, x + 12, y);
+                let _ = MoveToEx(dc, x, y - 12, None);
+                let _ = LineTo(dc, x, y + 12);
+                SelectObject(dc, old);
+                let _ = DeleteObject(pen.into());
+                let _ = EndPaint(hwnd, &paint);
+                return LRESULT(0);
+            }
+            if message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN {
+                let x = lp.0 as u16 as i16;
+                let y = (lp.0 >> 16) as u16 as i16;
+                println!("{{\"fixture_event\":\"pointer_down\",\"x\":{x},\"y\":{y}}}");
+                let title = format!("Frames QA source click: {x},{y}");
+                let wide: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+                let _ = SetWindowTextW(hwnd, windows::core::PCWSTR(wide.as_ptr()));
+            }
             if message == WM_COMMAND {
                 if wp.0 & 0xffff == 101 {
                     let _ = SetWindowTextW(hwnd, w!("Frames QA source marked"));
@@ -90,6 +122,13 @@ fn main() -> anyhow::Result<()> {
         let _ = ShowWindow(source, SW_SHOW);
         let _ = SetFocus(Some(edit));
         let _ = UpdateWindow(source);
+        let mut client = RECT::default();
+        GetClientRect(source, &mut client)?;
+        println!(
+            "{{\"fixture_event\":\"ready\",\"center_x\":{},\"center_y\":{}}}",
+            client.right / 2,
+            client.bottom / 2
+        );
         let cover = CreateWindowExW(
             WS_EX_NOACTIVATE,
             w!("FramesQACover"),
