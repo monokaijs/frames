@@ -71,8 +71,10 @@ def main():
                    FRAMES_NO_DISCOVERY="1", FRAMES_DOWNLOAD_DIR=str(root / "downloaded"))
         if os.environ.get("FRAMES_CROSS_RUST_LOG"):
             env["RUST_LOG"] = os.environ["FRAMES_CROSS_RUST_LOG"]
+        elif args.native_ui:
+            env["RUST_LOG"] = "warn,frames=info,frames_native=info"
         if role == "fixture":
-            env["FRAMES_QA_SECONDS"] = str(min(max(args.hold_ui + 60, 300), 900))
+            env["FRAMES_QA_SECONDS"] = str(min(max(args.hold_ui + 60, 300), 3660))
         if args.native_ui:
             env["FRAMES_INPUT_DIAGNOSTICS"] = "1"
         return env
@@ -85,8 +87,11 @@ def main():
         output = {"out": "", "err": ""}
         logs.append((role, output))
         def reader(stream, key):
-            for line in stream:
-                output[key] += line
+            with (root / (role + "." + key + ".log")).open("w", encoding="utf-8") as live_log:
+                for line in stream:
+                    output[key] += line
+                    live_log.write(line)
+                    live_log.flush()
         for key, stream in (("out", child.stdout), ("err", child.stderr)):
             threading.Thread(target=reader, args=(stream, key), daemon=True).start()
         return child, output
@@ -115,6 +120,8 @@ def main():
                    "--stderr", folder + "/err.log", "--args", *arguments]
         if os.environ.get("FRAMES_CROSS_RUST_LOG"):
             command[4:4] = ["--env", "RUST_LOG=" + os.environ["FRAMES_CROSS_RUST_LOG"]]
+        elif args.native_ui:
+            command[4:4] = ["--env", "RUST_LOG=warn,frames=info,frames_native=info"]
         ssh(shlex.join(command))
         return writer, folder
 
@@ -219,7 +226,7 @@ def main():
                 if args.desktop_bridge:
                     windows("windows-client", ["connect", args.mac_address + ":47991", "--view", "desktop", "--no-clipboard"])
                 print("UI READY: " + str(root), flush=True)
-                end = time.monotonic() + min(args.hold_ui, 600)
+                end = time.monotonic() + min(args.hold_ui, 3600)
                 while time.monotonic() < end and not (root / "stop-ui").exists():
                     time.sleep(0.5)
     except Exception as error:

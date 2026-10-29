@@ -594,7 +594,8 @@ pub async fn client(
                 Some(ClientEvent::SendFiles{window,paths,x,y})=>{for path in paths.into_iter().take(100){let tx=prepared_tx.clone();let slots=prepare_slots.clone();let epoch=prepare_epoch.clone();let version=epoch.load(std::sync::atomic::Ordering::Relaxed);tokio::spawn(async move{let Ok(_permit)=slots.acquire_owned().await else{return;};let result=file_metadata(&path).await.map_err(|e|e.to_string());if epoch.load(std::sync::atomic::Ordering::Relaxed)==version{let _=tx.send((path,window,x,y,result)).await;}});}},
                 Some(ClientEvent::CancelTransfers)=>{prepare_epoch.fetch_add(1,std::sync::atomic::Ordering::Relaxed);let mut ids=downloads.active_ids();ids.extend(uploads.keys().cloned());for id in ids{if let Some(job)=upload_jobs.remove(&id){job.abort();}uploads.remove(&id);downloads.cancel(&id).await?;io.send.send(Message::Transfer(TransferMessage::Cancel{id,reason:"canceled locally".into()})).await?;}let _=ui.try_send(ClientUpdate::TransferProgress{name:"Transfers canceled".into(),done:0,total:0});},
                 Some(ClientEvent::DownloadFile{path})=>io.send.send(Message::DownloadFile{path}).await?,
-                Some(ClientEvent::ReleaseInput)=>io.send.send(Message::ReleaseInput).await?,Some(ClientEvent::Disconnected)|None=>break,
+                Some(ClientEvent::ReleaseInput)=>io.send.send(Message::ReleaseInput).await?,
+                Some(ClientEvent::Disconnected)|None=>{tracing::info!("Client UI requested disconnect or closed its event channel");break;},
             },
             message=io.receive.recv()=>{let Some(message)=message else{break;};match message{
                 Message::ViewModeChanged{mode,error}=>{if error.is_none(){media.clear_video();}ui.send(ClientUpdate::ViewMode{mode,error})?;},

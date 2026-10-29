@@ -160,7 +160,7 @@ fn main() -> anyhow::Result<()> {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(300)
-            .clamp(30, 900);
+            .clamp(30, 3660);
         let end = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
         let mut msg = MSG::default();
         while std::time::Instant::now() < end {

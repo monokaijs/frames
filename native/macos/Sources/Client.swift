@@ -18,7 +18,11 @@ import QuartzCore
     init(host: String) { self.host = host; super.init() }
     deinit { if let session { frames_session_free(session) } }
     static func key(_ object: [String: Any]) -> String { "\(object["id"] ?? 0):\(object["generation"] ?? 0)" }
-    func applicationDidFinishLaunching(_ notification:Notification){installMenu()}
+    func applicationDidFinishLaunching(_ notification:Notification){Wire.diagnostic("client_started",["pid":ProcessInfo.processInfo.processIdentifier]);installMenu()}
+    // A host can temporarily have no shared windows during graph reconciliation.
+    // Keep the session alive until an explicit disconnect or a transport failure.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication)->Bool{false}
+    func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply{Wire.diagnostic("client_terminate_requested");return .terminateNow}
     func activate(_ proxy:RemoteProxy){activeProxy=proxy;installMenu()}
     func menuWillOpen(_ menu:NSMenu){menuTracking+=1}
     func menuDidClose(_ menu:NSMenu){menuTracking=max(0,menuTracking-1);if menuTracking==0 && needsMenu{DispatchQueue.main.async{[weak self] in self?.installMenu()}}}
@@ -47,7 +51,7 @@ import QuartzCore
     }
     @objc func windowsView(){Wire.send(["event":"release"]);Wire.send(["event":"view_mode","mode":"windows"])}
     @objc func desktopView(){Wire.send(["event":"release"]);Wire.send(["event":"view_mode","mode":"desktop"])}
-    @objc func disconnect(){Wire.send(["event":"release"]);Wire.send(["event":"disconnect"])}
+    @objc func disconnect(){Wire.diagnostic("client_disconnect_requested");Wire.send(["event":"release"]);Wire.send(["event":"disconnect"])}
     @objc func toggleAdb(){Wire.send(["event":"adb_bridge","enabled":!adbEnabled])}
     @objc func deviceSupport(){let alert=NSAlert();alert.messageText="Device forwarding";alert.informativeText="Android ADB: start adb on this computer, then enable Android ADB bridge. On the host use adb -H 127.0.0.1 -P 15037. Raw USB, fastboot, DFU, and iOS passthrough require separate driver support and are not enabled.";alert.runModal()}
     func error(_ title:String,_ message:String){let alert=NSAlert();alert.messageText=title;alert.informativeText=message;alert.runModal()}
@@ -118,7 +122,7 @@ import QuartzCore
         }
         do { try process.run(); docks[id] = process } catch { fputs("Dock proxy: \(error)\n", stderr) }
     }
-    func applicationWillTerminate(_ notification: Notification) { for process in docks.values { process.terminate() }; Wire.send(["event":"release"]) }
+    func applicationWillTerminate(_ notification: Notification) { Wire.diagnostic("client_terminated",["window_count":windows.count]);for process in docks.values { process.terminate() }; Wire.send(["event":"release"]) }
 }
 
 final class DockEventReader: @unchecked Sendable {

@@ -75,6 +75,7 @@ if args.contains("--permissions"){
             guard let bytes = line.data(using: .utf8), let message = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { continue }
             DispatchQueue.main.async { client.update(message) }
         }
+        Wire.diagnostic("client_stdin_closed")
         DispatchQueue.main.async { app.terminate(nil) }
     }
     withExtendedLifetime(client){app.run()}

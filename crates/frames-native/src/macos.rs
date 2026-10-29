@@ -408,6 +408,7 @@ pub fn run_client(
                 let _ = events.send(event);
             }
         }
+        tracing::info!("Mac client helper event pipe closed");
         let _ = events.send(ClientEvent::Disconnected);
     });
     for update in updates {
@@ -442,12 +443,17 @@ pub fn run_client(
             ClientUpdate::Ack(window, actual, error) => {
                 json!({"type":"ack","window":window,"actual":actual,"error":error})
             }
-            ClientUpdate::Shutdown => break,
+            ClientUpdate::Shutdown => {
+                tracing::info!("Mac client received session shutdown");
+                break;
+            }
         };
         if serde_json::to_writer(&mut input, &value).is_err() || input.write_all(b"\n").is_err() {
+            tracing::warn!("Mac client helper update pipe closed");
             break;
         }
     }
+    tracing::info!(status = ?child.try_wait(), "Mac client bridge ending");
     drop(input);
     let _ = child.kill();
     let _ = child.wait();
