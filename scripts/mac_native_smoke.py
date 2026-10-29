@@ -50,7 +50,8 @@ def main():
             snapshot = any(e.get("native_event") == "window_snapshot" and e.get("count") == 1 for e in events)
             gpu = any(e.get("native_event") == "metal_present_completed" and e.get("success")
                       and e.get("width") == 640 and e.get("height") == 400 for e in events)
-            menu = any(e.get("native_event") == "menu_installed" and e.get("remote_top_level_items") == 1 for e in events)
+            menu = any(e.get("native_event") == "menu_installed" and e.get("remote_top_level_items") == 1
+                       and e.get("activation_policy") == 0 for e in events)
             if snapshot and gpu and menu:
                 print("PASS: Rust/Swift bridge, AppKit proxy, native application menu, Metal GPU completion")
                 return

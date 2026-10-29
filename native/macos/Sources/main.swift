@@ -65,6 +65,9 @@ if args.contains("--permissions"){
     }
     withExtendedLifetime(host){app.run()}
 } else if args.contains("--client") {
+    // Accessory apps do not own the system menu bar. The client must activate
+    // normally so focused remote application menus are visible and actionable.
+    app.setActivationPolicy(.regular)
     let client = NativeClient(host: args.last ?? "remote")
     app.delegate = client
     DispatchQueue.global(qos: .userInteractive).async {

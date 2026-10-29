@@ -43,7 +43,7 @@ import QuartzCore
         let support=NSMenuItem(title:"Device forwarding support...",action:#selector(deviceSupport),keyEquivalent:"");support.target=self;devices.addItem(support)
         let deviceItem=NSMenuItem(title:"Devices",action:nil,keyEquivalent:"");deviceItem.submenu=devices;bar.addItem(deviceItem)
         NSApp.mainMenu=bar
-        Wire.diagnostic("menu_installed", ["top_level_items":bar.items.count,"remote_top_level_items":activeProxy?.remoteMenuItems.count ?? 0])
+        Wire.diagnostic("menu_installed", ["top_level_items":bar.items.count,"remote_top_level_items":activeProxy?.remoteMenuItems.count ?? 0,"activation_policy":NSApp.activationPolicy().rawValue])
     }
     @objc func windowsView(){Wire.send(["event":"release"]);Wire.send(["event":"view_mode","mode":"windows"])}
     @objc func desktopView(){Wire.send(["event":"release"]);Wire.send(["event":"view_mode","mode":"desktop"])}
