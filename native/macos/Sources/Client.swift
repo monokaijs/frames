@@ -93,7 +93,7 @@ import QuartzCore
         case "status": if let id = message["window"] as? [String: Any], let proxy = windows[Self.key(id)] { proxy.status = message["status"] as? String ?? ""; proxy.refreshTitle() }
         case "ack": if let id = message["window"] as? [String: Any], let proxy = windows[Self.key(id)] {
             if let actual = message["actual"] as? [String: Any] { proxy.remote = actual }
-            if let error = message["error"] as? String { proxy.status = error }
+            proxy.commandError = message["error"] as? String
             proxy.refreshTitle()
         }
         default: break
@@ -148,6 +148,7 @@ final class DockEventReader: @unchecked Sendable {
     var swap: Bool
     var physical: Bool
     var status = "Connecting stream…"
+    var commandError:String?
     var resizeWork: DispatchWorkItem?
     var lastSize = CGSize.zero
     var destroying = false
@@ -176,7 +177,7 @@ final class DockEventReader: @unchecked Sendable {
     }
     func send(_ event: String, _ fields: [String: Any] = [:]) { var value = fields;value["event"] = event;value["window"] = id;Wire.send(value) }
     func visibility() { send("visibility",["visible":window.isVisible && !window.isMiniaturized && window.occlusionState.contains(.visible),"focused":window.isKeyWindow]) }
-    func refreshTitle() { window.title = "\(remote["title"] ?? "Remote window") — \(mode == "resize_remote" && resizable ? "Resize remote" : "Stretch locally")\(physical ? " / Physical keys":"")\(status.isEmpty ? "" : " — "+status)" }
+    func refreshTitle() { let detail=commandError ?? status;window.title = "\(remote["title"] ?? "Remote window") — \(mode == "resize_remote" && resizable ? "Resize remote" : "Stretch locally")\(physical ? " / Physical keys":"")\(detail.isEmpty ? "" : " — "+detail)" }
     func save() { UserDefaults.standard.set(mode,forKey:preference+":mode");UserDefaults.standard.set(fill,forKey:preference+":fill");UserDefaults.standard.set(swap,forKey:preference+":swap");UserDefaults.standard.set(physical,forKey:preference+":physical");refreshTitle();view.redraw() }
     @objc func setResize() { if resizable { mode="resize_remote";save() } }
     @objc func setStretch() { mode="stretch_local";save() }
@@ -220,7 +221,7 @@ final class DockEventReader: @unchecked Sendable {
         if !(proxy?.fill ?? false) { let aspect=picture.width/picture.height;if rect.width/rect.height>aspect{let width=rect.height*aspect;rect.origin.x=(rect.width-width)/2;rect.size.width=width}else{let height=rect.width/aspect;rect.origin.y=(rect.height-height)/2;rect.size.height=height} }
         return ["x":min(1,max(0,(p.x-rect.minX)/max(1,rect.width))),"y":min(1,max(0,1-(p.y-rect.minY)/max(1,rect.height)))]
     }
-    func pointer(_ event:NSEvent,kind:String,button:Int?=nil,down:Bool?=nil) { var value=position(event);value["kind"]=kind;if let button{value["button"]=button};if let down{value["down"]=down};proxy?.send("input",["input":value]) }
+    func pointer(_ event:NSEvent,kind:String,button:Int?=nil,down:Bool?=nil) { var value=position(event);value["kind"]=kind;if let button{value["button"]=button};if let down{value["down"]=down};if kind=="button"{Wire.diagnostic("pointer_button",["window":proxy?.id ?? [:],"x":value["x"] ?? 0,"y":value["y"] ?? 0,"view_width":bounds.width,"view_height":bounds.height,"picture_width":picture.width,"picture_height":picture.height,"down":down ?? false])};proxy?.send("input",["input":value]) }
     override func mouseMoved(with event:NSEvent){pointer(event,kind:"pointer")}
     override func mouseDragged(with event:NSEvent){pointer(event,kind:"pointer")}
     override func rightMouseDragged(with event:NSEvent){pointer(event,kind:"pointer")}

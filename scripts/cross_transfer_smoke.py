@@ -73,6 +73,8 @@ def main():
             env["RUST_LOG"] = os.environ["FRAMES_CROSS_RUST_LOG"]
         if role == "fixture":
             env["FRAMES_QA_SECONDS"] = str(min(max(args.hold_ui + 60, 300), 900))
+        if args.native_ui:
+            env["FRAMES_INPUT_DIAGNOSTICS"] = "1"
         return env
 
     def windows(role, arguments, executable=None):

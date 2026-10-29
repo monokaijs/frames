@@ -18,6 +18,35 @@ use windows::{
     core::*,
 };
 
+// WGC/DWM rectangles are physical pixels, including on mixed-DPI desktops.
+// Tokio workers may have a different inherited thread DPI context from the UI.
+struct PhysicalDpi(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT);
+impl PhysicalDpi {
+    unsafe fn enter() -> Self {
+        use windows::Win32::UI::HiDpi::*;
+        Self(unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) })
+    }
+}
+impl Drop for PhysicalDpi {
+    fn drop(&mut self) {
+        if !self.0.0.is_null() {
+            unsafe {
+                windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(self.0);
+            }
+        }
+    }
+}
+fn physical_point(rect: RECT, x: f64, y: f64) -> anyhow::Result<POINT> {
+    anyhow::ensure!(
+        x.is_finite() && y.is_finite() && rect.right > rect.left && rect.bottom > rect.top,
+        "invalid pointer coordinates or capture bounds"
+    );
+    Ok(POINT {
+        x: rect.left + ((rect.right - rect.left - 1) as f64 * x.clamp(0., 1.)).round() as i32,
+        y: rect.top + ((rect.bottom - rect.top - 1) as f64 * y.clamp(0., 1.)).round() as i32,
+    })
+}
+
 pub struct Host {
     registry: Mutex<WindowRegistry>,
     known: Mutex<HashMap<WindowId, RemoteWindow>>,
@@ -386,6 +415,7 @@ impl Desktop for Host {
     }
     fn input(&self, window_key: WindowId, event: &InputEvent) -> anyhow::Result<()> {
         unsafe {
+            let _dpi = PhysicalDpi::enter();
             let secure = self.registry.lock().handle(window_key) == Some(super::secure::HANDLE);
             let desktop =
                 self.registry.lock().handle(window_key) == Some(super::capture::DESKTOP_HANDLE);
@@ -418,23 +448,62 @@ impl Desktop for Host {
                 }
             }
             let position = |x: f64, y: f64| -> anyhow::Result<()> {
-                anyhow::ensure!(
-                    x.is_finite() && y.is_finite(),
-                    "invalid pointer coordinates"
-                );
-                SetCursorPos(
-                    rect.left + ((rect.right - rect.left) as f64 * x.clamp(0.0, 1.0)) as i32,
-                    rect.top + ((rect.bottom - rect.top) as f64 * y.clamp(0.0, 1.0)) as i32,
-                )?;
+                let point = physical_point(rect, x, y)?;
+                SetPhysicalCursorPos(point.x, point.y)?;
+                Ok(())
+            };
+            let check_target = || -> anyhow::Result<()> {
+                if !desktop && !secure {
+                    let mut point = POINT::default();
+                    GetPhysicalCursorPos(&mut point)?;
+                    let hit = WindowFromPhysicalPoint(point);
+                    let correct = GetAncestor(hit, GA_ROOT) == GetAncestor(hwnd, GA_ROOT);
+                    if std::env::var_os("FRAMES_INPUT_DIAGNOSTICS").is_some() {
+                        tracing::info!(
+                            window = window_key.id,
+                            left = rect.left,
+                            top = rect.top,
+                            width = rect.right - rect.left,
+                            height = rect.bottom - rect.top,
+                            screen_x = point.x,
+                            screen_y = point.y,
+                            target_matches = correct,
+                            "physical input target"
+                        );
+                    }
+                    anyhow::ensure!(
+                        correct,
+                        "Input blocked: the host window is covered or inactive; focus it on the host or use full desktop view"
+                    );
+                }
                 Ok(())
             };
             let mut inputs = vec![];
             match event {
                 InputEvent::Pointer { x, y } => position(*x, *y)?,
                 InputEvent::Button { button, down, x, y } => {
-                    position(*x, *y)?;
+                    if !*down && !self.pressed.lock().button_is_down(*button) {
+                        return Ok(());
+                    }
                     if *down && !desktop && !secure {
+                        // Raising without activation is allowed even when the
+                        // foreground lock refuses keyboard activation. The real
+                        // click can then activate this window, rather than land
+                        // on an unrelated window covering the capture surface.
+                        let _ = SetWindowPos(
+                            hwnd,
+                            Some(HWND_TOP),
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
                         let _ = SetForegroundWindow(hwnd);
+                    }
+                    position(*x, *y)?;
+                    if *down {
+                        check_target()?;
                     }
                     let flags = match (*button, *down) {
                         (0, true) => MOUSEEVENTF_LEFTDOWN,
@@ -449,6 +518,7 @@ impl Desktop for Host {
                 }
                 InputEvent::Scroll { dx, dy, x, y } => {
                     position(*x, *y)?;
+                    check_target()?;
                     if *dy != 0.0 {
                         inputs.push(mouse(MOUSEEVENTF_WHEEL, (-dy * 120.0) as i32 as u32));
                     }
@@ -645,6 +715,7 @@ impl Desktop for Host {
 }
 
 unsafe fn capture_bounds(hwnd: HWND) -> anyhow::Result<RECT> {
+    let _dpi = PhysicalDpi::enter();
     let mut rect = RECT::default();
     if windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
         hwnd,
@@ -912,4 +983,68 @@ unsafe fn icon_png(hwnd: HWND) -> Option<String> {
         let _ = DeleteObject(info.hbmMask.into());
     }
     output
+}
+
+#[cfg(test)]
+mod coordinate_tests {
+    use super::*;
+    #[test]
+    fn physical_coordinates_support_negative_origins_and_stay_inside_edges() {
+        let rect = RECT {
+            left: -1920,
+            top: -200,
+            right: -920,
+            bottom: 600,
+        };
+        let p = physical_point(rect, 0., 0.).unwrap();
+        assert_eq!((p.x, p.y), (-1920, -200));
+        let p = physical_point(rect, 1., 1.).unwrap();
+        assert_eq!((p.x, p.y), (-921, 599));
+        let p = physical_point(rect, 0.5, 0.5).unwrap();
+        assert_eq!((p.x, p.y), (-1420, 200));
+        assert!(physical_point(rect, f64::NAN, 0.).is_err());
+    }
+    #[test]
+    #[ignore = "moves the cursor inside a temporary fixture and restores it; requires interactive Windows"]
+    fn pointer_coordinates_remain_physical_on_an_unaware_worker_thread() {
+        use windows::Win32::UI::HiDpi::*;
+        unsafe {
+            let _restore = PhysicalDpi(SetThreadDpiAwarenessContext(
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            ));
+            let mut original = POINT::default();
+            GetPhysicalCursorPos(&mut original).unwrap();
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                windows::core::w!("STATIC"),
+                windows::core::w!("Frames physical pointer fixture"),
+                WS_OVERLAPPEDWINDOW,
+                100,
+                100,
+                400,
+                300,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let bounds = capture_bounds(hwnd).unwrap();
+            let expected = physical_point(bounds, 0.5, 0.5).unwrap();
+            let host = Host::new(vec![]).unwrap();
+            let key = host.registry.lock().reconcile(&[(hwnd.0 as u64, 1)])[&(hwnd.0 as u64)];
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE);
+            let result = host.input(key, &InputEvent::Pointer { x: 0.5, y: 0.5 });
+            let mut actual = POINT::default();
+            let read = GetPhysicalCursorPos(&mut actual);
+            let restored = GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext());
+            let _ = SetPhysicalCursorPos(original.x, original.y);
+            let _ = DestroyWindow(hwnd);
+            result.unwrap();
+            read.unwrap();
+            assert_eq!((actual.x, actual.y), (expected.x, expected.y));
+            assert_eq!(restored, DPI_AWARENESS_UNAWARE);
+        }
+    }
 }

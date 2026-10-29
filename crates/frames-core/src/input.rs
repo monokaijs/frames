@@ -84,6 +84,9 @@ pub struct PressedInput {
     buttons: BTreeSet<u8>,
 }
 impl PressedInput {
+    pub fn button_is_down(&self, button: u8) -> bool {
+        self.buttons.contains(&button)
+    }
     pub fn track(&mut self, event: &InputEvent) {
         match *event {
             InputEvent::Key { usage, down } => {
