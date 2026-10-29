@@ -244,6 +244,14 @@ fn main() -> anyhow::Result<()> {
                     ensure!(error.is_none(), "resize rejected: {error:?}");
                     let actual =
                         actual.context("resize acknowledgement missing actual geometry")?;
+                    measurements.insert(
+                        "resize_requested".into(),
+                        serde_json::json!([requested_size.0, requested_size.1]),
+                    );
+                    measurements.insert(
+                        "resize_acknowledged".into(),
+                        serde_json::json!([actual.bounds.width, actual.bounds.height]),
+                    );
                     ensure!(
                         (actual.bounds.width - requested_size.0).abs() < 3.
                             && (actual.bounds.height - requested_size.1).abs() < 3.,

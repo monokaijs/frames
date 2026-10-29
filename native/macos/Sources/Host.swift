@@ -44,7 +44,13 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
             }
             return [:]
         case "stop": if let capture = captures.removeValue(forKey: id) { await capture.stop() }; return [:]
-        case "action": try action(id, data["action"] as? [String: Any] ?? [:]); return [:]
+        case "action":
+            let command=data["action"] as? [String:Any] ?? [:]
+            let resizing=command["kind"] as? String == "resize"
+            let element=resizing ? windows[id].flatMap(axWindow) : nil
+            try action(id,command)
+            if let element { try await synchronizeResize(id,element) }
+            return [:]
         case "input": try input(id, data["event"] as? [String: Any] ?? [:]); return [:]
         case "release": release(); return [:]
         case "menu": return ["items": try menu(id)]
@@ -73,6 +79,26 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
             NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string); return [:]
         default: throw Wire.failure("Unsupported native command")
         }
+    }
+
+    // AX accepts a resize before ScreenCaptureKit publishes its new bounds.
+    // Wait for the actual (possibly constrained) AX size, not the requested size,
+    // so the following window snapshot cannot acknowledge pre-resize geometry.
+    func synchronizeResize(_ id:CGWindowID,_ element:AXUIElement) async throws {
+        for attempt in 0..<12 {
+            let content=try await SCShareableContent.excludingDesktopWindows(true,onScreenWindowsOnly:false)
+            guard let window=content.windows.first(where:{$0.windowID==id}) else{throw Wire.failure("Window closed during resize")}
+            if let value=attribute(element,kAXSizeAttribute),CFGetTypeID(value)==AXValueGetTypeID(){
+                var size=CGSize.zero
+                if AXValueGetValue(value as! AXValue,.cgSize,&size),abs(window.frame.width-size.width)<1,abs(window.frame.height-size.height)<1{
+                    windows[id]=window
+                    Wire.diagnostic("resize_geometry_synchronized",["attempts":attempt+1])
+                    return
+                }
+            }
+            try await Task.sleep(nanoseconds:20_000_000)
+        }
+        throw Wire.failure("Host resized the window but capture geometry has not synchronized yet")
     }
 
     func enumerate(exclusions: [String]) async throws -> [String: Any] {

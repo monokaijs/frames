@@ -35,7 +35,7 @@ import ApplicationServices
         if host?.isRunning == true{return};host=nil
         guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else{status.stringValue="Grant Frames Screen Recording in Privacy & Security, then reopen Frames.";return}
         let trusted=AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String:true] as CFDictionary)
-        do{var arguments=["host","--pair"];if unattended.state == .on{arguments.append("--unattended")};host=try process(arguments);status.stringValue=trusted ? "Sharing this Mac on port 47990.":"Sharing. Grant Accessibility to allow keyboard, mouse, and resizing."}catch{status.stringValue=error.localizedDescription}
+        do{var arguments=["host","--pair"];if unattended.state == .on{arguments.append("--unattended")};host=try process(arguments);status.stringValue=trusted ? "Sharing this Mac on port 47990.":"Sharing. Grant \(Wire.controlPermissionLabel) for input and resizing."}catch{status.stringValue=error.localizedDescription}
     }
     @objc func stop(){host?.terminate();host=nil;discovery?.terminate();discovery=nil;for process in clients where process.isRunning{process.terminate()};clients.removeAll();status.stringValue="All sessions stopped."}
     @objc func discover(){

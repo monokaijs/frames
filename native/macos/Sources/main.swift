@@ -4,6 +4,7 @@ import ApplicationServices
 
 enum Wire {
     static let lock = NSLock()
+    static let controlPermissionLabel = ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27 ? "Device Control and Data Access (Accessibility)" : "Accessibility"
     static let diagnosticsEnabled = ProcessInfo.processInfo.environment["FRAMES_NATIVE_DIAGNOSTICS"] == "1"
     // Metadata only: no titles, pixels, clipboard contents, or input text.
     static func diagnostic(_ event: String, _ fields: [String: Any] = [:]) {
@@ -35,7 +36,7 @@ if args.contains("--permissions"){
         _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String:true] as CFDictionary)
         RunLoop.current.run(until:Date(timeIntervalSinceNow:1))
     }
-    Wire.send(["screen_capture":CGPreflightScreenCaptureAccess(),"accessibility":AXIsProcessTrusted(),"bundle_id":Bundle.main.bundleIdentifier ?? "unbundled","executable":CommandLine.arguments[0]])
+    Wire.send(["screen_capture":CGPreflightScreenCaptureAccess(),"accessibility":AXIsProcessTrusted(),"control_permission_name":Wire.controlPermissionLabel,"bundle_id":Bundle.main.bundleIdentifier ?? "unbundled","executable":CommandLine.arguments[0]])
 }else if args.contains("--error"){
     app.setActivationPolicy(.regular);app.activate(ignoringOtherApps:true);let alert=NSAlert();alert.messageText=args.count>2 ? args[2]:"Frames";alert.informativeText=args.count>3 ? args[3]:"Unknown error";alert.alertStyle = .critical;alert.runModal()
 }else if args.contains("--approve"){
