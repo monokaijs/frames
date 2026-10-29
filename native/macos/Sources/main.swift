@@ -4,6 +4,16 @@ import ApplicationServices
 
 enum Wire {
     static let lock = NSLock()
+    static let diagnosticsEnabled = ProcessInfo.processInfo.environment["FRAMES_NATIVE_DIAGNOSTICS"] == "1"
+    // Metadata only: no titles, pixels, clipboard contents, or input text.
+    static func diagnostic(_ event: String, _ fields: [String: Any] = [:]) {
+        guard diagnosticsEnabled else { return }
+        var object = fields
+        object["native_event"] = event
+        guard let bytes = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { return }
+        lock.lock(); defer { lock.unlock() }
+        FileHandle.standardError.write(bytes); FileHandle.standardError.write(Data([10]))
+    }
     static func send(_ object: [String: Any]) {
         guard JSONSerialization.isValidJSONObject(object), let bytes = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { return }
         lock.lock(); defer { lock.unlock() }
