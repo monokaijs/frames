@@ -17,6 +17,12 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect macOS permissions, optionally opening the system permission prompts.
+    #[cfg(target_os = "macos")]
+    Permissions {
+        #[arg(long)]
+        request: bool,
+    },
     #[cfg(windows)]
     Service {
         #[command(subcommand)]
@@ -141,6 +147,7 @@ fn run() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     match command{
+        #[cfg(target_os="macos")] Command::Permissions{request}=>{println!("{}",serde_json::to_string_pretty(&frames_native::permission_status(request)?)?);Ok(())},
         #[cfg(windows)] Command::Service{action:ServiceCommand::Agent}=>runtime.block_on(session::host("0.0.0.0:47990".parse()?,false,true,vec![],None,8,true)),
         #[cfg(windows)] Command::Service{..}=>unreachable!(),
         Command::Host{listen,pair,unattended,exclude,receive_dir,max_streams,no_clipboard}=>runtime.block_on(session::host(listen,pair,unattended,exclude,receive_dir,max_streams,!no_clipboard)),

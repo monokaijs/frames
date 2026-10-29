@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import ApplicationServices
 
 enum Wire {
     static let lock = NSLock()
@@ -17,7 +18,15 @@ let args = CommandLine.arguments
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 
-if args.contains("--error"){
+if args.contains("--permissions"){
+    if args.contains("--request"){
+        app.setActivationPolicy(.regular);app.activate(ignoringOtherApps:true)
+        if !CGPreflightScreenCaptureAccess(){_ = CGRequestScreenCaptureAccess()}
+        _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String:true] as CFDictionary)
+        RunLoop.current.run(until:Date(timeIntervalSinceNow:1))
+    }
+    Wire.send(["screen_capture":CGPreflightScreenCaptureAccess(),"accessibility":AXIsProcessTrusted(),"bundle_id":Bundle.main.bundleIdentifier ?? "unbundled","executable":CommandLine.arguments[0]])
+}else if args.contains("--error"){
     app.setActivationPolicy(.regular);app.activate(ignoringOtherApps:true);let alert=NSAlert();alert.messageText=args.count>2 ? args[2]:"Frames";alert.informativeText=args.count>3 ? args[3]:"Unknown error";alert.alertStyle = .critical;alert.runModal()
 }else if args.contains("--approve"){
     app.setActivationPolicy(.regular);app.activate(ignoringOtherApps:true)

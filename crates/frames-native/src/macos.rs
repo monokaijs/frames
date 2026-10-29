@@ -49,6 +49,20 @@ pub fn launcher() -> anyhow::Result<()> {
     );
     Ok(())
 }
+pub fn permission_status(request: bool) -> anyhow::Result<Value> {
+    let mut command = Command::new(helper_path()?);
+    command.arg("--permissions");
+    if request {
+        command.arg("--request");
+    }
+    let output = command.output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "permission helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
 pub fn show_error(title: &str, message: &str) -> anyhow::Result<()> {
     Command::new(helper_path()?)
         .args(["--error", title, message])

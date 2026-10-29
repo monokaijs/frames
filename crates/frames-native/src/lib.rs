@@ -4,6 +4,11 @@ use tokio::sync::{mpsc, watch};
 pub mod audio;
 
 #[cfg(target_os = "macos")]
+pub fn permission_status(request: bool) -> anyhow::Result<serde_json::Value> {
+    macos::permission_status(request)
+}
+
+#[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]
 mod windows;

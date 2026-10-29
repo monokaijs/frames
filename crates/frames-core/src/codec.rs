@@ -44,7 +44,26 @@ pub struct CodecCapability {
 }
 
 pub fn ffmpeg_path() -> std::ffi::OsString {
-    std::env::var_os("FRAMES_FFMPEG").unwrap_or_else(|| "ffmpeg".into())
+    if let Some(path) = std::env::var_os("FRAMES_FFMPEG") {
+        return path;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(executable) = std::env::current_exe() {
+            if let Some(directory) = executable.parent() {
+                let bundled = directory.join("ffmpeg");
+                if bundled.is_file() {
+                    return bundled.into_os_string();
+                }
+            }
+        }
+        for path in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
+            if std::path::Path::new(path).is_file() {
+                return path.into();
+            }
+        }
+    }
+    "ffmpeg".into()
 }
 
 pub fn command() -> Command {
