@@ -13,7 +13,7 @@ enum Wire {
 }
 
 @MainActor func runFrames(){
-guard frames_abi_version() == 1 else { fatalError("Frames native ABI mismatch") }
+guard frames_abi_version() == FRAMES_ABI_VERSION else { fatalError("Frames native ABI mismatch") }
 let args = CommandLine.arguments
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)

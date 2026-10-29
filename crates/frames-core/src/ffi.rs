@@ -1,10 +1,10 @@
 //! Owned UTF-8 buffers at the native boundary. No Rust allocation crosses an ABI unowned.
-use crate::{PROTOCOL_VERSION, model::WindowGraph, protocol::Message};
+use crate::{NATIVE_ABI_VERSION, model::WindowGraph, protocol::Message};
 use std::ffi::{CStr, CString, c_char};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn frames_abi_version() -> u32 {
-    PROTOCOL_VERSION as u32
+    NATIVE_ABI_VERSION
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn frames_session_new() -> *mut WindowGraph {
@@ -58,5 +58,32 @@ pub unsafe extern "C" fn frames_session_free(session: *mut WindowGraph) {
 pub unsafe extern "C" fn frames_string_free(string: *mut c_char) {
     if !string.is_null() {
         drop(unsafe { CString::from_raw(string) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn native_abi_one_accepts_desktop_snapshots_and_rejects_update_gaps() {
+        unsafe {
+            assert_eq!(frames_abi_version(), 1);
+            let session = frames_session_new();
+            let message=CString::new(r#"{"type":"snapshot","data":{"sequence":1,"windows":[{"key":{"id":1,"generation":1},"app_id":"fixture","app_name":"Fixture","title":"Desktop","icon_png":null,"parent":null,"role":"desktop","bounds":{"x":0,"y":0,"width":1920,"height":1080},"scale":1,"resize":"fixed","minimized":false,"visible":true,"modal":false}]}}"#).unwrap();
+            let result = frames_session_apply(session, message.as_ptr());
+            assert_eq!(CStr::from_ptr(result).to_str().unwrap(), r#"{"ok":true}"#);
+            frames_string_free(result);
+            let gap =
+                CString::new(r#"{"type":"delta","data":{"sequence":3,"upsert":[],"removed":[]}}"#)
+                    .unwrap();
+            let result = frames_session_apply(session, gap.as_ptr());
+            let value: serde_json::Value =
+                serde_json::from_slice(CStr::from_ptr(result).to_bytes()).unwrap();
+            assert_eq!(value["ok"], false);
+            assert_eq!((*session).sequence, 1);
+            assert_eq!((*session).windows.len(), 1);
+            frames_string_free(result);
+            frames_session_free(session);
+        }
     }
 }

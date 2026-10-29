@@ -15,4 +15,5 @@ pub mod transport;
 pub mod trust;
 
 pub const PROTOCOL_VERSION: u16 = 2;
+pub const NATIVE_ABI_VERSION: u32 = 1;
 pub const ALPN: &[u8] = b"frames/2";

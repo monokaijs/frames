@@ -1,6 +1,7 @@
 #ifndef FRAMES_H
 #define FRAMES_H
 #include <stdint.h>
+#define FRAMES_ABI_VERSION 1u
 #ifdef __cplusplus
 extern "C" {
 #endif
