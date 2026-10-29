@@ -2,6 +2,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
+export MACOSX_DEPLOYMENT_TARGET=14.2
 cargo build --locked --release --target aarch64-apple-darwin
 mkdir -p dist/macos/Frames.app/Contents/{MacOS,Resources,Library/LaunchAgents}
 swiftc -O -swift-version 5 -target arm64-apple-macos14.2 \
