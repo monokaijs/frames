@@ -24,6 +24,9 @@ def main():
     parser.add_argument("--mac-ssh", default="macmini")
     parser.add_argument("--mac-address", required=True)
     parser.add_argument("--windows-address", required=True)
+    parser.add_argument("--control-probe", type=Path,
+                        help="Optional production-session fixture client; requires Frames QA source on the Mac")
+    parser.add_argument("--capture-only", action="store_true")
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -62,8 +65,8 @@ def main():
             env["RUST_LOG"] = os.environ["FRAMES_CROSS_RUST_LOG"]
         return env
 
-    def windows(role, arguments):
-        child = subprocess.Popen([str(binary), *arguments], env=environment(role),
+    def windows(role, arguments, executable=None):
+        child = subprocess.Popen([str(executable or binary), *arguments], env=environment(role),
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                  text=True, encoding="utf-8", errors="replace", creationflags=creationflags)
         children.append(child)
@@ -156,6 +159,14 @@ def main():
         assert get.returncode == 0, get_log["err"]
         assert (root / "downloaded" / "Frames Mac Unicode.bin").read_bytes() == payload
         passed("Mac host -> Windows client: trusted download and integrity")
+
+        if args.control_probe:
+            probe_args = [args.mac_address + ":47991", str(root / "mac-host-control.json")]
+            probe_args += ["--capture-only"] if args.capture_only else ["--desktop"]
+            probe, probe_log = windows("windows-client", probe_args, args.control_probe.resolve(strict=True))
+            until(lambda: probe.poll() is not None, 120)
+            assert probe.returncode == 0, probe_log["err"] + probe_log["out"]
+            passed("Mac host live fixture capture/control probe")
 
         win_host, win_host_log = windows("windows-host", ["host", "--listen", "0.0.0.0:47992", "--pair",
                                                         "--unattended", "--no-clipboard", "--receive-dir",
