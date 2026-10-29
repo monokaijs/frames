@@ -85,7 +85,8 @@ import QuartzCore
                 if let owner = remote["parent"] as? [String: Any], let parent = windows[Self.key(owner)] {
                     parent.window.addChildWindow(proxy.window, ordered: .above)
                     let pr = parent.remote["bounds"] as? [String: Double] ?? [:], cr = remote["bounds"] as? [String: Double] ?? [:]
-                    proxy.window.setFrameOrigin(NSPoint(x:parent.window.frame.minX+(cr["x"] ?? 0)-(pr["x"] ?? 0),y:parent.window.frame.maxY-((cr["y"] ?? 0)-(pr["y"] ?? 0))-proxy.window.frame.height))
+                    let body=parent.window.convertToScreen(parent.view.convert(parent.view.bounds,to:nil))
+                    proxy.window.setFrameOrigin(NSPoint(x:body.minX+(cr["x"] ?? 0)-(pr["x"] ?? 0),y:body.maxY-((cr["y"] ?? 0)-(pr["y"] ?? 0))-proxy.view.bounds.height))
                 }
                 proxy.window.orderFront(nil); proxy.visibility()
                 let appID = remote["app_id"] as? String ?? "unknown"

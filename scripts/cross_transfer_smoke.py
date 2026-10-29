@@ -201,6 +201,7 @@ def main():
                                      encoding="utf-8", check=True, creationflags=creationflags)
             windows_list = json.loads(listing.stdout)
             assert any(w["title"] == "Frames QA source" for w in windows_list), "Start window_fixture --no-cover first"
+            fixture_source = next(w for w in windows_list if w["title"] == "Frames QA source")
             excluded = [arg for app_id in sorted({w["app_id"] for w in windows_list
                                                 if Path(w["app_id"]).stem != "window_fixture"})
                         for arg in ("--exclude", app_id)]
@@ -220,6 +221,13 @@ def main():
             _, native_folder = mac("mac-client-native", ["connect", args.windows_address + ":47992", "--no-clipboard"], "mac-client")
             until(lambda: '"native_event":"metal_present_completed"' in read_remote(native_folder + "/err.log"), 45)
             passed("Windows WGC -> QUIC -> Mac decoder -> native AppKit/Metal presentation")
+            native_events = [json.loads(line) for line in read_remote(native_folder + "/err.log").splitlines()
+                             if line.startswith('{"')]
+            first_frame = next(event for event in native_events if event.get("native_event") == "metal_present_completed")
+            expected = [round(fixture_source["bounds"][dimension] * fixture_source["scale"])
+                        for dimension in ("width", "height")]
+            assert [first_frame["width"], first_frame["height"]] == expected, "Mac presentation dimensions differ from Windows client-area metadata"
+            passed("Windows client-area dimensions match the Mac frame without captured frame/menu chrome")
             until(lambda: '"remote_top_level_items":1' in read_remote(native_folder + "/err.log"), 15)
             passed("Live Windows application menu installed in Mac native menu bar")
             if args.hold_ui:

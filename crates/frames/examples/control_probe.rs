@@ -196,7 +196,7 @@ fn main() -> anyhow::Result<()> {
                                     "host title bar leaked into captured content"
                                 );
                             }
-                            passed.push("standard Mac title bar excluded; content geometry matches Retina frames".into());
+                            passed.push("standard Mac title bar excluded; content dimensions match scale metadata".into());
                         }
                         let pixel =
                             ((frame.height / 2 * frame.width + frame.width / 2) * 4) as usize;
