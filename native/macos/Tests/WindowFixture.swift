@@ -23,7 +23,9 @@ import AppKit
     func controlTextDidChange(_ notification:Notification){source.title="Frames QA source text: "+input.stringValue}
     func windowWillClose(_ notification:Notification){NSApp.terminate(nil)}
 }
-let app=NSApplication.shared
-app.setActivationPolicy(.regular)
-let fixture=Fixture();app.delegate=fixture
-withExtendedLifetime(fixture){app.run()}
+MainActor.assumeIsolated {
+    let app=NSApplication.shared
+    app.setActivationPolicy(.regular)
+    let fixture=Fixture();app.delegate=fixture
+    withExtendedLifetime(fixture){app.run()}
+}
