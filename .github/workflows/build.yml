@@ -32,6 +32,8 @@ jobs:
         with:
           targets: aarch64-apple-darwin
       - run: cargo test --workspace --locked
+      - name: Signing identity regression checks
+        run: python3 native/macos/Tests/SigningTests.py
       - run: bash native/macos/build.sh
       - name: Mac modifier routing regression checks
         run: |
