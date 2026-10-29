@@ -2,7 +2,21 @@
 
 This file separates implemented paths from measured results. No latency, signing, or cross-machine guarantee is inferred from unit tests.
 
-Local runs on 2026-10-29: Windows 11 x64 GNU, Ryzen 7800X3D, RTX 3080 Ti plus AMD integrated graphics and a virtual-display adapter. Twenty-one core tests, one mutual-TLS test, four native fixture tests, the installed ADB client against a synthetic device through QUIC, Clippy with warnings denied, and native UI menu checks passed. Codec/audio roundtrips and the five CLI transfer scenarios were also exercised locally. This is a single-machine development check, not the reference Windows–Mac latency pair.
+Development runs on 2026-10-29: Windows 11 x64 GNU, Ryzen 7800X3D, RTX 3080 Ti plus AMD integrated graphics and a virtual-display adapter; Mac mini Apple M2 Pro, macOS 27.0.1 (26A434). Twenty-two core tests and one mutual-TLS test pass on both platforms. Four Windows native fixture tests, the installed ADB client against a synthetic device through QUIC, Clippy with warnings denied, and Windows native UI menu checks passed. Codec/audio roundtrips, CLI transfers, and the cross-machine checks below were exercised. This pair has not been validated against the latency targets.
+
+## Mac build and cross-machine run
+
+- Source pushed to `monokaijs/frames`, cloned at `~/WebstormProjects/frames` on `macmini`. Rust and Swift build on the physical Mac; the macOS CI compile gate also passes.
+- Development app installed at `~/Applications/Frames.app`, ad-hoc signed and verified. Developer ID signing currently requires access to the signing key through the user's GUI/Keychain; distribution signing and notarization remain outstanding.
+- Repaired a broken external FFmpeg installation by installing Homebrew's separate keg-only `ffmpeg-full`. Frames discovers it without changing the shell PATH or replacing the existing regular FFmpeg link.
+- Live Mac raw-frame encode/decode succeeds for H.264/HEVC through VideoToolbox and AV1/VP9 in software. Generated Opus PCM roundtrip passes. These are codec checks, not captured Mac app streams.
+- Mac GUI Keychain identity creation succeeds. Launching directly through SSH cannot access that GUI Keychain identity; cross-machine tests launch the installed app with `open` in Aqua.
+- Windows client → Mac host over Ethernet: matching TLS-exporter codes, explicit approvals, Unicode filename upload, 512 KiB payload, SHA-256 verification, trusted reconnect, and Mac → Windows download pass. Results/logs are in `dist/cross-platform/20261029T013517Z`; this run has two successful scenarios and the reverse connection failure below.
+- Mac client → Windows host fails before pairing. Quinn logs `sendmsg` errno 65 (`No route to host`) from the GUI-launched app, while an independent Mac UDP probe reaches Windows. Local Network permission/app identity is the leading cause; it is not proven until the permission is approved and the connection is retried. The Mac has Ethernet and Wi-Fi addresses; Ethernet `192.168.0.169` works for the incoming connection, whereas the Wi-Fi address `192.168.0.131` times out during handshake and needs separate multihomed-network investigation.
+- Real Aqua client fixture passes: Rust/Swift bridge creates an AppKit proxy, installs the generated remote application menu in the macOS menu bar, and receives successful Metal command-buffer completion for a 640×400 generated frame. Logs: `/var/folders/mr/28z60fqx1r7dj14g796fmvvh0000gn/T/frames-native-smoke.93oyax6f`. This does not verify native menu clicks, GPU pixel readback, or a live remote video stream.
+- Screen Recording and Accessibility both report **false**. Normal OS prompts were requested. Mac-host live window capture, input, resizing, popup/menu extraction, clipboard/audio integration, lock/login transitions, and full cross-platform acceptance remain blocked/unmeasured.
+
+Use `scripts/cross_transfer_smoke.py` and `scripts/mac_native_smoke.py` to repeat these checks. Neither grants macOS permissions or alters TCC databases.
 
 ## Exercised locally
 

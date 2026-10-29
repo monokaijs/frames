@@ -151,15 +151,19 @@ impl Outbound {
             let _ = ui.try_send(ClientUpdate::TransferProgress { name, done, total });
         }
     }
-    pub async fn send(&self, message: Message) -> Result<(), mpsc::error::SendError<Message>> {
-        if matches!(
+    pub async fn send(&self, message: Message) -> anyhow::Result<()> {
+        let channel = if matches!(
             &message,
             Message::Transfer(TransferMessage::Chunk { .. } | TransferMessage::Complete { .. })
         ) {
-            self.bulk.send(message).await
+            &self.bulk
         } else {
-            self.control.send(message).await
-        }
+            &self.control
+        };
+        channel
+            .send(message)
+            .await
+            .map_err(|_| anyhow::anyhow!("session writer stopped"))
     }
     pub fn blocking_send(&self, message: Message) -> anyhow::Result<()> {
         self.control
@@ -490,7 +494,8 @@ async fn connect(
         std::time::Duration::from_secs(10),
         endpoint.connect(address, "frames.local")?,
     )
-    .await??;
+    .await
+    .context(connection_timeout_hint())??;
     let (send, receive, peer) =
         handshake(&connection, &identity, codecs, false, true, true, purpose).await?;
     Ok((
@@ -499,6 +504,14 @@ async fn connect(
         control(connection, send, receive),
         peer,
     ))
+}
+
+fn connection_timeout_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "QUIC connection timed out. Check the host address and UDP port, and allow Frames in System Settings > Privacy & Security > Local Network before retrying"
+    } else {
+        "QUIC connection timed out. Check the host address, UDP port, and firewall settings"
+    }
 }
 
 pub async fn client(

@@ -7,8 +7,10 @@ try {
         $Target = 'x86_64-pc-windows-msvc'
         if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue) -and (Test-Path -LiteralPath 'C:\msys64\ucrt64\bin\gcc.exe')) {
             $Target = 'x86_64-pc-windows-gnu'
-            $env:Path = 'C:\msys64\ucrt64\bin;' + $env:Path
         }
+    }
+    if ($Target -eq 'x86_64-pc-windows-gnu' -and (Test-Path -LiteralPath 'C:\msys64\ucrt64\bin\gcc.exe')) {
+        $env:Path = 'C:\msys64\ucrt64\bin;' + $env:Path
     }
     $buildArgs = @('build', '--locked', '-p', 'frames', '--target', $Target)
     $profile = 'debug'

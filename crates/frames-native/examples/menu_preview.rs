@@ -63,8 +63,8 @@ fn main() -> anyhow::Result<()> {
         };
         let frame = || {
             let mut bgra = vec![0; 640 * 400 * 4];
-            for (y, row) in bgra.chunks_exact_mut(640 * 4).enumerate() {
-                for (x, p) in row.chunks_exact_mut(4).enumerate() {
+            for (y, row) in bgra.as_chunks_mut::<{ 640 * 4 }>().0.iter_mut().enumerate() {
+                for (x, p) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     p.copy_from_slice(&[90 + (x / 8) as u8, 60 + (y / 8) as u8, 35, 255]);
                 }
             }

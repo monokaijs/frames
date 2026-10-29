@@ -2,7 +2,7 @@
 
 Native per-window remote control for Windows 11 x64 and macOS 14.2+ on Apple silicon. Frames is an independent Rust application with Win32/D3D11 and AppKit/Metal frontends.
 
-**Development build, not a production release.** Direct Windows capture and local codec roundtrips have been exercised on Windows. The macOS sources need an Apple SDK build and hardware verification. See [release gates](docs/VALIDATION.md) for the exact limits and pending checks.
+**Development build, not a production release.** Windows direct capture, Mac AppKit/Metal presentation, codec roundtrips on both machines, and Windows-client/Mac-host LAN transfers have passed development checks. Live Mac capture/control and the reverse GUI connection still require macOS permission approval. See [release gates](docs/VALIDATION.md) for measured results and pending checks.
 
 ## Build and run on Windows
 
@@ -50,9 +50,13 @@ bash native/macos/build.sh
 open dist/macos/Frames.app
 ```
 
-Xcode command-line tools and FFmpeg are required. Grant the signed application Screen Recording and Accessibility permissions. Development signatures, executable paths, and responsible-process identity affect macOS permissions; signing/notarization must be completed before distribution.
+Xcode command-line tools and FFmpeg are required. Set `FRAMES_SIGN_IDENTITY` to your signing identity when building; `-` selects ad-hoc signing for local development. Signing/notarization must be completed before distribution. Development signatures, executable paths, and responsible-process identity affect macOS permissions.
 
-`FRAMES_MAC_HELPER` can select a development helper. `FRAMES_FFMPEG` can select an FFmpeg executable when it is not on the process's PATH. The launcher offers a per-user sharing login item. **Prelogin/FileVault access is not validated or enabled by this login item.**
+Open the installed app in the logged-in desktop session and allow **Local Network**, **Screen Recording**, and **Accessibility** in System Settings → Privacy & Security. Local Network is needed for outbound LAN connections on newer macOS versions. A connection timeout or `No route to host` can indicate this permission is missing; check the address and routing too. Apple documents the permission model in [TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy).
+
+`Frames.app/Contents/MacOS/frames permissions` reports capture/input permissions; add `--request` to show the normal OS prompts. The login Keychain may be unavailable to a process launched directly over SSH, so run host/client through the app's GUI session. Permissions are not granted by the test scripts.
+
+`FRAMES_MAC_HELPER` can select a development helper. `FRAMES_FFMPEG` can select an FFmpeg executable when it is not on the process's PATH. GUI builds also discover Homebrew's regular and keg-only `ffmpeg-full` binaries. The launcher offers a per-user sharing login item. **Prelogin/FileVault access is not validated or enabled by this login item.**
 
 ## Phones and developer devices
 
@@ -113,6 +117,16 @@ cargo test -p frames-native -- --ignored --nocapture
 python scripts/smoke_transfer.py target/debug/frames.exe
 ```
 
-The last command opens short-lived fixture windows on an interactive Windows desktop. It verifies that WGC captures the source even while another window covers it. GNU toolchains require `--target x86_64-pc-windows-gnu` and GCC on PATH. CI includes Windows builds and a macOS compile gate; CI has not been run from this local workspace.
+The native tests open short-lived fixture windows on an interactive Windows desktop. They verify independent WGC capture, native menus, and D3D11 presentation. The Python command tests pairing/transfers using generated files. GNU toolchains require `--target x86_64-pc-windows-gnu` and GCC on PATH. CI builds both platforms.
+
+For the real Windows/Mac LAN transfer check, install matching builds and run on Windows:
+
+```powershell
+python scripts/cross_transfer_smoke.py dist/windows/Frames.exe --mac-address MAC_IP --windows-address WINDOWS_IP
+```
+
+It uses SSH host `macmini` by default, the Mac app at `~/Applications/Frames.app`, fresh protected test identities, generated files, and dedicated ports 47991/47992. It compares both pairing codes before approving and records checksums/results under `dist/cross-platform`. It leaves generated test files for inspection.
+
+On the Mac, build `cargo build -p frames-native --example menu_preview --target aarch64-apple-darwin`, then run `python3 scripts/mac_native_smoke.py` to check the Rust/Swift bridge, native menu installation, AppKit window, and Metal GPU completion with generated pixels. `FRAMES_NATIVE_DIAGNOSTICS=1` emits native client metadata to stderr without recording titles, pixels, clipboard contents, or text input. These checks do not measure display latency.
 
 RustDesk and TwinDesk were studied as behavior/architecture references. Their implementations are not vendored. FFmpeg is an external runtime dependency and is not included in build artifacts. Review dependency and codec distribution obligations before packaging a public release.
