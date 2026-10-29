@@ -57,7 +57,12 @@ pub fn ffmpeg_path() -> std::ffi::OsString {
                 }
             }
         }
-        for path in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
+        for path in [
+            "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/opt/ffmpeg-full/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+        ] {
             if std::path::Path::new(path).is_file() {
                 return path.into();
             }

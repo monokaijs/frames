@@ -201,7 +201,7 @@ final class DockEventReader: @unchecked Sendable {
     }
 }
 
-@MainActor final class RemoteView: NSView, @preconcurrency NSTextInputClient {
+@MainActor final class RemoteView: NSView {
     weak var proxy: RemoteProxy?
     var renderer: MetalPicture?
     var picture = CGSize(width:1,height:1)
@@ -258,6 +258,12 @@ final class DockEventReader: @unchecked Sendable {
     override func draggingEntered(_ sender:NSDraggingInfo)->NSDragOperation{.copy}
     override func performDragOperation(_ sender:NSDraggingInfo)->Bool{guard let urls=sender.draggingPasteboard.readObjects(forClasses:[NSURL.self],options:[.urlReadingFileURLsOnly:true]) as? [URL],!urls.isEmpty else{return false};let point=convert(sender.draggingLocation,from:nil);proxy?.send("send_files",["paths":urls.map(\.path),"x":min(1,max(0,point.x/max(1,bounds.width))),"y":min(1,max(0,1-point.y/max(1,bounds.height)))]);return true}
 }
+
+#if compiler(>=6.0)
+extension RemoteView: @preconcurrency NSTextInputClient {}
+#else
+extension RemoteView: NSTextInputClient {}
+#endif
 
 @MainActor final class MetalPicture {
     let device:MTLDevice;let queue:MTLCommandQueue;let layer:CAMetalLayer;let pipeline:MTLRenderPipelineState
