@@ -1,3 +1,4 @@
+mod launcher;
 #[cfg(windows)]
 mod service;
 mod session;
@@ -132,7 +133,7 @@ fn run() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     let Some(command) = args.command else {
-        return frames_native::launcher();
+        return launcher::run();
     };
     #[cfg(windows)]
     if let Command::Service { action } = &command {

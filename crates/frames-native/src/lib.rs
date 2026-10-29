@@ -9,6 +9,21 @@ pub fn permission_status(request: bool) -> anyhow::Result<serde_json::Value> {
 }
 
 #[cfg(target_os = "macos")]
+pub fn configure_login_item() -> anyhow::Result<()> {
+    macos::configure_login_item()
+}
+
+#[cfg(target_os = "macos")]
+pub fn open_network_settings() -> anyhow::Result<()> {
+    macos::open_network_settings()
+}
+
+#[cfg(target_os = "macos")]
+pub fn request_permission(kind: &str) -> anyhow::Result<()> {
+    macos::request_permission(kind)
+}
+
+#[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]
 mod windows;

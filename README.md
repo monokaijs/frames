@@ -1,6 +1,6 @@
 # Frames
 
-Native per-window remote control for Windows 11 x64 and macOS 14.2+ on Apple silicon. Frames is an independent Rust application with Win32/D3D11 and AppKit/Metal frontends.
+Native per-window remote control for Windows 11 x64 and macOS 14.2+ on Apple silicon. Frames is an independent Rust application with a Slint connection workspace and Win32/D3D11 and AppKit/Metal remote-window frontends.
 
 **Development build, not a production release.** Live Mac capture/control, Windows-to-Mac AppKit/Metal video, native menu projection, desktop/window switching, codec roundtrips, and bidirectional LAN transfers have passed development checks. Resume latency and the full acceptance matrix still need work. See [release gates](docs/VALIDATION.md) for measurements and remaining checks.
 
@@ -13,7 +13,7 @@ Install Rust and either Visual Studio C++ Build Tools or an existing MSYS2 UCRT6
 .\dist\windows\Frames.exe
 ```
 
-Launching without arguments opens the native connection/sharing window. Enter a numeric IP address and port, or use **Nearby devices** to discover hosts. Both devices must explicitly approve the same pairing code. Stop sessions from the launcher before closing it.
+Launching without arguments opens the Slint workspace. **Connections** contains connect/share actions, session controls, and nearby discovery; **Devices** contains recent addresses and trusted certificates; **Permissions** guides macOS setup and sharing preferences. Enter a numeric IP address (port **47990** is used when omitted), or use **Scan network** to discover hosts. Both devices must explicitly approve the same pairing code. Closing the launcher stops the sessions it started. See [launcher design and preview](docs/LAUNCHER.md).
 
 CLI equivalents:
 
@@ -54,7 +54,7 @@ bash native/macos/build.sh
 open dist/macos/Frames.app
 ```
 
-Xcode command-line tools and FFmpeg are required. Set `FRAMES_SIGN_IDENTITY` to your signing identity when building; `-` selects ad-hoc signing for local development. Signing/notarization must be completed before distribution. Development signatures, executable paths, and responsible-process identity affect macOS permissions.
+Xcode command-line tools and FFmpeg are required. The build reuses its previous certificate, or selects a single available Developer ID / Apple Development identity. Set `FRAMES_SIGN_IDENTITY` to choose one explicitly; `-` selects ad-hoc signing, whose privacy grants may reset after every rebuild. Signing/notarization must be completed before distribution. Development signatures, executable paths, and responsible-process identity affect macOS permissions.
 
 Open the installed app in the logged-in desktop session and allow **Local Network**, **Screen Recording**, and **Accessibility** in System Settings → Privacy & Security. On macOS 27, Accessibility is named **Device Control and Data Access**. Local Network is needed for outbound LAN connections on newer macOS versions. A connection timeout or `No route to host` can indicate this permission is missing; check the address and routing too. Apple documents the network permission model in [TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy).
 
@@ -107,7 +107,7 @@ The privileged login agent intentionally disables file operations; use a normal 
 
 - `frames-core`: protocol, ordered window graph, input state, codec probing/process adapters, QUIC, certificate trust, protected identity storage, media fragmentation/recovery, transfer integrity, C ABI.
 - `frames-native`: direct WGC capture, Win32 proxies and D3D11 presentation, native clipboard/input/drag APIs, WASAPI loopback/CoreAudio playback, macOS helper bridge.
-- `frames`: host/client orchestration, separate low-priority QUIC file streams, discovery, native launcher integration, optional Windows service.
+- `frames`: host/client orchestration, separate low-priority QUIC file streams, discovery, Slint launcher and session supervision, optional Windows service.
 - `native/macos`: ScreenCaptureKit/Accessibility host, AppKit/Metal client, Dock helpers, file promises, system audio, login item.
 
 Seamless windows are **never desktop crops**. Explicit desktop mode uses WGC monitor capture or ScreenCaptureKit display capture. The privileged Windows secure-screen path separately uses Desktop Duplication. Host and client positions are independent. Hiding a client unsubscribes its video stream, drops its capture/encoder, and preserves metadata; audio remains independently enabled. Capture and codec I/O currently use CPU readback/FFmpeg pipes. GPU presentation is implemented; end-to-end zero-copy is not.

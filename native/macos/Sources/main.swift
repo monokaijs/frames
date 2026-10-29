@@ -1,6 +1,8 @@
 import AppKit
 import Foundation
 import ApplicationServices
+import ServiceManagement
+import ScreenCaptureKit
 
 enum Wire {
     static let lock = NSLock()
@@ -20,6 +22,9 @@ enum Wire {
         lock.lock(); defer { lock.unlock() }
         FileHandle.standardOutput.write(bytes); FileHandle.standardOutput.write(Data([10]))
     }
+    static func permissions(screen: Bool? = nil) -> [String: Any] {
+        ["screen_capture":screen ?? CGPreflightScreenCaptureAccess(),"accessibility":AXIsProcessTrusted(),"sharing_at_login":SMAppService.agent(plistName:"app.frames.agent.plist").status == .enabled,"control_permission_name":controlPermissionLabel,"bundle_id":Bundle.main.bundleIdentifier ?? "unbundled","executable":CommandLine.arguments[0]]
+    }
     static func failure(_ text: String) -> NSError { NSError(domain: "Frames", code: 1, userInfo: [NSLocalizedDescriptionKey: text]) }
 }
 
@@ -29,14 +34,57 @@ let args = CommandLine.arguments
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 
-if args.contains("--permissions"){
-    if args.contains("--request"){
-        app.setActivationPolicy(.regular);app.activate(ignoringOtherApps:true)
-        if !CGPreflightScreenCaptureAccess(){_ = CGRequestScreenCaptureAccess()}
-        _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String:true] as CFDictionary)
-        RunLoop.current.run(until:Date(timeIntervalSinceNow:1))
+if args.contains("--network-settings"){
+    Task { @MainActor in
+        Wire.send(["opened":await SettingsNavigation.openLocalNetwork()])
+        app.terminate(nil)
     }
-    Wire.send(["screen_capture":CGPreflightScreenCaptureAccess(),"accessibility":AXIsProcessTrusted(),"control_permission_name":Wire.controlPermissionLabel,"bundle_id":Bundle.main.bundleIdentifier ?? "unbundled","executable":CommandLine.arguments[0]])
+    app.run()
+}else if args.contains("--login-item"){
+    app.setActivationPolicy(.regular);app.activate(ignoringOtherApps:true)
+    let service=SMAppService.agent(plistName:"app.frames.agent.plist")
+    let enabled=service.status == .enabled || service.status == .requiresApproval
+    let alert=NSAlert();alert.messageText="Share this Mac at login"
+    alert.informativeText="Background sharing is \(enabled ? "registered" : "off"). Only devices already approved for unattended control can connect. Manage background sharing in System Settings → General → Login Items."
+    alert.addButton(withTitle:enabled ? "Disable sharing at login" : "Enable sharing at login")
+    alert.addButton(withTitle:"Cancel");alert.addButton(withTitle:"Open System Settings")
+    let response=alert.runModal()
+    do{
+        if response == .alertFirstButtonReturn{if enabled{try service.unregister()}else{try service.register()}}
+        else if response == .alertThirdButtonReturn{SMAppService.openSystemSettingsLoginItems()}
+    }catch{
+        let failure=NSAlert();failure.messageText="Couldn't update the login item";failure.informativeText=error.localizedDescription;failure.runModal();exit(1)
+    }
+}else if args.contains("--permissions"){
+    let wantsScreen=args.contains("--request") || args.contains("--request-screen")
+    let wantsControl=args.contains("--request") || args.contains("--request-control")
+    let needsScreen=wantsScreen && !CGPreflightScreenCaptureAccess()
+    let needsControl=wantsControl && !AXIsProcessTrusted()
+    if needsScreen || needsControl{
+        app.setActivationPolicy(.regular);app.activate(ignoringOtherApps:true)
+    }
+    if needsControl{
+        _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String:true] as CFDictionary)
+    }
+    if needsScreen{
+        // Only an explicit setup action may use ScreenCaptureKit's authorization
+        // path. Passive checks must never enumerate content or show a prompt.
+        Task { @MainActor in
+            let authorized:Bool
+            do{
+                _ = try await SCShareableContent.excludingDesktopWindows(true,onScreenWindowsOnly:true)
+                authorized=true
+            }catch{
+                authorized=false
+            }
+            Wire.send(Wire.permissions(screen:authorized))
+            app.terminate(nil)
+        }
+        app.run()
+    }else{
+        if needsControl{RunLoop.current.run(until:Date(timeIntervalSinceNow:1))}
+        Wire.send(Wire.permissions())
+    }
 }else if args.contains("--error"){
     app.setActivationPolicy(.regular);app.activate(ignoringOtherApps:true);let alert=NSAlert();alert.messageText=args.count>2 ? args[2]:"Frames";alert.informativeText=args.count>3 ? args[3]:"Unknown error";alert.alertStyle = .critical;alert.runModal()
 }else if args.contains("--approve"){

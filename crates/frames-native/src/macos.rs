@@ -63,6 +63,47 @@ pub fn permission_status(request: bool) -> anyhow::Result<Value> {
     );
     Ok(serde_json::from_slice(&output.stdout)?)
 }
+pub fn configure_login_item() -> anyhow::Result<()> {
+    anyhow::ensure!(
+        Command::new(helper_path()?)
+            .arg("--login-item")
+            .status()?
+            .success(),
+        "couldn't configure the sharing login item"
+    );
+    Ok(())
+}
+pub fn open_network_settings() -> anyhow::Result<()> {
+    let output = Command::new(helper_path()?)
+        .arg("--network-settings")
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "couldn't open Local Network settings"
+    );
+    let result: Value = serde_json::from_slice(&output.stdout)?;
+    anyhow::ensure!(
+        result["opened"].as_bool() == Some(true),
+        "Choose Local Network in the open Privacy & Security settings."
+    );
+    Ok(())
+}
+pub fn request_permission(kind: &str) -> anyhow::Result<()> {
+    let flag = match kind {
+        "screen" => "--request-screen",
+        "control" => "--request-control",
+        _ => return Ok(()),
+    };
+    anyhow::ensure!(
+        Command::new(helper_path()?)
+            .args(["--permissions", flag])
+            .stdout(Stdio::null())
+            .status()?
+            .success(),
+        "couldn't request {kind} permission"
+    );
+    Ok(())
+}
 pub fn show_error(title: &str, message: &str) -> anyhow::Result<()> {
     Command::new(helper_path()?)
         .args(["--error", title, message])
