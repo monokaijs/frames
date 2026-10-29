@@ -35,7 +35,7 @@ jobs:
       - run: bash native/macos/build.sh
       - name: Mac modifier routing regression checks
         run: |
-          swiftc native/macos/Sources/KeyboardModifiers.swift native/macos/Tests/KeyboardModifiers.swift -o /tmp/frames-keyboard-tests
+          swiftc native/macos/Sources/KeyboardModifiers.swift native/macos/Tests/KeyboardModifierTests.swift -o /tmp/frames-keyboard-tests
           /tmp/frames-keyboard-tests
       - uses: actions/upload-artifact@v4
         with:
