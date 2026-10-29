@@ -81,6 +81,9 @@ fn main() -> anyhow::Result<()> {
         });
         let mut mode = ViewMode::Windows;
         let mut window = surface(mode);
+        // Real connections acknowledge the initial mode before their snapshot.
+        // This activates the first proxy so its application menu is installed.
+        let _ = tx.send(ClientUpdate::ViewMode { mode, error: None });
         let _ = tx.send(ClientUpdate::Windows(vec![window.clone()]));
         let _ = tx.send(ClientUpdate::Frame(window.key, frame()));
         let _ = tx.send(ClientUpdate::Menu {
