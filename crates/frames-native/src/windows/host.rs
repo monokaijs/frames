@@ -20,9 +20,9 @@ use windows::{
 
 // WGC/DWM rectangles are physical pixels, including on mixed-DPI desktops.
 // Tokio workers may have a different inherited thread DPI context from the UI.
-struct PhysicalDpi(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT);
+pub(super) struct PhysicalDpi(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT);
 impl PhysicalDpi {
-    unsafe fn enter() -> Self {
+    pub(super) unsafe fn enter() -> Self {
         use windows::Win32::UI::HiDpi::*;
         Self(unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) })
     }
@@ -219,14 +219,8 @@ impl Desktop for Host {
             "file drop unavailable"
         );
         let hwnd = self.hwnd(key)?;
-        let mut rect = RECT::default();
-        unsafe {
-            GetWindowRect(hwnd, &mut rect)?;
-        }
-        let point = POINT {
-            x: rect.left + ((rect.right - rect.left) as f64 * x.clamp(0., 1.)) as i32,
-            y: rect.top + ((rect.bottom - rect.top) as f64 * y.clamp(0., 1.)) as i32,
-        };
+        let rect = unsafe { capture_bounds(hwnd)? };
+        let point = physical_point(rect, x, y)?;
         for path in paths {
             super::drag::drop_file(path, hwnd, point)?;
         }
@@ -321,6 +315,7 @@ impl Desktop for Host {
     }
     fn action(&self, key: WindowId, action: &WindowAction) -> anyhow::Result<()> {
         unsafe {
+            let _dpi = PhysicalDpi::enter();
             if matches!(
                 self.registry.lock().handle(key),
                 Some(super::secure::HANDLE | super::capture::DESKTOP_HANDLE)
@@ -714,7 +709,25 @@ impl Desktop for Host {
     }
 }
 
-unsafe fn capture_bounds(hwnd: HWND) -> anyhow::Result<RECT> {
+/// Physical screen rectangle of the app's client area. Standard non-client
+/// borders, title bars and menu bars are represented by the native proxy UI.
+pub(super) unsafe fn capture_bounds(hwnd: HWND) -> anyhow::Result<RECT> {
+    let _dpi = PhysicalDpi::enter();
+    let mut rect = RECT::default();
+    GetClientRect(hwnd, &mut rect)?;
+    let mut origin = POINT::default();
+    anyhow::ensure!(
+        ClientToScreen(hwnd, &mut origin).as_bool(),
+        "client origin unavailable"
+    );
+    rect.left += origin.x;
+    rect.right += origin.x;
+    rect.top += origin.y;
+    rect.bottom += origin.y;
+    Ok(rect)
+}
+
+pub(super) unsafe fn frame_bounds(hwnd: HWND) -> anyhow::Result<RECT> {
     let _dpi = PhysicalDpi::enter();
     let mut rect = RECT::default();
     if windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(

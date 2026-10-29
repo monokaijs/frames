@@ -37,6 +37,10 @@ jobs:
         run: |
           swiftc native/macos/Sources/KeyboardModifiers.swift native/macos/Tests/KeyboardModifierTests.swift -o /tmp/frames-keyboard-tests
           /tmp/frames-keyboard-tests
+      - name: Mac content geometry regression checks
+        run: |
+          swiftc native/macos/Sources/WindowContent.swift native/macos/Tests/WindowContentTests.swift -o /tmp/frames-content-tests
+          /tmp/frames-content-tests
       - uses: actions/upload-artifact@v4
         with:
           name: Frames-macOS-Apple-silicon-unsigned

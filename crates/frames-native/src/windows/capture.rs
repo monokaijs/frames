@@ -11,7 +11,7 @@ use windows::{
         DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat},
     },
     Win32::{
-        Foundation::{HMODULE, HWND},
+        Foundation::{HMODULE, HWND, RECT},
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_HARDWARE,
             Direct3D11::*,
@@ -27,6 +27,26 @@ use windows::{
     core::Interface,
 };
 pub const DESKTOP_HANDLE: u64 = u64::MAX - 1;
+
+// Select only the client area from this window's own WGC texture, never from a
+// display texture. All rectangles are physical pixels, even on mixed-DPI hosts.
+fn client_region(frame: RECT, client: RECT, width: u32, height: u32) -> Option<D3D11_BOX> {
+    if frame.right - frame.left != width as i32 || frame.bottom - frame.top != height as i32 {
+        return None; // Resize/DPI transition: wait for matching capture geometry.
+    }
+    let left = (client.left - frame.left).max(0) as u32;
+    let top = (client.top - frame.top).max(0) as u32;
+    let right = (client.right - frame.left).max(0) as u32;
+    let bottom = (client.bottom - frame.top).max(0) as u32;
+    (left < right && top < bottom && right <= width && bottom <= height).then_some(D3D11_BOX {
+        left,
+        top,
+        right,
+        bottom,
+        front: 0,
+        back: 1,
+    })
+}
 
 struct Apartment;
 impl Drop for Apartment {
@@ -110,6 +130,7 @@ unsafe fn capture_thread(
     stop: Arc<AtomicBool>,
     ready: std::sync::mpsc::SyncSender<Result<(), String>>,
 ) -> anyhow::Result<()> {
+    let _dpi = unsafe { super::host::PhysicalDpi::enter() };
     let setup = (|| -> anyhow::Result<_> {
         unsafe {
             RoInitialize(RO_INIT_MULTITHREADED)?;
@@ -194,7 +215,52 @@ unsafe fn capture_thread(
             unsafe {
                 source.GetDesc(&mut desc);
             }
-            if dims != (desc.Width, desc.Height) {
+            let width = (content.Width as u32).min(desc.Width);
+            let height = (content.Height as u32).min(desc.Height);
+            let region = if handle == DESKTOP_HANDLE {
+                Some(D3D11_BOX {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: height,
+                    front: 0,
+                    back: 1,
+                })
+            } else {
+                let hwnd = HWND(handle as *mut _);
+                unsafe {
+                    super::host::frame_bounds(hwnd)
+                        .ok()
+                        .zip(super::host::capture_bounds(hwnd).ok())
+                        .and_then(|(frame, client)| {
+                            client_region(
+                                frame,
+                                client,
+                                content.Width as u32,
+                                content.Height as u32,
+                            )
+                        })
+                        .filter(|r| r.right <= desc.Width && r.bottom <= desc.Height)
+                }
+            };
+            let changed =
+                content.Width as u32 != desc.Width || content.Height as u32 != desc.Height;
+            let Some(region) = region else {
+                frame.Close()?;
+                if changed {
+                    pool.Recreate(
+                        &direct,
+                        DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                        2,
+                        content,
+                    )?;
+                }
+                return Ok(());
+            };
+            let (width, height) = (region.right - region.left, region.bottom - region.top);
+            if dims != (width, height) {
+                desc.Width = width;
+                desc.Height = height;
                 desc.Usage = D3D11_USAGE_STAGING;
                 desc.BindFlags = 0;
                 desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
@@ -206,11 +272,9 @@ unsafe fn capture_thread(
                 dims = (desc.Width, desc.Height);
             }
             let target = texture.as_ref().unwrap();
-            let width = (content.Width as u32).min(desc.Width);
-            let height = (content.Height as u32).min(desc.Height);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             unsafe {
-                context.CopyResource(target, &source);
+                context.CopySubresourceRegion(target, 0, 0, 0, 0, &source, 0, Some(&region));
                 context.Map(target, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
             }
             let mut bgra = vec![0; width as usize * height as usize * 4];
@@ -226,8 +290,6 @@ unsafe fn capture_thread(
             unsafe {
                 context.Unmap(target, 0);
             }
-            let changed =
-                content.Width as u32 != desc.Width || content.Height as u32 != desc.Height;
             frame.Close()?;
             sender.send_replace(Some(RawFrame {
                 width,
@@ -256,6 +318,39 @@ unsafe fn capture_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn client_area_removes_chrome_and_preserves_negative_screen_origins() {
+        let frame = RECT {
+            left: -900,
+            top: -100,
+            right: -300,
+            bottom: 400,
+        };
+        let client = RECT {
+            left: -894,
+            top: -48,
+            right: -306,
+            bottom: 394,
+        };
+        let region = client_region(frame, client, 600, 500).unwrap();
+        assert_eq!(
+            (region.left, region.top, region.right, region.bottom),
+            (6, 52, 594, 494)
+        );
+        assert!(client_region(frame, client, 601, 500).is_none());
+        assert!(
+            client_region(
+                frame,
+                RECT {
+                    right: frame.right + 1,
+                    ..client
+                },
+                600,
+                500
+            )
+            .is_none()
+        );
+    }
     #[test]
     #[ignore = "captures the primary display locally; no pixels are persisted or transmitted"]
     fn full_desktop_uses_a_display_capture_surface() {
@@ -316,6 +411,8 @@ mod tests {
                     ..Default::default()
                 });
             }
+            let menu = CreateMenu().unwrap();
+            AppendMenuW(menu, MF_STRING, 101, w!("Fixture menu")).unwrap();
             let source = CreateWindowExW(
                 WS_EX_TOOLWINDOW,
                 w!("FramesFixtureSource"),
@@ -326,7 +423,7 @@ mod tests {
                 400,
                 300,
                 None,
-                None,
+                Some(menu),
                 Some(instance.into()),
                 None,
             )
@@ -359,7 +456,11 @@ mod tests {
                 SWP_NOACTIVATE,
             );
             let _ = UpdateWindow(cover);
-            ready_tx.send(source.0 as u64).unwrap();
+            let mut client = windows::Win32::Foundation::RECT::default();
+            GetClientRect(source, &mut client).unwrap();
+            ready_tx
+                .send((source.0 as u64, client.right as u32, client.bottom as u32))
+                .unwrap();
             let mut message = MSG::default();
             while stop_rx.try_recv().is_err() {
                 while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
@@ -374,7 +475,7 @@ mod tests {
             let _ = DeleteObject(blue.into());
             let _ = (HWND::default(), WPARAM(0), LPARAM(0));
         });
-        let handle = ready_rx.recv().unwrap();
+        let (handle, width, height) = ready_rx.recv().unwrap();
         let mut stream = start(handle).unwrap();
         let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let frame = loop {
@@ -391,6 +492,24 @@ mod tests {
         thread.join().unwrap();
         let frame = frame.expect("no frame captured");
         assert!(frame.validate());
+        assert_eq!(
+            (frame.width, frame.height),
+            (width, height),
+            "stream includes non-client chrome"
+        );
+        for (x, y) in [
+            (8, 8),
+            (width - 9, 8),
+            (8, height - 9),
+            (width - 9, height - 9),
+        ] {
+            let offset = ((y * width + x) * 4) as usize;
+            let pixel = &frame.bgra[offset..offset + 4];
+            assert!(
+                pixel[2] > 200 && pixel[0] < 40,
+                "non-client frame/menu leaked at {x},{y}: {pixel:?}"
+            );
+        }
         let center = ((frame.height / 2 * frame.width + frame.width / 2) * 4) as usize;
         let pixel = &frame.bgra[center..center + 4];
         assert!(

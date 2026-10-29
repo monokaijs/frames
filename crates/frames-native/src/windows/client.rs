@@ -495,7 +495,11 @@ unsafe extern "system" fn procedure(
             }
             return LRESULT(0);
         }
-        WM_CHAR => {
+        // TranslateMessage also emits WM_SYSCHAR for Alt combinations. Those
+        // shortcuts were already forwarded above; letting DefWindowProc handle
+        // them would additionally activate the client's local menu. AltGr text
+        // still follows the composed Unicode path.
+        WM_CHAR | WM_SYSCHAR => {
             if !state.pref.physical
                 && ((GetKeyState(VK_CONTROL.0 as i32) >= 0 && GetKeyState(VK_MENU.0 as i32) >= 0)
                     || GetKeyState(VK_RMENU.0 as i32) < 0)

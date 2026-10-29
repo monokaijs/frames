@@ -32,7 +32,7 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
             if captures[id] == nil {
                 let capture:WindowCapture
                 if id==desktopCaptureID,let display=desktopDisplay{capture=WindowCapture(display:display)}
-                else if let window=windows[id]{capture=WindowCapture(window:window)}
+                else if let window=windows[id]{capture=WindowCapture(window:window,content:contentBounds(window))}
                 else{throw Wire.failure("Window or display no longer exists")}
                 captures[id] = capture
                 do { try await capture.start() }
@@ -64,7 +64,8 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
         case "audio_stop": let capture=audio;audio=nil;await capture?.stop();return [:]
         case "drop_files":
             guard let window=windows[id],let paths=data["paths"] as? [String],let x=data["x"] as? Double,let y=data["y"] as? Double,x.isFinite,y.isFinite else{throw Wire.failure("Invalid file drop")}
-            let point=CGPoint(x:window.frame.minX+min(1,max(0,x))*window.frame.width,y:window.frame.minY+min(1,max(0,y))*window.frame.height)
+            let rect=contentBounds(window)
+            let point=CGPoint(x:rect.minX+min(1,max(0,x))*rect.width,y:rect.minY+min(1,max(0,y))*rect.height)
             dropper=NativeFileDropper(paths:paths,point:point);try dropper?.start();return [:]
         case "clipboard_image":
             if NSPasteboard.general.types?.contains(NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")) == true { return [:] }
@@ -125,7 +126,7 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
             let canResize = ax.map { AXUIElementIsAttributeSettable($0, kAXSizeAttribute as CFString, &settable) == .success && settable.boolValue }
             let minimized = ax.flatMap { attribute($0, kAXMinimizedAttribute) as? Bool } ?? false
             let modal = ax.flatMap { attribute($0, kAXModalAttribute) as? Bool } ?? false
-            let rect = window.frame
+            let rect = contentBounds(window,element:ax)
             let filter = SCContentFilter(desktopIndependentWindow: window)
             let parent = layer > 0 ? candidates.first(where: { $0.windowLayer == 0 && $0.owningApplication?.processID == owner.processID })?.windowID : nil
             let running = NSRunningApplication(processIdentifier: owner.processID)
@@ -146,7 +147,7 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
                 "minimized": minimized, "visible": !minimized && !(running?.isHidden ?? false), "modal": modal
             ])
             next[id] = window
-            if let capture = captures[id], capture.frame != rect { try await capture.resize(window) }
+            if let capture = captures[id], capture.frame != window.frame || capture.contentFrame != rect { try await capture.resize(window,content:rect) }
         }
         windows = next
         menuActions=menuActions.filter{next[$0.key] != nil}
@@ -155,6 +156,19 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
 
     func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
         var result: CFTypeRef?; guard AXUIElementCopyAttributeValue(element, name as CFString, &result) == .success else { return nil }; return result
+    }
+
+    func contentBounds(_ window:SCWindow,element:AXUIElement?=nil)->CGRect {
+        guard window.windowLayer==0,let ax=element ?? axWindow(window) else{return window.frame}
+        let buttons=[kAXCloseButtonAttribute,kAXMinimizeButtonAttribute,kAXZoomButtonAttribute].compactMap{name -> CGRect? in
+            guard let value=attribute(ax,name),CFGetTypeID(value)==AXUIElementGetTypeID() else{return nil}
+            let button=value as! AXUIElement
+            guard let p=attribute(button,kAXPositionAttribute),let s=attribute(button,kAXSizeAttribute),CFGetTypeID(p)==AXValueGetTypeID(),CFGetTypeID(s)==AXValueGetTypeID() else{return nil}
+            var point=CGPoint.zero;var size=CGSize.zero
+            guard AXValueGetValue(p as! AXValue,.cgPoint,&point),AXValueGetValue(s as! AXValue,.cgSize,&size) else{return nil}
+            return CGRect(origin:point,size:size)
+        }
+        return WindowContent.bounds(frame:window.frame,titleButtons:buttons)
     }
 
     // Public APIs do not expose a universal AX → SCWindow ID conversion.
@@ -194,7 +208,8 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
             var settable = DarwinBoolean(false)
             guard AXUIElementIsAttributeSettable(ax, kAXSizeAttribute as CFString, &settable) == .success, settable.boolValue,
                   let width = action["width"] as? Double, let height = action["height"] as? Double, width.isFinite, height.isFinite, width >= 32, height >= 32, width <= 16384, height <= 16384 else { throw Wire.failure("Window is not resizable or size is invalid") }
-            var size = CGSize(width: width, height: height)
+            let content=contentBounds(window,element:ax)
+            var size = CGSize(width: width+window.frame.width-content.width, height: height+window.frame.height-content.height)
             guard let value = AXValueCreate(.cgSize, &size) else { throw Wire.failure("Invalid size") }
             result = AXUIElementSetAttributeValue(ax, kAXSizeAttribute as CFString, value)
         case "menu_item":
@@ -239,7 +254,7 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
         guard AXIsProcessTrusted() else { throw Wire.failure("Accessibility permission required") }
         let bounds:CGRect
         if id==desktopCaptureID,let display=desktopDisplay{bounds=CGDisplayBounds(display.displayID)}
-        else if let window=windows[id]{bounds=window.frame}
+        else if let window=windows[id]{bounds=contentBounds(window)}
         else{throw Wire.failure("Window no longer exists")}
         let source = CGEventSource(stateID: .hidSystemState)
         let x = event["x"] as? Double ?? 0, y = event["y"] as? Double ?? 0
@@ -280,18 +295,24 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
 }
 
 final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate {
-    let id: CGWindowID; var frame: CGRect; var stream: SCStream?; var configuration: SCStreamConfiguration
+    let id: CGWindowID; var frame: CGRect; var contentFrame:CGRect;var stream: SCStream?; var configuration: SCStreamConfiguration
+    private let geometryLock=NSLock()
+    private var pixelRegion=CGRect.zero
+    private var pixelSize=CGSize.zero
     let queue = DispatchQueue(label: "app.frames.capture", qos: .userInteractive)
-    convenience init(window: SCWindow) { self.init(id:window.windowID,frame:window.frame,filter:SCContentFilter(desktopIndependentWindow:window),cursor:false,children:true) }
-    convenience init(display: SCDisplay) { self.init(id:desktopCaptureID,frame:CGDisplayBounds(display.displayID),filter:SCContentFilter(display:display,excludingWindows:[]),cursor:true,children:false) }
-    init(id:CGWindowID,frame:CGRect,filter:SCContentFilter,cursor:Bool,children:Bool) {
-        self.id=id;self.frame=frame
+    convenience init(window: SCWindow,content:CGRect) { self.init(id:window.windowID,frame:window.frame,content:content,filter:SCContentFilter(desktopIndependentWindow:window),cursor:false,children:true) }
+    convenience init(display: SCDisplay) { let rect=CGDisplayBounds(display.displayID);self.init(id:desktopCaptureID,frame:rect,content:rect,filter:SCContentFilter(display:display,excludingWindows:[]),cursor:true,children:false) }
+    init(id:CGWindowID,frame:CGRect,content:CGRect,filter:SCContentFilter,cursor:Bool,children:Bool) {
+        self.id=id;self.frame=frame;self.contentFrame=content
         configuration = SCStreamConfiguration()
-        configuration.width = Int(frame.width * CGFloat(filter.pointPixelScale))
-        configuration.height = Int(frame.height * CGFloat(filter.pointPixelScale))
+        configuration.width = Int((frame.width * CGFloat(filter.pointPixelScale)).rounded())
+        configuration.height = Int((frame.height * CGFloat(filter.pointPixelScale)).rounded())
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
         configuration.queueDepth = 3; configuration.showsCursor = cursor; configuration.includeChildWindows = children
+        if id != desktopCaptureID{configuration.ignoreShadowsSingleWindow=true;configuration.ignoreGlobalClipSingleWindow=true;filter.includeMenuBar=false}
+        pixelSize=CGSize(width:configuration.width,height:configuration.height)
+        pixelRegion=WindowContent.pixelRegion(frame:frame,content:content,scale:CGFloat(filter.pointPixelScale))
         super.init(); stream = SCStream(filter: filter, configuration: configuration, delegate: self)
     }
     func start() async throws {
@@ -306,19 +327,26 @@ final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         try? stream.removeStreamOutput(self,type:.screen)
         try? await stream.stopCapture()
     }
-    func resize(_ window: SCWindow) async throws {
+    func resize(_ window: SCWindow,content:CGRect) async throws {
         let filter = SCContentFilter(desktopIndependentWindow: window)
-        configuration.width = Int(window.frame.width * CGFloat(filter.pointPixelScale)); configuration.height = Int(window.frame.height * CGFloat(filter.pointPixelScale))
-        try await stream?.updateConfiguration(configuration); frame = window.frame
+        configuration.width = Int((window.frame.width * CGFloat(filter.pointPixelScale)).rounded()); configuration.height = Int((window.frame.height * CGFloat(filter.pointPixelScale)).rounded())
+        try await stream?.updateConfiguration(configuration)
+        geometryLock.withLock{pixelSize=CGSize(width:configuration.width,height:configuration.height);pixelRegion=WindowContent.pixelRegion(frame:window.frame,content:content,scale:CGFloat(filter.pointPixelScale))}
+        frame = window.frame;contentFrame=content
     }
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen, sampleBuffer.isValid, let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         CVPixelBufferLockBaseAddress(buffer, .readOnly); defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddress(buffer) else { return }
-        let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer), stride = CVPixelBufferGetBytesPerRow(buffer)
-        guard width > 0, height > 0, width <= 8192, height <= 8192 else { return }
+        let fullWidth=CVPixelBufferGetWidth(buffer),fullHeight=CVPixelBufferGetHeight(buffer),stride=CVPixelBufferGetBytesPerRow(buffer)
+        geometryLock.lock();let expected=pixelSize,region=pixelRegion;geometryLock.unlock()
+        guard fullWidth==Int(expected.width),fullHeight==Int(expected.height) else{return}
+        let left=Int(region.minX),top=Int(region.minY),width=Int(region.width),height=Int(region.height)
+        guard left>=0,top>=0,width>0,height>0,width<=8192,height<=8192,left+width<=fullWidth,top+height<=fullHeight else{return}
         var data = Data(capacity: width*height*4)
-        for row in 0..<height { data.append(base.advanced(by: row*stride).assumingMemoryBound(to: UInt8.self), count: width*4) }
+        // ScreenCaptureKit ignores sourceRect for independent-window streams.
+        // Remove only verified chrome from that window's buffer before encoding.
+        for row in 0..<height { data.append(base.advanced(by:(top+row)*stride+left*4).assumingMemoryBound(to: UInt8.self), count: width*4) }
         Wire.send(["event":"frame","handle":id,"width":width,"height":height,"bgra":data.base64EncodedString()])
     }
     func stream(_ stream: SCStream, didStopWithError error: Error) { fputs("Frames capture: \(error.localizedDescription)\n", stderr) }

@@ -219,6 +219,7 @@ final class DockEventReader: @unchecked Sendable {
     var marked = NSAttributedString(string:"")
     var forwarded: Set<UInt16> = []
     var modifiers = KeyboardModifiers()
+    var optionPointer = false
     override var acceptsFirstResponder: Bool { true }
     override init(frame:NSRect) { super.init(frame:frame);wantsLayer=true;renderer=try? MetalPicture(view:self);registerForDraggedTypes([.fileURL]);addTrackingArea(NSTrackingArea(rect:.zero,options:[.activeAlways,.inVisibleRect,.mouseMoved],owner:self,userInfo:nil)) }
     required init?(coder:NSCoder) { fatalError("not used") }
@@ -230,7 +231,7 @@ final class DockEventReader: @unchecked Sendable {
         if !(proxy?.fill ?? false) { let aspect=picture.width/picture.height;if rect.width/rect.height>aspect{let width=rect.height*aspect;rect.origin.x=(rect.width-width)/2;rect.size.width=width}else{let height=rect.width/aspect;rect.origin.y=(rect.height-height)/2;rect.size.height=height} }
         return ["x":min(1,max(0,(p.x-rect.minX)/max(1,rect.width))),"y":min(1,max(0,1-(p.y-rect.minY)/max(1,rect.height)))]
     }
-    func pointer(_ event:NSEvent,kind:String,button:Int?=nil,down:Bool?=nil) { var value=position(event);value["kind"]=kind;if let button{value["button"]=button};if let down{value["down"]=down};if kind=="button"{Wire.diagnostic("pointer_button",["window":proxy?.id ?? [:],"x":value["x"] ?? 0,"y":value["y"] ?? 0,"view_width":bounds.width,"view_height":bounds.height,"picture_width":picture.width,"picture_height":picture.height,"down":down ?? false])};proxy?.send("input",["input":value]) }
+    func pointer(_ event:NSEvent,kind:String,button:Int?=nil,down:Bool?=nil) { if down == true{optionPointer=true;synchronizeModifiers()};var value=position(event);value["kind"]=kind;if let button{value["button"]=button};if let down{value["down"]=down};if kind=="button"{Wire.diagnostic("pointer_button",["window":proxy?.id ?? [:],"x":value["x"] ?? 0,"y":value["y"] ?? 0,"view_width":bounds.width,"view_height":bounds.height,"picture_width":picture.width,"picture_height":picture.height,"down":down ?? false])};proxy?.send("input",["input":value]) }
     override func mouseMoved(with event:NSEvent){pointer(event,kind:"pointer")}
     override func mouseDragged(with event:NSEvent){pointer(event,kind:"pointer")}
     override func rightMouseDragged(with event:NSEvent){pointer(event,kind:"pointer")}
@@ -241,11 +242,12 @@ final class DockEventReader: @unchecked Sendable {
     override func rightMouseUp(with event:NSEvent){pointer(event,kind:"button",button:1,down:false)}
     override func otherMouseDown(with event:NSEvent){if event.buttonNumber==2{pointer(event,kind:"button",button:2,down:true)}}
     override func otherMouseUp(with event:NSEvent){if event.buttonNumber==2{pointer(event,kind:"button",button:2,down:false)}}
-    override func scrollWheel(with event:NSEvent){var value=position(event);value["kind"]="scroll";value["dx"]=event.scrollingDeltaX/20;value["dy"] = -event.scrollingDeltaY/20;proxy?.send("input",["input":value])}
+    override func scrollWheel(with event:NSEvent){optionPointer=true;synchronizeModifiers();var value=position(event);value["kind"]="scroll";value["dx"]=event.scrollingDeltaX/20;value["dy"] = -event.scrollingDeltaY/20;proxy?.send("input",["input":value])}
     func key(_ usage:UInt16,down:Bool){var mapped=usage;if proxy?.swap == true && proxy?.physical != true{mapped=[UInt16(0xe0):0xe3,0xe3:0xe0,0xe4:0xe7,0xe7:0xe4][usage] ?? usage};proxy?.send("input",["input":["kind":"key","usage":mapped,"down":down]])}
-    func synchronizeModifiers(suspend:Bool=false){for(usage,down)in modifiers.synchronize(physical:proxy?.physical == true,optionShortcut:!forwarded.isEmpty,suspend:suspend){key(usage,down:down)}}
-    func releaseInput(){proxy?.send("release");forwarded.removeAll();modifiers.reset();marked=NSAttributedString(string:"");inputContext?.discardMarkedText()}
+    func synchronizeModifiers(suspend:Bool=false){for(usage,down)in modifiers.synchronize(physical:proxy?.physical == true,optionShortcut:!forwarded.isEmpty || optionPointer,suspend:suspend){key(usage,down:down)}}
+    func releaseInput(){proxy?.send("release");forwarded.removeAll();modifiers.reset();optionPointer=false;marked=NSAttributedString(string:"");inputContext?.discardMarkedText()}
     override func keyDown(with event:NSEvent){
+        optionPointer=false
         if event.modifierFlags.contains(.command),[48,49].contains(event.keyCode){releaseInput();return} // Local app switching / Spotlight.
         guard let usage=usageToMac.first(where:{$0.value==event.keyCode})?.key else{return}
         if event.keyCode==111,event.modifierFlags.contains([.control,.option]){releaseInput();window?.miniaturize(nil);return}
@@ -265,6 +267,7 @@ final class DockEventReader: @unchecked Sendable {
         if usage==57{if proxy?.physical == true{key(usage,down:true);key(usage,down:false)};return}
         let hadCommand = !modifiers.held.isDisjoint(with:[0xe3,0xe7])
         modifiers.changed(usage,flags:event.modifierFlags.rawValue)
+        if modifiers.held.isDisjoint(with:[0xe2,0xe6]){optionPointer=false}
         // AppKit can consume keyUp for Command shortcuts. Release their keys
         // when the final Command key goes up, before remapping modifiers.
         if hadCommand && modifiers.held.isDisjoint(with:[0xe3,0xe7]){for keyUsage in forwarded.sorted(){key(keyUsage,down:false)};forwarded.removeAll()}

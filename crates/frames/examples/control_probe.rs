@@ -175,6 +175,29 @@ fn main() -> anyhow::Result<()> {
                 ClientUpdate::Frame(key, frame) if Some(key) == target.as_ref().map(|w| w.key) => {
                     ensure!(frame.validate(), "invalid decoded frame");
                     if stage == "first_frame" {
+                        let source = target.as_ref().unwrap();
+                        if source.app_id == "dev.frames.qa.fixture" {
+                            ensure!(
+                                (source.bounds.width - 440.).abs() < 1.
+                                    && (source.bounds.height - 320.).abs() < 1.,
+                                "Mac fixture still includes title-bar chrome: {:?}",
+                                source.bounds
+                            );
+                            ensure!(
+                                frame.width == (source.bounds.width * source.scale).round() as u32
+                                    && frame.height
+                                        == (source.bounds.height * source.scale).round() as u32,
+                                "content capture dimensions do not match metadata"
+                            );
+                            for (x, y) in [(8, 8), (frame.width - 9, 8)] {
+                                let index = ((y * frame.width + x) * 4) as usize;
+                                ensure!(
+                                    frame.bgra[index + 2] > 150 && frame.bgra[index] < 100,
+                                    "host title bar leaked into captured content"
+                                );
+                            }
+                            passed.push("standard Mac title bar excluded; content geometry matches Retina frames".into());
+                        }
                         let pixel =
                             ((frame.height / 2 * frame.width + frame.width / 2) * 4) as usize;
                         let bgra = &frame.bgra[pixel..pixel + 4];
