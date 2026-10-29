@@ -43,6 +43,7 @@ import QuartzCore
         let support=NSMenuItem(title:"Device forwarding support...",action:#selector(deviceSupport),keyEquivalent:"");support.target=self;devices.addItem(support)
         let deviceItem=NSMenuItem(title:"Devices",action:nil,keyEquivalent:"");deviceItem.submenu=devices;bar.addItem(deviceItem)
         NSApp.mainMenu=bar
+        Wire.diagnostic("menu_installed", ["top_level_items":bar.items.count,"remote_top_level_items":activeProxy?.remoteMenuItems.count ?? 0])
     }
     @objc func windowsView(){Wire.send(["event":"release"]);Wire.send(["event":"view_mode","mode":"windows"])}
     @objc func desktopView(){Wire.send(["event":"release"]);Wire.send(["event":"view_mode","mode":"desktop"])}
@@ -66,6 +67,7 @@ import QuartzCore
                 let result = string.withCString { frames_session_apply(session, $0) }; if let result { frames_string_free(result) }
             }
             let keys = Set(list.compactMap { ($0["key"] as? [String: Any]).map(Self.key) })
+            Wire.diagnostic("window_snapshot", ["count":keys.count,"view_mode":viewMode])
             for key in Array(windows.keys) where !keys.contains(key) { windows.removeValue(forKey: key)?.destroy() }
             let sorted = list.sorted { ($0["parent"] is NSNull) && !($1["parent"] is NSNull) }
             for remote in sorted {
@@ -268,6 +270,8 @@ extension RemoteView: NSTextInputClient {}
 @MainActor final class MetalPicture {
     let device:MTLDevice;let queue:MTLCommandQueue;let layer:CAMetalLayer;let pipeline:MTLRenderPipelineState
     var texture:MTLTexture?
+    let diagnosticID = UUID().uuidString
+    var diagnosticPending = true
     init(view:NSView)throws{
         guard let device=MTLCreateSystemDefaultDevice(),let queue=device.makeCommandQueue()else{throw Wire.failure("Metal unavailable")};self.device=device;self.queue=queue
         layer=CAMetalLayer();layer.device=device;layer.pixelFormat = .bgra8Unorm;layer.framebufferOnly=true;view.layer=layer
@@ -286,7 +290,7 @@ extension RemoteView: NSTextInputClient {}
         let library=try device.makeLibrary(source:source,options:nil);let descriptor=MTLRenderPipelineDescriptor();descriptor.vertexFunction=library.makeFunction(name:"vertexMain");descriptor.fragmentFunction=library.makeFunction(name:"fragmentMain");descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm;pipeline=try device.makeRenderPipelineState(descriptor:descriptor)
     }
     func upload(_ data:Data,width:Int,height:Int){
-        if texture?.width != width||texture?.height != height{let desc=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.bgra8Unorm,width:width,height:height,mipmapped:false);desc.usage = .shaderRead;desc.storageMode = .shared;texture=device.makeTexture(descriptor:desc)}
+        if texture?.width != width||texture?.height != height{let desc=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.bgra8Unorm,width:width,height:height,mipmapped:false);desc.usage = .shaderRead;desc.storageMode = .shared;texture=device.makeTexture(descriptor:desc);diagnosticPending=true}
         data.withUnsafeBytes{bytes in if let base=bytes.baseAddress{texture?.replace(region:MTLRegionMake2D(0,0,width,height),mipmapLevel:0,withBytes:base,bytesPerRow:width*4)}}
     }
     func draw(size:CGSize,fill:Bool){
@@ -294,7 +298,15 @@ extension RemoteView: NSTextInputClient {}
         guard let drawable=layer.nextDrawable(),let buffer=queue.makeCommandBuffer()else{return};let pass=MTLRenderPassDescriptor();pass.colorAttachments[0].texture=drawable.texture;pass.colorAttachments[0].loadAction = .clear;pass.colorAttachments[0].storeAction = .store;pass.colorAttachments[0].clearColor=MTLClearColorMake(0,0,0,1)
         guard let encoder=buffer.makeRenderCommandEncoder(descriptor:pass)else{return};var scale=SIMD2<Float>(1,1)
         if !fill{let aspect=Float(texture.width)/Float(texture.height),screen=Float(size.width/size.height);if screen>aspect{scale.x=aspect/screen}else{scale.y=screen/aspect}}
-        encoder.setRenderPipelineState(pipeline);encoder.setVertexBytes(&scale,length:MemoryLayout<SIMD2<Float>>.size,index:0);encoder.setFragmentTexture(texture,index:0);encoder.drawPrimitives(type:.triangleStrip,vertexStart:0,vertexCount:4);encoder.endEncoding();buffer.present(drawable);buffer.commit()
+        encoder.setRenderPipelineState(pipeline);encoder.setVertexBytes(&scale,length:MemoryLayout<SIMD2<Float>>.size,index:0);encoder.setFragmentTexture(texture,index:0);encoder.drawPrimitives(type:.triangleStrip,vertexStart:0,vertexCount:4);encoder.endEncoding()
+        if Wire.diagnosticsEnabled && diagnosticPending {
+            diagnosticPending=false
+            let id=diagnosticID,width=texture.width,height=texture.height
+            buffer.addCompletedHandler { completed in
+                Wire.diagnostic("metal_present_completed", ["renderer":id,"width":width,"height":height,"success":completed.status == .completed,"error":completed.error?.localizedDescription ?? ""])
+            }
+        }
+        buffer.present(drawable);buffer.commit()
     }
 }
 

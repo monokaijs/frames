@@ -37,8 +37,10 @@ async fn opus_stream_roundtrips_generated_pcm() {
     let pcm = result.expect("no decoded Opus audio");
     assert_eq!(pcm.len(), 48000 * 2 * 4 / 50);
     assert!(
-        pcm.chunks_exact(4)
-            .map(|unit| f32::from_le_bytes(unit.try_into().unwrap()).abs())
+        pcm.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|unit| f32::from_le_bytes(*unit).abs())
             .any(|v| v > 0.05)
     );
 }

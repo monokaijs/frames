@@ -144,7 +144,7 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
             let title = attribute(element, kAXTitleAttribute) as? String ?? ""
             let r = window.frame
             let score = abs(point.x-r.minX)+abs(point.y-r.minY)+abs(size.width-r.width)+abs(size.height-r.height)+(title == (window.title ?? "") ? 0 : 100)
-            return (element, score)
+            return (element, Double(score))
         }.sorted { $0.1 < $1.1 }
         guard let first = scored.first, first.1 < 8, scored.count == 1 || scored[1].1 > first.1 + 1 else { return nil }
         return first.0

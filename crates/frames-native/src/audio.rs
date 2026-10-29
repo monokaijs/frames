@@ -161,8 +161,8 @@ impl Playback {
     pub fn push(&self, pcm: &[u8]) {
         let mut queue = self.queue.lock();
         let max = self.format.rate as usize * self.format.channels as usize / 10;
-        for unit in pcm.chunks_exact(4) {
-            queue.push_back(f32::from_le_bytes(unit.try_into().unwrap()));
+        for unit in pcm.as_chunks::<4>().0 {
+            queue.push_back(f32::from_le_bytes(*unit));
         }
         while queue.len() > max {
             queue.pop_front();

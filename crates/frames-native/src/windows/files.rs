@@ -76,11 +76,7 @@ impl Shelf {
     }
     pub unsafe fn progress(&mut self, name: String, done: u64, total: u64) {
         unsafe {
-            let percent = if total == 0 {
-                0
-            } else {
-                done.saturating_mul(100) / total
-            };
+            let percent = done.saturating_mul(100).checked_div(total).unwrap_or(0);
             let title = wide(&format!("Frames transfers — {name} ({percent}%)"));
             let _ = SetWindowTextW(self.hwnd, PCWSTR(title.as_ptr()));
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
