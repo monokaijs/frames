@@ -33,6 +33,10 @@ jobs:
           targets: aarch64-apple-darwin
       - run: cargo test --workspace --locked
       - run: bash native/macos/build.sh
+      - name: Mac modifier routing regression checks
+        run: |
+          swiftc native/macos/Sources/KeyboardModifiers.swift native/macos/Tests/KeyboardModifiers.swift -o /tmp/frames-keyboard-tests
+          /tmp/frames-keyboard-tests
       - uses: actions/upload-artifact@v4
         with:
           name: Frames-macOS-Apple-silicon-unsigned

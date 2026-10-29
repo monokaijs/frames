@@ -572,7 +572,7 @@ pub async fn client(
     let mut adb_jobs = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
-            _=connection.closed()=>break,
+            reason=connection.closed()=>{tracing::info!(%reason,"Host connection closed");break;},
             _=adb_jobs.join_next(),if !adb_jobs.is_empty()=>{},
             stream=connection.accept_bi()=>if let Ok((mut send,mut receive))=stream{
                 if !adb_enabled||adb_jobs.len()>=8{let _=send.reset(1u32.into());let _=receive.stop(1u32.into());}
@@ -580,7 +580,7 @@ pub async fn client(
             },
             prepared=prepared_rx.recv()=>if let Some((path,window,x,y,result))=prepared{match result{Ok((name,size,hash))=>{let id=transfer::transfer_id(&name,&hash,size);uploads.insert(id.clone(),(path,window,x,y));io.send.send(Message::Transfer(TransferMessage::Offer{id,name,size,sha256:hash})).await?;},Err(error)=>{let _=ui.try_send(ClientUpdate::Status(window,error));}}},
             _=timer.tick()=>{media.expire(&io.send).await?;ticks+=1;if clipboard&&ticks%5==0{poll_clipboard(local.as_ref(),&mut clip_state,"client",&io.send).await?;}},
-            packet=connection.read_datagram()=>match packet{Ok(packet)=>media.packet(&packet,&io.send).await?,Err(_)=>break},
+            packet=connection.read_datagram()=>match packet{Ok(packet)=>media.packet(&packet,&io.send).await?,Err(reason)=>{tracing::info!(%reason,"Host media connection closed");break;}},
             event=events.recv()=>match event{
                 Some(ClientEvent::ViewMode(mode))=>{io.send.send(Message::ReleaseInput).await?;io.send.send(Message::SetViewMode{mode}).await?;},
                 Some(ClientEvent::AdbBridge{enabled})=>{
@@ -597,7 +597,7 @@ pub async fn client(
                 Some(ClientEvent::ReleaseInput)=>io.send.send(Message::ReleaseInput).await?,
                 Some(ClientEvent::Disconnected)|None=>{tracing::info!("Client UI requested disconnect or closed its event channel");break;},
             },
-            message=io.receive.recv()=>{let Some(message)=message else{break;};match message{
+            message=io.receive.recv()=>{let Some(message)=message else{tracing::info!("Host control stream closed");break;};match message{
                 Message::ViewModeChanged{mode,error}=>{if error.is_none(){media.clear_video();}ui.send(ClientUpdate::ViewMode{mode,error})?;},
                 Message::AdbBridgeStatus{enabled,address,error}=>{
                     adb_enabled=enabled&&adb_requested;
@@ -627,7 +627,7 @@ pub async fn client(
                     }
                 },
         Message::Clipboard{origin,revision,text,png_base64}if clipboard=>{if let Err(error)=apply_clipboard(local.as_ref(),&mut clip_state,&origin,revision,text,png_base64){tracing::debug!(%error,"clipboard update unavailable");}},
-                Message::Error{message}=>tracing::warn!(%message,"host error"),Message::Goodbye=>break,_=>{}
+                Message::Error{message}=>tracing::warn!(%message,"host error"),Message::Goodbye=>{tracing::info!("Host sent session goodbye");break;},_=>{}
             }}
         }
     }

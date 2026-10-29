@@ -23,6 +23,8 @@ import QuartzCore
     // Keep the session alive until an explicit disconnect or a transport failure.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication)->Bool{false}
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply{Wire.diagnostic("client_terminate_requested");return .terminateNow}
+    func applicationDidResignActive(_ notification:Notification){for proxy in windows.values{proxy.view.releaseInput()}}
+    func applicationDidHide(_ notification:Notification){for proxy in windows.values{proxy.view.releaseInput()}}
     func activate(_ proxy:RemoteProxy){activeProxy=proxy;installMenu()}
     func menuWillOpen(_ menu:NSMenu){menuTracking+=1}
     func menuDidClose(_ menu:NSMenu){menuTracking=max(0,menuTracking-1);if menuTracking==0 && needsMenu{DispatchQueue.main.async{[weak self] in self?.installMenu()}}}
@@ -36,7 +38,9 @@ import QuartzCore
         local.addItem(.separator())
         if let proxy=activeProxy{
             for(title,action)in[("Resize remote app",#selector(RemoteProxy.setResize)),("Stretch locally",#selector(RemoteProxy.setStretch)),("Toggle aspect fit / fill",#selector(RemoteProxy.toggleFill)),("Toggle Control / Command swap",#selector(RemoteProxy.toggleSwap)),("Toggle physical keys (terminal)",#selector(RemoteProxy.togglePhysical)),("Refresh application menus",#selector(RemoteProxy.remoteMenu)),("Fetch remote file...",#selector(RemoteProxy.fetchFile))]{
-                let item=NSMenuItem(title:title,action:action,keyEquivalent:"");item.target=proxy;item.isEnabled=action != #selector(RemoteProxy.setResize) || proxy.resizable;local.addItem(item)
+                let item=NSMenuItem(title:title,action:action,keyEquivalent:"");item.target=proxy;item.isEnabled=action != #selector(RemoteProxy.setResize) || proxy.resizable
+                let checked = action == #selector(RemoteProxy.setResize) ? proxy.mode == "resize_remote" && proxy.resizable : action == #selector(RemoteProxy.setStretch) ? proxy.mode == "stretch_local" || !proxy.resizable : action == #selector(RemoteProxy.toggleFill) ? proxy.fill : action == #selector(RemoteProxy.toggleSwap) ? proxy.swap : action == #selector(RemoteProxy.togglePhysical) ? proxy.physical : false
+                item.state=checked ? .on:.off;local.addItem(item)
             }
             let remote=proxy.makeMenu(proxy.remoteMenuItems)
             for item in Array(remote.items){remote.removeItem(item);bar.addItem(item)}
@@ -186,8 +190,8 @@ final class DockEventReader: @unchecked Sendable {
     @objc func setResize() { if resizable { mode="resize_remote";save() } }
     @objc func setStretch() { mode="stretch_local";save() }
     @objc func toggleFill() { fill.toggle();save() }
-    @objc func toggleSwap() { send("release");view.forwarded.removeAll();swap.toggle();save() }
-    @objc func togglePhysical() { send("release");view.forwarded.removeAll();view.marked=NSAttributedString(string:"");physical.toggle();save() }
+    @objc func toggleSwap() { view.releaseInput();swap.toggle();save() }
+    @objc func togglePhysical() { view.releaseInput();physical.toggle();save() }
     @objc func remoteMenu(){send("action",["action":["kind":"menu"]])}
     @objc func fetchFile(){let alert=NSAlert();alert.messageText="Fetch remote file";alert.informativeText="Enter a path relative to the remote user's home folder.";let input=NSTextField(frame:NSRect(x:0,y:0,width:400,height:24));input.stringValue="Downloads/";alert.accessoryView=input;alert.addButton(withTitle:"Download");alert.addButton(withTitle:"Cancel");if alert.runModal() == .alertFirstButtonReturn{send("download_file",["path":input.stringValue])}}
     @objc func pressMenu(_ item:NSMenuItem){if let id=item.representedObject as? String{send("action",["action":["kind":"menu_item","id":id]])}}
@@ -198,7 +202,7 @@ final class DockEventReader: @unchecked Sendable {
     func windowShouldClose(_ sender: NSWindow) -> Bool { if destroying { return true };if remote["role"] as? String == "desktop"{client?.disconnect()}else{send("action",["action":["kind":"close"]])};return false }
     func destroy() { destroying=true;resizeWork?.cancel();window.close() }
     func windowDidBecomeKey(_ notification: Notification) { client?.activate(self);send("action",["action":["kind":"focus"]]);if remote["role"] as? String != "desktop"{remoteMenu()};visibility() }
-    func windowDidResignKey(_ notification: Notification) { send("release");view.forwarded.removeAll();visibility() }
+    func windowDidResignKey(_ notification: Notification) { view.releaseInput();visibility() }
     func windowDidMiniaturize(_ notification: Notification) { visibility() }
     func windowDidDeminiaturize(_ notification: Notification) { visibility() }
     func windowDidChangeOcclusionState(_ notification: Notification) { visibility() }
@@ -214,6 +218,7 @@ final class DockEventReader: @unchecked Sendable {
     var picture = CGSize(width:1,height:1)
     var marked = NSAttributedString(string:"")
     var forwarded: Set<UInt16> = []
+    var modifiers = KeyboardModifiers()
     override var acceptsFirstResponder: Bool { true }
     override init(frame:NSRect) { super.init(frame:frame);wantsLayer=true;renderer=try? MetalPicture(view:self);registerForDraggedTypes([.fileURL]);addTrackingArea(NSTrackingArea(rect:.zero,options:[.activeAlways,.inVisibleRect,.mouseMoved],owner:self,userInfo:nil)) }
     required init?(coder:NSCoder) { fatalError("not used") }
@@ -238,20 +243,34 @@ final class DockEventReader: @unchecked Sendable {
     override func otherMouseUp(with event:NSEvent){if event.buttonNumber==2{pointer(event,kind:"button",button:2,down:false)}}
     override func scrollWheel(with event:NSEvent){var value=position(event);value["kind"]="scroll";value["dx"]=event.scrollingDeltaX/20;value["dy"] = -event.scrollingDeltaY/20;proxy?.send("input",["input":value])}
     func key(_ usage:UInt16,down:Bool){var mapped=usage;if proxy?.swap == true && proxy?.physical != true{mapped=[UInt16(0xe0):0xe3,0xe3:0xe0,0xe4:0xe7,0xe7:0xe4][usage] ?? usage};proxy?.send("input",["input":["kind":"key","usage":mapped,"down":down]])}
+    func synchronizeModifiers(suspend:Bool=false){for(usage,down)in modifiers.synchronize(physical:proxy?.physical == true,optionShortcut:!forwarded.isEmpty,suspend:suspend){key(usage,down:down)}}
+    func releaseInput(){proxy?.send("release");forwarded.removeAll();modifiers.reset();marked=NSAttributedString(string:"");inputContext?.discardMarkedText()}
     override func keyDown(with event:NSEvent){
+        if event.modifierFlags.contains(.command),[48,49].contains(event.keyCode){releaseInput();return} // Local app switching / Spotlight.
         guard let usage=usageToMac.first(where:{$0.value==event.keyCode})?.key else{return}
-        if event.keyCode==111,event.modifierFlags.contains([.control,.option]){proxy?.send("release");window?.miniaturize(nil);return}
+        if event.keyCode==111,event.modifierFlags.contains([.control,.option]){releaseInput();window?.miniaturize(nil);return}
         let printable=(4...39).contains(usage)||(44...56).contains(usage)
         if proxy?.physical == true || event.modifierFlags.contains(.command) || event.modifierFlags.contains(.control) || !printable {
             forwarded.insert(usage)
+            synchronizeModifiers()
             key(usage,down:true)
         } else {
+            synchronizeModifiers(suspend:true)
             interpretKeyEvents([event])
         }
     }
-    override func keyUp(with event:NSEvent){if let usage=usageToMac.first(where:{$0.value==event.keyCode})?.key,forwarded.remove(usage) != nil{key(usage,down:false)}}
-    override func flagsChanged(with event:NSEvent){guard let usage=usageToMac.first(where:{$0.value==event.keyCode})?.key else{return};let flag:NSEvent.ModifierFlags;switch usage{case 0xe0,0xe4:flag = .control;case 0xe1,0xe5:flag = .shift;case 0xe2,0xe6:flag = .option;default:flag = .command};key(usage,down:event.modifierFlags.contains(flag))}
-    func insertText(_ string:Any,replacementRange:NSRange){let text=(string as? NSAttributedString)?.string ?? string as? String ?? "";proxy?.send("input",["input":["kind":"text","text":text]]);marked=NSAttributedString(string:"")}
+    override func keyUp(with event:NSEvent){if let usage=usageToMac.first(where:{$0.value==event.keyCode})?.key,forwarded.remove(usage) != nil{key(usage,down:false)};synchronizeModifiers()}
+    override func flagsChanged(with event:NSEvent){
+        guard let usage=usageToMac.first(where:{$0.value==event.keyCode})?.key else{return}
+        if usage==57{if proxy?.physical == true{key(usage,down:true);key(usage,down:false)};return}
+        let hadCommand = !modifiers.held.isDisjoint(with:[0xe3,0xe7])
+        modifiers.changed(usage,flags:event.modifierFlags.rawValue)
+        // AppKit can consume keyUp for Command shortcuts. Release their keys
+        // when the final Command key goes up, before remapping modifiers.
+        if hadCommand && modifiers.held.isDisjoint(with:[0xe3,0xe7]){for keyUsage in forwarded.sorted(){key(keyUsage,down:false)};forwarded.removeAll()}
+        synchronizeModifiers()
+    }
+    func insertText(_ string:Any,replacementRange:NSRange){let text=(string as? NSAttributedString)?.string ?? string as? String ?? "";synchronizeModifiers(suspend:true);proxy?.send("input",["input":["kind":"text","text":text]]);synchronizeModifiers();marked=NSAttributedString(string:"")}
     func setMarkedText(_ string:Any,selectedRange:NSRange,replacementRange:NSRange){marked=(string as? NSAttributedString) ?? NSAttributedString(string:string as? String ?? "")}
     func unmarkText(){marked=NSAttributedString(string:"")}
     func selectedRange()->NSRange{NSRange(location:0,length:0)}

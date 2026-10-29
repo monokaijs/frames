@@ -195,7 +195,7 @@ def main():
         excluded = []
         if args.native_ui:
             assert args.window_fixture, "Pass --window-fixture with --native-ui"
-            windows("fixture", ["--no-cover"], args.window_fixture.resolve(strict=True))
+            fixture, _ = windows("fixture", ["--no-cover"], args.window_fixture.resolve(strict=True))
             time.sleep(0.5)
             listing = subprocess.run([str(binary), "windows"], capture_output=True, text=True,
                                      encoding="utf-8", check=True, creationflags=creationflags)
@@ -227,7 +227,16 @@ def main():
                     windows("windows-client", ["connect", args.mac_address + ":47991", "--view", "desktop", "--no-clipboard"])
                 print("UI READY: " + str(root), flush=True)
                 end = time.monotonic() + min(args.hold_ui, 3600)
+                next_health_check = 0
                 while time.monotonic() < end and not (root / "stop-ui").exists():
+                    if time.monotonic() >= next_health_check:
+                        assert fixture.poll() is None, "Windows QA fixture exited during interaction check"
+                        assert win_host.poll() is None, "Windows host exited during interaction check"
+                        pattern = "^" + re.escape(mac_app + "/Contents/MacOS/frames connect " + args.windows_address + ":47992")
+                        alive = ssh(f"pgrep -f {q(pattern)} | while read -r pid; do "
+                                    f"if ps e -p \"$pid\" -o command= | grep -Fq {q(mac_root)}; then echo alive; fi; done")
+                        assert "alive" in alive, "Mac native client exited during interaction check; inspect its err.log"
+                        next_health_check = time.monotonic() + 5
                     time.sleep(0.5)
     except Exception as error:
         failure = str(error)

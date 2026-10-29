@@ -421,10 +421,15 @@ unsafe extern "system" fn procedure(
             let altgr = GetKeyState(VK_RMENU.0 as i32) < 0;
             if down && vk == VK_F12.0 && ctrl && alt {
                 state.event(ClientEvent::ReleaseInput);
+                state.forwarded.clear();
+                state.surrogate = None;
                 let _ = ShowWindow(hwnd, SW_MINIMIZE);
                 return LRESULT(0);
             }
             if alt && vk == VK_TAB.0 {
+                state.event(ClientEvent::ReleaseInput);
+                state.forwarded.clear();
+                state.surrogate = None;
                 return DefWindowProcW(hwnd, message, wparam, lparam);
             }
             let vk = match vk {
