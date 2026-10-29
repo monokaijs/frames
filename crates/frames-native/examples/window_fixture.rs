@@ -173,7 +173,10 @@ fn main() -> anyhow::Result<()> {
                     let _ = DeleteObject(blue.into());
                     return Ok(());
                 }
-                if matches!(msg.message, WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP) {
+                if matches!(
+                    msg.message,
+                    WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP
+                ) {
                     use windows::Win32::UI::Input::KeyboardAndMouse::*;
                     println!(
                         "{{\"fixture_event\":\"key\",\"vk\":{},\"down\":{},\"control\":{},\"alt\":{},\"shift\":{},\"windows\":{}}}",
