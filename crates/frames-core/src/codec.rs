@@ -513,6 +513,10 @@ pub async fn decode(codec: Codec, width: u32, height: u32) -> anyhow::Result<Dec
             "0",
             "-f",
             codec.demuxer(),
+            // This is an input option: bound decoder parallelism per window.
+            // Putting it only after -i configures the rawvideo output instead.
+            "-threads",
+            "1",
             "-i",
             "pipe:0",
             "-an",
@@ -525,7 +529,7 @@ pub async fn decode(codec: Codec, width: u32, height: u32) -> anyhow::Result<Dec
             "-pix_fmt",
             "bgra",
             "-threads",
-            "2",
+            "1",
             "pipe:1",
         ])
         .spawn()?;
