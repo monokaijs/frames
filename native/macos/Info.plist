@@ -1,15 +1,30 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>CFBundleIdentifier</key><string>app.frames.desktop</string>
-<key>CFBundleName</key><string>Frames</string>
-<key>CFBundleExecutable</key><string>frames</string>
-<key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleVersion</key><string>0.1.0</string>
-<key>CFBundleShortVersionString</key><string>0.1.0</string>
-<key>LSMinimumSystemVersion</key><string>14.2</string>
-<key>NSHighResolutionCapable</key><true/>
-<key>NSScreenCaptureUsageDescription</key><string>Frames shares your application windows with devices you approve.</string>
-<key>NSLocalNetworkUsageDescription</key><string>Frames connects to devices you approve on your local network for remote windows, audio, and file transfer.</string>
-<key>NSBonjourServices</key><array><string>_frames._udp</string></array>
-</dict></plist>
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>app.frames.desktop</string>
+	<key>CFBundleName</key>
+	<string>Frames</string>
+	<key>CFBundleExecutable</key>
+	<string>frames</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.1</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.2</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Frames shares your application windows with devices you approve.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Frames connects to devices you approve on your local network for remote windows, audio, and file transfer.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_frames._udp</string>
+	</array>
+</dict>
+</plist>
