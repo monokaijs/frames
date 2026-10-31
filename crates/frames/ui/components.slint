@@ -1,11 +1,13 @@
 export global Theme {
     out property <color> ink: #30343b;
     out property <color> muted: #7a7f89;
-    out property <color> accent: #304bd2;
+    out property <color> accent: #000000;
+    out property <color> accent-hover: #242424;
+    out property <color> accent-pressed: #404040;
     out property <color> line: #eaecf0;
     out property <color> canvas: white;
     out property <color> green: #25825e;
-    out property <color> rail: #1c2785;
+    out property <color> rail: #0b0b0b;
 }
 
 export component Glyph inherits Rectangle {
@@ -35,7 +37,7 @@ export component AppButton inherits Rectangle {
     horizontal-stretch: 0;
     min-width: root.label == "" ? 32px : content.preferred-width + 10px;
     border-radius: 5px;
-    background: !enabled ? #f1f2f4 : primary ? (touch.pressed ? #233aac : (touch.has-hover || focus.has-focus) ? #2943c4 : Theme.accent) : (touch.has-hover || focus.has-focus) ? (danger ? #fff2f2 : #f5f6f9) : quiet ? transparent : white;
+    background: !enabled ? #f1f2f4 : primary ? (touch.pressed ? Theme.accent-pressed : (touch.has-hover || focus.has-focus) ? Theme.accent-hover : Theme.accent) : (touch.has-hover || focus.has-focus) ? (danger ? #fff2f2 : #f5f6f9) : quiet ? transparent : white;
     border-width: quiet || primary ? 0px : 1px;
     border-color: #d6d9e0;
     animate background { duration: 100ms; }
@@ -68,13 +70,13 @@ export component NavItem inherits Rectangle {
     callback clicked();
     width: 40px; height: 40px;
     border-radius: 6px;
-    background: selected ? #354ad1 : (touch.has-hover || focus.has-focus) ? #2b389b : transparent;
+    background: selected ? #363636 : (touch.has-hover || focus.has-focus) ? #242424 : transparent;
     forward-focus: focus;
-    Glyph { source: root.icon; colorize: root.selected ? white : #b8c0ec; width: 20px; height: 20px; x: 10px; y: 10px; }
+    Glyph { source: root.icon; colorize: root.selected ? white : #bdbdbd; width: 20px; height: 20px; x: 10px; y: 10px; }
     if root.badge != "": Rectangle { x: 29px; y: 7px; width: 6px; height: 6px; border-radius: 3px; background: #f1bd65; }
     if touch.has-hover || focus.has-focus: Rectangle {
         x: root.width + 12px; y: 6px; width: hint.preferred-width + 20px; height: 28px;
-        background: #29304b; border-radius: 4px;
+        background: #262626; border-radius: 4px;
         hint := Text { text: root.label; color: white; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
     }
     focus := FocusScope { key-pressed(event) => { if event.text == " " || event.text == Key.Return { root.clicked(); return accept; } return reject; } }
@@ -121,4 +123,57 @@ export component SectionTitle inherits Text {
 
 export component MutedText inherits Text {
     color: Theme.muted; font-size: 12px; wrap: word-wrap;
+}
+
+// Keep selection controls on the same accent as primary actions.
+export component AppSwitch inherits Rectangle {
+    in property <bool> enabled: true;
+    in-out property <bool> checked;
+    callback toggled();
+    width: 40px; height: 20px;
+    horizontal-stretch: 0; vertical-stretch: 0;
+    forward-focus: focus;
+    border-radius: 10px;
+    border-width: root.checked ? 0px : 1px;
+    border-color: root.enabled ? #858585 : #c8c8c8;
+    background: !root.enabled ? (root.checked ? #bdbdbd : transparent) : root.checked ? (touch.pressed ? Theme.accent-pressed : touch.has-hover ? Theme.accent-hover : Theme.accent) : touch.has-hover ? #eeeeee : transparent;
+    Rectangle {
+        x: root.checked ? 24px : 4px; y: 4px; width: 12px; height: 12px;
+        border-radius: 6px; background: root.checked ? white : root.enabled ? #656565 : #bdbdbd;
+        animate x { duration: 100ms; }
+    }
+    if focus.has-focus: Rectangle { x: -3px; y: -3px; width: parent.width + 6px; height: parent.height + 6px; border-radius: 13px; border-width: 1px; border-color: Theme.accent; }
+    function toggle() { if root.enabled { root.checked = !root.checked; root.toggled(); } }
+    focus := FocusScope { enabled: root.enabled; key-pressed(event) => { if event.text == " " || event.text == Key.Return { root.toggle(); return accept; } return reject; } }
+    touch := TouchArea { enabled: root.enabled; mouse-cursor: pointer; clicked => { focus.focus(); root.toggle(); } }
+    accessible-role: switch; accessible-enabled: root.enabled;
+    accessible-checkable: true; accessible-checked <=> root.checked;
+    accessible-action-default => { root.toggle(); }
+}
+
+export component AppCheckBox inherits Rectangle {
+    in property <bool> enabled: true;
+    in property <string> text;
+    in-out property <bool> checked;
+    callback toggled();
+    min-width: layout.min-width; height: 24px;
+    horizontal-stretch: 0; vertical-stretch: 0;
+    forward-focus: focus;
+    layout := HorizontalLayout {
+        spacing: 8px; alignment: start; padding-top: 3px; padding-bottom: 3px;
+        Rectangle {
+            width: 18px; height: 18px; border-radius: 3px;
+            border-width: 1px; border-color: !root.enabled ? #c8c8c8 : root.checked ? Theme.accent : #858585;
+            background: !root.enabled ? #eeeeee : root.checked ? (touch.pressed ? Theme.accent-pressed : touch.has-hover ? Theme.accent-hover : Theme.accent) : touch.has-hover ? #eeeeee : white;
+            if root.checked: Glyph { x: 2px; y: 2px; width: 14px; height: 14px; source: @image-url("icons/check.svg"); colorize: root.enabled ? white : #aaaaaa; }
+            if focus.has-focus: Rectangle { x: -3px; y: -3px; width: parent.width + 6px; height: parent.height + 6px; border-radius: 5px; border-width: 1px; border-color: Theme.accent; }
+        }
+        Text { text: root.text; color: root.enabled ? Theme.ink : #aaaaaa; vertical-alignment: center; }
+    }
+    function toggle() { if root.enabled { root.checked = !root.checked; root.toggled(); } }
+    focus := FocusScope { enabled: root.enabled; key-pressed(event) => { if event.text == " " || event.text == Key.Return { root.toggle(); return accept; } return reject; } }
+    touch := TouchArea { enabled: root.enabled; mouse-cursor: pointer; clicked => { focus.focus(); root.toggle(); } }
+    accessible-role: checkbox; accessible-label: root.text; accessible-enabled: root.enabled;
+    accessible-checkable: true; accessible-checked <=> root.checked;
+    accessible-action-default => { root.toggle(); }
 }

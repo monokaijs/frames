@@ -70,6 +70,7 @@ class SigningIdentityTests(unittest.TestCase):
             requirement = args[args.index('-R') + 1]
             self.assertTrue(requirement.startswith('=anchor apple generic'))
             self.assertIn('certificate leaf[subject.OU] = "V59Z6S9A36"', requirement)
+            self.assertIn('identifier "dev.creaton.frames"', requirement)
 
 
 if __name__ == '__main__':

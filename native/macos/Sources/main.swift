@@ -22,7 +22,7 @@ if args.contains("--network-settings"){
     app.run()
 }else if args.contains("--login-item"){
     app.setActivationPolicy(.regular);app.activate(ignoringOtherApps:true)
-    let service=SMAppService.agent(plistName:"app.frames.agent.plist")
+    let service=SMAppService.agent(plistName:"dev.creaton.frames.agent.plist")
     let enabled=service.status == .enabled || service.status == .requiresApproval
     let alert=NSAlert();alert.messageText="Share this Mac at login"
     alert.informativeText="Background sharing is \(enabled ? "registered" : "off"). Only devices already approved for unattended control can connect. Manage background sharing in System Settings → General → Login Items."

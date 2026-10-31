@@ -4,7 +4,8 @@ The Slint launcher supervises the same host/connect commands exposed by the CLI.
 
 - **Connections:** sharing, connection options, nearby discovery, and running sessions. A running process may still be waiting for pairing.
 - **Devices:** recent addresses, approved certificate fingerprints, and trust revocation. Revocation affects future connections; disconnect existing sessions separately.
-- **Permissions:** macOS capture/input checks, Settings shortcuts, and sharing preferences. Local Network permission must be checked in Settings.
+- **Settings:** saved defaults for connection view, host audio, video codec, clipboard sync, unattended access, and the shared-window limit. Save changes to apply them to new sessions; audio and desktop checkboxes on Connections override the defaults for that connection. Sharing at login is managed separately on macOS.
+- **Permissions dialog:** open the shield button in the rail to review macOS capture/input checks and system settings shortcuts. Missing sharing permissions open this dialog automatically. Local Network permission must be checked in system settings. Close with Done, the close button, or Escape.
 
 Discovery, permission helpers, trust changes, and session supervision run outside the UI thread. Preferences live in `launcher.json` next to the trust store. Child output is retained in `sharing.log` and `connection-N.log`. Closing the launcher stops its supervised sessions.
 
@@ -15,6 +16,7 @@ The preview uses fixture data and the production Slint views without starting se
 ```sh
 cargo run -p frames --example launcher_preview -- connections
 cargo run -p frames --example launcher_preview -- devices
+cargo run -p frames --example launcher_preview -- settings --compact
 cargo run -p frames --example launcher_preview -- permissions --compact
 SLINT_BACKEND=winit-software cargo run -p frames --example launcher_preview -- connections /tmp/frames-preview.png
 ```

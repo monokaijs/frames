@@ -74,6 +74,8 @@ jobs:
         env:
           FRAMES_RELEASE_BUILD: '1'
         run: ./scripts/build.ps1 -Target x86_64-pc-windows-msvc
+      - name: Verify Windows installation and upgrade
+        run: ./scripts/test_windows_installer.ps1
       - name: Package and upload to draft
         env:
           GH_TOKEN: ${{ github.token }}
@@ -81,6 +83,8 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           python scripts/release.py package windows-x86_64 $env:RELEASE_VERSION
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/release.py windows-installer $env:RELEASE_VERSION
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           gh release upload $env:RELEASE_TAG dist/release/* --clobber
 
@@ -147,12 +151,17 @@ jobs:
           FRAMES_RELEASE_BUILD: '1'
           FRAMES_SIGN_IDENTITY: ${{ vars.MACOS_SIGN_IDENTITY }}
         run: bash native/macos/build.sh
+      - name: Verify signed macOS updater replacement and rejection
+        env:
+          FRAMES_UPDATE_TEST_APP: ${{ github.workspace }}/dist/macos/Frames.app
+        run: cargo test -p frames update::tests:: --locked -- --include-ignored --nocapture
       - name: Notarize and staple
         env:
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          FRAMES_SIGN_IDENTITY: ${{ vars.MACOS_SIGN_IDENTITY }}
         run: |
           set -euo pipefail
           umask 077
@@ -165,6 +174,18 @@ jobs:
           xcrun stapler validate dist/macos/Frames.app
           spctl --assess --type execute --verbose=2 dist/macos/Frames.app
           python scripts/release.py package macos-aarch64 "$RELEASE_VERSION"
+          python scripts/release.py dmg "$RELEASE_VERSION"
+          image="dist/release/Frames-$RELEASE_VERSION-macos-aarch64.dmg"
+          source native/macos/sign.sh
+          identity="$(frames_signing_identity dist/macos/Frames.app)"
+          codesign --force --sign "$identity" --timestamp "$image"
+          xcrun notarytool submit "$image" --key "$RUNNER_TEMP/notary-key.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --wait --timeout 10m --output-format json > "$RUNNER_TEMP/notary-result.json"
+          python -c 'import json,os; d=json.load(open(os.environ["RUNNER_TEMP"]+"/notary-result.json")); print("Installer notarization:",d["status"]); assert d["status"]=="Accepted"'
+          xcrun stapler staple "$image"
+          xcrun stapler validate "$image"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$image"
+          python scripts/release.py verify-dmg "$image" "$RELEASE_VERSION"
+          (cd dist/release && shasum -a 256 "Frames-$RELEASE_VERSION-macos-aarch64.dmg" > "Frames-$RELEASE_VERSION-macos-aarch64.dmg.sha256")
       - name: Remote header regression checks
         run: |
           sources=()

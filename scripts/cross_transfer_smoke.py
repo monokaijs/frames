@@ -241,7 +241,7 @@ def main():
                     if time.monotonic() >= next_health_check:
                         assert fixture.poll() is None, "Windows QA fixture exited during interaction check"
                         assert win_host.poll() is None, "Windows host exited during interaction check"
-                        pattern = "^" + re.escape(mac_app + "/Contents/MacOS/frames connect " + args.windows_address + ":47992")
+                        pattern = "^" + re.escape(mac_app + "/Contents/MacOS/Frames connect " + args.windows_address + ":47992")
                         alive = ssh(f"pgrep -f {q(pattern)} | while read -r pid; do "
                                     f"if ps e -p \"$pid\" -o command= | grep -Fq {q(mac_root)}; then echo alive; fi; done")
                         assert "alive" in alive, "Mac native client exited during interaction check; inspect its err.log"
@@ -260,11 +260,11 @@ def main():
                 (root / (role + "." + channel + ".log")).write_text(contents, encoding="utf-8")
         for address in remote_hosts:
             # Only this invocation's app, dedicated port, and receive-folder marker.
-            pattern = "^" + re.escape(mac_app + "/Contents/MacOS/frames host --listen " + address)
+            pattern = "^" + re.escape(mac_app + "/Contents/MacOS/Frames host --listen " + address)
             ssh(f"pgrep -f {q(pattern)} | while read -r pid; do "
                 f"if ps -p \"$pid\" -o command= | grep -Fq {q(mac_root)}; then kill \"$pid\"; fi; done")
         if args.native_ui:
-            pattern = "^" + re.escape(mac_app + "/Contents/MacOS/frames connect " + args.windows_address + ":47992")
+            pattern = "^" + re.escape(mac_app + "/Contents/MacOS/Frames connect " + args.windows_address + ":47992")
             ssh(f"pgrep -f {q(pattern)} | while read -r pid; do "
                 f"if ps e -p \"$pid\" -o command= | grep -Fq {q(mac_root)}; then kill \"$pid\"; fi; done")
         (root / "results.json").write_text(json.dumps({"passed": results, "failure": failure,

@@ -146,7 +146,7 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
         var result: [[String: Any]] = []
         var nextContent:[CGWindowID:CGRect]=[:]
         let candidates = content.windows.filter { window in
-            guard let owner = window.owningApplication, owner.processID != getpid(), !owner.bundleIdentifier.hasPrefix("app.frames"), window.frame.width > 0, window.frame.height > 0 else { return false }
+            guard let owner = window.owningApplication, owner.processID != getpid(), !owner.bundleIdentifier.hasPrefix("dev.creaton.frames"), !owner.bundleIdentifier.hasPrefix("app.frames"), window.frame.width > 0, window.frame.height > 0 else { return false }
             if kill(owner.processID,0) != 0 && errno == ESRCH { return false }
             guard window.isOnScreen, !(NSRunningApplication(processIdentifier:owner.processID)?.isHidden ?? false) else { return false }
             // These processes own desktop/menu-bar surfaces, not application windows.

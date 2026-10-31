@@ -14,6 +14,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
     window_style::initialize()?;
     let ui = Launcher::new()?;
+    ui.set_app_version(env!("CARGO_PKG_VERSION").into());
+    if args.iter().any(|arg| arg == "--update-ready") {
+        ui.set_update_ready(true);
+        ui.set_update_status(
+            "Frames 0.1.3 is ready. It will install after all Frames sessions close.".into(),
+        );
+    }
     ui.set_design_preview(true);
     ui.window().set_size(slint::LogicalSize::new(
         if args.iter().any(|s| s == "--compact") {
@@ -35,9 +42,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_address("192.168.1.18:47990".into());
     ui.set_page(match args.get(1).map(String::as_str) {
         Some("devices") => 1,
-        Some("permissions") => 2,
+        Some("settings") => 2,
         _ => 0,
     });
+    ui.set_permissions_open(args.get(1).map(String::as_str) == Some("permissions"));
     ui.set_device_tab(1);
     if !args.iter().any(|s| s == "--empty") {
         ui.set_nearby(rows(vec![DeviceRow {
@@ -158,6 +166,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.on_clear_history(move || preview_notice(&weak));
     let weak = ui.as_weak();
     ui.on_login_settings(move || preview_notice(&weak));
+    let weak = ui.as_weak();
+    ui.on_save_settings(move || preview_notice(&weak));
     if let Some(path) = args.get(2).filter(|s| !s.starts_with("--")) {
         let weak = ui.as_weak();
         let path = path.clone();

@@ -69,6 +69,32 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(bundle["CFBundleVersion"], "1.2.3")
         self.assertEqual(bundle["CFBundleShortVersionString"], "1.2.3")
 
+    def test_mac_package_requires_frames_identity_icon_and_executable_modes(self):
+        archive = release.ROOT / "mac.zip"
+        def write_bundle(bundle_id=release.BUNDLE_ID, executable_mode=0o100755, icon=True):
+            info = plistlib.loads((release.ROOT / "native/macos/Info.plist").read_bytes())
+            info["CFBundleIdentifier"] = bundle_id
+            with zipfile.ZipFile(archive, "w") as package:
+                package.writestr("Frames.app/Contents/Info.plist", plistlib.dumps(info))
+                for name in ("Frames", "FramesHelper"):
+                    entry = zipfile.ZipInfo("Frames.app/Contents/MacOS/" + name)
+                    entry.external_attr = executable_mode << 16
+                    package.writestr(entry, b"binary")
+                package.writestr("Frames.app/Contents/Library/LaunchAgents/dev.creaton.frames.agent.plist", b"agent")
+                if icon:
+                    package.writestr("Frames.app/Contents/Resources/Frames.icns", b"icns")
+        write_bundle()
+        release.verify_package(archive, "macos-aarch64")
+        write_bundle(bundle_id="app.frames.desktop")
+        with self.assertRaisesRegex(ValueError, "identity"):
+            release.verify_package(archive, "macos-aarch64")
+        write_bundle(executable_mode=0o100644)
+        with self.assertRaisesRegex(ValueError, "not executable"):
+            release.verify_package(archive, "macos-aarch64")
+        write_bundle(icon=False)
+        with self.assertRaisesRegex(ValueError, "Frames.icns"):
+            release.verify_package(archive, "macos-aarch64")
+
     def test_manifest_signature_covers_actual_archive_bytes(self):
         root = release.ROOT
         key = root / "test-key.pem"

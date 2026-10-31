@@ -32,9 +32,12 @@ slint = { version = "=1.13.1", default-features = false, features = ["std", "bac
 [build-dependencies]
 slint-build = "=1.13.1"
 
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
-windows = { workspace = true, features = ["Win32_System_RemoteDesktop", "Win32_Security", "Win32_System_StationsAndDesktops", "Win32_System_Console", "Win32_Storage_FileSystem"] }
+windows = { workspace = true, features = ["Win32_System_RemoteDesktop", "Win32_Security", "Win32_System_StationsAndDesktops", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_System_Registry"] }
 
 [dev-dependencies]
 png = "0.17"

@@ -27,7 +27,11 @@ enum Command {
         check: bool,
     },
     #[command(hide = true)]
-    ApplyUpdate { plan: PathBuf },
+    ApplyUpdate {
+        plan: PathBuf,
+        #[arg(long)]
+        relaunch: bool,
+    },
     /// Inspect macOS permissions, optionally opening the system permission prompts.
     #[cfg(target_os = "macos")]
     Permissions {
@@ -178,15 +182,13 @@ fn run() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
-    if let Some(Command::ApplyUpdate { plan }) = &args.command {
-        return update::apply(plan);
+    if let Some(Command::ApplyUpdate { plan, relaunch }) = &args.command {
+        return update::apply(plan, *relaunch);
     }
     let _lease = update::runtime_lease()?;
     let Some(command) = args.command else {
         let result = launcher::run();
-        if option_env!("FRAMES_RELEASE_BUILD") == Some("1")
-            && let Err(error) = update::install_on_exit()
-        {
+        if let Err(error) = update::install_on_exit() {
             tracing::warn!(%error, "update installation deferred");
         }
         return result;

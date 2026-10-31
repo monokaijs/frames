@@ -3,11 +3,15 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>app.frames.desktop</string>
+	<string>dev.creaton.frames</string>
 	<key>CFBundleName</key>
 	<string>Frames</string>
+	<key>CFBundleDisplayName</key>
+	<string>Frames</string>
+	<key>CFBundleIconFile</key>
+	<string>Frames.icns</string>
 	<key>CFBundleExecutable</key>
-	<string>frames</string>
+	<string>Frames</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleVersion</key>

@@ -39,7 +39,7 @@ enum Wire {
         mediaOutput.write(header);mediaOutput.write(bytes)
     }
     static func permissions(screen: Bool? = nil) -> [String: Any] {
-        ["screen_capture":screen ?? CGPreflightScreenCaptureAccess(),"accessibility":AXIsProcessTrusted(),"sharing_at_login":SMAppService.agent(plistName:"app.frames.agent.plist").status == .enabled,"control_permission_name":controlPermissionLabel,"bundle_id":Bundle.main.bundleIdentifier ?? "unbundled","executable":CommandLine.arguments[0]]
+        ["screen_capture":screen ?? CGPreflightScreenCaptureAccess(),"accessibility":AXIsProcessTrusted(),"sharing_at_login":SMAppService.agent(plistName:"dev.creaton.frames.agent.plist").status == .enabled,"control_permission_name":controlPermissionLabel,"bundle_id":Bundle.main.bundleIdentifier ?? "unbundled","executable":CommandLine.arguments[0]]
     }
     static func failure(_ text: String) -> NSError { NSError(domain: "Frames", code: 1, userInfo: [NSLocalizedDescriptionKey: text]) }
 }

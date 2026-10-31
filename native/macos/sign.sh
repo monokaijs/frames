@@ -34,11 +34,11 @@ frames_sign_app() {
     return
   fi
   if [[ "${FRAMES_RELEASE_BUILD:-}" == 1 && "$identity" == - ]]; then echo "Release builds require Developer ID signing" >&2; return 1; fi
-  codesign --force --sign "$identity" --identifier app.frames.helper --options runtime "$timestamp" "$app/Contents/MacOS/FramesHelper"
+  codesign --force --sign "$identity" --identifier dev.creaton.frames.helper --options runtime "$timestamp" "$app/Contents/MacOS/FramesHelper"
   codesign --force --sign "$identity" --options runtime "$timestamp" "$app"
   codesign --verify --deep --strict "$app"
   if [[ "${FRAMES_RELEASE_BUILD:-}" == 1 ]]; then
-    codesign --verify --strict -R '=anchor apple generic and identifier "app.frames.desktop" and certificate leaf[subject.OU] = "V59Z6S9A36"' "$app"
+    codesign --verify --strict -R '=anchor apple generic and identifier "dev.creaton.frames" and certificate leaf[subject.OU] = "V59Z6S9A36"' "$app"
   fi
   if [[ "$identity" == - ]]; then
     printf 'Ad-hoc signed %s; macOS privacy grants may reset after rebuilds.\n' "$app"

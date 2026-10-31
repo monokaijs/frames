@@ -29,7 +29,7 @@ import ApplicationServices
         window.center();window.makeKeyAndOrderFront(nil);NSApp.activate(ignoringOtherApps:true)
     }
     func button(_ title:String,_ action:Selector,_ rect:NSRect,_ parent:NSView){let button=NSButton(title:title,target:self,action:action);button.frame=rect;button.bezelStyle = .rounded;parent.addSubview(button)}
-    func process(_ arguments:[String],output:Any?=nil)throws->Process{let process=Process();let resources=URL(fileURLWithPath:CommandLine.arguments[0]).deletingLastPathComponent();process.executableURL=resources.appendingPathComponent("../MacOS/frames").standardizedFileURL;process.arguments=arguments;var environment=ProcessInfo.processInfo.environment;environment["FRAMES_GUI_CHILD"]="1";process.environment=environment;process.standardOutput=output ?? FileHandle.nullDevice;process.standardError=FileHandle.nullDevice;try process.run();return process}
+    func process(_ arguments:[String],output:Any?=nil)throws->Process{let process=Process();let resources=URL(fileURLWithPath:CommandLine.arguments[0]).deletingLastPathComponent();process.executableURL=resources.appendingPathComponent("../MacOS/Frames").standardizedFileURL;process.arguments=arguments;var environment=ProcessInfo.processInfo.environment;environment["FRAMES_GUI_CHILD"]="1";process.environment=environment;process.standardOutput=output ?? FileHandle.nullDevice;process.standardError=FileHandle.nullDevice;try process.run();return process}
     @objc func connect(){do{var arguments=["connect",address.stringValue];if audio.state == .on{arguments.append("--audio")};if desktop.state == .on{arguments.append(contentsOf:["--view","desktop"])};clients.append(try process(arguments));status.stringValue="Connecting. Compare the pairing code on both devices."}catch{status.stringValue=error.localizedDescription}}
     @objc func share(){
         if host?.isRunning == true{return};host=nil
@@ -61,7 +61,7 @@ import ApplicationServices
         if alert.runModal() == .alertFirstButtonReturn,choices.indexOfSelectedItem>=0{address.stringValue=endpoints[choices.indexOfSelectedItem];connect()}
         else{status.stringValue="Found \(devices.count) nearby hosts."}
     }
-    @objc func loginItem(){do{try SMAppService.agent(plistName:"app.frames.agent.plist").register();status.stringValue="Sharing registered for login. Approve it in Login Items if requested."}catch{status.stringValue=error.localizedDescription}}
+    @objc func loginItem(){do{try SMAppService.agent(plistName:"dev.creaton.frames.agent.plist").register();status.stringValue="Sharing registered for login. Approve it in Login Items if requested."}catch{status.stringValue=error.localizedDescription}}
     func applicationWillTerminate(_ notification:Notification){stop()}
     func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication)->Bool{true}
 }

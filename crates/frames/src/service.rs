@@ -95,7 +95,7 @@ pub fn install() -> anyhow::Result<()> {
     frames_core::trust::Identity::load()?.install_service_identity(&data)?;
     let info = ServiceInfo {
         name: NAME.into(),
-        display_name: "Frames Remote Windows".into(),
+        display_name: "Frames".into(),
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,

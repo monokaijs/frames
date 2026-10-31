@@ -4,13 +4,15 @@ Native remote control for Windows 11 x64 and macOS 14.2+ on Apple silicon. Open 
 
 [Download the latest release](https://github.com/monokaijs/frames/releases/latest). Install FFmpeg separately, or set `FRAMES_FFMPEG` to its executable. Both computers need matching Frames builds; the current protocol is **4**.
 
+On Windows, run **Frames-VERSION-windows-x86_64-setup.exe**. It installs Frames for your account, adds a Start menu shortcut and an Installed Apps entry, and includes an uninstaller. The default installation directory supports automatic updates without administrator access. The ZIP is also available for portable use.
+
 ## Connect
 
 Launch Frames, enable sharing on the host, and enter its address on the client. Nearby discovery works on the local network. Both computers must approve the same pairing code on first connection. Saving an address does not grant access; unattended reconnection requires the host's explicit approval.
 
 Frames connects directly over LAN or VPN on UDP **47990**. Allow that port through the host firewall. There is no relay or NAT traversal service.
 
-On macOS, move Frames.app to Applications and open it in the logged-in desktop session. Allow Local Network, Screen Recording, and Accessibility in System Settings > Privacy & Security. Accessibility is named Device Control and Data Access on newer macOS versions. A locked Mac must be unlocked locally before application control can continue.
+On macOS, open the Frames DMG, drag Frames.app to Applications, and open it in the logged-in desktop session. Allow Local Network, Screen Recording, and Accessibility in System Settings > Privacy & Security. Accessibility is named Device Control and Data Access on newer macOS versions. A locked Mac must be unlocked locally before application control can continue.
 
 ## Remote windows
 
@@ -45,7 +47,7 @@ frames update
 
 Use `--no-clipboard` on host or client to disable clipboard sharing. Automatic codec selection probes working implementations; `--codec` accepts h264, hevc, av1, or vp9. Run `frames --help` for all options.
 
-Official builds check for signed updates in the background every six hours. Background downloads defer while a remote session is active. Verified packages install after all Frames processes using that installation close. Active sessions are never interrupted. Updates require write access to the installation directory. See [release setup](docs/RELEASES.md).
+Official builds check for signed updates in the background every six hours. Use **Settings > Check for updates** to check manually and see download progress, then **Restart to update** when sessions are stopped. Background downloads defer while a remote session is active. Verified packages install after all Frames processes using that installation close. Active sessions are never interrupted. Updates require write access to the installation directory. See [release setup](docs/RELEASES.md), including migration from the previous bundle identifier.
 
 ## Build
 

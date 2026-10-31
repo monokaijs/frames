@@ -26,9 +26,92 @@ slint::include_modules!();
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Preferences {
+    #[serde(flatten)]
+    options: SessionOptions,
+    recent: Vec<Recent>,
+}
+/// Saved defaults are also used to build the CLI arguments for supervised sessions.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct SessionOptions {
     audio: bool,
     desktop: bool,
-    recent: Vec<Recent>,
+    clipboard: bool,
+    unattended: bool,
+    codec: String,
+    max_streams: usize,
+}
+const CODECS: [&str; 5] = ["auto", "h264", "hevc", "av1", "vp9"];
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            audio: false,
+            desktop: false,
+            clipboard: true,
+            unattended: false,
+            codec: "auto".into(),
+            max_streams: 8,
+        }
+    }
+}
+impl SessionOptions {
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            CODECS.contains(&self.codec.as_str()),
+            "Choose a supported video codec."
+        );
+        anyhow::ensure!(
+            (1..=32).contains(&self.max_streams),
+            "Choose a shared window limit between 1 and 32."
+        );
+        Ok(())
+    }
+    fn connection_args(&self, address: SocketAddr) -> Vec<String> {
+        let mut args = vec![
+            "connect".into(),
+            address.to_string(),
+            "--codec".into(),
+            self.codec.clone(),
+        ];
+        if self.audio {
+            args.push("--audio".into());
+        }
+        if self.desktop {
+            args.extend(["--view".into(), "desktop".into()]);
+        }
+        if !self.clipboard {
+            args.push("--no-clipboard".into());
+        }
+        args
+    }
+    fn sharing_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "host".into(),
+            "--pair".into(),
+            "--max-streams".into(),
+            self.max_streams.to_string(),
+        ];
+        if self.unattended {
+            args.push("--unattended".into());
+        }
+        if !self.clipboard {
+            args.push("--no-clipboard".into());
+        }
+        args
+    }
+    fn from_ui(ui: &Launcher) -> Self {
+        Self {
+            audio: ui.get_default_audio(),
+            desktop: ui.get_default_desktop(),
+            clipboard: ui.get_clipboard(),
+            unattended: ui.get_unattended(),
+            codec: CODECS
+                .get(ui.get_codec() as usize)
+                .unwrap_or(&"auto")
+                .to_string(),
+            max_streams: ui.get_max_streams() as usize,
+        }
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Recent {
@@ -44,7 +127,9 @@ impl Preferences {
         if !path.exists() {
             return Ok(Self::default());
         }
-        Ok(serde_json::from_slice(&fs::read(path)?)?)
+        let preferences: Self = serde_json::from_slice(&fs::read(path)?)?;
+        preferences.options.validate()?;
+        Ok(preferences)
     }
     fn save(&self) -> Result<()> {
         let path = Self::path()?;
@@ -155,7 +240,8 @@ fn trusted_rows() -> Result<Vec<Device>> {
 // Keep Slint types on the UI thread; only plain Rust values cross channels.
 enum Action {
     Connect(String, bool, bool),
-    ToggleSharing(bool),
+    ToggleSharing,
+    SaveSettings(SessionOptions),
     Stop(i32),
     Discover,
     Refresh,
@@ -167,6 +253,8 @@ enum Action {
 }
 enum Event {
     Notice(String, bool),
+    SettingsSaved(Result<(), String>),
+    Update(crate::update::Status),
     #[cfg(target_os = "macos")]
     SharingBlocked(String),
     Recent(Vec<Device>),
@@ -274,13 +362,10 @@ impl Worker {
                         .any(|s| !s.host && s.name == address.to_string()),
                     "A connection to this address is already running. Manage it under Your sessions."
                 );
-                let mut args = vec!["connect".into(), address.to_string()];
-                if audio {
-                    args.push("--audio".into());
-                }
-                if desktop {
-                    args.extend(["--view".into(), "desktop".into()]);
-                }
+                let mut options = self.preferences.options.clone();
+                options.audio = audio;
+                options.desktop = desktop;
+                let args = options.connection_args(address);
                 self.spawn(
                     &args,
                     address.to_string(),
@@ -295,8 +380,6 @@ impl Worker {
                         if audio { " · host audio" } else { "" }
                     ),
                 )?;
-                self.preferences.audio = audio;
-                self.preferences.desktop = desktop;
                 self.preferences.remember(address);
                 let _ = self
                     .events
@@ -310,7 +393,19 @@ impl Worker {
                     self.notice("Connection started. If prompted, compare the pairing code on both devices.", false);
                 }
             }
-            Action::ToggleSharing(unattended) => {
+            Action::SaveSettings(options) => {
+                let result = (|| -> Result<()> {
+                    options.validate()?;
+                    let mut preferences = self.preferences.clone();
+                    preferences.options = options;
+                    preferences.save()?;
+                    self.preferences = preferences;
+                    Ok(())
+                })()
+                .map_err(|error| format!("{error:#}"));
+                let _ = self.events.send(Event::SettingsSaved(result));
+            }
+            Action::ToggleSharing => {
                 if let Some(index) = self.sessions.iter().position(|s| s.host) {
                     self.sessions.remove(index);
                     self.notice(
@@ -335,15 +430,12 @@ impl Worker {
                             return Ok(());
                         }
                     }
-                    let mut args = vec!["host".into(), "--pair".into()];
-                    if unattended {
-                        args.push("--unattended".into());
-                    }
+                    let args = self.preferences.options.sharing_args();
                     self.spawn(
                         &args,
                         "This device".into(),
                         true,
-                        if unattended {
+                        if self.preferences.options.unattended {
                             "Unattended"
                         } else {
                             "Ask to connect"
@@ -593,6 +685,7 @@ fn local_address() -> String {
 pub fn run() -> Result<()> {
     window_style::initialize()?;
     let ui = Launcher::new()?;
+    ui.set_app_version(env!("CARGO_PKG_VERSION").into());
     ui.on_filter_devices(|rows, query| {
         let query = query.trim().to_lowercase();
         model(
@@ -628,8 +721,19 @@ pub fn run() -> Result<()> {
             Preferences::default()
         }
     };
-    ui.set_audio(preferences.audio);
-    ui.set_desktop(preferences.desktop);
+    ui.set_audio(preferences.options.audio);
+    ui.set_desktop(preferences.options.desktop);
+    ui.set_default_audio(preferences.options.audio);
+    ui.set_default_desktop(preferences.options.desktop);
+    ui.set_clipboard(preferences.options.clipboard);
+    ui.set_unattended(preferences.options.unattended);
+    ui.set_codec(
+        CODECS
+            .iter()
+            .position(|codec| *codec == preferences.options.codec)
+            .unwrap_or(0) as i32,
+    );
+    ui.set_max_streams(preferences.options.max_streams as i32);
     ui.set_recent(model(
         recent_rows(&preferences)
             .into_iter()
@@ -639,8 +743,26 @@ pub fn run() -> Result<()> {
     let (actions, action_rx) = mpsc::channel();
     let (events, event_rx) = mpsc::channel();
     let update_events = events.clone();
-    crate::update::start(move |message| {
-        let _ = update_events.send(Event::Notice(message, false));
+    let update_requests = crate::update::start(move |status| {
+        let _ = update_events.send(Event::Update(status));
+    });
+    let weak = ui.as_weak();
+    ui.on_check_updates(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_update_busy(true);
+        }
+        let _ = update_requests.send(());
+    });
+    let weak = ui.as_weak();
+    ui.on_restart_update(move || {
+        if let Some(ui) = weak.upgrade()
+            && ui.get_update_ready()
+            && ui.get_sessions().row_count() == 0
+            && !ui.get_background_sharing()
+        {
+            crate::update::request_restart();
+            let _ = slint::quit_event_loop();
+        }
     });
     let worker = std::thread::spawn(move || {
         let (discovery_tx, discovery_done) = mpsc::channel();
@@ -689,10 +811,15 @@ pub fn run() -> Result<()> {
     });
     let weak = ui.as_weak();
     let tx = actions.clone();
-    ui.on_toggle_sharing(move || {
+    ui.on_save_settings(move || {
         if let Some(ui) = weak.upgrade() {
-            let _ = tx.send(Action::ToggleSharing(ui.get_unattended()));
+            ui.set_settings_saving(true);
+            let _ = tx.send(Action::SaveSettings(SessionOptions::from_ui(&ui)));
         }
+    });
+    let tx = actions.clone();
+    ui.on_toggle_sharing(move || {
+        let _ = tx.send(Action::ToggleSharing);
     });
     let weak = ui.as_weak();
     let tx = actions.clone();
@@ -733,15 +860,49 @@ pub fn run() -> Result<()> {
         let Some(ui) = weak.upgrade() else { return; };
         for event in event_rx.try_iter() {
             match event {
+                Event::Update(status) => {
+                    use crate::update::Status;
+                    ui.set_update_busy(matches!(status, Status::Checking | Status::Downloading(..)));
+                    ui.set_update_error(matches!(status, Status::Error(_)));
+                    let message = match status {
+                        Status::Checking => "Checking for Frames updates…".into(),
+                        Status::Downloading(done, total) => format!("Downloading Frames update… {}%", done * 100 / total.max(1)),
+                        Status::Ready(version) => {
+                            ui.set_update_ready(true);
+                            format!("Frames {version} is ready. It will install after all Frames sessions close.")
+                        }
+                        Status::Current => "Frames is up to date.".into(),
+                        Status::Deferred => "Updates will resume when remote sessions have stopped.".into(),
+                        Status::Error(message) => format!("Couldn't update Frames: {message}"),
+                    };
+                    ui.set_update_status(message.into());
+                }
                 Event::Notice(message, error) => {
                     permission_notice = false;
                     ui.set_notice(message.into()); ui.set_notice_error(error);
                     ui.set_status(if error { "Action needed — see the message above" } else { "Ready · direct encrypted connections" }.into());
                     ui.set_status_error(error);
                 }
+                Event::SettingsSaved(result) => {
+                    ui.set_settings_saving(false);
+                    match result {
+                        Ok(()) => {
+                            ui.set_audio(ui.get_default_audio());
+                            ui.set_desktop(ui.get_default_desktop());
+                            ui.set_settings_dirty(false);
+                            ui.set_settings_error(false);
+                            ui.set_settings_status("Saved. Changes apply to new sessions.".into());
+                        }
+                        Err(error) => {
+                            ui.set_settings_error(true);
+                            ui.set_settings_status(format!("Couldn't save settings: {error}").into());
+                        }
+                    }
+                }
                 #[cfg(target_os = "macos")]
                 Event::SharingBlocked(message) => {
                     permission_notice = true;
+                    ui.invoke_show_permissions();
                     ui.set_notice(message.into());
                     ui.set_notice_error(true);
                 }
@@ -800,6 +961,103 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn old_preferences_keep_connection_defaults_and_gain_safe_settings() {
+        let preferences: Preferences = serde_json::from_str(
+            r#"{"audio":true,"desktop":true,"recent":[{"address":"127.0.0.1:47990","opened":42}]}"#,
+        )
+        .unwrap();
+        assert!(preferences.options.audio);
+        assert!(preferences.options.desktop);
+        assert!(preferences.options.clipboard);
+        assert!(!preferences.options.unattended);
+        assert_eq!(preferences.options.codec, "auto");
+        assert_eq!(preferences.options.max_streams, 8);
+        assert_eq!(preferences.recent.len(), 1);
+        preferences.options.validate().unwrap();
+        let restored: Preferences =
+            serde_json::from_slice(&serde_json::to_vec(&preferences).unwrap()).unwrap();
+        assert_eq!(restored.options, preferences.options);
+        assert_eq!(restored.recent[0].address, preferences.recent[0].address);
+    }
+
+    #[test]
+    fn settings_reach_the_real_host_and_connect_cli() {
+        use clap::Parser;
+        let options = SessionOptions {
+            audio: true,
+            desktop: true,
+            clipboard: false,
+            unattended: true,
+            codec: "hevc".into(),
+            max_streams: 12,
+        };
+        let connect = crate::Args::try_parse_from(
+            std::iter::once("frames".to_string())
+                .chain(options.connection_args(endpoint("127.0.0.1").unwrap())),
+        )
+        .unwrap();
+        assert!(matches!(
+            connect.command,
+            Some(crate::Command::Connect {
+                audio: true,
+                no_clipboard: true,
+                view: crate::ViewChoice::Desktop,
+                codec: crate::CodecChoice::Hevc,
+                ..
+            })
+        ));
+        let host = crate::Args::try_parse_from(
+            std::iter::once("frames".to_string()).chain(options.sharing_args()),
+        )
+        .unwrap();
+        assert!(matches!(
+            host.command,
+            Some(crate::Command::Host {
+                pair: true,
+                unattended: true,
+                no_clipboard: true,
+                max_streams: 12,
+                ..
+            })
+        ));
+        let defaults = SessionOptions::default();
+        assert!(
+            !defaults
+                .sharing_args()
+                .iter()
+                .any(|arg| arg == "--unattended" || arg == "--no-clipboard")
+        );
+        assert!(
+            !defaults
+                .connection_args(endpoint("127.0.0.1").unwrap())
+                .iter()
+                .any(|arg| arg == "--audio" || arg == "--view" || arg == "--no-clipboard")
+        );
+    }
+
+    #[test]
+    fn invalid_saved_options_are_rejected() {
+        for max_streams in [0, 33] {
+            assert!(
+                SessionOptions {
+                    max_streams,
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            SessionOptions {
+                codec: "unknown".into(),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
     #[test]
     fn sharing_errors_only_name_permissions_still_missing() {
         let granted_screen = serde_json::json!({"screen_capture":true,"accessibility":false,"control_permission_name":"Device Control and Data Access"});
