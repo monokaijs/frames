@@ -416,7 +416,7 @@ impl Worker {
                     #[cfg(target_os = "macos")]
                     {
                         let permissions = frames_native::permission_status(false)?;
-                        if permissions["sharing_at_login"].as_bool() == Some(true) {
+                        if permissions["sharing_running"].as_bool() == Some(true) {
                             let _ = self.events.send(Event::Permissions(Ok(permissions)));
                             self.notice(
                                 "Sharing is managed at login. Use Manage sharing to configure it.",
@@ -758,7 +758,7 @@ pub fn run() -> Result<()> {
         if let Some(ui) = weak.upgrade()
             && ui.get_update_ready()
             && ui.get_sessions().row_count() == 0
-            && !ui.get_background_sharing()
+            && !ui.get_background_sharing_running()
         {
             crate::update::request_restart();
             let _ = slint::quit_event_loop();
@@ -922,7 +922,8 @@ pub fn run() -> Result<()> {
                     Ok(value) => {
                         ui.set_screen_permission(value["screen_capture"].as_bool().map_or(-1, i32::from));
                         ui.set_control_permission(value["accessibility"].as_bool().map_or(-1, i32::from));
-                        ui.set_background_sharing(value["sharing_at_login"].as_bool().unwrap_or(false));
+                        ui.set_background_sharing_registered(value["sharing_at_login"].as_bool().unwrap_or(false));
+                        ui.set_background_sharing_running(value["sharing_running"].as_bool().unwrap_or(false));
                         if let Some(label) = value["control_permission_name"].as_str() { ui.set_control_label(label.into()); }
                         if permission_notice {
                             if ui.get_notice().is_empty() {
@@ -961,6 +962,49 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registered_but_stopped_login_sharing_allows_unattended_settings() {
+        struct Headless;
+        impl slint::platform::Platform for Headless {
+            fn create_window_adapter(
+                &self,
+            ) -> Result<Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError> {
+                Ok(
+                    slint::platform::software_renderer::MinimalSoftwareWindow::new(
+                        slint::platform::software_renderer::RepaintBufferType::ReusedBuffer,
+                    ),
+                )
+            }
+        }
+        slint::platform::set_platform(Box::new(Headless)).unwrap();
+        let ui = Launcher::new().unwrap();
+        ui.set_background_sharing_registered(true);
+        ui.set_background_sharing_running(false);
+        assert!(ui.get_unattended_editable());
+
+        ui.set_unattended(true);
+        ui.set_max_streams(8);
+        let saved = serde_json::to_string(&SessionOptions::from_ui(&ui)).unwrap();
+        let options: SessionOptions = serde_json::from_str(&saved).unwrap();
+        assert!(options.unattended);
+        assert!(
+            options
+                .sharing_args()
+                .iter()
+                .any(|arg| arg == "--unattended")
+        );
+
+        ui.set_sharing(true);
+        assert!(
+            !ui.get_unattended_editable(),
+            "Running hosts must be restarted to apply changed options"
+        );
+        ui.set_sharing(false);
+        ui.set_background_sharing_running(true);
+        assert!(!ui.get_unattended_editable());
+    }
+
     #[test]
     fn old_preferences_keep_connection_defaults_and_gain_safe_settings() {
         let preferences: Preferences = serde_json::from_str(

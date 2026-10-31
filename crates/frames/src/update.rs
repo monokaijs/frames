@@ -383,12 +383,7 @@ pub fn install_on_exit() -> Result<()> {
             let _ = fs::remove_file(path);
         }
     }
-    let helper = root.join(format!(
-        "apply-helper-{}{}",
-        uuid::Uuid::new_v4(),
-        std::env::consts::EXE_SUFFIX
-    ));
-    fs::copy(std::env::current_exe()?, &helper)?;
+    let helper = prepare_update_helper(&root, &target)?;
     let mut command = Command::new(&helper);
     command
         .arg("apply-update")
@@ -412,6 +407,45 @@ pub fn install_on_exit() -> Result<()> {
     }
     command.spawn()?;
     Ok(())
+}
+
+fn prepare_update_helper(root: &Path, target: &Path) -> Result<PathBuf> {
+    let name = format!("apply-helper-{}", uuid::Uuid::new_v4());
+    #[cfg(target_os = "macos")]
+    {
+        // A signed app executable seals its Info.plist. Copying only the Mach-O
+        // makes AMFI reject it before main(), so preserve the complete bundle.
+        let bundle = root.join(format!("{name}.app"));
+        let result = (|| {
+            ensure!(
+                Command::new("/usr/bin/ditto")
+                    .arg(target)
+                    .arg(&bundle)
+                    .status()?
+                    .success(),
+                "could not prepare the updater app bundle"
+            );
+            ensure!(
+                Command::new("/usr/bin/codesign")
+                    .args(["--verify", "--deep", "--strict"])
+                    .arg(&bundle)
+                    .status()?
+                    .success(),
+                "updater app bundle signature is invalid"
+            );
+            Ok(installed_binary(&bundle, true))
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&bundle);
+        }
+        result
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let helper = root.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        fs::copy(target, &helper)?;
+        Ok(helper)
+    }
 }
 fn extract(archive: &Path, destination: &Path, bundle: bool) -> Result<PathBuf> {
     let mut zip = zip::ZipArchive::new(File::open(archive)?)?;
@@ -594,6 +628,16 @@ fn apply_in(
     #[cfg(unix)]
     {
         let executable = std::env::current_exe()?;
+        #[cfg(target_os = "macos")]
+        if let Some(bundle) = executable.ancestors().find(|path| {
+            path.parent() == Some(root)
+                && path.extension().is_some_and(|ext| ext == "app")
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("apply-helper-"))
+        }) {
+            let _ = fs::remove_dir_all(bundle);
+        }
         if executable.parent() == Some(root)
             && executable
                 .file_name()
@@ -619,6 +663,73 @@ fn replace_installation(target: &Path, replacement: &Path, backup: &Path) -> Res
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_updater_preserves_the_signed_bundle_and_launches() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("Frames.app");
+        let binary = installed_binary(&app, true);
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(
+            app.join("Contents/Info.plist"),
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>dev.frames.update-test</string>
+<key>CFBundleExecutable</key><string>Frames</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+</dict></plist>"#,
+        )
+        .unwrap();
+        let source = temp.path().join("main.c");
+        fs::write(&source, "int main(void) { return 0; }\n").unwrap();
+        assert!(
+            Command::new("/usr/bin/clang")
+                .arg(&source)
+                .arg("-o")
+                .arg(&binary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("/usr/bin/codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(&app)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+
+        let helper = prepare_update_helper(&cache, &app).unwrap();
+        let bundle = helper
+            .ancestors()
+            .find(|path| path.extension().is_some_and(|ext| ext == "app"))
+            .unwrap();
+        assert_ne!(bundle, app);
+        assert_eq!(
+            fs::read(bundle.join("Contents/Info.plist")).unwrap(),
+            fs::read(app.join("Contents/Info.plist")).unwrap()
+        );
+        assert!(
+            Command::new(&helper).status().unwrap().success(),
+            "macOS must accept the copied updater's signature"
+        );
+        // This is the old launch path: AMFI rejects a signed app executable
+        // detached from the Info.plist sealed by its signature.
+        let detached = cache.join("detached-updater");
+        fs::copy(&binary, &detached).unwrap();
+        assert!(
+            !Command::new("/usr/bin/codesign")
+                .args(["--verify", "--strict"])
+                .arg(&detached)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
 
     #[test]
     fn mac_bundle_extracts_frames_and_rejects_symlinks() {

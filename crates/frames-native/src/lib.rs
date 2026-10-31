@@ -42,6 +42,10 @@ pub struct CaptureStream {
     pub guard: Box<dyn Capture>,
 }
 pub trait Desktop: Send + Sync {
+    /// Detect a lost native backend even when no remote session is connected.
+    fn check_health(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn windows(&self) -> anyhow::Result<Vec<RemoteWindow>>;
     fn desktop_windows(&self) -> anyhow::Result<Vec<RemoteWindow>> {
         anyhow::bail!("full-desktop capture is unavailable")

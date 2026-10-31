@@ -36,7 +36,9 @@ Updates stage in the user's cache and apply after every Frames process using the
 
 `frames update --check` checks manually. `frames update` downloads and schedules the update. Development builds do not check automatically. Keep the update private key backed up securely: losing it requires a manually distributed build with a new pinned public key.
 
-In **Settings**, Check for updates shows progress and errors. After verification, Restart to update closes the idle launcher and reopens the installed replacement. Stop sessions and disable sharing at login first; another Frames process can defer installation. An app running from a read-only DMG must first be copied to Applications. The updater does not request administrator access.
+In **Settings**, Check for updates shows progress and errors. After verification, Restart to update closes the idle launcher and reopens the installed replacement. Stop running sessions and background sharing first; another Frames process can defer installation. A registered sharing-at-login preference does not block updates when its service is stopped. An app running from a read-only DMG must first be copied to Applications. The updater does not request administrator access.
+
+On macOS, the updater runs from a temporary copy of the complete signed app bundle. Its executable must stay with the signed Info.plist and resources so macOS can validate it before launch.
 
 Older builds used `app.frames.desktop`. Install this DMG manually once to migrate to `dev.creaton.frames`: the old updater intentionally rejects a different bundle identifier. Disable the old sharing login item before replacing the app and grant the new Frames identity its macOS privacy permissions. Pairing data is retained in its existing location.
 

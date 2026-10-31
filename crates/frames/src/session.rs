@@ -409,11 +409,15 @@ pub async fn host(
         identity.device_id,
         receive_dir.display()
     );
-    loop {
+    let mut health = tokio::time::interval(std::time::Duration::from_secs(1));
+    let result = loop {
         tokio::select! {
-            _=tokio::signal::ctrl_c()=>break,
+            _=tokio::signal::ctrl_c()=>break Ok(()),
+            _=health.tick()=>{
+                if let Err(error)=desktop.check_health(){break Err(error);}
+            }
             incoming=endpoint.accept()=>{
-                let Some(incoming)=incoming else{break;};
+                let Some(incoming)=incoming else{break Ok(());};
                 let Ok(pending_permit)=pending_slots.clone().try_acquire_owned()else{incoming.refuse();continue;};
                 let(identity,desktop,codecs,receive_dir)=(identity.clone(),desktop.clone(),codecs.clone(),receive_dir.clone());
                 let(controller_slots,transfer_slots,active)=(semaphore.clone(),transfer_slots.clone(),active.clone());
@@ -449,11 +453,11 @@ pub async fn host(
                 });
             }
         }
-    }
+    };
     endpoint.close(0u32.into(), b"host shutting down");
     desktop.release_input();
     endpoint.wait_idle().await;
-    Ok(())
+    result
 }
 
 #[allow(clippy::too_many_arguments)] // Authenticated session dependencies, distinct from persistent options.

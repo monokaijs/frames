@@ -65,8 +65,23 @@ pub fn permission_status(request: bool) -> anyhow::Result<Value> {
         "permission helper failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    Ok(serde_json::from_slice(&output.stdout)?)
+    let mut permissions: Value = serde_json::from_slice(&output.stdout)?;
+    // SMAppService.status describes the login preference, not whether launchd
+    // still has the service loaded. A stopped login agent must not block updates.
+    permissions["sharing_running"] = launch_agent_loaded("dev.creaton.frames.agent")?.into();
+    Ok(permissions)
 }
+
+fn launch_agent_loaded(label: &str) -> anyhow::Result<bool> {
+    let service = format!("gui/{}/{label}", unsafe { libc::getuid() });
+    Ok(Command::new("/bin/launchctl")
+        .args(["print", &service])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?
+        .success())
+}
+
 pub fn configure_login_item() -> anyhow::Result<()> {
     anyhow::ensure!(
         Command::new(helper_path()?)
@@ -129,6 +144,12 @@ impl Drop for Bridge {
     }
 }
 impl Bridge {
+    fn check_health(&self) -> anyhow::Result<()> {
+        if let Some(status) = self.child.lock().try_wait()? {
+            anyhow::bail!("macOS capture helper exited: {status}");
+        }
+        Ok(())
+    }
     fn new() -> anyhow::Result<Arc<Self>> {
         // Media must never hold up acknowledgements or input on stdout.
         let (media_read, media_write) = UnixStream::pair()?;
@@ -224,9 +245,7 @@ impl Bridge {
         }))
     }
     fn request(&self, command: &str, data: Value) -> anyhow::Result<Value> {
-        if let Some(status) = self.child.lock().try_wait()? {
-            anyhow::bail!("macOS capture helper exited: {status}");
-        }
+        self.check_health()?;
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.pending.lock().insert(id, tx);
@@ -315,6 +334,9 @@ impl Drop for AudioGuard {
     }
 }
 impl Desktop for Host {
+    fn check_health(&self) -> anyhow::Result<()> {
+        self.bridge.check_health()
+    }
     fn desktop_windows(&self) -> anyhow::Result<Vec<RemoteWindow>> {
         self.enumerate("desktop")
     }
@@ -579,4 +601,73 @@ pub fn run_client(
     let _ = reader.join();
     let _ = video_writer.join();
     Ok(())
+}
+
+#[cfg(test)]
+mod launch_agent_tests {
+    use super::*;
+
+    #[test]
+    fn stopped_agent_is_not_reported_as_running() {
+        let domain = format!("gui/{}", unsafe { libc::getuid() });
+        if !Command::new("/bin/launchctl")
+            .args(["print", &domain])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+        {
+            eprintln!("No Aqua login domain; launch agent integration requires a logged-in Mac");
+            return;
+        }
+        let label = format!("dev.frames.update-test.{}", std::process::id());
+        let service = format!("{domain}/{label}");
+        let path = std::env::temp_dir().join(format!("{label}.plist"));
+        struct Cleanup(String, std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = Command::new("/bin/launchctl")
+                    .args(["bootout", &self.0])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let _ = std::fs::remove_file(&self.1);
+            }
+        }
+        let _cleanup = Cleanup(service.clone(), path.clone());
+        std::fs::write(
+            &path,
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>Label</key><string>{label}</string>
+<key>ProgramArguments</key><array><string>/bin/sleep</string><string>60</string></array>
+<key>RunAtLoad</key><true/>
+</dict></plist>"#
+            ),
+        )
+        .unwrap();
+        assert!(!launch_agent_loaded(&label).unwrap());
+        assert!(
+            Command::new("/bin/launchctl")
+                .args(["bootstrap", &domain])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(launch_agent_loaded(&label).unwrap());
+        assert!(
+            Command::new("/bin/launchctl")
+                .args(["bootout", &service])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            !launch_agent_loaded(&label).unwrap(),
+            "An unloaded service must not block Restart to update"
+        );
+    }
 }
