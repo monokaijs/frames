@@ -337,36 +337,9 @@ pub async fn probe_decoders() -> Vec<CodecCapability> {
     ];
     let mut capabilities = Vec::new();
     for (codec, sample) in samples {
-        let Ok(mut decoder) = command()
-            .args([
-                "-v",
-                "error",
-                "-c:v",
-                codec.decoder(),
-                "-f",
-                codec.demuxer(),
-                "-i",
-                "pipe:0",
-                "-frames:v",
-                "1",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "bgra",
-                "pipe:1",
-            ])
-            .spawn()
-        else {
-            continue;
-        };
-        let mut stdin = decoder.stdin.take().unwrap();
-        let write = tokio::spawn(async move {
-            let _ = stdin.write_all(sample).await;
-        });
-        let valid = matches!(tokio::time::timeout(Duration::from_secs(5), decoder.wait_with_output()).await,
-            Ok(Ok(ref output)) if output.status.success() && output.stdout.len() == 128 * 128 * 4);
-        let _ = write.await;
-        if valid {
+        // Match live decoding: let FFmpeg choose an available implementation.
+        // Essentials builds may support AV1 without shipping libdav1d.
+        if probe_bitstream(codec, sample.to_vec()).await {
             capabilities.push(CodecCapability {
                 codec,
                 encoder: None,

@@ -471,7 +471,7 @@ pub fn apply(path: &Path) -> Result<()> {
     let replacement = extract(&plan.archive, temporary.path(), plan.bundle)?;
     #[cfg(target_os = "macos")]
     {
-        let requirement = "anchor apple generic and identifier app.frames.desktop and certificate leaf[subject.OU] = V59Z6S9A36";
+        let requirement = "=anchor apple generic and identifier \"app.frames.desktop\" and certificate leaf[subject.OU] = \"V59Z6S9A36\"";
         ensure!(
             Command::new("/usr/bin/codesign")
                 .args(["--verify", "--deep", "--strict", "-R", requirement])

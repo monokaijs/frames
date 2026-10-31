@@ -38,7 +38,7 @@ frames_sign_app() {
   codesign --force --sign "$identity" --options runtime "$timestamp" "$app"
   codesign --verify --deep --strict "$app"
   if [[ "${FRAMES_RELEASE_BUILD:-}" == 1 ]]; then
-    codesign --verify --strict -R "anchor apple generic and identifier app.frames.desktop and certificate leaf[subject.OU] = V59Z6S9A36" "$app"
+    codesign --verify --strict -R '=anchor apple generic and identifier "app.frames.desktop" and certificate leaf[subject.OU] = "V59Z6S9A36"' "$app"
   fi
   if [[ "$identity" == - ]]; then
     printf 'Ad-hoc signed %s; macOS privacy grants may reset after rebuilds.\n' "$app"

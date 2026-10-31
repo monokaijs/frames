@@ -52,6 +52,25 @@ class SigningIdentityTests(unittest.TestCase):
     def test_missing_certificate_keeps_ci_builds_possible(self):
         self.assertEqual(self.select(), '')
 
+    def test_release_uses_secure_timestamp_and_inline_team_requirement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / 'codesign'
+            executable.write_text('#!/bin/sh\nprintf "%s\\0" "$@" >> "$TEST_CODESIGN_ARGS"\n')
+            executable.chmod(0o755)
+            output = root / 'arguments'
+            env = dict(os.environ, PATH=f'{root}:/usr/bin:/bin',
+                       FRAMES_SIGN_IDENTITY=FIRST, FRAMES_RELEASE_BUILD='1',
+                       TEST_CODESIGN_ARGS=str(output))
+            subprocess.run(['bash', str(SCRIPT), '/test/Frames.app'], env=env,
+                           check=True, capture_output=True)
+            args = output.read_bytes().decode().split('\0')
+            self.assertIn('--timestamp', args)
+            self.assertNotIn('--timestamp=none', args)
+            requirement = args[args.index('-R') + 1]
+            self.assertTrue(requirement.startswith('=anchor apple generic'))
+            self.assertIn('certificate leaf[subject.OU] = "V59Z6S9A36"', requirement)
+
 
 if __name__ == '__main__':
     unittest.main()
