@@ -1,0 +1,76 @@
+{
+  "machines": {
+    "windows": "NVIDIA RTX 3080 Ti + AMD Radeon graphics; AMF encoder selected explicitly for matched comparison",
+    "macos": "Apple M2 Pro; VideoToolbox encoder; VideoToolbox decoder after rewrite"
+  },
+  "results": [
+    {
+      "decode_p50_ms": 8.725,
+      "decode_p95_ms": 9.509,
+      "encode_p50_ms": 12.122,
+      "encode_p95_ms": 12.986,
+      "encoder": "h264_amf",
+      "height": 1080,
+      "sample_count": 40,
+      "scope": "generated flat pixels through live codec processes and pipes; excludes capture, networking, native presentation, and panel",
+      "total_p50_ms": 20.807,
+      "total_p95_ms": 21.698,
+      "warmup_samples": 1,
+      "width": 1920,
+      "platform": "windows",
+      "stage": "before",
+      "build": "f214f42 (before) / in-process media rewrite (after)"
+    },
+    {
+      "decode_p50_ms": 3.772,
+      "decode_p95_ms": 3.966,
+      "encode_p50_ms": 7.534,
+      "encode_p95_ms": 8.144,
+      "encoder": "h264_amf",
+      "height": 1080,
+      "sample_count": 40,
+      "scope": "generated flat pixels through live in-process codec workers; excludes capture, networking, native presentation, and panel",
+      "total_p50_ms": 11.247,
+      "total_p95_ms": 11.641,
+      "warmup_samples": 1,
+      "width": 1920,
+      "platform": "windows",
+      "stage": "after",
+      "build": "f214f42 (before) / in-process media rewrite (after)"
+    },
+    {
+      "decode_p50_ms": 12.718,
+      "decode_p95_ms": 14.176,
+      "encode_p50_ms": 20.053,
+      "encode_p95_ms": 25.201,
+      "encoder": "frames_videotoolbox",
+      "height": 1080,
+      "sample_count": 40,
+      "scope": "generated flat pixels through live codec processes and pipes; excludes capture, networking, native presentation, and panel",
+      "total_p50_ms": 32.41,
+      "total_p95_ms": 39.377,
+      "warmup_samples": 1,
+      "width": 1920,
+      "platform": "macos",
+      "stage": "before",
+      "build": "f214f42 (before) / in-process media rewrite (after)"
+    },
+    {
+      "decode_p50_ms": 9.899,
+      "decode_p95_ms": 11.987,
+      "encode_p50_ms": 12.086,
+      "encode_p95_ms": 13.16,
+      "encoder": "h264_videotoolbox",
+      "height": 1080,
+      "sample_count": 40,
+      "scope": "generated flat pixels through live in-process codec workers; excludes capture, networking, native presentation, and panel",
+      "total_p50_ms": 21.879,
+      "total_p95_ms": 24.747,
+      "warmup_samples": 1,
+      "width": 1920,
+      "platform": "macos",
+      "stage": "after",
+      "build": "f214f42 (before) / in-process media rewrite (after)"
+    }
+  ]
+}

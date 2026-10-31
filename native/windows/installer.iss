@@ -49,7 +49,7 @@ SetupLogging=yes
 Name: desktopicon; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
 
 [Messages]
-FinishedLabel=Frames is installed. Frames needs FFmpeg for remote media; install FFmpeg separately before starting a session if it is not already available.
+FinishedLabel=Frames is installed and ready to connect. Media codecs are included.
 
 [Files]
 Source: "{#AppSource}"; DestDir: "{app}"; DestName: "Frames.exe"; Flags: ignoreversion

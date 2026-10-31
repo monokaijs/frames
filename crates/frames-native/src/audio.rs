@@ -32,7 +32,7 @@ pub fn loopback() -> anyhow::Result<AudioCapture> {
     }
     #[cfg(windows)]
     {
-        let (tx, packets) = tokio::sync::mpsc::channel(8);
+        let (tx, packets) = tokio::sync::mpsc::channel(2);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));
         let guard = Guard(stop.clone());
@@ -160,7 +160,7 @@ impl Playback {
     }
     pub fn push(&self, pcm: &[u8]) {
         let mut queue = self.queue.lock();
-        let max = self.format.rate as usize * self.format.channels as usize * 40 / 1000;
+        let max = self.format.rate as usize * self.format.channels as usize * 20 / 1000;
         for unit in pcm.as_chunks::<4>().0 {
             queue.push_back(f32::from_le_bytes(*unit));
         }

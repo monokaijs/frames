@@ -24,6 +24,11 @@ hex = "0.4"
 directories = "6"
 fs2 = "0.4"
 mdns-sd = "0.17"
+opus = "0.4"
+
+[build-dependencies]
+cc = "1"
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32_System_JobObjects"] }

@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 jobs:
   windows:
-    timeout-minutes: 35
+    timeout-minutes: 60
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -13,19 +13,20 @@ jobs:
         with:
           toolchain: 1.94.1
           components: rustfmt, clippy
+      - name: Prepare bundled media SDK
+        run: python scripts/prepare_media.py
       - run: cargo fmt --all --check
       - run: python scripts/test_release.py -k executable
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: choco install ffmpeg -y --no-progress
       - name: Real software codec roundtrip
-        run: cargo test -p frames-core --test media_roundtrip --locked -- --ignored --nocapture
+        run: cargo test -p frames-core --test media_roundtrip --locked -- --nocapture
       - name: Generated Opus audio roundtrip
-        run: cargo test -p frames-core --test audio_roundtrip --locked -- --ignored --nocapture
+        run: cargo test -p frames-core --test audio_roundtrip --locked -- --nocapture
       - run: ./scripts/build.ps1 -Target x86_64-pc-windows-msvc
       - run: ./scripts/test_windows_installer.ps1
   macos:
-    timeout-minutes: 35
+    timeout-minutes: 60
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
@@ -33,6 +34,8 @@ jobs:
         with:
           toolchain: 1.94.1
           targets: aarch64-apple-darwin
+      - name: Prepare bundled media SDK
+        run: bash scripts/prepare_media_macos.sh
       - run: cargo test --workspace --locked
       - name: Signing identity regression checks
         run: python3 native/macos/Tests/SigningTests.py

@@ -8,9 +8,6 @@ import ScreenCaptureKit
 @MainActor func runFrames(){
 guard frames_abi_version() == FRAMES_ABI_VERSION else { fatalError("Frames native ABI mismatch") }
 let args = CommandLine.arguments
-if let position = args.firstIndex(of: "--encode-h264") {
-    exit(NativeVideoEncoder.run(Array(args.dropFirst(position + 1))))
-}
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 

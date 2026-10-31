@@ -9,6 +9,7 @@ export FRAMES_SIGN_IDENTITY
 export MACOSX_DEPLOYMENT_TARGET=14.2
 # macOS 27 rejects stripped proc-macro dylibs from older Rust toolchains.
 export CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP="${CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP:-none}"
+bash scripts/prepare_media_macos.sh
 cargo build --locked --release --target aarch64-apple-darwin
 mkdir -p dist/macos/Frames.app/Contents/{MacOS,Resources,Library/LaunchAgents}
 swiftc -O -swift-version 5 -target arm64-apple-macos14.2 \
@@ -20,7 +21,7 @@ swiftc -O -swift-version 5 -target arm64-apple-macos14.2 \
   -o dist/macos/Frames.app/Contents/MacOS/FramesHelper
 # Retire the previous bundle's executable and login item when rebuilding in place.
 # Do this before copying Frames: macOS volumes are usually case-insensitive.
-rm -f dist/macos/Frames.app/Contents/MacOS/frames dist/macos/Frames.app/Contents/Library/LaunchAgents/app.frames.agent.plist
+rm -f dist/macos/Frames.app/Contents/MacOS/frames dist/macos/Frames.app/Contents/Library/LaunchAgents/app.frames.agent.plist dist/macos/Frames.app/Contents/CodeResources
 cp target/aarch64-apple-darwin/release/frames dist/macos/Frames.app/Contents/MacOS/Frames
 cp assets/icons/Frames.icns dist/macos/Frames.app/Contents/Resources/Frames.icns
 cp native/macos/Info.plist dist/macos/Frames.app/Contents/Info.plist
@@ -30,5 +31,6 @@ test -n "$version"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" dist/macos/Frames.app/Contents/Info.plist
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" dist/macos/Frames.app/Contents/Info.plist
 cp native/macos/dev.creaton.frames.agent.plist dist/macos/Frames.app/Contents/Library/LaunchAgents/
+python3 scripts/bundle_media_macos.py
 frames_sign_app dist/macos/Frames.app
-printf 'Built dist/macos/Frames.app. FFmpeg must be on PATH or FRAMES_FFMPEG set.\n'
+printf 'Built dist/macos/Frames.app with bundled in-process codecs.\n'

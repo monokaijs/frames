@@ -123,7 +123,7 @@ def disk_image(value):
             "Frames\n\nDrag Frames.app to Applications, then open Frames from Applications.\n"
             "Eject this disk image after installing.\n\nRequires macOS 14.2 or later on Apple silicon.\n"
             "Allow Local Network, Screen Recording, and Accessibility when requested.\n"
-            "Install FFmpeg separately (for example: brew install ffmpeg).\n\n"
+            "Media codecs are included; no additional installation is required.\n\n"
             "In Frames, open Settings to check for updates. Updates install after all sessions close.\n"
         )
         subprocess.run(["hdiutil", "create", "-ov", "-volname", "Frames", "-fs", "HFS+", "-format", "UDZO", "-srcfolder", str(stage), str(output)], check=True)
@@ -148,6 +148,7 @@ def verify_disk_image(image, value):
                 raise ValueError("Installed application identity/version is incorrect")
             subprocess.run(["codesign", "--verify", "--deep", "--strict", str(installed)], check=True)
             actual = subprocess.check_output([str(installed / "Contents/MacOS/Frames"), "--version"], text=True).strip()
+            subprocess.run([str(installed / "Contents/MacOS/Frames"), "media-check"], check=True)
             if actual.lower() != f"frames {value}".lower():
                 raise ValueError(f"Installed executable reports {actual!r}")
             if not (installed / "Contents/Resources/Frames.icns").read_bytes().startswith(b"icns"):

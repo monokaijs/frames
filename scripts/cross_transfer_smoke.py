@@ -116,7 +116,6 @@ def main():
                    "--env", "FRAMES_CONFIG_DIR=" + (mac_root + "/" + config_role if config_role else folder),
                    "--env", "FRAMES_PAIRING_CONSOLE=1", "--env", "FRAMES_NO_DISCOVERY=1",
                    "--env", "FRAMES_NATIVE_DIAGNOSTICS=1",
-                   "--env", "FRAMES_FFMPEG=/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
                    "--stdin", folder + "/input", "--stdout", folder + "/out.log",
                    "--stderr", folder + "/err.log", "--args", *arguments]
         if os.environ.get("FRAMES_CROSS_RUST_LOG"):

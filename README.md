@@ -2,7 +2,7 @@
 
 Native remote control for Windows 11 x64 and macOS 14.2+ on Apple silicon. Open individual remote applications in local windows, or switch to a full desktop view.
 
-[Download the latest release](https://github.com/monokaijs/frames/releases/latest). Install FFmpeg separately, or set `FRAMES_FFMPEG` to its executable. Both computers need matching Frames builds; the current protocol is **4**.
+[Download the latest release](https://github.com/monokaijs/frames/releases/latest). Media codecs are bundled and run inside Frames; no FFmpeg executable is required. Both computers need matching Frames builds; the current protocol is **5**.
 
 On Windows, run **Frames-VERSION-windows-x86_64-setup.exe**. It installs Frames for your account, adds a Start menu shortcut and an Installed Apps entry, and includes an uninstaller. The default installation directory supports automatic updates without administrator access. The ZIP is also available for portable use.
 
@@ -51,7 +51,7 @@ Official builds check for signed updates in the background every six hours. Use 
 
 ## Build
 
-Rust, FFmpeg, and the platform toolchain are required: Visual Studio C++ Build Tools on Windows, or Xcode command-line tools on Mac. An existing MSYS2 UCRT64 toolchain is also supported locally.
+Rust, CMake, Python, and the platform toolchain are required: Visual Studio C++ Build Tools on Windows, or Xcode command-line tools on Mac. An existing MSYS2 UCRT64 toolchain is also supported locally.
 
 ```powershell
 .\scriptsuild.ps1
@@ -64,7 +64,7 @@ bash native/macos/build.sh
 open dist/macos/Frames.app
 ```
 
-Mac builds reuse the previous signing identity or select a unique Developer ID/Apple Development certificate. Set `FRAMES_SIGN_IDENTITY` to choose one explicitly. Ad-hoc signing (`-`) can reset privacy grants after rebuilds. `FRAMES_MAC_HELPER` selects a development helper; GUI builds also locate standard Homebrew FFmpeg installations.
+Mac builds reuse the previous signing identity or select a unique Developer ID/Apple Development certificate. Set `FRAMES_SIGN_IDENTITY` to choose one explicitly. Ad-hoc signing (`-`) can reset privacy grants after rebuilds. `FRAMES_MAC_HELPER` selects a development helper; Mac builds prepare a minimal LGPL codec runtime with Homebrew build dependencies. Windows builds fetch a checksum-pinned LGPL SDK. Run `python scripts/prepare_media.py` before direct Cargo commands on Windows, or `bash scripts/prepare_media_macos.sh` on Mac.
 
 An optional Windows service installs with `frames service install` from an Administrator terminal after unattended pairing. It uses machine-scoped protected credentials and an interactive-console agent. Uninstall with `frames service uninstall`. Secure-desktop support and Mac prelogin/FileVault access need further validation; see [validation](docs/VALIDATION.md).
 

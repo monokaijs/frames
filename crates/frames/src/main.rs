@@ -21,6 +21,10 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Verify bundled codecs without capturing the desktop or playing audio.
+    MediaCheck,
+    /// Print media library licenses and source/build references.
+    Licenses,
     /// Check for a signed release, or download and install it after sessions close.
     Update {
         #[arg(long)]
@@ -218,7 +222,28 @@ fn run() -> anyhow::Result<()> {
             let ui=frames_native::run_client(address.to_string(),updates_rx,events_tx);let network=runtime.block_on(task)?;ui?;network
         },
         Command::Discover{seconds}=>{println!("{}",serde_json::to_string_pretty(&runtime.block_on(frames_core::discovery::browse(seconds))?)?);Ok(())},
-        Command::Doctor=>runtime.block_on(async{let capabilities=frames_core::codec::probe().await;let native=frames_native::desktop(vec![]).and_then(|d|d.windows());println!("{}",serde_json::to_string_pretty(&serde_json::json!({"protocol":frames_core::PROTOCOL_VERSION,"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"ffmpeg":frames_core::codec::ffmpeg_path().to_string_lossy(),"codecs":capabilities,"windows":native.as_ref().ok().map(|w|w.len()),"native_error":native.err().map(|e|e.to_string()),"capture":"native per-window; CPU readback","release_gates":["hardware latency measurements","macOS build and permissions","secure desktop and login service integration","drag application compatibility","macOS prelogin handoff","end-to-end zero-copy media"]}))?);anyhow::ensure!(!capabilities.is_empty(),"no codec passed the encode/decode probe; install FFmpeg or set FRAMES_FFMPEG");Ok(())}),
+        Command::MediaCheck=>runtime.block_on(async{
+            let codecs=frames_core::codec::probe().await;
+            let decoders=frames_core::codec::probe_decoders().await;
+            anyhow::ensure!(!codecs.is_empty() && decoders.len()==4,"Bundled video codec verification failed");
+            let format=frames_core::audio::PcmFormat{rate:48000,channels:2};
+            let (tx,rx)=tokio::sync::mpsc::channel(1);
+            let mut encoder=frames_core::audio::encode(format,rx).await?;
+            let mut decoder=frames_core::audio::decode(format).await?;
+            let pixels:Vec<u8>=(0..480).flat_map(|i|{
+                let sample=(i as f32*440.*std::f32::consts::TAU/48000.).sin()*0.2;
+                [sample,sample].into_iter().flat_map(f32::to_le_bytes)
+            }).collect();
+            tx.send(pixels).await?;
+            let packet=tokio::time::timeout(std::time::Duration::from_secs(3),encoder.packets.recv()).await?.ok_or_else(||anyhow::anyhow!("Opus encoder stopped"))?;
+            decoder.input.send(packet).await?;
+            let pcm=tokio::time::timeout(std::time::Duration::from_secs(3),decoder.pcm.recv()).await?.ok_or_else(||anyhow::anyhow!("Opus decoder stopped"))?;
+            anyhow::ensure!(pcm.len()==frames_core::audio::packet_bytes(format) && pcm.chunks_exact(4).any(|v|f32::from_le_bytes(v.try_into().unwrap()).abs()>0.05),"Opus roundtrip failed");
+            encoder.shutdown().await;decoder.shutdown().await;
+            println!("{}",serde_json::to_string_pretty(&serde_json::json!({"protocol":frames_core::PROTOCOL_VERSION,"runtime":frames_core::codec::runtime_status()?,"encoders":codecs,"decoders":decoders,"opus_10ms_roundtrip":true}))?);Ok(())
+        }),
+        Command::Licenses=>{println!("{}",frames_core::codec::licenses());Ok(())},
+        Command::Doctor=>runtime.block_on(async{let capabilities=frames_core::codec::probe().await;let native=frames_native::desktop(vec![]).and_then(|d|d.windows());println!("{}",serde_json::to_string_pretty(&serde_json::json!({"protocol":frames_core::PROTOCOL_VERSION,"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"media_runtime":frames_core::codec::runtime_status().map_err(|e|e.to_string()),"codecs":capabilities,"windows":native.as_ref().ok().map(|w|w.len()),"native_error":native.err().map(|e|e.to_string()),"capture":"native per-window; CPU readback","release_gates":["hardware latency measurements","macOS build and permissions","secure desktop and login service integration","drag application compatibility","macOS prelogin handoff","end-to-end zero-copy media"]}))?);anyhow::ensure!(!capabilities.is_empty(),"no bundled codec passed the encode/decode probe; run Frames doctor for details");Ok(())}),
         Command::Windows=>{println!("{}",serde_json::to_string_pretty(&frames_native::desktop(vec![])?.windows()?)?);Ok(())},
         Command::Send{address,path}=>runtime.block_on(session::send_file(address,path)),
         Command::Get{address,path}=>runtime.block_on(session::fetch_file(address,path)),

@@ -77,21 +77,6 @@ pub fn install() -> anyhow::Result<()> {
     if current != executable {
         std::fs::copy(&current, &executable)?;
     }
-    let ffmpeg = std::env::var_os("FRAMES_FFMPEG")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::process::Command::new("where.exe")
-                .creation_flags(0x08000000)
-                .arg("ffmpeg.exe")
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .and_then(|s| s.lines().next().map(PathBuf::from))
-        })
-        .context("FFmpeg required for the service")?;
-    if ffmpeg != dir.join("ffmpeg.exe") {
-        std::fs::copy(ffmpeg, dir.join("ffmpeg.exe"))?;
-    }
     frames_core::trust::Identity::load()?.install_service_identity(&data)?;
     let info = ServiceInfo {
         name: NAME.into(),
@@ -265,7 +250,6 @@ pub fn agent_environment() -> anyhow::Result<()> {
     unsafe {
         std::env::set_var("FRAMES_CONFIG_DIR", config());
         std::env::set_var("FRAMES_PRIVILEGED_AGENT", "1");
-        std::env::set_var("FRAMES_FFMPEG", installation().join("ffmpeg.exe"));
     }
     Ok(())
 }

@@ -64,12 +64,16 @@ try {
     Assert-Installer ((Get-ItemProperty -LiteralPath $registration).DisplayVersion -eq $Version) 'Upgrade did not refresh Installed Apps version'
     $metadata = (Get-Item -LiteralPath $executable).VersionInfo
     Assert-Installer ($metadata.ProductName -eq 'Frames') 'Installed executable has the wrong product name'
+    $media = Start-Process -FilePath $executable -ArgumentList @('media-check') -WorkingDirectory $install -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $temporary 'media.json') -RedirectStandardError (Join-Path $temporary 'media.log')
+    Assert-Installer ($media.ExitCode -eq 0) 'Installed media codecs failed without an external FFmpeg executable'
+    $result = Get-Content -LiteralPath (Join-Path $temporary 'media.json') -Raw | ConvertFrom-Json
+    Assert-Installer $result.opus_10ms_roundtrip 'Installed Opus roundtrip failed'
     Assert-Installer ((Invoke-Installer $uninstaller 'uninstall' -Uninstall) -eq 0) 'Uninstallation failed'
     Assert-Installer (-not (Test-Path -LiteralPath $executable)) 'Uninstaller left the application executable'
     Assert-Installer (-not (Test-Path -LiteralPath $registration)) 'Uninstaller left the Installed Apps entry'
     Assert-Installer (-not (Test-Path -LiteralPath $shortcut)) 'Uninstaller left the Start menu shortcut'
     Assert-Installer (Test-Path -LiteralPath $sentinel) 'Uninstaller deleted an untracked user file'
-    Write-Host 'Frames installer: fresh install, shortcut, locked-file protection, upgrade, uninstall, and data preservation passed.'
+    Write-Host 'Frames installer: install, shortcut, locked-file protection, upgrade, bundled codecs, uninstall, and data preservation passed.'
 } catch {
     Get-ChildItem -LiteralPath $temporary -Filter '*.log' | ForEach-Object { Get-Content -LiteralPath $_.FullName -Tail 25 }
     throw

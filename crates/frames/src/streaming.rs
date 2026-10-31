@@ -53,7 +53,6 @@ impl Drop for HostStream {
 mod ready_tests {
     use super::*;
     #[tokio::test]
-    #[ignore = "requires FFmpeg; opens no native windows and sends no input"]
     async fn hidden_windows_reuse_only_a_bounded_set_of_drained_decoders() {
         let (out, _messages) = crate::session::test_outbound();
         let (ui, _updates) = frames_native::client_channel(16);
@@ -71,10 +70,10 @@ mod ready_tests {
         };
         let window = config(1, 1).window;
         client.start(config(1, 1), ui.clone(), &out).await.unwrap();
-        let original = client.streams[&window].decoder.child.id();
+        let original = client.streams[&window].decoder.worker.id();
         client.pause(window);
         client.start(config(1, 2), ui.clone(), &out).await.unwrap();
-        assert_eq!(client.streams[&window].decoder.child.id(), original);
+        assert_eq!(client.streams[&window].decoder.worker.id(), original);
         assert!(client.streams[&window].paused_at.is_none());
         for id in 1..=3 {
             if id != 1 {
@@ -86,7 +85,6 @@ mod ready_tests {
         assert!(!client.streams.contains_key(&window));
     }
     #[tokio::test]
-    #[ignore = "requires FFmpeg; does not capture or control a desktop"]
     async fn packet_loss_and_reordering_are_isolated_to_the_affected_generation() {
         let (out, mut messages) = crate::session::test_outbound();
         let (ui, _) = frames_native::client_channel(16);
@@ -138,7 +136,8 @@ mod ready_tests {
         client.expire(&out).await.unwrap();
         assert!(!client.streams[&a].recovering);
         assert!(messages.try_recv().is_err());
-        let data = include_bytes!("../../frames-core/fixtures/probe.h264").to_vec();
+        let mut data = vec![1];
+        data.extend_from_slice(include_bytes!("../../frames-core/fixtures/probe.h264"));
         for number in [1, 0] {
             let frame = EncodedFrame {
                 window: b,
@@ -226,10 +225,10 @@ pub fn start_audio(
         let mut encoder=frames_core::audio::encode(capture.format,capture.packets).await?;let generation=generations.fetch_add(1,Ordering::Relaxed);
         task_generation.store(generation,Ordering::Release);
         out.send(Message::AudioStarted{generation}).await?;tokio::time::timeout(Duration::from_secs(10),ready_rx.wait_for(|value|*value==generation)).await??;let mut number=0;
-        loop{tokio::select!{_=async{let _=restart.wait_for(|value|*value==generation).await;}=>break,page=encoder.pages.recv()=>{let Some(bytes)=page else{anyhow::bail!("Opus encoder stopped");};let frame=EncodedFrame{window:media::AUDIO_WINDOW,generation,number,keyframe:number==0,bytes};number+=1;
+        loop{tokio::select!{_=async{let _=restart.wait_for(|value|*value==generation).await;}=>break,page=encoder.packets.recv()=>{let Some(bytes)=page else{anyhow::bail!("Opus encoder stopped");};let frame=EncodedFrame{window:media::AUDIO_WINDOW,generation,number,keyframe:number==0,bytes};number+=1;
             for packet in media::fragment(&frame,connection.max_datagram_size().unwrap_or(1200).min(1200))?{connection.send_datagram(packet.into())?;tokio::task::yield_now().await;}
         }}}
-        encoder.writer.abort();let _=encoder.child.kill().await;
+        encoder.shutdown().await;
     }#[allow(unreachable_code)]Ok::<(),anyhow::Error>(())}.await;
         if let Err(error) = result {
             let _ = out
@@ -302,7 +301,7 @@ pub fn start_host(
                         }
                     }
                 }
-                encoder.input_task.abort();let _=encoder.child.kill().await;
+                encoder.shutdown().await;
                 out.send(Message::StreamStopped{window,generation}).await?;
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -361,6 +360,7 @@ impl Drop for ClientStream {
 }
 struct ClientAudio {
     generation: u32,
+    next: u64,
     decoder: frames_core::audio::Decoder,
     render: tokio::task::JoinHandle<()>,
 }
@@ -407,7 +407,7 @@ impl ClientMedia {
             self.streams.remove(&window);
         }
         // Idle decoders consume no video work. Retain at most two so restoring
-        // a hidden window need not cold-start FFmpeg, without unbounded workers.
+        // a hidden window need not cold-start a codec worker, without unbounded workers.
         let mut idle: Vec<_> = self
             .streams
             .iter()
@@ -432,6 +432,7 @@ impl ClientMedia {
         });
         self.audio = Some(ClientAudio {
             generation,
+            next: 0,
             decoder,
             render,
         });
@@ -450,7 +451,7 @@ impl ClientMedia {
     ) -> anyhow::Result<()> {
         self.reassembly.forget_window(config.window);
         // H.264/HEVC IDRs reset reference pictures without restarting the
-        // decoder process. Keeping it warm avoids a cold-start recovery loop.
+        // decoder worker. Keeping it warm avoids a cold-start recovery loop.
         if let Some(stream) = self.streams.get_mut(&config.window)
             && stream.generation < config.generation
             && stream.codec == config.codec
@@ -550,9 +551,21 @@ impl ClientMedia {
             return Ok(());
         };
         if frame.window == media::AUDIO_WINDOW {
-            if let Some(audio) = &self.audio
+            if let Some(audio) = &mut self.audio
                 && audio.generation == frame.generation
+                && frame.number >= audio.next
             {
+                // Raw Opus packets need no stream restart after a loss. Conceal
+                // at most 20 ms, then favor current audio over an old backlog.
+                let conceal = frame
+                    .number
+                    .saturating_sub(audio.next)
+                    .min(2)
+                    .min(audio.decoder.input.capacity().saturating_sub(1) as u64);
+                for _ in 0..conceal {
+                    let _ = audio.decoder.input.try_send(Vec::new());
+                }
+                audio.next = frame.number + 1;
                 let _ = audio.decoder.input.try_send(frame.bytes);
             }
             return Ok(());
@@ -585,9 +598,7 @@ impl ClientMedia {
         while let Some(frame) = next.take() {
             stream.pending.retain(|number, _| *number > frame.number);
             stream.next = frame.number + 1;
-            if stream.decoder.output.borrow().is_some()
-                && stream.decoder.input.max_capacity() - stream.decoder.input.capacity() >= 4
-            {
+            if stream.decoder.output.borrow().is_some() && stream.decoder.input.capacity() == 0 {
                 // A burst can fill the queue before its writer gets scheduled.
                 // Let it run before declaring a slow decoder and resetting video.
                 tokio::task::yield_now().await;
@@ -597,11 +608,11 @@ impl ClientMedia {
                 stream.queued_at.pop_front();
             }
             let overloaded = stream.decoder.output.borrow().is_some()
-                && backlog >= 4
+                && backlog >= 2
                 && stream
                     .queued_at
                     .front()
-                    .is_some_and(|at| at.elapsed() > Duration::from_millis(100));
+                    .is_some_and(|at| at.elapsed() > Duration::from_millis(40));
             if overloaded || stream.decoder.try_submit(frame.bytes).is_err() {
                 tracing::warn!(window=?frame.window,generation=frame.generation,"video decoder input queue full; requesting fresh stream");
                 stream.recovering = true;
@@ -634,18 +645,6 @@ impl ClientMedia {
                 stream.recovering = true;
                 stream.pending.clear();
                 out.send(Message::Keyframe { window, generation }).await?;
-            }
-            if window == media::AUDIO_WINDOW
-                && self
-                    .audio
-                    .as_ref()
-                    .is_some_and(|a| a.generation == generation)
-            {
-                out.send(Message::Keyframe {
-                    window: media::AUDIO_WINDOW,
-                    generation,
-                })
-                .await?;
             }
         }
         for (&window, stream) in &mut self.streams {

@@ -11,7 +11,10 @@ try {
     }
     if ($Target -eq 'x86_64-pc-windows-gnu' -and (Test-Path -LiteralPath 'C:\msys64\ucrt64\bin\gcc.exe')) {
         $env:Path = 'C:\msys64\ucrt64\bin;' + $env:Path
+        $env:CMAKE_GENERATOR = 'MinGW Makefiles'
     }
+    & python scripts/prepare_media.py
+    if ($LASTEXITCODE -ne 0) { throw 'Media SDK preparation failed' }
     $buildArgs = @('build', '--locked', '-p', 'frames', '--target', $Target)
     $profile = 'debug'
     if (-not $Debug) { $buildArgs += '--release'; $profile = 'release' }
@@ -23,5 +26,5 @@ try {
     $digest = (Get-FileHash -LiteralPath (Join-Path $destination 'Frames.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
     "$digest  Frames.exe" | Set-Content -LiteralPath (Join-Path $destination 'Frames.exe.sha256') -Encoding ascii
     Write-Host "Built $destination\Frames.exe"
-    Write-Host 'Install FFmpeg separately, or set FRAMES_FFMPEG to its executable path.'
+    Write-Host 'Frames includes its media codecs. No FFmpeg installation is required.'
 } finally { Pop-Location }

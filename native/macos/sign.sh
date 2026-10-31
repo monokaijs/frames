@@ -34,6 +34,11 @@ frames_sign_app() {
     return
   fi
   if [[ "${FRAMES_RELEASE_BUILD:-}" == 1 && "$identity" == - ]]; then echo "Release builds require Developer ID signing" >&2; return 1; fi
+  if [[ -d "$app/Contents/Frameworks" ]]; then
+    while IFS= read -r -d '' library; do
+      codesign --force --sign "$identity" --options runtime "$timestamp" "$library"
+    done < <(find "$app/Contents/Frameworks" -type f -name '*.dylib' -print0)
+  fi
   codesign --force --sign "$identity" --identifier dev.creaton.frames.helper --options runtime "$timestamp" "$app/Contents/MacOS/FramesHelper"
   codesign --force --sign "$identity" --options runtime "$timestamp" "$app"
   codesign --verify --deep --strict "$app"

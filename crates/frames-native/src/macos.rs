@@ -388,7 +388,7 @@ impl Desktop for Host {
         Ok(serde_json::from_value(response["items"].clone())?)
     }
     fn audio(&self) -> anyhow::Result<crate::audio::AudioCapture> {
-        let (tx, packets) = tokio::sync::mpsc::channel(8);
+        let (tx, packets) = tokio::sync::mpsc::channel(2);
         *self.bridge.audio.lock() = Some(tx);
         let guard = AudioGuard(self.bridge.clone());
         let response = self.bridge.request("audio_start", json!({}))?;

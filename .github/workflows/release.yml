@@ -45,7 +45,7 @@ jobs:
   windows:
     needs: prepare
     runs-on: windows-latest
-    timeout-minutes: 35
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -61,15 +61,16 @@ jobs:
         run: python scripts/release.py set-version $env:RELEASE_VERSION
       - name: Packaging regression checks
         run: python scripts/test_release.py -k executable
+      - name: Prepare bundled media SDK
+        run: python scripts/prepare_media.py
       - run: cargo fmt --all --check
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - run: choco install ffmpeg -y --no-progress
       - name: Codec and audio checks
         run: |
-          cargo test -p frames-core --locked --test media_roundtrip -- --ignored --nocapture
+          cargo test -p frames-core --locked --test media_roundtrip -- --nocapture
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo test -p frames-core --locked --test audio_roundtrip -- --ignored --nocapture
+          cargo test -p frames-core --locked --test audio_roundtrip -- --nocapture
       - name: Build release
         env:
           FRAMES_RELEASE_BUILD: '1'
@@ -91,7 +92,7 @@ jobs:
   macos:
     needs: prepare
     runs-on: macos-15
-    timeout-minutes: 35
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -111,6 +112,8 @@ jobs:
         run: |
           brew list --versions openssl@3 >/dev/null || brew install openssl@3
           python scripts/test_release.py
+      - name: Prepare bundled media SDK
+        run: bash scripts/prepare_media_macos.sh
       - run: cargo test --workspace --locked
       - name: Swift checks
         run: |

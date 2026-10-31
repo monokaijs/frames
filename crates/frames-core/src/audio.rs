@@ -1,10 +1,13 @@
+//! Raw 10 ms Opus packets, without Ogg pages or subprocess buffering.
+use crate::{codec::runtime::Resampler, worker::Worker};
 use serde::{Deserialize, Serialize};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::Child,
-    sync::mpsc,
-};
+use tokio::sync::{mpsc, oneshot, watch};
 pub const PACKET_MILLIS: usize = 10;
+const OPUS_FORMAT: PcmFormat = PcmFormat {
+    rate: 48000,
+    channels: 2,
+};
+const OPUS_SAMPLES: usize = 480 * 2;
 pub fn packet_bytes(format: PcmFormat) -> usize {
     format.rate as usize * format.channels as usize * 4 * PACKET_MILLIS / 1000
 }
@@ -13,152 +16,159 @@ pub struct PcmFormat {
     pub rate: u32,
     pub channels: u16,
 }
+fn validate(format: PcmFormat) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (8000..=192000).contains(&format.rate) && (1..=8).contains(&format.channels),
+        "Invalid PCM format"
+    );
+    Ok(())
+}
 pub struct Encoder {
-    pub child: Child,
-    pub pages: mpsc::Receiver<Vec<u8>>,
-    pub writer: tokio::task::JoinHandle<()>,
+    pub worker: Worker,
+    pub packets: mpsc::Receiver<Vec<u8>>,
+}
+impl Encoder {
+    pub async fn shutdown(&mut self) {
+        self.worker.shutdown().await;
+    }
 }
 pub async fn encode(
     format: PcmFormat,
     mut input: mpsc::Receiver<Vec<u8>>,
 ) -> anyhow::Result<Encoder> {
-    anyhow::ensure!(
-        (8000..=192000).contains(&format.rate) && (1..=8).contains(&format.channels),
-        "invalid PCM audio format"
-    );
-    let mut child = crate::codec::command()
-        .args([
-            "-v",
-            "error",
-            "-f",
-            "f32le",
-            "-ar",
-            &format.rate.to_string(),
-            "-ac",
-            &format.channels.to_string(),
-            "-i",
-            "pipe:0",
-            "-vn",
-            "-ar",
-            "48000",
-            "-ac",
-            "2",
-            "-c:a",
-            "libopus",
-            "-application",
-            "lowdelay",
-            "-frame_duration",
-            "10",
-            "-b:a",
-            "128k",
-            "-page_duration",
-            "10000",
-            "-flush_packets",
-            "1",
-            "-f",
-            "opus",
-            "pipe:1",
-        ])
-        .spawn()?;
-    crate::process::track(&child)?;
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = child.stdout.take().unwrap();
-    let writer = tokio::spawn(async move {
-        while let Some(bytes) = input.recv().await {
-            if stdin.write_all(&bytes).await.is_err() {
-                break;
+    validate(format)?;
+    let (sender, packets) = mpsc::channel(1);
+    let (stop, mut stopping) = watch::channel(false);
+    let (ready, started) = oneshot::channel();
+    let handle = tokio::runtime::Handle::current();
+    let task = tokio::task::spawn_blocking(move || {
+        let setup = (|| -> anyhow::Result<_> {
+            let mut encoder =
+                opus::Encoder::new(48000, opus::Channels::Stereo, opus::Application::LowDelay)?;
+            encoder.set_bitrate(opus::Bitrate::Bits(128000))?;
+            encoder.set_complexity(5)?;
+            let resampler = Resampler::new(format, OPUS_FORMAT)?;
+            Ok((encoder, resampler))
+        })();
+        let (mut encoder, mut resampler) = match setup {
+            Ok(v) => {
+                let _ = ready.send(Ok(()));
+                v
             }
-        }
-    });
-    let (tx, pages) = mpsc::channel(2);
-    tokio::spawn(async move {
-        let mut headers = Vec::new();
+            Err(e) => {
+                let _ = ready.send(Err(e));
+                return;
+            }
+        };
+        let mut pending = Vec::new();
         loop {
-            let mut header = [0; 27];
-            if stdout.read_exact(&mut header).await.is_err() || &header[..4] != b"OggS" {
+            let bytes = handle.block_on(async {
+                tokio::select! {biased;_=stopping.changed()=>None,b=input.recv()=>b}
+            });
+            let Some(bytes) = bytes else { break };
+            if bytes.len() > 192000 * 8 * 4
+                || !bytes.len().is_multiple_of(format.channels as usize * 4)
+            {
                 break;
             }
-            let mut segments = vec![0; header[26] as usize];
-            if stdout.read_exact(&mut segments).await.is_err() {
-                break;
+            let samples: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|v| {
+                    let v = f32::from_le_bytes(v.try_into().unwrap());
+                    if v.is_finite() { v.clamp(-1., 1.) } else { 0. }
+                })
+                .collect();
+            let samples = match resampler.convert(&samples) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error=%e,"Audio resample failed");
+                    break;
+                }
+            };
+            pending.extend(samples);
+            let complete = pending.len() / OPUS_SAMPLES * OPUS_SAMPLES;
+            for samples in pending[..complete].chunks_exact(OPUS_SAMPLES) {
+                let mut packet = vec![0; 4000];
+                match encoder.encode_float(samples, &mut packet) {
+                    Ok(n) => packet.truncate(n),
+                    Err(e) => {
+                        tracing::warn!(error=%e,"Opus encode failed");
+                        return;
+                    }
+                }
+                if !handle.block_on(async{tokio::select!{biased;_=stopping.changed()=>false,r=sender.send(packet)=>r.is_ok()}}){return;}
             }
-            let count: usize = segments.iter().map(|&b| b as usize).sum();
-            let mut payload = vec![0; count];
-            if stdout.read_exact(&mut payload).await.is_err() {
-                break;
-            }
-            let mut page = header.to_vec();
-            page.extend(segments);
-            page.extend(&payload);
-            if payload.starts_with(b"OpusHead") || payload.starts_with(b"OpusTags") {
-                headers.extend(page);
-                continue;
-            }
-            if !headers.is_empty() {
-                headers.extend(page);
-                page = std::mem::take(&mut headers);
-            }
-            if tx.send(page).await.is_err() {
-                break;
-            }
+            pending.drain(..complete);
         }
     });
-    Ok(Encoder {
-        child,
-        pages,
-        writer,
-    })
+    let worker = Worker::new(stop, task);
+    started.await??;
+    Ok(Encoder { worker, packets })
 }
 pub struct Decoder {
-    pub child: Child,
+    pub worker: Worker,
     pub input: mpsc::Sender<Vec<u8>>,
     pub pcm: mpsc::Receiver<Vec<u8>>,
 }
+impl Decoder {
+    pub async fn shutdown(&mut self) {
+        self.worker.shutdown().await;
+    }
+}
 pub async fn decode(format: PcmFormat) -> anyhow::Result<Decoder> {
-    let mut child = crate::codec::command()
-        .args([
-            "-v",
-            "error",
-            "-probesize",
-            "32",
-            "-analyzeduration",
-            "0",
-            "-f",
-            "ogg",
-            "-i",
-            "pipe:0",
-            "-vn",
-            "-ar",
-            &format.rate.to_string(),
-            "-ac",
-            &format.channels.to_string(),
-            "-f",
-            "f32le",
-            "-flush_packets",
-            "1",
-            "pipe:1",
-        ])
-        .spawn()?;
-    crate::process::track(&child)?;
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = child.stdout.take().unwrap();
-    let (input, mut incoming) = mpsc::channel::<Vec<u8>>(4);
-    let (tx, pcm) = mpsc::channel(2);
-    tokio::spawn(async move {
-        while let Some(bytes) = incoming.recv().await {
-            if stdin.write_all(&bytes).await.is_err() {
-                break;
+    validate(format)?;
+    let (input, mut incoming) = mpsc::channel::<Vec<u8>>(2);
+    let (sender, pcm) = mpsc::channel(2);
+    let (stop, mut stopping) = watch::channel(false);
+    let (ready, started) = oneshot::channel();
+    let handle = tokio::runtime::Handle::current();
+    let task = tokio::task::spawn_blocking(move || {
+        let setup = (|| -> anyhow::Result<_> {
+            Ok((
+                opus::Decoder::new(48000, opus::Channels::Stereo)?,
+                Resampler::new(OPUS_FORMAT, format)?,
+            ))
+        })();
+        let (mut decoder, mut resampler) = match setup {
+            Ok(v) => {
+                let _ = ready.send(Ok(()));
+                v
             }
-        }
-    });
-    tokio::spawn(async move {
-        let count = packet_bytes(format);
+            Err(e) => {
+                let _ = ready.send(Err(e));
+                return;
+            }
+        };
+        let mut buffer = vec![0.; OPUS_SAMPLES];
         loop {
-            let mut bytes = vec![0; count];
-            if stdout.read_exact(&mut bytes).await.is_err() || tx.send(bytes).await.is_err() {
+            let packet = handle.block_on(async {
+                tokio::select! {biased;_=stopping.changed()=>None,p=incoming.recv()=>p}
+            });
+            let Some(packet) = packet else { break };
+            if packet.len() > 4000 {
+                continue;
+            }
+            // Empty packet requests one 10 ms Opus loss-concealment frame.
+            let count = match decoder.decode_float(&packet, &mut buffer, false) {
+                Ok(n) if n == 480 => n,
+                _ => continue,
+            };
+            let samples = match resampler.convert(&buffer[..count * 2]) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error=%e,"Audio resample failed");
+                    break;
+                }
+            };
+            let bytes = samples.into_iter().flat_map(f32::to_le_bytes).collect();
+            if !handle.block_on(async {
+                tokio::select! {biased;_=stopping.changed()=>false,r=sender.send(bytes)=>r.is_ok()}
+            }) {
                 break;
             }
         }
     });
-    Ok(Decoder { child, input, pcm })
+    let worker = Worker::new(stop, task);
+    started.await??;
+    Ok(Decoder { worker, input, pcm })
 }

@@ -2,7 +2,6 @@ use frames_core::{codec, media::RawFrame};
 use std::time::Duration;
 
 #[tokio::test]
-#[ignore = "requires FFmpeg with H.264, HEVC, AV1, and VP9 decoders"]
 async fn receiving_client_probes_all_decoders_without_an_encoder() {
     let capabilities = codec::probe_decoders().await;
     assert_eq!(
@@ -18,7 +17,6 @@ async fn receiving_client_probes_all_decoders_without_an_encoder() {
 }
 
 #[tokio::test]
-#[ignore = "requires a local FFmpeg executable; exercises actual encoder/decoder processes"]
 async fn every_advertised_codec_roundtrips_a_live_window_frame() {
     let capabilities = codec::probe().await;
     assert!(
@@ -73,9 +71,8 @@ async fn every_advertised_codec_roundtrips_a_live_window_frame() {
                     }}
                 }
             };
-            encoder.input_task.abort();
-            let _ = encoder.child.kill().await;
-            let _ = decoder.child.kill().await;
+            encoder.shutdown().await;
+            decoder.shutdown().await;
             drop(tx);
             let frame = result.unwrap_or_else(|| {
                 panic!(
@@ -95,20 +92,9 @@ async fn every_advertised_codec_roundtrips_a_live_window_frame() {
 }
 
 #[tokio::test]
-#[ignore = "requires FFmpeg with libx264, libx265, libaom, libvpx; uses only generated pixels"]
 async fn one_capture_encodes_and_decodes_without_a_later_capture_or_eof() {
-    for (codec, name) in [
-        (codec::Codec::H264, "libx264"),
-        (codec::Codec::Hevc, "libx265"),
-        (codec::Codec::Av1, "libaom-av1"),
-        (codec::Codec::Vp9, "libvpx-vp9"),
-    ] {
-        let capability = codec::CodecCapability {
-            codec,
-            encoder: Some(name.into()),
-            decoder: true,
-            hardware: false,
-        };
+    for capability in codec::probe().await {
+        let codec = capability.codec;
         let (tx, rx) = tokio::sync::watch::channel(Some(RawFrame {
             width: 128,
             height: 128,
@@ -133,9 +119,8 @@ async fn one_capture_encodes_and_decodes_without_a_later_capture_or_eof() {
                 .is_err(),
             "unchanged capture was encoded repeatedly"
         );
-        encoder.input_task.abort();
-        let _ = encoder.child.kill().await;
-        let _ = decoder.child.kill().await;
+        encoder.shutdown().await;
+        decoder.shutdown().await;
         drop(tx);
     }
 }

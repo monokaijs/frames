@@ -6,12 +6,12 @@
 cargo fmt --all --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test -p frames-core --test media_roundtrip --locked -- --ignored --nocapture
-cargo test -p frames-core --test audio_roundtrip --locked -- --ignored --nocapture
+cargo test -p frames-core --test media_roundtrip --locked -- --nocapture
+cargo test -p frames-core --test audio_roundtrip --locked -- --nocapture
 python native/macos/Tests/SigningTests.py
 ```
 
-Codec/audio integration tests require FFmpeg. The release workflow also compiles Swift fixtures for geometry, modifier routing, binary media, blocked-media control delivery, session state, and remote header behavior. Update tests reject forged manifests, modified signatures, unsafe archives, and incompatible packages.
+Codec/audio integration tests use the bundled shared libraries and run with the normal test suite. Prepare the media SDK before invoking Cargo directly. The release workflow also compiles Swift fixtures for geometry, modifier routing, binary media, blocked-media control delivery, session state, and remote header behavior. Update tests reject forged manifests, modified signatures, unsafe archives, and incompatible packages.
 
 ## Physical-machine checks
 

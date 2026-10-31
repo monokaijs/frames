@@ -1,4 +1,4 @@
-//! Synthetic codec/pipe timing. No capture, input injection, or device audio.
+//! Synthetic in-process codec timing. No capture, input injection, or device audio.
 use frames_core::{
     codec::{self, Codec, CodecCapability},
     media::RawFrame,
@@ -8,11 +8,20 @@ use std::time::{Duration, Instant};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args().collect();
-    let name = args.get(1).map(String::as_str).unwrap_or("libx264");
+    let capabilities = codec::probe().await;
+    let default = codec::negotiate(&capabilities, &capabilities, None)?;
+    let name = args
+        .get(1)
+        .map(String::as_str)
+        .unwrap_or(default.encoder.as_deref().unwrap());
     let width: u32 = args.get(2).map(|v| v.parse()).transpose()?.unwrap_or(1920);
     let height: u32 = args.get(3).map(|v| v.parse()).transpose()?.unwrap_or(1080);
     let codec = if name.starts_with("hevc") || name == "libx265" {
         Codec::Hevc
+    } else if name.starts_with("av1") || name == "libaom-av1" {
+        Codec::Av1
+    } else if name == "libvpx-vp9" {
+        Codec::Vp9
     } else {
         Codec::H264
     };
@@ -49,11 +58,10 @@ async fn main() -> anyhow::Result<()> {
             values.sort_unstable();
             values[(values.len() * percent).div_ceil(100).saturating_sub(1)] as f64 / 1000.0
         };
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({"encoder":name,"width":width,"height":height,"sample_count":samples.len(),"warmup_samples":1,"encode_p50_ms":percentile("encode_us",50),"encode_p95_ms":percentile("encode_us",95),"decode_p50_ms":percentile("decode_us",50),"decode_p95_ms":percentile("decode_us",95),"total_p50_ms":percentile("total_us",50),"total_p95_ms":percentile("total_us",95),"samples":samples,"scope":"generated flat pixels through live codec processes and pipes; excludes capture, networking, native presentation, and panel"}))?);
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({"encoder":name,"width":width,"height":height,"sample_count":samples.len(),"warmup_samples":1,"encode_p50_ms":percentile("encode_us",50),"encode_p95_ms":percentile("encode_us",95),"decode_p50_ms":percentile("decode_us",50),"decode_p95_ms":percentile("decode_us",95),"total_p50_ms":percentile("total_us",50),"total_p95_ms":percentile("total_us",95),"samples":samples,"scope":"generated flat pixels through live in-process codec workers; excludes capture, networking, native presentation, and panel"}))?);
         Ok::<_,anyhow::Error>(())
     }.await;
-    encoder.input_task.abort();
-    let _ = encoder.child.kill().await;
-    let _ = decoder.child.kill().await;
+    encoder.shutdown().await;
+    decoder.shutdown().await;
     result
 }
