@@ -7,9 +7,55 @@ import subprocess
 import struct
 import tempfile
 import unittest
+from unittest.mock import call, patch
 import zipfile
 
 import release
+
+
+class StaplerTests(unittest.TestCase):
+    def test_success_staples_then_validates_without_waiting(self):
+        path = Path("installer with spaces/Frames.dmg")
+        with patch.object(release.subprocess, "run") as run, patch.object(release.time, "sleep") as sleep:
+            release.staple(path)
+        self.assertEqual(run.call_args_list, [
+            call(["xcrun", "stapler", "staple", str(path)], check=True),
+            call(["xcrun", "stapler", "validate", str(path)], check=True),
+        ])
+        sleep.assert_not_called()
+
+    def test_cloudkit_failure_recovers_during_stapling_or_validation(self):
+        for action in ("staple", "validate"):
+            with self.subTest(action=action):
+                command = ["xcrun", "stapler", action, "Frames.app"]
+                failure = subprocess.CalledProcessError(68, command)
+                results = [failure, None, None] if action == "staple" else [None, failure, None]
+                with patch.object(release.subprocess, "run", side_effect=results) as run, patch.object(release.time, "sleep") as sleep:
+                    release.staple(Path("Frames.app"))
+                self.assertEqual(run.call_args_list.count(call(command, check=True)), 2)
+                self.assertEqual(run.call_count, 3)
+                sleep.assert_called_once_with(5)
+
+    def test_persistent_cloudkit_failure_exhausts_retries_and_fails_release(self):
+        command = ["xcrun", "stapler", "validate", "Frames.app"]
+        failure = subprocess.CalledProcessError(68, command)
+        with patch.object(release.subprocess, "run", side_effect=[None] + [failure] * 5) as run, patch.object(release.time, "sleep") as sleep:
+            with self.assertRaises(subprocess.CalledProcessError) as raised:
+                release.staple(Path("Frames.app"))
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(run.call_args_list.count(call(command, check=True)), 5)
+        self.assertEqual(sleep.call_args_list, [call(5), call(10), call(20), call(40)])
+
+    def test_other_errors_fail_immediately(self):
+        for action in ("staple", "validate"):
+            with self.subTest(action=action):
+                failure = subprocess.CalledProcessError(65, ["xcrun", "stapler", action, "Frames.app"])
+                results = [failure] if action == "staple" else [None, failure]
+                with patch.object(release.subprocess, "run", side_effect=results) as run, patch.object(release.time, "sleep") as sleep:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        release.staple(Path("Frames.app"))
+                self.assertEqual(run.call_count, len(results))
+                sleep.assert_not_called()
 
 
 class ReleaseTests(unittest.TestCase):

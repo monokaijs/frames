@@ -9,6 +9,7 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import time
 import tomllib
 import zipfile
 
@@ -50,6 +51,25 @@ def set_version(value):
 def checksum(path):
     with path.open("rb") as file:
         return hashlib.file_digest(file, "sha256").hexdigest()
+
+
+def staple(path):
+    """Staple and validate, tolerating temporary CloudKit ticket lookup failures."""
+    for action in ("staple", "validate"):
+        for attempt in range(5):
+            try:
+                subprocess.run(["xcrun", "stapler", action, str(path)], check=True)
+                break
+            except subprocess.CalledProcessError as error:
+                # stapler reports CloudKit failures as EX_NOHOST (68), including
+                # a dropped connection after Apple has accepted notarization.
+                if error.returncode != 68 or attempt == 4:
+                    raise
+                delay = 5 * 2 ** attempt
+                print(f"stapler {action}: CloudKit lookup failed (68); retrying in {delay}s "
+                      f"(attempt {attempt + 2}/5)", flush=True)
+                time.sleep(delay)
+
 
 def verify_windows_executable(data):
     if len(data) < 64 or data[:2] != b"MZ":
@@ -193,6 +213,7 @@ def main():
     dmg_cmd = commands.add_parser("dmg"); dmg_cmd.add_argument("version")
     installer_cmd = commands.add_parser("windows-installer"); installer_cmd.add_argument("version")
     verify_dmg_cmd = commands.add_parser("verify-dmg"); verify_dmg_cmd.add_argument("image", type=Path); verify_dmg_cmd.add_argument("version")
+    staple_cmd = commands.add_parser("staple"); staple_cmd.add_argument("path", type=Path)
     sign_cmd = commands.add_parser("manifest"); sign_cmd.add_argument("version"); sign_cmd.add_argument("directory", type=Path); sign_cmd.add_argument("key", type=Path)
     args = parser.parse_args()
     if args.command == "next": print(next_version(args.bump))
@@ -201,6 +222,7 @@ def main():
     elif args.command == "dmg": disk_image(args.version)
     elif args.command == "windows-installer": windows_installer(args.version)
     elif args.command == "verify-dmg": verify_disk_image(args.image, args.version)
+    elif args.command == "staple": staple(args.path)
     else: manifest(args.version, args.directory, args.key)
 
 if __name__ == "__main__": main()

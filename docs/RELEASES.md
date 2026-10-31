@@ -24,6 +24,8 @@ Windows releases include **Frames-VERSION-windows-x86_64-setup.exe**, built with
 
 The workflow imports the certificate into a temporary keychain, signs with hardened runtime and a secure timestamp, submits to Apple, staples the ticket, and checks Gatekeeper acceptance. It then builds, signs, notarizes, and staples a **Frames-VERSION-macos-aarch64.dmg** containing Frames.app and an Applications shortcut. The installer check mounts the DMG read-only, copies the app to a temporary Applications directory, verifies its signature and identity, and runs the copied executable. The signed ZIP remains the updater payload. Signing material is removed in an always-run cleanup step. Windows builds are currently unsigned by Authenticode.
 
+Apple ticket stapling and validation retry CloudKit lookup failures (exit 68) up to five attempts, waiting 5, 10, 20, and 40 seconds between attempts. Other errors fail immediately; exhausted retries still block publication. This applies to both the app and DMG. After a failed release has removed its draft, start a new Release workflow run from `main` so the draft is recreated.
+
 Packages upload directly to a draft GitHub Release. No Actions artifacts or dependency caches are created. Ordinary CI runs on pull requests or manual dispatch; release builds run the checks themselves, avoiding a duplicate build on each release push. Successful releases retain the install archives, checksums, and signed update manifest as release assets. Runner files disappear when GitHub destroys the hosted runner. Deleting artifacts does not recover execution minutes.
 
 ## Automatic updates

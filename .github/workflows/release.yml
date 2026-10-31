@@ -171,8 +171,7 @@ jobs:
           archive="dist/release/Frames-$RELEASE_VERSION-macos-aarch64.zip"
           xcrun notarytool submit "$archive" --key "$RUNNER_TEMP/notary-key.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --wait --timeout 10m --output-format json > "$RUNNER_TEMP/notary-result.json"
           python -c 'import json,os; d=json.load(open(os.environ["RUNNER_TEMP"]+"/notary-result.json")); print("Notarization:",d["status"]); assert d["status"]=="Accepted"'
-          xcrun stapler staple dist/macos/Frames.app
-          xcrun stapler validate dist/macos/Frames.app
+          python scripts/release.py staple dist/macos/Frames.app
           spctl --assess --type execute --verbose=2 dist/macos/Frames.app
           python scripts/release.py package macos-aarch64 "$RELEASE_VERSION"
           python scripts/release.py dmg "$RELEASE_VERSION"
@@ -182,8 +181,7 @@ jobs:
           codesign --force --sign "$identity" --timestamp "$image"
           xcrun notarytool submit "$image" --key "$RUNNER_TEMP/notary-key.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --wait --timeout 10m --output-format json > "$RUNNER_TEMP/notary-result.json"
           python -c 'import json,os; d=json.load(open(os.environ["RUNNER_TEMP"]+"/notary-result.json")); print("Installer notarization:",d["status"]); assert d["status"]=="Accepted"'
-          xcrun stapler staple "$image"
-          xcrun stapler validate "$image"
+          python scripts/release.py staple "$image"
           spctl --assess --type open --context context:primary-signature --verbose=2 "$image"
           python scripts/release.py verify-dmg "$image" "$RELEASE_VERSION"
           (cd dist/release && shasum -a 256 "Frames-$RELEASE_VERSION-macos-aarch64.dmg" > "Frames-$RELEASE_VERSION-macos-aarch64.dmg.sha256")
