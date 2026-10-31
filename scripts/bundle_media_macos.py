@@ -29,7 +29,7 @@ def main():
             if dependency.startswith(('/usr/lib/', '/System/Library/')):
                 continue
             dep = Path(dependency)
-            if dependency.startswith(('@rpath/', '@loader_path/')):
+            if dependency.startswith(('@rpath/', '@loader_path/')) or not dep.is_absolute():
                 dep = source.parent / dep.name
                 if not dep.is_file():
                     dep = SDK.parent/'macos-deps/lib'/Path(dependency).name

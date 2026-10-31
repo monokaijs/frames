@@ -39,7 +39,7 @@ def checksum(archive,name):
 
 def main():
     BASE.mkdir(exist_ok=True)
-    identity=json.dumps(SOURCES,sort_keys=True)
+    identity=json.dumps({'sources':SOURCES,'recipe':2},sort_keys=True)
     stamp=PREFIX/'frames-build-id'
     if stamp.exists() and stamp.read_text()==identity:
         return
@@ -65,6 +65,9 @@ def main():
                  '--enable-shared','--disable-static','--disable-examples','--disable-tools',
                  '--disable-docs','--disable-unit-tests'],source)
             run(['make','-j'+jobs],source);run(['make','install'],source)
+            for library in PREFIX.joinpath('lib').glob('libvpx.*.dylib'):
+                if not library.is_symlink():
+                    run(['install_name_tool','-id',library,library])
         elif name=='aom':
             build=BASE/'aom-build'
             run(['cmake','-S',source,'-B',build,f'-DCMAKE_INSTALL_PREFIX={PREFIX}',

@@ -12,7 +12,7 @@ for dependency in cmake pkgconf meson ninja; do
   brew list --versions "$dependency" >/dev/null || brew install "$dependency"
 done
 mkdir -p "$BASE"
-BUILD_ID="$COMMIT-sdk-v3"
+BUILD_ID="$COMMIT-sdk-v4"
 if [[ -f "$SDK/frames-build-id" && "$(cat "$SDK/frames-build-id")" == "$BUILD_ID" ]]; then
   printf 'Prepared codec SDK: %s\n' "$SDK"; exit
 fi
