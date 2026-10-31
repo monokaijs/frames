@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import plistlib
 import re
+import struct
 import subprocess
 import tomllib
 import zipfile
@@ -47,6 +48,32 @@ def checksum(path):
     with path.open("rb") as file:
         return hashlib.file_digest(file, "sha256").hexdigest()
 
+def verify_windows_executable(data):
+    if len(data) < 64 or data[:2] != b"MZ":
+        raise ValueError("Frames.exe is not a Windows executable")
+    pe = struct.unpack_from("<I", data, 60)[0]
+    if pe + 94 > len(data) or data[pe:pe + 4] != b"PE\0\0":
+        raise ValueError("Frames.exe has an invalid PE header")
+    if struct.unpack_from("<H", data, pe + 4)[0] != 0x8664:
+        raise ValueError("Frames.exe must target Windows x64")
+    if struct.unpack_from("<H", data, pe + 24 + 68)[0] != 2:
+        raise ValueError("Frames.exe must use the GUI subsystem to avoid a terminal window")
+
+
+def verify_package(archive, platform):
+    with zipfile.ZipFile(archive) as package:
+        if platform == "windows-x86_64":
+            if package.namelist() != ["Frames.exe"]:
+                raise ValueError("Windows release ZIP must contain only Frames.exe")
+            verify_windows_executable(package.read("Frames.exe"))
+        else:
+            for name in package.namelist():
+                if Path(name).parts[0] not in ("Frames.app", "__MACOSX"):
+                    raise ValueError("Mac release ZIP must contain only Frames.app")
+            if "Frames.app/Contents/MacOS/frames" not in package.namelist():
+                raise ValueError("Mac release ZIP is missing the app executable")
+
+
 def package(platform, value):
     value = version(value)
     output = ROOT / "dist/release"
@@ -56,9 +83,8 @@ def package(platform, value):
         subprocess.run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(ROOT / "dist/macos/Frames.app"), str(archive)], check=True)
     else:
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zip:
-            source = ROOT / "dist/windows"
-            for path in sorted(source.rglob("*")):
-                if path.is_file() and path.suffix != ".sha256": zip.write(path, path.relative_to(source))
+            zip.write(ROOT / "dist/windows/Frames.exe", "Frames.exe")
+    verify_package(archive, platform)
     archive.with_suffix(".zip.sha256").write_text(f"{checksum(archive)}  {archive.name}\n")
     print(archive)
 

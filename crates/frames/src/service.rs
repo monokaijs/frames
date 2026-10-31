@@ -1,7 +1,7 @@
 #![cfg(windows)]
 //! Optional Windows service broker. Installation is a separate, explicit CLI action.
 use anyhow::Context;
-use std::{ffi::OsString, path::PathBuf, time::Duration};
+use std::{ffi::OsString, os::windows::process::CommandExt, path::PathBuf, time::Duration};
 use windows::{
     Win32::{
         Foundation::*,
@@ -56,6 +56,7 @@ pub fn install() -> anyhow::Result<()> {
     // not translated account names, and fail installation if ACL hardening fails.
     for path in [&dir, &data] {
         let status = std::process::Command::new("icacls.exe")
+            .creation_flags(0x08000000)
             .arg(path)
             .args([
                 "/setowner",
@@ -80,6 +81,7 @@ pub fn install() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .or_else(|| {
             std::process::Command::new("where.exe")
+                .creation_flags(0x08000000)
                 .arg("ffmpeg.exe")
                 .output()
                 .ok()

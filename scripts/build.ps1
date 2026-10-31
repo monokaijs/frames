@@ -20,8 +20,6 @@ try {
     $destination = Join-Path $root 'dist\windows'
     New-Item -ItemType Directory -Path $destination -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $root "target\$Target\$profile\frames.exe") -Destination (Join-Path $destination 'Frames.exe') -Force
-    Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $destination -Force
-    Copy-Item -LiteralPath (Join-Path $root 'docs') -Destination $destination -Recurse -Force
     $digest = (Get-FileHash -LiteralPath (Join-Path $destination 'Frames.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
     "$digest  Frames.exe" | Set-Content -LiteralPath (Join-Path $destination 'Frames.exe.sha256') -Encoding ascii
     Write-Host "Built $destination\Frames.exe"

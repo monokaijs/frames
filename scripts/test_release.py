@@ -4,8 +4,10 @@ from pathlib import Path
 import plistlib
 import shutil
 import subprocess
+import struct
 import tempfile
 import unittest
+import zipfile
 
 import release
 
@@ -21,6 +23,39 @@ class ReleaseTests(unittest.TestCase):
             destination = release.ROOT / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(self.original / name, destination)
+
+    @staticmethod
+    def windows_executable(subsystem=2):
+        data = bytearray(512)
+        data[:2] = b"MZ"
+        struct.pack_into("<I", data, 60, 128)
+        data[128:132] = b"PE\0\0"
+        struct.pack_into("<H", data, 132, 0x8664)
+        struct.pack_into("<H", data, 152, 0x20B)
+        struct.pack_into("<H", data, 220, subsystem)
+        return data
+
+    def test_windows_zip_contains_only_executable_even_with_stale_docs(self):
+        source = release.ROOT / "dist/windows"
+        (source / "docs").mkdir(parents=True)
+        (source / "Frames.exe").write_bytes(self.windows_executable())
+        (source / "README.md").write_text("must not ship")
+        (source / "docs/VALIDATION.md").write_text("must not ship")
+        (source / "Frames.exe.sha256").write_text("must not ship inside zip")
+        release.package("windows-x86_64", "1.2.3")
+        archive = release.ROOT / "dist/release/Frames-1.2.3-windows-x86_64.zip"
+        with zipfile.ZipFile(archive) as package:
+            self.assertEqual(package.namelist(), ["Frames.exe"])
+
+    def test_console_executable_and_extra_archive_entries_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "GUI subsystem"):
+            release.verify_windows_executable(self.windows_executable(subsystem=3))
+        archive = release.ROOT / "bad.zip"
+        with zipfile.ZipFile(archive, "w") as package:
+            package.writestr("Frames.exe", self.windows_executable())
+            package.writestr("README.md", "must not ship")
+        with self.assertRaisesRegex(ValueError, "only Frames.exe"):
+            release.verify_package(archive, "windows-x86_64")
 
     def test_bumps_and_package_versions_stay_in_sync(self):
         release.set_version("1.2.3")

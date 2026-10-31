@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod launcher;
 #[cfg(windows)]
 mod service;
@@ -123,6 +125,8 @@ impl CodecChoice {
 }
 
 fn main() {
+    #[cfg(windows)]
+    attach_cli_console();
     if let Err(error) = run() {
         eprintln!("Frames: {error:#}");
         if std::env::var_os("FRAMES_GUI_CHILD").is_some()
@@ -134,6 +138,37 @@ fn main() {
         std::process::exit(1);
     }
 }
+#[cfg(windows)]
+fn attach_cli_console() {
+    if std::env::args_os().len() == 1 {
+        return;
+    }
+    use windows::Win32::{
+        Storage::FileSystem::{FILE_TYPE_UNKNOWN, GetFileType},
+        System::Console::{
+            ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+            STD_OUTPUT_HANDLE, SetStdHandle,
+        },
+    };
+    // Reuse an existing terminal for CLI commands; never allocate a new one.
+    // Preserve the pipes/files used by the launcher, updater, and shell redirects.
+    unsafe {
+        let handles = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].map(|kind| {
+            let handle = GetStdHandle(kind)
+                .ok()
+                .filter(|handle| !handle.is_invalid() && GetFileType(*handle) != FILE_TYPE_UNKNOWN);
+            (kind, handle)
+        });
+        if AttachConsole(ATTACH_PARENT_PROCESS).is_ok() {
+            for (kind, handle) in handles {
+                if let Some(handle) = handle {
+                    let _ = SetStdHandle(kind, handle);
+                }
+            }
+        }
+    }
+}
+
 fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(

@@ -59,6 +59,8 @@ jobs:
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: python scripts/release.py set-version $env:RELEASE_VERSION
+      - name: Packaging regression checks
+        run: python scripts/test_release.py -k executable
       - run: cargo fmt --all --check
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
