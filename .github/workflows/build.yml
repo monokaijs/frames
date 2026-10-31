@@ -24,7 +24,7 @@ jobs:
       - run: ./scripts/build.ps1 -Target x86_64-pc-windows-msvc
   macos:
     timeout-minutes: 35
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
