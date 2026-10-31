@@ -99,6 +99,12 @@ jobs:
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: python scripts/release.py set-version "$RELEASE_VERSION"
+      - name: Configure Ed25519 signing tools
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: |
+          brew list --versions openssl@3 >/dev/null || brew install openssl@3
+          python scripts/test_release.py
       - run: cargo test --workspace --locked
       - name: Swift checks
         run: |
@@ -114,8 +120,6 @@ jobs:
           "$RUNNER_TEMP/session-tests"
           swiftc native/macos/Sources/Wire.swift native/macos/Tests/BridgeOutputTests.swift -framework AppKit -framework ScreenCaptureKit -framework ServiceManagement -o "$RUNNER_TEMP/bridge-tests"
           "$RUNNER_TEMP/bridge-tests"
-      - name: Release script checks
-        run: python scripts/test_release.py
       - name: Import Developer ID certificate
         env:
           CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
