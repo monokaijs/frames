@@ -112,6 +112,8 @@ jobs:
         run: |
           brew list --versions openssl@3 >/dev/null || brew install openssl@3
           python scripts/test_release.py
+      - name: Codec source download regression checks
+        run: python scripts/test_prepare_media_macos_deps.py
       - name: Prepare bundled media SDK
         run: bash scripts/prepare_media_macos.sh
       - run: cargo test --workspace --locked

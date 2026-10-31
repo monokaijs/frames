@@ -34,6 +34,8 @@ jobs:
         with:
           toolchain: 1.94.1
           targets: aarch64-apple-darwin
+      - name: Codec source download regression checks
+        run: python scripts/test_prepare_media_macos_deps.py
       - name: Prepare bundled media SDK
         run: bash scripts/prepare_media_macos.sh
       - run: cargo test --workspace --locked

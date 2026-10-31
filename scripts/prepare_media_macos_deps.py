@@ -1,11 +1,15 @@
 """Build codec dependencies from pinned source for macOS 14.2 (not brew bottles)."""
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tarfile
+import tempfile
+import time
+import urllib.error
 import urllib.request
 
 ROOT=Path(__file__).resolve().parent.parent
@@ -37,6 +41,39 @@ def checksum(archive,name):
             digest.update(hashlib.sha256(payload).digest())
     return digest.hexdigest()
 
+def ensure_source(url,archive,name,digest,attempts=5):
+    try:
+        if checksum(archive,name)==digest:
+            return
+    except (FileNotFoundError,tarfile.TarError,EOFError):
+        # Older downloads could leave an incomplete archive in the cache.
+        pass
+    for attempt in range(attempts):
+        with tempfile.NamedTemporaryFile(dir=archive.parent,prefix=archive.name+'.',
+                                         suffix='.part',delete=False) as temporary:
+            pending=Path(temporary.name)
+        try:
+            with urllib.request.urlopen(url,timeout=60) as response,pending.open('wb') as output:
+                shutil.copyfileobj(response,output)
+            if checksum(pending,name)!=digest:
+                raise RuntimeError(f'{name} source checksum mismatch')
+            pending.replace(archive)
+            return
+        except (urllib.error.URLError,TimeoutError,ConnectionError,http.client.IncompleteRead) as error:
+            if isinstance(error,urllib.error.HTTPError):
+                error.close()
+                if error.code not in (408,429,500,502,503,504):
+                    raise
+            if attempt+1==attempts:
+                raise
+            pending.unlink(missing_ok=True)
+            delay=2**attempt
+            print(f'{name} source download failed ({error}); retrying in {delay}s '
+                  f'({attempt+1}/{attempts})',flush=True)
+            time.sleep(delay)
+        finally:
+            pending.unlink(missing_ok=True)
+
 def main():
     BASE.mkdir(exist_ok=True)
     identity=json.dumps({'sources':SOURCES,'recipe':2},sort_keys=True)
@@ -51,10 +88,7 @@ def main():
     jobs=str(os.cpu_count() or 4)
     for name,(url,digest) in SOURCES.items():
         archive=BASE/(name+'-source.tar'+('.bz2' if url.endswith('.bz2') else '.gz'))
-        if not archive.exists() or checksum(archive,name)!=digest:
-            urllib.request.urlretrieve(url,archive)
-        if checksum(archive,name)!=digest:
-            raise RuntimeError(f'{name} source checksum mismatch')
+        ensure_source(url,archive,name,digest)
         destination=BASE/(name+'-source')
         destination.mkdir(exist_ok=True)
         with tarfile.open(archive) as t:
