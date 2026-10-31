@@ -1,7 +1,8 @@
 """Bidirectional LAN transfers between Windows and a signed, GUI-launched Mac app.
 
 Uses fresh test identities, generated files, matching-code pairing, and dedicated
-ports. Does not capture desktops, inject input, alter clipboard, or grant TCC.
+ports. Optional control probes target generated QA windows. Clipboard stays off;
+the fixture never grants TCC permissions.
 Mac GUI launch is required for access to its login Keychain.
 """
 import argparse
@@ -28,6 +29,7 @@ def main():
     parser.add_argument("--control-probe", type=Path,
                         help="Optional production-session fixture client; requires Frames QA source on the Mac")
     parser.add_argument("--capture-only", action="store_true")
+    parser.add_argument("--latency", action="store_true", help="Measure 20 clicks in the generated 1080p Mac fixture")
     parser.add_argument("--native-ui", action="store_true",
                         help="Present the Windows QA fixture through the real Mac AppKit/Metal client")
     parser.add_argument("--window-fixture", type=Path,
@@ -186,7 +188,7 @@ def main():
 
         if args.control_probe:
             probe_args = [args.mac_address + ":47991", str(root / "mac-host-control.json")]
-            probe_args += ["--capture-only"] if args.capture_only else ["--desktop"]
+            probe_args += ["--latency-only","--1080p","--focused"] if args.latency else (["--capture-only"] if args.capture_only else ["--desktop"])
             probe, probe_log = windows("windows-client", probe_args, args.control_probe.resolve(strict=True))
             until(lambda: probe.poll() is not None, 120)
             assert probe.returncode == 0, probe_log["err"] + probe_log["out"]
