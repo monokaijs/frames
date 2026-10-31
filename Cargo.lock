@@ -1916,7 +1916,7 @@ dependencies = [
 
 [[package]]
 name = "frames"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1949,7 +1949,7 @@ dependencies = [
 
 [[package]]
 name = "frames-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1973,7 +1973,7 @@ dependencies = [
 
 [[package]]
 name = "frames-native"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
