@@ -38,9 +38,9 @@ class ReleaseTests(unittest.TestCase):
         root = release.ROOT
         key = root / "test-key.pem"
         public = root / "test-public.pem"
-        subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(key)], check=True)
-        subprocess.run(["openssl", "pkey", "-in", str(key), "-pubout", "-out", str(public)], check=True)
-        raw = subprocess.check_output(["openssl", "pkey", "-in", str(key), "-pubout", "-outform", "DER"])[-32:]
+        subprocess.run([release.OPENSSL, "genpkey", "-algorithm", "ED25519", "-out", str(key)], check=True)
+        subprocess.run([release.OPENSSL, "pkey", "-in", str(key), "-pubout", "-out", str(public)], check=True)
+        raw = subprocess.check_output([release.OPENSSL, "pkey", "-in", str(key), "-pubout", "-outform", "DER"])[-32:]
         (root / "scripts").mkdir()
         (root / "scripts/update-public-key.hex").write_text(raw.hex())
         for platform in ["windows-x86_64", "macos-aarch64"]:
@@ -48,7 +48,7 @@ class ReleaseTests(unittest.TestCase):
         release.manifest("1.2.3", root, key)
         manifest = root / "update.json"
         signature = root / "update.json.sig"
-        verify = ["openssl", "pkeyutl", "-verify", "-rawin", "-pubin", "-inkey", str(public), "-in", str(manifest), "-sigfile", str(signature)]
+        verify = [release.OPENSSL, "pkeyutl", "-verify", "-rawin", "-pubin", "-inkey", str(public), "-in", str(manifest), "-sigfile", str(signature)]
         self.assertEqual(subprocess.run(verify, capture_output=True).returncode, 0)
         data = json.loads(manifest.read_bytes())
         for target, asset in data["targets"].items():

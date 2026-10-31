@@ -11,6 +11,10 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO = "monokaijs/frames"
+OPENSSL = next((str(path) for path in (
+    Path("/opt/homebrew/opt/openssl@3/bin/openssl"),
+    Path("/usr/local/opt/openssl@3/bin/openssl"),
+) if path.is_file()), "openssl")
 
 def version(value):
     if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", value):
@@ -66,10 +70,10 @@ def manifest(value, directory, key):
         targets[platform] = {"url": f"https://github.com/{REPO}/releases/download/v{value}/{archive.name}", "sha256": checksum(archive), "size": archive.stat().st_size}
     output = directory / "update.json"
     output.write_text(json.dumps({"schema": 1, "version": value, "targets": targets}, sort_keys=True, separators=(",", ":")) + "\n")
-    public = subprocess.check_output(["openssl", "pkey", "-in", str(key), "-pubout", "-outform", "DER"])[-32:].hex()
+    public = subprocess.check_output([OPENSSL, "pkey", "-in", str(key), "-pubout", "-outform", "DER"])[-32:].hex()
     if public != (ROOT / "scripts/update-public-key.hex").read_text().strip():
         raise ValueError("Update signing key does not match the application public key")
-    subprocess.run(["openssl", "pkeyutl", "-sign", "-rawin", "-inkey", str(key), "-in", str(output), "-out", str(directory / "update.json.sig")], check=True)
+    subprocess.run([OPENSSL, "pkeyutl", "-sign", "-rawin", "-inkey", str(key), "-in", str(output), "-out", str(directory / "update.json.sig")], check=True)
 
 def main():
     parser = argparse.ArgumentParser()
