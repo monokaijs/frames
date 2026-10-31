@@ -154,7 +154,8 @@ jobs:
       - name: Verify signed macOS updater replacement and rejection
         env:
           FRAMES_UPDATE_TEST_APP: ${{ github.workspace }}/dist/macos/Frames.app
-        run: cargo test -p frames update::tests:: --locked -- --include-ignored --nocapture
+        run: |
+          cargo test -p frames update::tests:: --locked -- --include-ignored --nocapture
       - name: Notarize and staple
         env:
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
