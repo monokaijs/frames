@@ -16,6 +16,16 @@ parking_lot = "0.12"
 image = { version = "0.25", default-features = false, features = ["png"] }
 cpal = "0.18"
 
+[features]
+media-diagnostics = []
+
+[[example]]
+name = "presentation_probe"
+required-features = ["media-diagnostics"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.62.2"
 windows = { workspace = true, features = ["Win32_System_StationsAndDesktops", "Win32_System_Console", "Win32_Graphics_Dwm", "Win32_Graphics_Direct3D_Fxc", "Win32_System_Ole", "Win32_System_SystemServices", "Win32_UI_Shell_Common"] }

@@ -2,6 +2,10 @@ use frames_core::{input::InputEvent, media::RawFrame, model::*};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 pub mod audio;
+mod client_updates;
+pub use client_updates::{ClientReceiver, ClientSendError, ClientSender, client_channel};
+#[cfg(all(windows, feature = "media-diagnostics"))]
+pub use windows::diagnostic_capture_window;
 
 #[cfg(target_os = "macos")]
 pub fn permission_status(request: bool) -> anyhow::Result<serde_json::Value> {
@@ -25,6 +29,8 @@ pub fn request_permission(kind: &str) -> anyhow::Result<()> {
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "macos", test))]
+mod native_media;
 #[cfg(windows)]
 mod windows;
 
@@ -52,7 +58,7 @@ pub trait Desktop: Send + Sync {
     fn action(&self, key: WindowId, action: &WindowAction) -> anyhow::Result<()>;
     fn input(&self, key: WindowId, event: &InputEvent) -> anyhow::Result<()>;
     fn release_input(&self);
-    fn capture(&self, key: WindowId) -> anyhow::Result<CaptureStream>;
+    fn capture(&self, key: WindowId, show_cursor: bool) -> anyhow::Result<CaptureStream>;
     fn clipboard(&self) -> anyhow::Result<Option<String>>;
     fn set_clipboard(&self, text: &str) -> anyhow::Result<()>;
     fn clipboard_image(&self) -> anyhow::Result<Option<Vec<u8>>> {
@@ -83,7 +89,15 @@ pub trait Desktop: Send + Sync {
 
 #[derive(Clone, Debug)]
 pub enum ClientEvent {
+    TimedInput {
+        window: WindowId,
+        event: InputEvent,
+        created: std::time::Instant,
+    },
     ViewMode(ViewMode),
+    RemoteCursor {
+        visible: bool,
+    },
     AdbBridge {
         enabled: bool,
     },
@@ -114,6 +128,9 @@ pub enum ClientEvent {
     },
 }
 pub enum ClientUpdate {
+    RemoteCursor {
+        visible: bool,
+    },
     ViewMode {
         mode: ViewMode,
         error: Option<String>,
@@ -164,7 +181,7 @@ pub fn desktop(exclusions: Vec<String>) -> anyhow::Result<Arc<dyn Desktop>> {
 }
 pub fn run_client(
     host: String,
-    updates: std::sync::mpsc::Receiver<ClientUpdate>,
+    updates: ClientReceiver,
     events: mpsc::UnboundedSender<ClientEvent>,
 ) -> anyhow::Result<()> {
     #[cfg(windows)]

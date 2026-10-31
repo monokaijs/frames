@@ -22,6 +22,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=Path)
     parser.add_argument("--mac-ssh", default="macmini")
+    parser.add_argument("--mac-app", help="Use an isolated Mac app build instead of ~/Applications/Frames.app")
     parser.add_argument("--mac-address", required=True)
     parser.add_argument("--windows-address", required=True)
     parser.add_argument("--control-probe", type=Path,
@@ -59,7 +60,7 @@ def main():
 
     home = ssh("printf '%s' \"$HOME\"").strip()
     mac_root = home + "/Library/Caches/FramesCrossTest/" + run_id
-    mac_app = home + "/Applications/Frames.app"
+    mac_app = args.mac_app or home + "/Applications/Frames.app"
     q = shlex.quote
     ssh(f"mkdir -p {q(mac_root)}")
 

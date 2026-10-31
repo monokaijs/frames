@@ -3,7 +3,7 @@
 fn main() -> anyhow::Result<()> {
     use frames_core::{media::RawFrame, model::*};
     use frames_native::{ClientEvent, ClientUpdate};
-    let (tx, rx) = std::sync::mpsc::sync_channel(16);
+    let (tx, rx) = frames_native::client_channel(16);
     let (events, mut actions) = tokio::sync::mpsc::unbounded_channel();
     let worker = std::thread::spawn(move || {
         let menus = || {
@@ -60,6 +60,7 @@ fn main() -> anyhow::Result<()> {
             visible: true,
             minimized: false,
             modal: false,
+            show_header: false,
         };
         let frame = || {
             let mut bgra = vec![0; 640 * 400 * 4];
@@ -71,7 +72,7 @@ fn main() -> anyhow::Result<()> {
             RawFrame {
                 width: 640,
                 height: 400,
-                bgra,
+                bgra: bgra.into(),
             }
         };
         let _ = tx.send(ClientUpdate::Peer {

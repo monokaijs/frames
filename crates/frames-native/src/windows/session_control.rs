@@ -16,6 +16,7 @@ struct Context {
     events: tokio::sync::mpsc::UnboundedSender<ClientEvent>,
     mode: ViewMode,
     adb: bool,
+    show_remote_cursor: bool,
 }
 pub struct SessionControl {
     hwnd: HWND,
@@ -35,6 +36,7 @@ impl SessionControl {
                 events,
                 mode: ViewMode::Windows,
                 adb: false,
+                show_remote_cursor: true,
             });
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
@@ -68,9 +70,10 @@ impl SessionControl {
             Ok(Self { hwnd, context })
         }
     }
-    pub fn update(&mut self, mode: ViewMode, adb: bool) {
+    pub fn update(&mut self, mode: ViewMode, adb: bool, show_remote_cursor: bool) {
         self.context.mode = mode;
         self.context.adb = adb;
+        self.context.show_remote_cursor = show_remote_cursor;
     }
 }
 impl Drop for SessionControl {
@@ -113,6 +116,12 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                     2,
                     w!("Full desktop view"),
                 );
+                let _ = AppendMenuW(
+                    menu,
+                    MF_STRING | checked(context.show_remote_cursor),
+                    5,
+                    w!("Show remote cursor"),
+                );
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
                 let _ = AppendMenuW(
                     menu,
@@ -151,6 +160,11 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                     }
                     4 => {
                         let _ = context.events.send(ClientEvent::Disconnected);
+                    }
+                    5 => {
+                        let _ = context.events.send(ClientEvent::RemoteCursor {
+                            visible: !context.show_remote_cursor,
+                        });
                     }
                     _ => {}
                 }

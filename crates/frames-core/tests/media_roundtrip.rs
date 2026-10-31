@@ -2,6 +2,22 @@ use frames_core::{codec, media::RawFrame};
 use std::time::Duration;
 
 #[tokio::test]
+#[ignore = "requires FFmpeg with H.264, HEVC, AV1, and VP9 decoders"]
+async fn receiving_client_probes_all_decoders_without_an_encoder() {
+    let capabilities = codec::probe_decoders().await;
+    assert_eq!(
+        capabilities.len(),
+        4,
+        "reference frames must decode through FFmpeg"
+    );
+    assert!(
+        capabilities
+            .iter()
+            .all(|c| c.decoder && c.encoder.is_none() && !c.hardware)
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires a local FFmpeg executable; exercises actual encoder/decoder processes"]
 async fn every_advertised_codec_roundtrips_a_live_window_frame() {
     let capabilities = codec::probe().await;
@@ -29,7 +45,7 @@ async fn every_advertised_codec_roundtrips_a_live_window_frame() {
             let (tx, rx) = tokio::sync::watch::channel(Some(RawFrame {
                 width: width as u32,
                 height: height as u32,
-                bgra: pixels,
+                bgra: pixels.into(),
             }));
             let mut encoder = codec::encode(width as u32, height as u32, 30, &capability, rx)
                 .await
@@ -38,10 +54,13 @@ async fn every_advertised_codec_roundtrips_a_live_window_frame() {
                 .await
                 .unwrap();
             let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+            let mut source = tokio::time::interval(Duration::from_millis(33));
+            source.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut count = 0;
             let mut decoded = 0;
             let result = loop {
                 tokio::select! {
+                    _=source.tick()=>{ let frame = tx.borrow().clone(); tx.send_replace(frame); },
                     _=tokio::time::sleep_until(deadline)=>break None,
                     frame=encoder.frames.recv()=>{let frame=frame.unwrap_or_else(||panic!("{:?} encoder {:?} stopped",capability.codec,capability.encoder));count+=1;decoder.input.send(frame).await.unwrap();},
                     result=decoder.output.changed()=>{result.unwrap();let frame=decoder.output.borrow().clone();if let Some(frame)=frame {
@@ -72,5 +91,51 @@ async fn every_advertised_codec_roundtrips_a_live_window_frame() {
                 capability.codec
             );
         }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg with libx264, libx265, libaom, libvpx; uses only generated pixels"]
+async fn one_capture_encodes_and_decodes_without_a_later_capture_or_eof() {
+    for (codec, name) in [
+        (codec::Codec::H264, "libx264"),
+        (codec::Codec::Hevc, "libx265"),
+        (codec::Codec::Av1, "libaom-av1"),
+        (codec::Codec::Vp9, "libvpx-vp9"),
+    ] {
+        let capability = codec::CodecCapability {
+            codec,
+            encoder: Some(name.into()),
+            decoder: true,
+            hardware: false,
+        };
+        let (tx, rx) = tokio::sync::watch::channel(Some(RawFrame {
+            width: 128,
+            height: 128,
+            bgra: [20, 30, 220, 255].repeat(128 * 128).into(),
+        }));
+        let mut encoder = codec::encode(128, 128, 60, &capability, rx).await.unwrap();
+        let packet = tokio::time::timeout(Duration::from_secs(3), encoder.frames.recv())
+            .await
+            .expect("encoder waited for another capture")
+            .expect("encoder stopped");
+        let mut decoder = codec::decode(codec, 128, 128).await.unwrap();
+        decoder.input.send(packet).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), decoder.output.changed())
+            .await
+            .expect("decoder waited for another capture")
+            .unwrap();
+        let frame = decoder.output.borrow().clone().unwrap();
+        assert!(frame.bgra[2] > 150 && frame.bgra[0] < 80);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), encoder.frames.recv())
+                .await
+                .is_err(),
+            "unchanged capture was encoded repeatedly"
+        );
+        encoder.input_task.abort();
+        let _ = encoder.child.kill().await;
+        let _ = decoder.child.kill().await;
+        drop(tx);
     }
 }

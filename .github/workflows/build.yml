@@ -1,15 +1,17 @@
 name: Frames
 on:
-  push:
   pull_request:
+    paths-ignore: ["**.md"]
   workflow_dispatch:
 jobs:
   windows:
+    timeout-minutes: 35
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.94.1
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo test --workspace --locked
@@ -20,16 +22,14 @@ jobs:
       - name: Generated Opus audio roundtrip
         run: cargo test -p frames-core --test audio_roundtrip --locked -- --ignored --nocapture
       - run: ./scripts/build.ps1 -Target x86_64-pc-windows-msvc
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Frames-Windows-x64-unsigned
-          path: dist/windows/
   macos:
+    timeout-minutes: 35
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.94.1
           targets: aarch64-apple-darwin
       - run: cargo test --workspace --locked
       - name: Signing identity regression checks
@@ -43,7 +43,23 @@ jobs:
         run: |
           swiftc native/macos/Sources/WindowContent.swift native/macos/Tests/WindowContentTests.swift -o /tmp/frames-content-tests
           /tmp/frames-content-tests
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Frames-macOS-Apple-silicon-unsigned
-          path: dist/macos/
+      - name: Mac remote header toggle regression checks
+        run: |
+          sources=()
+          for source in native/macos/Sources/*.swift; do
+            if [[ "$source" != */main.swift ]]; then sources+=("$source"); fi
+          done
+          swiftc -swift-version 5 -target arm64-apple-macos14.2 -import-objc-header native/include/frames.h "${sources[@]}" native/macos/Tests/RemoteHeaderTests.swift target/aarch64-apple-darwin/release/libframes_core.a -framework AppKit -framework ScreenCaptureKit -framework Metal -framework QuartzCore -framework VideoToolbox -framework Security -framework CoreGraphics -framework ServiceManagement -framework UniformTypeIdentifiers -framework AudioToolbox -o /tmp/frames-remote-header-tests
+          /tmp/frames-remote-header-tests
+      - name: Mac control remains responsive when media is blocked
+        run: |
+          swiftc native/macos/Sources/Wire.swift native/macos/Tests/BridgeOutputTests.swift -framework AppKit -framework ScreenCaptureKit -framework ServiceManagement -o /tmp/frames-bridge-output-tests
+          /tmp/frames-bridge-output-tests
+      - name: Mac binary client video and latest-frame delivery
+        run: |
+          swiftc native/macos/Sources/ClientMedia.swift native/macos/Tests/ClientMediaTests.swift -o /tmp/frames-client-media-tests
+          /tmp/frames-client-media-tests
+      - name: Mac locked session control checks
+        run: |
+          swiftc native/macos/Sources/SessionState.swift native/macos/Tests/SessionStateTests.swift -o /tmp/frames-session-state-tests
+          /tmp/frames-session-state-tests

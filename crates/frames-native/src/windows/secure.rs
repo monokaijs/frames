@@ -61,6 +61,7 @@ pub fn window(key: WindowId) -> RemoteWindow {
             minimized: false,
             visible: true,
             modal: false,
+            show_header: false,
         }
     }
 }
@@ -217,7 +218,7 @@ unsafe fn run(
                 tx.send_replace(Some(RawFrame {
                     width: desc.Width,
                     height: desc.Height,
-                    bgra,
+                    bgra: bgra.into(),
                 }));
                 Ok(())
             })();

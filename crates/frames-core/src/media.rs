@@ -18,7 +18,7 @@ const MAX_REASSEMBLY_BYTES: usize = 24 * 1024 * 1024;
 pub struct RawFrame {
     pub width: u32,
     pub height: u32,
-    pub bgra: Vec<u8>,
+    pub bgra: bytes::Bytes,
 }
 impl RawFrame {
     pub fn validate(&self) -> bool {
@@ -74,13 +74,36 @@ struct Partial {
     chunks: Vec<Option<Vec<u8>>>,
     bytes: usize,
     keyframe: bool,
+    remaining: usize,
 }
 #[derive(Default)]
 pub struct Reassembler {
     frames: HashMap<(WindowId, u32, u64), Partial>,
     total_bytes: usize,
+    expired: std::collections::HashSet<(WindowId, u32, u64)>,
 }
 impl Reassembler {
+    pub fn identity(packet: &[u8]) -> Option<(WindowId, u32, u64)> {
+        if packet.len() <= HEADER_BYTES || &packet[..2] != b"FR" {
+            return None;
+        }
+        Some((
+            WindowId {
+                id: u64::from_be_bytes(packet[2..10].try_into().ok()?),
+                generation: u32::from_be_bytes(packet[10..14].try_into().ok()?),
+            },
+            u32::from_be_bytes(packet[14..18].try_into().ok()?),
+            u64::from_be_bytes(packet[18..26].try_into().ok()?),
+        ))
+    }
+    pub fn forget_window(&mut self, window: WindowId) {
+        self.frames.retain(|(w, _, _), _| *w != window);
+        self.expired.retain(|(w, _, _)| *w != window);
+        self.total_bytes = self.frames.values().map(|p| p.bytes).sum();
+    }
+    pub fn take_expired(&mut self) -> Vec<(WindowId, u32, u64)> {
+        self.expired.drain().collect()
+    }
     pub fn push(&mut self, packet: &[u8], now: Instant) -> Option<EncodedFrame> {
         self.expire(now);
         if packet.len() <= HEADER_BYTES || &packet[..2] != b"FR" {
@@ -106,6 +129,7 @@ impl Reassembler {
         }
         let frame = self.frames.entry(key).or_insert_with(|| Partial {
             created: now,
+            remaining: count,
             chunks: vec![None; count],
             bytes: 0,
             keyframe: packet[30] != 0,
@@ -120,7 +144,8 @@ impl Reassembler {
         frame.bytes += bytes.len();
         self.total_bytes += bytes.len();
         frame.chunks[index] = Some(bytes.to_vec());
-        if !frame.chunks.iter().all(Option::is_some) {
+        frame.remaining -= 1;
+        if frame.remaining != 0 {
             return None;
         }
         let partial = self.frames.remove(&key)?;
@@ -135,8 +160,13 @@ impl Reassembler {
     }
     pub fn expire(&mut self, now: Instant) -> usize {
         let before = self.frames.len();
-        self.frames
-            .retain(|_, p| now.saturating_duration_since(p.created) < Duration::from_millis(150));
+        self.frames.retain(|key, p| {
+            let keep = now.saturating_duration_since(p.created) < Duration::from_millis(150);
+            if !keep && self.expired.len() < MAX_IN_FLIGHT * 4 {
+                self.expired.insert(*key);
+            }
+            keep
+        });
         self.total_bytes = self.frames.values().map(|p| p.bytes).sum();
         before - self.frames.len()
     }
@@ -196,5 +226,31 @@ mod tests {
         let mut r = Reassembler::default();
         assert!(r.push(&p, Instant::now()).is_none());
         assert_eq!(r.total_bytes, 0);
+    }
+    #[test]
+    fn expiry_is_scoped_and_survives_push_cleanup() {
+        let a = frame();
+        let mut b = frame();
+        b.window.id += 1;
+        let pa = fragment(&a, 1200).unwrap();
+        let pb = fragment(&b, 1200).unwrap();
+        let at = Instant::now();
+        let mut r = Reassembler::default();
+        r.push(&pa[0], at);
+        r.push(&pb[0], at + Duration::from_millis(80));
+        // push() also expires frames, so the notification must not be lost.
+        r.push(&pb[1], at + Duration::from_millis(160));
+        assert_eq!(r.take_expired(), vec![(a.window, a.generation, a.number)]);
+        let completed = pb
+            .iter()
+            .skip(2)
+            .find_map(|packet| r.push(packet, at + Duration::from_millis(161)))
+            .unwrap();
+        assert_eq!(completed.bytes, b.bytes);
+        assert!(r.take_expired().is_empty());
+        r.push(&pa[0], at);
+        r.expire(at + Duration::from_secs(1));
+        r.forget_window(a.window);
+        assert!(r.take_expired().is_empty());
     }
 }

@@ -7,6 +7,10 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Write},
+    os::{
+        fd::AsRawFd,
+        unix::{net::UnixStream, process::CommandExt},
+    },
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Arc,
@@ -126,12 +130,27 @@ impl Drop for Bridge {
 }
 impl Bridge {
     fn new() -> anyhow::Result<Arc<Self>> {
-        let mut child = Command::new(helper_path()?)
+        // Media must never hold up acknowledgements or input on stdout.
+        let (media_read, media_write) = UnixStream::pair()?;
+        let media_fd = media_write.as_raw_fd();
+        let mut command = Command::new(helper_path()?);
+        command
             .arg("--host")
+            .env("FRAMES_MEDIA_FD", "198")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+            .stderr(Stdio::inherit());
+        // SAFETY: only async-signal-safe descriptor operations run after fork.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(media_fd, 198) < 0 || libc::fcntl(198, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn()?;
+        drop(media_write);
         let input = child.stdin.take().unwrap();
         let output = child.stdout.take().unwrap();
         let pending = Arc::new(Mutex::new(
@@ -141,51 +160,56 @@ impl Bridge {
             HashMap::<u64, watch::Sender<Option<RawFrame>>>::new(),
         ));
         let audio = Arc::new(Mutex::new(None::<tokio::sync::mpsc::Sender<Vec<u8>>>));
-        let sound = audio.clone();
-        let replies = pending.clone();
-        let streams = frames.clone();
+        {
+            let replies = pending.clone();
+            let streams = frames.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(output).lines() {
+                    let Ok(line) = line else {
+                        break;
+                    };
+                    let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    if let Some(id) = value["id"].as_u64() {
+                        if let Some(sender) = replies.lock().remove(&id) {
+                            let _ = sender.send(value);
+                        }
+                    } else if value["event"] == "capture_error"
+                        && let Some(handle) = value["handle"].as_u64()
+                    {
+                        tracing::warn!(handle,error=?value["error"].as_str(),"macOS window capture stopped");
+                        streams.lock().remove(&handle);
+                    }
+                }
+            });
+        }
+        let media_frames = frames.clone();
+        let media_audio = audio.clone();
         std::thread::spawn(move || {
-            for line in BufReader::new(output).lines() {
-                let Ok(line) = line else {
-                    break;
-                };
-                let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                if let Some(id) = value["id"].as_u64() {
-                    if let Some(sender) = replies.lock().remove(&id) {
-                        let _ = sender.send(value);
-                    }
-                } else if value["event"] == "audio" {
-                    if let Some(sender) = sound.lock().as_ref() {
-                        if let Some(encoded) = value["pcm"].as_str() {
-                            if let Ok(bytes) =
-                                base64::engine::general_purpose::STANDARD.decode(encoded)
-                            {
-                                let _ = sender.try_send(bytes);
-                            }
+            let mut reader = BufReader::new(media_read);
+            loop {
+                match crate::native_media::read_packet(&mut reader) {
+                    Ok(packet) if packet.kind == 1 => {
+                        if let Some(sender) = media_frames.lock().get(&packet.handle).cloned() {
+                            sender.send_replace(Some(RawFrame {
+                                width: packet.width,
+                                height: packet.height,
+                                bgra: packet.bytes.into(),
+                            }));
                         }
                     }
-                } else if value["event"] == "frame" {
-                    let Some(handle) = value["handle"].as_u64() else {
-                        continue;
-                    };
-                    let Some(sender) = streams.lock().get(&handle).cloned() else {
-                        continue;
-                    };
-                    let width = value["width"].as_u64().unwrap_or(0) as u32;
-                    let height = value["height"].as_u64().unwrap_or(0) as u32;
-                    if let Some(data) = value["bgra"].as_str() {
-                        if let Ok(bgra) = base64::engine::general_purpose::STANDARD.decode(data) {
-                            let frame = RawFrame {
-                                width,
-                                height,
-                                bgra,
-                            };
-                            if frame.validate() {
-                                sender.send_replace(Some(frame));
-                            }
+                    Ok(packet) => {
+                        if let Some(sender) = media_audio.lock().as_ref() {
+                            let _ = sender.try_send(packet.bytes);
                         }
+                    }
+                    Err(error) => {
+                        if error.kind() != std::io::ErrorKind::UnexpectedEof {
+                            tracing::warn!(%error,"Mac media channel failed");
+                        }
+                        media_frames.lock().clear();
+                        break;
                     }
                 }
             }
@@ -200,6 +224,9 @@ impl Bridge {
         }))
     }
     fn request(&self, command: &str, data: Value) -> anyhow::Result<Value> {
+        if let Some(status) = self.child.lock().try_wait()? {
+            anyhow::bail!("macOS capture helper exited: {status}");
+        }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.pending.lock().insert(id, tx);
@@ -211,7 +238,9 @@ impl Bridge {
             input.write_all(b"\n")?;
             input.flush()?;
             drop(input);
-            let response = rx.recv_timeout(std::time::Duration::from_secs(10))?;
+            let response = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .with_context(|| format!("macOS {command} reply timed out"))?;
             if let Some(error) = response["error"].as_str() {
                 anyhow::bail!("{error}");
             }
@@ -307,7 +336,7 @@ impl Desktop for Host {
     fn release_input(&self) {
         let _ = self.bridge.request("release", json!({}));
     }
-    fn capture(&self, key: WindowId) -> anyhow::Result<CaptureStream> {
+    fn capture(&self, key: WindowId, show_cursor: bool) -> anyhow::Result<CaptureStream> {
         let handle = self.handle(key)?;
         let (tx, frames) = watch::channel(None);
         self.bridge.frames.lock().insert(handle, tx);
@@ -315,7 +344,10 @@ impl Desktop for Host {
             bridge: self.bridge.clone(),
             handle,
         };
-        self.bridge.request("capture", json!({"handle":handle}))?;
+        self.bridge.request(
+            "capture",
+            json!({"handle":handle,"show_cursor":show_cursor}),
+        )?;
         Ok(CaptureStream {
             frames,
             guard: Box::new(guard),
@@ -389,15 +421,42 @@ fn stable(text: &str) -> u64 {
 
 pub fn run_client(
     host: String,
-    updates: std::sync::mpsc::Receiver<ClientUpdate>,
+    updates: crate::ClientReceiver,
     events: tokio::sync::mpsc::UnboundedSender<ClientEvent>,
 ) -> anyhow::Result<()> {
-    let mut child = Command::new(helper_path()?)
+    let (media_read, mut media_write) = UnixStream::pair()?;
+    let media_fd = media_read.as_raw_fd();
+    let mut command = Command::new(helper_path()?);
+    command
         .args(["--client", &host])
+        .env("FRAMES_CLIENT_MEDIA_FD", "198")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+        .stderr(Stdio::inherit());
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(media_fd, 198) < 0 || libc::fcntl(198, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+    drop(media_read);
+    // A blocked video socket must never block control updates to the helper.
+    let shutdown_media = media_write.try_clone()?;
+    let (video_tx, video_rx) = crate::client_channel(16);
+    let video_writer = std::thread::spawn(move || {
+        for update in video_rx {
+            if let ClientUpdate::Frame(window, frame) = update
+                && let Err(error) =
+                    crate::native_media::write_video(&mut media_write, window, &frame)
+            {
+                tracing::warn!(%error, "Mac client media socket closed");
+                break;
+            }
+        }
+    });
     let mut input = child.stdin.take().unwrap();
     let output = child.stdout.take().unwrap();
     let reader = std::thread::spawn(move || {
@@ -413,6 +472,9 @@ pub fn run_client(
                 Some("view_mode") => serde_json::from_value(value["mode"].clone())
                     .ok()
                     .map(ClientEvent::ViewMode),
+                Some("remote_cursor") => value["visible"]
+                    .as_bool()
+                    .map(|visible| ClientEvent::RemoteCursor { visible }),
                 Some("adb_bridge") => Some(ClientEvent::AdbBridge {
                     enabled: value["enabled"].as_bool().unwrap_or(false),
                 }),
@@ -440,7 +502,11 @@ pub fn run_client(
                 Some("input") => window.and_then(|window| {
                     serde_json::from_value(value["input"].clone())
                         .ok()
-                        .map(|event| ClientEvent::Input { window, event })
+                        .map(|event| ClientEvent::TimedInput {
+                            window,
+                            event,
+                            created: std::time::Instant::now(),
+                        })
                 }),
                 Some("release") => Some(ClientEvent::ReleaseInput),
                 _ => None,
@@ -454,6 +520,9 @@ pub fn run_client(
     });
     for update in updates {
         let value = match update {
+            ClientUpdate::RemoteCursor { visible } => {
+                json!({"type":"remote_cursor","visible":visible})
+            }
             ClientUpdate::ViewMode { mode, error } => {
                 json!({"type":"view_mode","mode":mode,"error":error})
             }
@@ -476,7 +545,14 @@ pub fn run_client(
             }
             ClientUpdate::Windows(windows) => json!({"type":"windows","windows":windows}),
             ClientUpdate::Frame(window, frame) => {
-                json!({"type":"frame","window":window,"width":frame.width,"height":frame.height,"bgra":base64::engine::general_purpose::STANDARD.encode(frame.bgra)})
+                if video_tx
+                    .try_send(ClientUpdate::Frame(window, frame))
+                    .is_err()
+                {
+                    tracing::warn!("Mac client video writer stopped");
+                    break;
+                }
+                continue;
             }
             ClientUpdate::Status(window, status) => {
                 json!({"type":"status","window":window,"status":status})
@@ -495,9 +571,12 @@ pub fn run_client(
         }
     }
     tracing::info!(status = ?child.try_wait(), "Mac client bridge ending");
+    drop(video_tx);
+    let _ = shutdown_media.shutdown(std::net::Shutdown::Both);
     drop(input);
     let _ = child.kill();
     let _ = child.wait();
     let _ = reader.join();
+    let _ = video_writer.join();
     Ok(())
 }

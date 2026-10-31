@@ -5,6 +5,7 @@
 <key>CFBundleName</key><string>Frames</string>
 <key>CFBundleExecutable</key><string>frames</string>
 <key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleVersion</key><string>0.1.0</string>
 <key>CFBundleShortVersionString</key><string>0.1.0</string>
 <key>LSMinimumSystemVersion</key><string>14.2</string>
 <key>NSHighResolutionCapable</key><true/>

@@ -57,6 +57,8 @@ pub struct RemoteWindow {
     pub minimized: bool,
     pub visible: bool,
     pub modal: bool,
+    #[serde(default)]
+    pub show_header: bool,
 }
 
 impl RemoteWindow {
@@ -92,6 +94,7 @@ pub enum WindowAction {
     Close,
     Restore,
     Resize { width: f64, height: f64 },
+    SetHeader { visible: bool },
     Menu,
     MenuItem { id: String },
 }

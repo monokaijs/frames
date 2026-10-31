@@ -3,6 +3,7 @@ mod launcher;
 mod service;
 mod session;
 mod streaming;
+mod update;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::{net::SocketAddr, path::PathBuf};
 
@@ -18,6 +19,13 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Check for a signed release, or download and install it after sessions close.
+    Update {
+        #[arg(long)]
+        check: bool,
+    },
+    #[command(hide = true)]
+    ApplyUpdate { plan: PathBuf },
     /// Inspect macOS permissions, optionally opening the system permission prompts.
     #[cfg(target_os = "macos")]
     Permissions {
@@ -117,7 +125,10 @@ impl CodecChoice {
 fn main() {
     if let Err(error) = run() {
         eprintln!("Frames: {error:#}");
-        if std::env::var_os("FRAMES_GUI_CHILD").is_some() || std::env::args_os().len() == 1 {
+        if std::env::var_os("FRAMES_GUI_CHILD").is_some()
+            || std::env::args_os().len() == 1
+            || std::env::args().nth(1).as_deref() == Some("connect")
+        {
             let _ = frames_native::show_error("Frames", &format!("{error:#}"));
         }
         std::process::exit(1);
@@ -132,8 +143,18 @@ fn run() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
+    if let Some(Command::ApplyUpdate { plan }) = &args.command {
+        return update::apply(plan);
+    }
+    let _lease = update::runtime_lease()?;
     let Some(command) = args.command else {
-        return launcher::run();
+        let result = launcher::run();
+        if option_env!("FRAMES_RELEASE_BUILD") == Some("1")
+            && let Err(error) = update::install_on_exit()
+        {
+            tracing::warn!(%error, "update installation deferred");
+        }
+        return result;
     };
     #[cfg(windows)]
     if let Command::Service { action } = &command {
@@ -148,12 +169,14 @@ fn run() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     match command{
+        Command::Update{check}=>update::manual(check),
+        Command::ApplyUpdate{..}=>unreachable!(),
         #[cfg(target_os="macos")] Command::Permissions{request}=>{println!("{}",serde_json::to_string_pretty(&frames_native::permission_status(request)?)?);Ok(())},
         #[cfg(windows)] Command::Service{action:ServiceCommand::Agent}=>runtime.block_on(session::host("0.0.0.0:47990".parse()?,false,true,vec![],None,8,true)),
         #[cfg(windows)] Command::Service{..}=>unreachable!(),
         Command::Host{listen,pair,unattended,exclude,receive_dir,max_streams,no_clipboard}=>runtime.block_on(session::host(listen,pair,unattended,exclude,receive_dir,max_streams,!no_clipboard)),
         Command::Connect{address,codec,no_clipboard,audio,view}=>{
-            let (updates_tx,updates_rx)=std::sync::mpsc::sync_channel(16);let(events_tx,events_rx)=tokio::sync::mpsc::unbounded_channel();
+            let (updates_tx,updates_rx)=frames_native::client_channel(16);let(events_tx,events_rx)=tokio::sync::mpsc::unbounded_channel();
             let shutdown=updates_tx.clone();let task=runtime.spawn(async move{let result=session::client(address,codec.codec(),updates_tx,events_rx,!no_clipboard,audio,match view{ViewChoice::Windows=>frames_core::model::ViewMode::Windows,ViewChoice::Desktop=>frames_core::model::ViewMode::Desktop}).await;if let Err(e)=&result{tracing::error!(error=%e,"connection ended");}let _=shutdown.send(frames_native::ClientUpdate::Shutdown);result});
             let ui=frames_native::run_client(address.to_string(),updates_rx,events_tx);let network=runtime.block_on(task)?;ui?;network
         },

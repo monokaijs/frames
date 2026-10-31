@@ -421,15 +421,7 @@ impl Worker {
                 let request = self.requested_permissions.insert(kind.clone());
                 let events = self.events.clone();
                 std::thread::spawn(move || {
-                    let result = (|| -> Result<()> {
-                        #[cfg(target_os = "macos")]
-                        if request {
-                            frames_native::request_permission(&kind)?;
-                        }
-                        #[cfg(not(target_os = "macos"))]
-                        let _ = request;
-                        open_permission(&kind)
-                    })();
+                    let result = permission_action(&kind, request);
                     if let Err(error) = result {
                         let _ = events.send(Event::Notice(format!("{error:#}"), true));
                     }
@@ -535,6 +527,15 @@ fn sharing_permission_error(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+fn permission_action(kind: &str, request: bool) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if request {
+        frames_native::request_permission(kind)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = request;
+    open_permission(kind)
+}
 fn open_permission(kind: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     if kind == "network" {
@@ -637,6 +638,10 @@ pub fn run() -> Result<()> {
     ));
     let (actions, action_rx) = mpsc::channel();
     let (events, event_rx) = mpsc::channel();
+    let update_events = events.clone();
+    crate::update::start(move |message| {
+        let _ = update_events.send(Event::Notice(message, false));
+    });
     let worker = std::thread::spawn(move || {
         let (discovery_tx, discovery_done) = mpsc::channel();
         let mut worker = Worker {

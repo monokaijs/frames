@@ -31,7 +31,7 @@ final class SystemAudioCapture:NSObject,SCStreamOutput,SCStreamDelegate{
         let status=CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sampleBuffer,bufferListSizeNeededOut:nil,bufferListOut:list,bufferListSize:size,blockBufferAllocator:kCFAllocatorDefault,blockBufferMemoryAllocator:kCFAllocatorDefault,flags:0,blockBufferOut:&retained)
         guard status==noErr else{return};let buffers=UnsafeMutableAudioBufferListPointer(list);var output=Data(capacity:frames*channels*4)
         for frame in 0..<frames{for channel in 0..<channels{let index=buffers.count==1 ? 0:channel;let offset=buffers.count==1 ? frame*channels+channel:frame;guard let data=buffers[index].mData,offset*4+4<=Int(buffers[index].mDataByteSize)else{return};var sample=data.assumingMemoryBound(to:Float32.self)[offset];withUnsafeBytes(of:&sample){output.append(contentsOf:$0)}}}
-        Wire.send(["event":"audio","pcm":output.base64EncodedString()])
+        Wire.sendAudio(output)
     }
     func stream(_ stream:SCStream,didStopWithError error:Error){fputs("Frames system audio: \(error)\n",stderr)}
 }

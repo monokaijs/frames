@@ -7,7 +7,10 @@ use frames_core::{
     model::*,
 };
 use parking_lot::Mutex;
-use std::{collections::HashMap, io::Cursor};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Cursor,
+};
 use windows::{
     Win32::{
         Foundation::*,
@@ -54,6 +57,7 @@ pub struct Host {
     pressed: Mutex<PressedInput>,
     icons: Mutex<HashMap<String, Option<String>>>,
     menus: super::menus::Projection,
+    headers: Mutex<HashSet<WindowId>>,
 }
 impl Host {
     pub fn new(exclusions: Vec<String>) -> anyhow::Result<Self> {
@@ -69,6 +73,7 @@ impl Host {
             pressed: Mutex::new(PressedInput::default()),
             icons: Mutex::new(HashMap::new()),
             menus: Default::default(),
+            headers: Default::default(),
         })
     }
     fn hwnd(&self, key: WindowId) -> anyhow::Result<HWND> {
@@ -77,6 +82,13 @@ impl Host {
             .handle(key)
             .map(|h| HWND(h as *mut _))
             .ok_or_else(|| anyhow::anyhow!("window no longer exists"))
+    }
+    unsafe fn bounds(&self, key: WindowId, hwnd: HWND) -> anyhow::Result<RECT> {
+        if self.headers.lock().contains(&key) {
+            unsafe { frame_bounds(hwnd) }
+        } else {
+            unsafe { capture_bounds(hwnd) }
+        }
     }
 }
 
@@ -200,6 +212,7 @@ impl Desktop for Host {
             minimized: false,
             visible: true,
             modal: false,
+            show_header: false,
         };
         *self.known.lock() = HashMap::from([(key, window.clone())]);
         Ok(vec![window])
@@ -219,7 +232,7 @@ impl Desktop for Host {
             "file drop unavailable"
         );
         let hwnd = self.hwnd(key)?;
-        let rect = unsafe { capture_bounds(hwnd)? };
+        let rect = unsafe { self.bounds(key, hwnd)? };
         let point = physical_point(rect, x, y)?;
         for path in paths {
             super::drag::drop_file(path, hwnd, point)?;
@@ -265,7 +278,12 @@ impl Desktop for Host {
                         .or_insert_with(|| icon_png(HWND(w.handle as *mut _)))
                         .clone();
                     let scale = w.scale.max(1.0);
-                    let rect = w.rect;
+                    let show_header = self.headers.lock().contains(&keys[&w.handle]);
+                    let rect = if show_header {
+                        frame_bounds(HWND(w.handle as *mut _)).ok()?
+                    } else {
+                        w.rect
+                    };
                     let role = match w.class.as_str() {
                         "#32768" => WindowRole::Menu,
                         "tooltips_class32" => WindowRole::Tooltip,
@@ -305,10 +323,14 @@ impl Desktop for Host {
                         minimized: w.minimized,
                         visible: !w.minimized,
                         modal: w.owner != 0 && !IsWindowEnabled(HWND(w.owner as *mut _)).as_bool(),
+                        show_header,
                     };
                     window.validate().then_some(window)
                 })
                 .collect();
+            self.headers
+                .lock()
+                .retain(|key| windows.iter().any(|w| w.key == *key));
             *self.known.lock() = windows.iter().map(|w| (w.key, w.clone())).collect();
             Ok(windows)
         }
@@ -344,6 +366,13 @@ impl Desktop for Host {
                 WindowAction::Close => {
                     PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0))?;
                 }
+                WindowAction::SetHeader { visible } => {
+                    if *visible {
+                        self.headers.lock().insert(key);
+                    } else {
+                        self.headers.lock().remove(&key);
+                    }
+                }
                 WindowAction::Resize { width, height } => {
                     anyhow::ensure!(
                         width.is_finite()
@@ -359,7 +388,7 @@ impl Desktop for Host {
                         "window is not resizable"
                     );
                     let scale = GetDpiForWindow(hwnd).max(96) as f64 / 96.;
-                    let visible = capture_bounds(hwnd)?;
+                    let visible = self.bounds(key, hwnd)?;
                     let mut outer = RECT::default();
                     GetWindowRect(hwnd, &mut outer)?;
                     let mut limits = MINMAXINFO::default();
@@ -431,7 +460,7 @@ impl Desktop for Host {
                 rect.right = GetSystemMetrics(SM_CXSCREEN);
                 rect.bottom = GetSystemMetrics(SM_CYSCREEN);
             } else {
-                rect = capture_bounds(hwnd)?;
+                rect = self.bounds(window_key, hwnd)?;
                 if matches!(event, InputEvent::Key { .. } | InputEvent::Text { .. })
                     && GetForegroundWindow() != hwnd
                 {
@@ -566,13 +595,14 @@ impl Desktop for Host {
             }
         }
     }
-    fn capture(&self, key: WindowId) -> anyhow::Result<CaptureStream> {
+    fn capture(&self, key: WindowId, show_cursor: bool) -> anyhow::Result<CaptureStream> {
         if self.registry.lock().handle(key) == Some(super::secure::HANDLE) {
             super::secure::capture()
         } else if self.registry.lock().handle(key) == Some(super::capture::DESKTOP_HANDLE) {
-            super::capture::start(super::capture::DESKTOP_HANDLE)
+            super::capture::start_with_options(super::capture::DESKTOP_HANDLE, show_cursor, false)
         } else {
-            super::capture::start(self.hwnd(key)?.0 as u64)
+            let show_header = self.headers.lock().contains(&key);
+            super::capture::start_with_options(self.hwnd(key)?.0 as u64, show_cursor, show_header)
         }
     }
     fn clipboard(&self) -> anyhow::Result<Option<String>> {

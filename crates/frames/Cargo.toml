@@ -19,6 +19,14 @@ uuid.workspace = true
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+ed25519-dalek = "2.2"
+hex = "0.4"
+semver = "1"
+fs2 = "0.4"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+tempfile = "3"
+directories = "6"
 slint = { version = "=1.13.1", default-features = false, features = ["std", "backend-winit", "unstable-winit-030", "renderer-femtovg", "renderer-software", "accessibility", "compat-1-2"] }
 
 [build-dependencies]

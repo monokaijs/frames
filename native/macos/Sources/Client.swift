@@ -11,10 +11,26 @@ import QuartzCore
     var fileShelf: FileShelf?
     weak var activeProxy:RemoteProxy?
     var viewMode="windows"
+    var showRemoteCursor=true
     var adbEnabled=false
     var menuTracking=0
     var needsMenu=false
     var focusAfterSwitch=false
+    var pendingVideo: [String: ClientVideoFrame] = [:]
+    func receiveVideo(_ frames: [ClientVideoFrame]) {
+        for frame in frames {
+            if pendingVideo[frame.key] == nil && pendingVideo.count >= 16, let key = pendingVideo.keys.first { pendingVideo.removeValue(forKey: key) }
+            pendingVideo[frame.key] = frame
+        }
+        presentVideo()
+    }
+    func presentVideo() {
+        for key in Array(pendingVideo.keys) {
+            guard let proxy = windows[key], let frame = pendingVideo.removeValue(forKey: key) else { continue }
+            proxy.view.display(frame.bytes, width: frame.width, height: frame.height)
+            if !proxy.status.isEmpty { proxy.status = ""; proxy.refreshTitle() }
+        }
+    }
     init(host: String) { self.host = host; super.init() }
     deinit { if let session { frames_session_free(session) } }
     static func key(_ object: [String: Any]) -> String { "\(object["id"] ?? 0):\(object["generation"] ?? 0)" }
@@ -35,8 +51,10 @@ import QuartzCore
         let appItem=NSMenuItem(title:"Frames",action:nil,keyEquivalent:"");appItem.submenu=local;bar.addItem(appItem)
         func add(_ title:String,_ action:Selector,_ state:Bool?=nil){let item=NSMenuItem(title:title,action:action,keyEquivalent:"");item.target=self;if let state{item.state=state ? .on:.off};local.addItem(item)}
         add("Per-window view",#selector(windowsView),viewMode=="windows");add("Full desktop view",#selector(desktopView),viewMode=="desktop")
+        add("Show remote cursor",#selector(toggleRemoteCursor),showRemoteCursor)
         local.addItem(.separator())
         if let proxy=activeProxy{
+            let header=NSMenuItem(title:"Show remote window header",action:#selector(RemoteProxy.toggleHeader),keyEquivalent:"");header.target=proxy;header.state=proxy.showHeader ? .on:.off;header.isEnabled=proxy.remote["role"] as? String != "desktop";local.addItem(header)
             for(title,action)in[("Resize remote app",#selector(RemoteProxy.setResize)),("Stretch locally",#selector(RemoteProxy.setStretch)),("Toggle aspect fit / fill",#selector(RemoteProxy.toggleFill)),("Toggle Control / Command swap",#selector(RemoteProxy.toggleSwap)),("Toggle physical keys (terminal)",#selector(RemoteProxy.togglePhysical)),("Refresh application menus",#selector(RemoteProxy.remoteMenu)),("Fetch remote file...",#selector(RemoteProxy.fetchFile))]{
                 let item=NSMenuItem(title:title,action:action,keyEquivalent:"");item.target=proxy;item.isEnabled=action != #selector(RemoteProxy.setResize) || proxy.resizable
                 let checked = action == #selector(RemoteProxy.setResize) ? proxy.mode == "resize_remote" && proxy.resizable : action == #selector(RemoteProxy.setStretch) ? proxy.mode == "stretch_local" || !proxy.resizable : action == #selector(RemoteProxy.toggleFill) ? proxy.fill : action == #selector(RemoteProxy.toggleSwap) ? proxy.swap : action == #selector(RemoteProxy.togglePhysical) ? proxy.physical : false
@@ -57,10 +75,12 @@ import QuartzCore
     @objc func desktopView(){Wire.send(["event":"release"]);Wire.send(["event":"view_mode","mode":"desktop"])}
     @objc func disconnect(){Wire.diagnostic("client_disconnect_requested");Wire.send(["event":"release"]);Wire.send(["event":"disconnect"])}
     @objc func toggleAdb(){Wire.send(["event":"adb_bridge","enabled":!adbEnabled])}
+    @objc func toggleRemoteCursor(){Wire.send(["event":"remote_cursor","visible":!showRemoteCursor])}
     @objc func deviceSupport(){let alert=NSAlert();alert.messageText="Device forwarding";alert.informativeText="Android ADB: start adb on this computer, then enable Android ADB bridge. On the host use adb -H 127.0.0.1 -P 15037. Raw USB, fastboot, DFU, and iOS passthrough require separate driver support and are not enabled.";alert.runModal()}
     func error(_ title:String,_ message:String){let alert=NSAlert();alert.messageText=title;alert.informativeText=message;alert.runModal()}
     func update(_ message: [String: Any]) {
         switch message["type"] as? String {
+        case "remote_cursor":showRemoteCursor=message["visible"] as? Bool ?? true;installMenu()
         case "view_mode":viewMode=message["mode"] as? String ?? "windows";if let error=message["error"] as? String{self.error("Frames view mode",error)}else{focusAfterSwitch=true};installMenu()
         case "adb_bridge":adbEnabled=message["enabled"] as? Bool ?? false;if let error=message["error"] as? String{self.error("Android ADB bridge",error)};installMenu()
         case "peer": host = "\(message["platform"] ?? "remote"):\(message["device_id"] ?? "")"
@@ -80,7 +100,7 @@ import QuartzCore
             let sorted = list.sorted { ($0["parent"] is NSNull) && !($1["parent"] is NSNull) }
             for remote in sorted {
                 guard let id = remote["key"] as? [String: Any] else { continue }; let key = Self.key(id)
-                if let proxy = windows[key] { proxy.remote = remote; proxy.refreshTitle(); continue }
+                if let proxy = windows[key] { proxy.remote = remote; proxy.refreshTitle(); if activeProxy === proxy{installMenu()};continue }
                 let proxy = RemoteProxy(remote: remote, host: host);proxy.client=self; windows[key] = proxy
                 if let owner = remote["parent"] as? [String: Any], let parent = windows[Self.key(owner)] {
                     parent.window.addChildWindow(proxy.window, ordered: .above)
@@ -94,16 +114,14 @@ import QuartzCore
             }
             let alive = Set(list.compactMap { $0["app_id"] as? String })
             for id in Array(docks.keys) where !alive.contains(id) { docks.removeValue(forKey: id)?.terminate() }
+            presentVideo()
             if focusAfterSwitch,let proxy=windows.values.first{focusAfterSwitch=false;NSApp.activate(ignoringOtherApps:true);proxy.window.makeKeyAndOrderFront(nil)}
-        case "frame":
-            guard let id = message["window"] as? [String: Any], let proxy = windows[Self.key(id)], let encoded = message["bgra"] as? String, let bytes = Data(base64Encoded: encoded), let width = message["width"] as? Int, let height = message["height"] as? Int else { return }
-            guard width > 0, height > 0, width <= 8192, height <= 8192, bytes.count == width*height*4 else { return }
-            proxy.view.display(bytes, width: width, height: height); proxy.status = ""; proxy.refreshTitle()
         case "status": if let id = message["window"] as? [String: Any], let proxy = windows[Self.key(id)] { proxy.status = message["status"] as? String ?? ""; proxy.refreshTitle() }
         case "ack": if let id = message["window"] as? [String: Any], let proxy = windows[Self.key(id)] {
             if let actual = message["actual"] as? [String: Any] { proxy.remote = actual }
             proxy.commandError = message["error"] as? String
             proxy.refreshTitle()
+            if activeProxy === proxy{installMenu()}
         }
         default: break
         }
@@ -145,11 +163,17 @@ final class DockEventReader: @unchecked Sendable {
     }
 }
 
+@MainActor final class ProxyWindow: NSWindow {
+    var acceptsFocus=true
+    override var canBecomeKey:Bool{acceptsFocus}
+    override var canBecomeMain:Bool{acceptsFocus}
+}
+
 @MainActor final class RemoteProxy: NSObject, NSWindowDelegate {
     weak var client:NativeClient?
     var remoteMenuItems:[[String:Any]]=[]
     var remote: [String: Any]
-    let window: NSWindow
+    let window: ProxyWindow
     let view: RemoteView
     let preference: String
     var mode: String
@@ -161,6 +185,7 @@ final class DockEventReader: @unchecked Sendable {
     var resizeWork: DispatchWorkItem?
     var lastSize = CGSize.zero
     var destroying = false
+    var showHeader:Bool{remote["show_header"] as? Bool ?? false}
     var id: [String: Any] { remote["key"] as? [String: Any] ?? [:] }
     var resizable: Bool { remote["resize"] as? String == "supported" }
     init(remote: [String: Any], host: String) {
@@ -177,9 +202,9 @@ final class DockEventReader: @unchecked Sendable {
         if remote["role"] as? String == "desktop"{let fit=min(width/sourceWidth,height/sourceHeight);width=sourceWidth*fit;height=sourceHeight*fit}
         let rect = NSRect(x: 150, y: 150, width:CGFloat(width),height:CGFloat(height))
         let transient = ["menu","tooltip","popover"].contains(remote["role"] as? String ?? "") && !(remote["parent"] is NSNull)
-        window = NSWindow(contentRect:rect,styleMask: transient ? [.borderless] : [.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
+        window = ProxyWindow(contentRect:rect,styleMask: transient ? [.borderless] : [.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
         view = RemoteView(frame:NSRect(origin:.zero,size:rect.size))
-        super.init(); view.proxy = self; window.contentView = view; window.delegate = self; window.isReleasedWhenClosed = false; window.acceptsMouseMovedEvents = true; window.title = remote["title"] as? String ?? "Remote window"
+        super.init(); window.acceptsFocus = !transient;view.proxy = self; window.contentView = view; window.delegate = self; window.isReleasedWhenClosed = false; window.acceptsMouseMovedEvents = true; window.title = remote["title"] as? String ?? "Remote window"
         window.collectionBehavior = [.managed, .fullScreenPrimary]
         if remote["role"] as? String == "desktop"{window.center()}
         refreshTitle()
@@ -193,6 +218,12 @@ final class DockEventReader: @unchecked Sendable {
     @objc func toggleFill() { fill.toggle();save() }
     @objc func toggleSwap() { view.releaseInput();swap.toggle();save() }
     @objc func togglePhysical() { view.releaseInput();physical.toggle();save() }
+    @objc func toggleHeader() {
+        guard remote["role"] as? String != "desktop" else{return}
+        view.releaseInput()
+        resizeWork?.cancel()
+        send("action",["action":["kind":"set_header","visible":!showHeader]])
+    }
     @objc func remoteMenu(){send("action",["action":["kind":"menu"]])}
     @objc func fetchFile(){let alert=NSAlert();alert.messageText="Fetch remote file";alert.informativeText="Enter a path relative to the remote user's home folder.";let input=NSTextField(frame:NSRect(x:0,y:0,width:400,height:24));input.stringValue="Downloads/";alert.accessoryView=input;alert.addButton(withTitle:"Download");alert.addButton(withTitle:"Cancel");if alert.runModal() == .alertFirstButtonReturn{send("download_file",["path":input.stringValue])}}
     @objc func pressMenu(_ item:NSMenuItem){if let id=item.representedObject as? String{send("action",["action":["kind":"menu_item","id":id]])}}

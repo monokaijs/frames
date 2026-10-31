@@ -24,6 +24,12 @@ pub enum SessionPurpose {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Message {
+    SetRemoteCursor {
+        visible: bool,
+    },
+    RemoteCursorChanged {
+        visible: bool,
+    },
     SetViewMode {
         mode: ViewMode,
     },
@@ -72,6 +78,10 @@ pub enum Message {
     Input {
         window: WindowId,
         event: InputEvent,
+        elapsed_ms: u64,
+    },
+    InputClock {
+        elapsed_ms: u64,
     },
     ReleaseInput,
     SelectCodec {
@@ -110,6 +120,7 @@ pub enum Message {
     },
     Keyframe {
         window: WindowId,
+        generation: u32,
     },
     Feedback {
         window: WindowId,

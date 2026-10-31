@@ -19,6 +19,8 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt},
     sync::{Semaphore, mpsc},
 };
+#[path = "input_dispatch.rs"]
+mod input_dispatch;
 
 fn hello(identity: &Identity, codecs: Vec<CodecCapability>, purpose: SessionPurpose) -> Message {
     Message::Hello(Hello {
@@ -142,8 +144,23 @@ async fn handshake(
 #[derive(Clone)]
 pub struct Outbound {
     control: mpsc::Sender<Message>,
+    input: mpsc::Sender<Message>,
     bulk: mpsc::Sender<Message>,
-    progress: Option<std::sync::mpsc::SyncSender<ClientUpdate>>,
+    progress: Option<frames_native::ClientSender>,
+}
+#[cfg(test)]
+pub(crate) fn test_outbound() -> (Outbound, mpsc::Receiver<Message>) {
+    let (control, rx) = mpsc::channel(64);
+    let (bulk, _) = mpsc::channel(4);
+    (
+        Outbound {
+            input: control.clone(),
+            control,
+            bulk,
+            progress: None,
+        },
+        rx,
+    )
 }
 impl Outbound {
     fn progress(&self, name: String, done: u64, total: u64) {
@@ -152,7 +169,9 @@ impl Outbound {
         }
     }
     pub async fn send(&self, message: Message) -> anyhow::Result<()> {
-        let channel = if matches!(
+        let channel = if interactive(&message) {
+            &self.input
+        } else if matches!(
             &message,
             Message::Transfer(TransferMessage::Chunk { .. } | TransferMessage::Complete { .. })
         ) {
@@ -171,9 +190,34 @@ impl Outbound {
             .map_err(|_| anyhow::anyhow!("control writer stopped"))
     }
 }
+fn interactive(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::Input { .. }
+            | Message::InputClock { .. }
+            | Message::ReleaseInput
+            | Message::Command { .. }
+            | Message::Visibility { .. }
+            | Message::SetViewMode { .. }
+            | Message::SetRemoteCursor { .. }
+    )
+}
+struct Incoming {
+    control: mpsc::Receiver<Message>,
+    input: mpsc::Receiver<Message>,
+}
+impl Incoming {
+    async fn recv(&mut self) -> Option<Message> {
+        tokio::select! {
+            biased;
+            message = self.input.recv() => message,
+            message = self.control.recv() => message,
+        }
+    }
+}
 struct Control {
     send: Outbound,
-    receive: mpsc::Receiver<Message>,
+    receive: Incoming,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 impl Drop for Control {
@@ -190,13 +234,19 @@ fn control(
 ) -> Control {
     let (tx, mut outgoing) = mpsc::channel::<Message>(64);
     let (bulk_tx, mut bulk) = mpsc::channel::<Message>(4);
+    let (input_tx, mut inputs) = mpsc::channel::<Message>(64);
+    let (input_incoming, input_rx) = mpsc::channel::<Message>(64);
     let (incoming, rx) = mpsc::channel(64);
     let conn = connection.clone();
     let reader_incoming = incoming.clone();
     let bulk_connection = connection.clone();
     let write = tokio::spawn(async move {
         while let Some(message) = outgoing.recv().await {
-            if protocol::send_json(&mut writer, &message).await.is_err() {
+            if let Err(error) = protocol::send_json(&mut writer, &message).await {
+                tracing::warn!(%error,"control writer failed");
+                if conn.close_reason().is_none() {
+                    conn.close(1u32.into(), b"control writer failed");
+                }
                 break;
             }
         }
@@ -211,7 +261,10 @@ fn control(
                     }
                 }
                 Err(error) => {
-                    tracing::debug!(%error,"control reader ended");
+                    tracing::warn!(%error,"control reader ended");
+                    if connection.close_reason().is_none() {
+                        connection.close(1u32.into(), b"control reader failed");
+                    }
                     break;
                 }
             }
@@ -219,11 +272,31 @@ fn control(
         connection.close(0u32.into(), b"control reader ended");
     });
     let outgoing_connection = bulk_connection.clone();
+    let input_connection = bulk_connection.clone();
+    let input_write = tokio::spawn(async move {
+        let result = async {
+            let mut writer = input_connection.open_uni().await?;
+            writer.set_priority(10)?;
+            writer.write_all(b"I").await?;
+            while let Some(message) = inputs.recv().await {
+                protocol::send_json(&mut writer, &message).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(%error, "input writer failed");
+            input_connection.close(1u32.into(), b"input writer failed");
+        }
+    });
     let bulk_write = tokio::spawn(async move {
         let Ok(mut writer) = outgoing_connection.open_uni().await else {
             return;
         };
         let _ = writer.set_priority(-10);
+        if writer.write_all(b"F").await.is_err() {
+            return;
+        }
         while let Some(message) = bulk.recv().await {
             if protocol::send_json(&mut writer, &message).await.is_err() {
                 break;
@@ -233,19 +306,37 @@ fn control(
     let bulk_read = tokio::spawn(async move {
         while let Ok(mut reader) = bulk_connection.accept_uni().await {
             let incoming = incoming.clone();
+            let input_incoming = input_incoming.clone();
             let conn = bulk_connection.clone();
             tokio::spawn(async move {
+                let Ok(lane) = reader.read_u8().await else {
+                    return;
+                };
+                if !matches!(lane, b'I' | b'F') {
+                    conn.close(1u32.into(), b"invalid stream lane");
+                    return;
+                }
                 while let Ok(message) = protocol::recv_json(&mut reader).await {
-                    if !matches!(
-                        &message,
-                        Message::Transfer(
-                            TransferMessage::Chunk { .. } | TransferMessage::Complete { .. }
+                    let valid = if lane == b'I' {
+                        interactive(&message)
+                    } else {
+                        matches!(
+                            &message,
+                            Message::Transfer(
+                                TransferMessage::Chunk { .. } | TransferMessage::Complete { .. }
+                            )
                         )
-                    ) {
+                    };
+                    if !valid {
                         conn.close(1u32.into(), b"invalid bulk message");
                         break;
                     }
-                    if incoming.send(message).await.is_err() {
+                    let destination = if lane == b'I' {
+                        &input_incoming
+                    } else {
+                        &incoming
+                    };
+                    if destination.send(message).await.is_err() {
                         break;
                     }
                 }
@@ -255,11 +346,15 @@ fn control(
     Control {
         send: Outbound {
             control: tx,
+            input: input_tx,
             bulk: bulk_tx,
             progress: None,
         },
-        receive: rx,
-        tasks: vec![write, read, bulk_write, bulk_read],
+        receive: Incoming {
+            control: rx,
+            input: input_rx,
+        },
+        tasks: vec![write, read, input_write, bulk_write, bulk_read],
     }
 }
 
@@ -372,6 +467,7 @@ async fn host_session(
     max_streams: usize,
     clipboard: bool,
 ) -> anyhow::Result<()> {
+    let _update_lease = crate::update::session_lease()?;
     let epoch = uuid::Uuid::new_v4().to_string();
     io.send
         .send(Message::Ready {
@@ -390,21 +486,35 @@ async fn host_session(
     let mut completed_files = HashMap::<String, PathBuf>::new();
     let mut outgoing_files = HashMap::<String, PathBuf>::new();
     let mut outgoing_jobs = HashMap::<String, tokio::task::JoinHandle<()>>::new();
+    let menu_slots = Arc::new(Semaphore::new(2));
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut clip_state = frames_core::clipboard::ClipboardState::default();
+    let clipboard_worker = (clipboard && peer.purpose == SessionPurpose::Control)
+        .then(|| ClipboardWorker::start(desktop.clone(), epoch.clone(), io.send.clone()))
+        .transpose()?;
     let mut scan = 0u64;
     let mut view_mode = ViewMode::Windows;
+    let mut show_cursor = true;
+    let mut scan_mode = view_mode;
+    let mut window_scan: Option<tokio::task::JoinHandle<anyhow::Result<Vec<RemoteWindow>>>> = None;
     let mut adb_bridge = None::<frames_core::device_bridge::HostBridge>;
+    let mut input = input_dispatch::Dispatcher::new(
+        desktop.clone(),
+        io.send.clone(),
+        peer.purpose == SessionPurpose::Control,
+    )?;
     loop {
         tokio::select! {
             _=connection.closed()=>break,
-            packet=connection.read_datagram()=>{if peer.purpose==SessionPurpose::Control&&let Ok(packet)=packet&& packet.starts_with(b"FP")&&packet.len()<2048&& let Ok(Message::Input{window,event:frames_core::input::InputEvent::Pointer{x,y}})=serde_json::from_slice(&packet[2..]){let _=desktop.input(window,&frames_core::input::InputEvent::Pointer{x,y});}},
-            _=tick.tick()=>{
-                scan+=1;
-                if scan.is_multiple_of(10){anyhow::ensure!(TrustStore::load()?.peers.get(&peer.device_id).is_some_and(|p|p.allow_control),"device access revoked");}
-                if peer.purpose==SessionPurpose::Transfer{continue;}
-                let d=desktop.clone();let list=tokio::task::spawn_blocking(move||d.surfaces(view_mode)).await??;
+            _=connection.read_datagram()=>{},
+            result=async{window_scan.as_mut().unwrap().await},if window_scan.is_some()=>{
+                window_scan.take();
+                if scan_mode!=view_mode{continue;}
+                let list=match result{
+                    Ok(Ok(list))=>list,
+                    Ok(Err(error))=>{tracing::warn!(%error,"window scan failed; retaining the last snapshot");continue;},
+                    Err(error)=>{tracing::warn!(%error,"window scan task failed; retaining the last snapshot");continue;}
+                };
                 let next:HashMap<_,_>=list.iter().map(|w|(w.key,w.clone())).collect();
                 if sequence==0{sequence=1;io.send.send(Message::Snapshot{sequence,windows:list}).await?;}
                 else{
@@ -412,6 +522,15 @@ async fn host_session(
                     if !upsert.is_empty()||!removed.is_empty(){sequence+=1;io.send.send(Message::Delta{sequence,upsert,removed:removed.clone()}).await?;for key in removed{streams.remove(&key);subscriptions.remove(&key);}}
                 }
                 known=next;
+            },
+            _=tick.tick()=>{
+                scan+=1;
+                if scan.is_multiple_of(10){anyhow::ensure!(TrustStore::load()?.peers.get(&peer.device_id).is_some_and(|p|p.allow_control),"device access revoked");}
+                if peer.purpose==SessionPurpose::Transfer{continue;}
+                if window_scan.is_none(){
+                    let d=desktop.clone();scan_mode=view_mode;
+                    window_scan=Some(tokio::task::spawn_blocking(move||d.surfaces(view_mode)));
+                }
                 let ended:Vec<_>=streams.iter().filter(|(_,s)|s.task.is_finished()).map(|(&key,_)|key).collect();for key in ended{streams.remove(&key);*failures.entry(key).or_default()+=1;}
                 let desired=frames_core::scheduler::select(subscriptions.iter().map(|(&key,sub)|frames_core::scheduler::Demand{
                     window:key,visible:sub.visible&&known.get(&key).is_some_and(|w|w.visible&&!w.minimized),focused:sub.focused,running:streams.contains_key(&key)
@@ -420,14 +539,15 @@ async fn host_session(
                 for key in evicted{if let Some(mut stream)=streams.remove(&key){stream.shutdown().await;io.send.send(Message::StreamPaused{window:key}).await?;}}
                 for key in desired{
                     let sub=&subscriptions[&key];
+                    if let Some(stream)=streams.get(&key){stream.set_fps(sub.fps());}
                     if let std::collections::hash_map::Entry::Vacant(entry)=streams.entry(key){
                         if failures.get(&key).copied().unwrap_or(0)>1&&!scan.is_multiple_of(50){continue;}
                         let selected=if preference.is_none()&&failures.get(&key).copied().unwrap_or(0)>0{Some(Codec::Vp9)}else{preference};
                         let cap=codec::negotiate(&codecs,&peer.codecs,selected)?;
-                        entry.insert(crate::streaming::start_host(desktop.clone(),key,cap,sub.fps(),connection.clone(),io.send.clone(),generations.clone()));
+                        entry.insert(crate::streaming::start_host(desktop.clone(),key,cap,crate::streaming::VideoOptions{fps:sub.fps(),show_cursor},connection.clone(),io.send.clone(),generations.clone()));
                     }
                 }
-                if clipboard&&scan.is_multiple_of(5){poll_clipboard(desktop.as_ref(),&mut clip_state,&epoch,&io.send).await?;}
+
             },
             message=io.receive.recv()=>{let Some(message)=message else{break;};
                 if peer.purpose==SessionPurpose::Transfer{anyhow::ensure!(matches!(&message,Message::Transfer(_)|Message::DownloadFile{..}|Message::Ping{..}|Message::Pong{..}|Message::Goodbye),"transfer sessions cannot control the desktop");}
@@ -436,11 +556,19 @@ async fn host_session(
                     continue;
                 }
                 match message{
+                Message::SetRemoteCursor{visible}=>{
+                    if show_cursor!=visible{
+                        for(key,mut stream)in streams.drain(){stream.shutdown().await;io.send.send(Message::StreamPaused{window:key}).await?;}
+                        show_cursor=visible;failures.clear();
+                    }
+                    io.send.send(Message::RemoteCursorChanged{visible:show_cursor}).await?;
+                },
                 Message::SetViewMode{mode}=>{
+                    if let Some(job)=window_scan.take(){let _=job.await;}
                     let d=desktop.clone();let result=tokio::task::spawn_blocking(move||d.surfaces(mode)).await?;
                     match result{
                         Ok(list)=>{
-                            desktop.release_input();for(_,mut stream)in streams.drain(){stream.shutdown().await;}
+                            input.release()?;for(_,mut stream)in streams.drain(){stream.shutdown().await;}
                             subscriptions.clear();failures.clear();view_mode=mode;sequence+=1;
                             known=list.iter().map(|w|(w.key,w.clone())).collect();
                             io.send.send(Message::ViewModeChanged{mode,error:None}).await?;
@@ -457,15 +585,29 @@ async fn host_session(
                     }else{Ok(None)};
                     match result{Ok(bridge)=>{let address=bridge.as_ref().map(|b|b.address.to_string());adb_bridge=bridge;io.send.send(Message::AdbBridgeStatus{enabled:adb_bridge.is_some(),address,error:None}).await?;},Err(error)=>io.send.send(Message::AdbBridgeStatus{enabled:false,address:None,error:Some(error.to_string())}).await?}
                 },
-                Message::Visibility{window,visible,focused}=>{if known.contains_key(&window){let subscription=subscriptions.entry(window).or_default();let changed_focus=subscription.focused!=focused;subscription.update(visible,focused);if !visible||changed_focus{streams.remove(&window);}}},
+                Message::Visibility{window,visible,focused}=>{if known.contains_key(&window){let subscription=subscriptions.entry(window).or_default();subscription.update(visible,focused);if !visible{streams.remove(&window);}else if let Some(stream)=streams.get(&window){stream.set_fps(subscription.fps());}}},
                 Message::SelectCodec{codec}=>{codec::negotiate(&codecs,&peer.codecs,codec)?;preference=codec;streams.clear();failures.clear();},
-                Message::StreamReady{window,..}=>if window==frames_core::media::AUDIO_WINDOW{if let Some(audio)=&audio{audio.ready.notify_one();}}else if let Some(stream)=streams.get(&window){stream.ready.notify_one();},
-                Message::Keyframe{window}=>if window==frames_core::media::AUDIO_WINDOW{if let Some(audio)=&audio{audio.reset.notify_one();}}else if let Some(stream)=streams.get(&window){stream.reset.notify_one();},
+                Message::StreamReady{window,generation}=>if window==frames_core::media::AUDIO_WINDOW{if let Some(audio)=&audio{audio.acknowledge(generation);}}else if let Some(stream)=streams.get(&window){stream.acknowledge(generation);},
+                Message::Keyframe{window,generation}=>if window==frames_core::media::AUDIO_WINDOW{if let Some(audio)=&audio{audio.request_keyframe(generation);}}else if let Some(stream)=streams.get(&window){stream.request_keyframe(generation);},
                 Message::AudioPreference{enabled}=>{audio=None;if enabled{audio=Some(crate::streaming::start_audio(desktop.clone(),connection.clone(),io.send.clone(),generations.clone()));}},
-                Message::Command{request,window,action}=>{let result=if matches!(&action,WindowAction::Menu){match desktop.menu(window){Ok(items)=>{io.send.send(Message::Menu{window,items}).await?;Ok(())},Err(error)=>Err(error)}}else{desktop.action(window,&action)};let actual=desktop.surfaces(view_mode)?.into_iter().find(|w|w.key==window);io.send.send(Message::Ack{request,window,actual,error:result.err().map(|e|e.to_string())}).await?;},
-                Message::Input{window,event}=>{if let Err(error)=desktop.input(window,&event){tracing::debug!(%error,"input rejected");io.send.send(Message::Ack{request:0,window,actual:known.get(&window).cloned(),error:Some(error.to_string())}).await?;}},
-                Message::ReleaseInput=>desktop.release_input(),
-                Message::Clipboard{origin,revision,text,png_base64}if clipboard=>{if let Err(error)=apply_clipboard(desktop.as_ref(),&mut clip_state,&origin,revision,text,png_base64){tracing::debug!(%error,"clipboard update unavailable");}},
+                Message::Command{request,window,action}=>{
+                    if matches!(&action,WindowAction::Menu){
+                        if let Ok(slot)=menu_slots.clone().try_acquire_owned(){
+                            let d=desktop.clone();let out=io.send.clone();let actual=known.get(&window).cloned();
+                            tokio::task::spawn_blocking(move||{
+                                let _slot=slot;
+                                let result=d.menu(window).and_then(|items|out.blocking_send(Message::Menu{window,items}));
+                                let _=out.blocking_send(Message::Ack{request,window,actual,error:result.err().map(|e|e.to_string())});
+                            });
+                        }
+                    }else{
+                        input.action(request,window,action,known.get(&window).cloned(),view_mode)?;
+                    }
+                },
+                Message::InputClock{elapsed_ms}=>input.clock(elapsed_ms),
+                Message::Input{window,event,elapsed_ms}=>input.input(window,event,elapsed_ms)?,
+                Message::ReleaseInput=>input.release()?,
+                message @ Message::Clipboard{..}=>{if let Some(worker)=&clipboard_worker{worker.push(message);}},
                 Message::Transfer(TransferMessage::Accept{id,offset})=>{if let Some(path)=outgoing_files.get(&id).cloned(){let out=io.send.clone();let key=id.clone();outgoing_jobs.insert(key,tokio::spawn(async move{if let Err(error)=upload_chunks(&id,&path,offset,&out).await{let _=out.send(Message::Error{message:error.to_string()}).await;}}));}},
                 Message::Transfer(TransferMessage::Cancel{id,..})=>{if let Some(job)=outgoing_jobs.remove(&id){job.abort();}transfers.cancel(&id).await?;},
                 Message::Transfer(message)=>{if !desktop.allow_file_transfer(){io.send.send(Message::Error{message:"File transfers require a user-session host; the privileged login agent does not perform file operations".into()}).await?;}else{match receive_transfer(&mut transfers,message).await{Ok(Some(reply))=>{if let TransferMessage::Finished{id,name}=&reply{completed_files.insert(id.clone(),transfers.received_path(name)?);}io.send.send(Message::Transfer(reply)).await?;},Ok(None)=>{},Err(error)=>io.send.send(Message::Error{message:format!("File transfer: {error}")}).await?}}},
@@ -475,11 +617,12 @@ async fn host_session(
             }}
         }
     }
+    if let Some(job) = window_scan.take() {
+        job.abort();
+    }
     drop(streams);
     drop(adb_bridge);
-    if peer.purpose == SessionPurpose::Control {
-        desktop.release_input();
-    }
+    drop(input);
     Ok(())
 }
 
@@ -517,19 +660,22 @@ fn connection_timeout_hint() -> &'static str {
 pub async fn client(
     address: SocketAddr,
     requested: Option<Codec>,
-    ui: std::sync::mpsc::SyncSender<ClientUpdate>,
+    ui: frames_native::ClientSender,
     mut events: mpsc::UnboundedReceiver<ClientEvent>,
     clipboard: bool,
     audio: bool,
     initial_view: ViewMode,
 ) -> anyhow::Result<()> {
-    let codecs = codec::probe().await;
+    let _update_lease = crate::update::session_lease()?;
+    let codecs = codec::probe_decoders().await;
     anyhow::ensure!(
         !codecs.is_empty(),
         "no working media codecs; run frames doctor"
     );
     let (_endpoint, connection, mut io, peer) =
         connect(address, codecs.clone(), SessionPurpose::Control).await?;
+    let input_epoch = std::time::Instant::now();
+    io.send.send(Message::InputClock { elapsed_ms: 0 }).await?;
     io.send.progress = Some(ui.clone());
     let selected = codec::negotiate(&peer.codecs, &codecs, requested)?;
     tracing::info!(codec=?selected.codec,encoder=?selected.encoder,"media negotiation");
@@ -550,8 +696,15 @@ pub async fn client(
     let mut graph = WindowGraph::default();
     let mut media = crate::streaming::ClientMedia::default();
     let mut request = 0u64;
-    let local = frames_native::desktop(vec![])?;
-    let mut clip_state = frames_core::clipboard::ClipboardState::default();
+    let clipboard_worker = if clipboard {
+        Some(ClipboardWorker::start(
+            frames_native::desktop(vec![])?,
+            "client".into(),
+            io.send.clone(),
+        )?)
+    } else {
+        None
+    };
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut ticks = 0;
     let mut uploads = HashMap::<String, (PathBuf, WindowId, f64, f64)>::new();
@@ -570,6 +723,7 @@ pub async fn client(
     let mut adb_enabled = false;
     let mut adb_requested = false;
     let mut adb_jobs = tokio::task::JoinSet::new();
+    let mut pending_event = None;
     loop {
         tokio::select! {
             reason=connection.closed()=>{tracing::info!(%reason,"Host connection closed");break;},
@@ -579,9 +733,13 @@ pub async fn client(
                 else{adb_jobs.spawn(async move{if let Err(error)=frames_core::device_bridge::serve_local(send,receive).await{tracing::debug!(%error,"ADB device stream ended");}});}
             },
             prepared=prepared_rx.recv()=>if let Some((path,window,x,y,result))=prepared{match result{Ok((name,size,hash))=>{let id=transfer::transfer_id(&name,&hash,size);uploads.insert(id.clone(),(path,window,x,y));io.send.send(Message::Transfer(TransferMessage::Offer{id,name,size,sha256:hash})).await?;},Err(error)=>{let _=ui.try_send(ClientUpdate::Status(window,error));}}},
-            _=timer.tick()=>{media.expire(&io.send).await?;ticks+=1;if clipboard&&ticks%5==0{poll_clipboard(local.as_ref(),&mut clip_state,"client",&io.send).await?;}},
+            _=timer.tick()=>{media.expire(&io.send).await?;ticks+=1;
+                if ticks%10==0{io.send.send(Message::InputClock{elapsed_ms:input_epoch.elapsed().as_millis() as u64}).await?;}
+
+            },
             packet=connection.read_datagram()=>match packet{Ok(packet)=>media.packet(&packet,&io.send).await?,Err(reason)=>{tracing::info!(%reason,"Host media connection closed");break;}},
-            event=events.recv()=>match event{
+            event=async{if pending_event.is_some(){pending_event.take()}else{events.recv().await}}=>match event{
+                Some(ClientEvent::RemoteCursor{visible})=>io.send.send(Message::SetRemoteCursor{visible}).await?,
                 Some(ClientEvent::ViewMode(mode))=>{io.send.send(Message::ReleaseInput).await?;io.send.send(Message::SetViewMode{mode}).await?;},
                 Some(ClientEvent::AdbBridge{enabled})=>{
                     let result=if enabled{frames_core::device_bridge::probe_local_adb().await}else{Ok(())};
@@ -589,8 +747,25 @@ pub async fn client(
                 },
                 Some(ClientEvent::Visibility{window,visible,focused})=>{if !visible{media.pause(window);}io.send.send(Message::Visibility{window,visible,focused}).await?;},
                 Some(ClientEvent::Action{window,action})=>{request+=1;io.send.send(Message::Command{request,window,action}).await?;},
-                Some(ClientEvent::Input{window,event:frames_core::input::InputEvent::Pointer{x,y}})=>{let mut packet=b"FP".to_vec();packet.extend(serde_json::to_vec(&Message::Input{window,event:frames_core::input::InputEvent::Pointer{x,y}})?);let _=connection.send_datagram(packet.into());},
-                Some(ClientEvent::Input{window,event})=>io.send.send(Message::Input{window,event}).await?,
+                Some(event @ (ClientEvent::Input{..}|ClientEvent::TimedInput{..}))=>{
+                    let (mut window,mut event,mut created)=match event {
+                        ClientEvent::Input{window,event}=>(window,event,std::time::Instant::now()),
+                        ClientEvent::TimedInput{window,event,created}=>(window,event,created),
+                        _=>unreachable!()
+                    };
+                    if matches!(event,frames_core::input::InputEvent::Pointer{..}) {
+                        for _ in 0..4096 {
+                            let Ok(next)=events.try_recv() else{break;};
+                            match next {
+                                ClientEvent::Input{window:w,event:e} if matches!(e,frames_core::input::InputEvent::Pointer{..})=>{window=w;event=e;created=std::time::Instant::now();},
+                                ClientEvent::TimedInput{window:w,event:e,created:c} if matches!(e,frames_core::input::InputEvent::Pointer{..})=>{window=w;event=e;created=c;},
+                                other=>{pending_event=Some(other);break;}
+                            }
+                        }
+                    }
+                    let elapsed_ms=created.saturating_duration_since(input_epoch).as_millis() as u64;
+                    io.send.send(Message::Input{window,event,elapsed_ms}).await?;
+                },
                 Some(ClientEvent::SendFiles{window,paths,x,y})=>{for path in paths.into_iter().take(100){let tx=prepared_tx.clone();let slots=prepare_slots.clone();let epoch=prepare_epoch.clone();let version=epoch.load(std::sync::atomic::Ordering::Relaxed);tokio::spawn(async move{let Ok(_permit)=slots.acquire_owned().await else{return;};let result=file_metadata(&path).await.map_err(|e|e.to_string());if epoch.load(std::sync::atomic::Ordering::Relaxed)==version{let _=tx.send((path,window,x,y,result)).await;}});}},
                 Some(ClientEvent::CancelTransfers)=>{prepare_epoch.fetch_add(1,std::sync::atomic::Ordering::Relaxed);let mut ids=downloads.active_ids();ids.extend(uploads.keys().cloned());for id in ids{if let Some(job)=upload_jobs.remove(&id){job.abort();}uploads.remove(&id);downloads.cancel(&id).await?;io.send.send(Message::Transfer(TransferMessage::Cancel{id,reason:"canceled locally".into()})).await?;}let _=ui.try_send(ClientUpdate::TransferProgress{name:"Transfers canceled".into(),done:0,total:0});},
                 Some(ClientEvent::DownloadFile{path})=>io.send.send(Message::DownloadFile{path}).await?,
@@ -598,6 +773,7 @@ pub async fn client(
                 Some(ClientEvent::Disconnected)|None=>{tracing::info!("Client UI requested disconnect or closed its event channel");break;},
             },
             message=io.receive.recv()=>{let Some(message)=message else{tracing::info!("Host control stream closed");break;};match message{
+                Message::RemoteCursorChanged{visible}=>ui.send(ClientUpdate::RemoteCursor{visible})?,
                 Message::ViewModeChanged{mode,error}=>{if error.is_none(){media.clear_video();}ui.send(ClientUpdate::ViewMode{mode,error})?;},
                 Message::AdbBridgeStatus{enabled,address,error}=>{
                     adb_enabled=enabled&&adb_requested;
@@ -626,7 +802,7 @@ pub async fn client(
                         let _ = ui.try_send(ClientUpdate::TransferProgress { name, done, total });
                     }
                 },
-        Message::Clipboard{origin,revision,text,png_base64}if clipboard=>{if let Err(error)=apply_clipboard(local.as_ref(),&mut clip_state,&origin,revision,text,png_base64){tracing::debug!(%error,"clipboard update unavailable");}},
+        message @ Message::Clipboard{..}=>{if let Some(worker)=&clipboard_worker{worker.push(message);}},
                 Message::Error{message}=>tracing::warn!(%message,"host error"),Message::Goodbye=>{tracing::info!("Host sent session goodbye");break;},_=>{}
             }}
         }
@@ -679,7 +855,75 @@ async fn receive_transfer(
     })
 }
 
-async fn poll_clipboard(
+// Native clipboard calls (and PNG conversion) can block. Keep them off both
+// session loops, with a replaceable pending remote value instead of a backlog.
+struct ClipboardWorker {
+    shared: Arc<(std::sync::Mutex<Option<Message>>, std::sync::Condvar)>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+}
+impl ClipboardWorker {
+    fn start(desktop: Arc<dyn Desktop>, origin: String, out: Outbound) -> anyhow::Result<Self> {
+        let shared = Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pending = shared.clone();
+        let stop = stopped.clone();
+        std::thread::Builder::new()
+            .name("frames-clipboard".into())
+            .spawn(move || {
+                let mut state = frames_core::clipboard::ClipboardState::default();
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let (lock, ready) = &*pending;
+                    let message = {
+                        let mut slot = lock.lock().unwrap();
+                        if slot.is_none() && !stop.load(std::sync::atomic::Ordering::Acquire) {
+                            slot = ready
+                                .wait_timeout(slot, std::time::Duration::from_millis(500))
+                                .unwrap()
+                                .0;
+                        }
+                        slot.take()
+                    };
+                    if stop.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    let result = if let Some(Message::Clipboard {
+                        origin,
+                        revision,
+                        text,
+                        png_base64,
+                    }) = message
+                    {
+                        apply_clipboard(
+                            desktop.as_ref(),
+                            &mut state,
+                            &origin,
+                            revision,
+                            text,
+                            png_base64,
+                        )
+                    } else {
+                        poll_clipboard(desktop.as_ref(), &mut state, &origin, &out)
+                    };
+                    if let Err(error) = result {
+                        tracing::debug!(%error, "clipboard unavailable");
+                    }
+                }
+            })?;
+        Ok(Self { shared, stopped })
+    }
+    fn push(&self, message: Message) {
+        *self.shared.0.lock().unwrap() = Some(message);
+        self.shared.1.notify_one();
+    }
+}
+impl Drop for ClipboardWorker {
+    fn drop(&mut self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.shared.1.notify_one();
+    }
+}
+fn poll_clipboard(
     desktop: &dyn Desktop,
     state: &mut frames_core::clipboard::ClipboardState,
     origin: &str,
@@ -716,7 +960,7 @@ async fn poll_clipboard(
                 png_base64,
             };
             if serde_json::to_vec(&message)?.len() <= protocol::MAX_CONTROL_BYTES {
-                out.send(message).await?;
+                out.blocking_send(message)?;
                 *state = next;
             }
         }

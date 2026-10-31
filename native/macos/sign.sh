@@ -25,14 +25,21 @@ frames_signing_identity() {
 
 frames_sign_app() {
   local app="$1" identity
+  local timestamp=--timestamp=none
+  if [[ "${FRAMES_RELEASE_BUILD:-}" == 1 ]]; then timestamp=--timestamp; fi
   identity="$(frames_signing_identity "$app")"
   if [[ -z "$identity" ]]; then
+    if [[ "${FRAMES_RELEASE_BUILD:-}" == 1 ]]; then echo "Release signing identity is required" >&2; return 1; fi
     printf 'No unambiguous signing identity. Set FRAMES_SIGN_IDENTITY; unsigned/ad-hoc builds can lose macOS privacy grants after rebuilds.\n' >&2
     return
   fi
-  codesign --force --sign "$identity" --identifier app.frames.helper --options runtime --timestamp=none "$app/Contents/MacOS/FramesHelper"
-  codesign --force --sign "$identity" --options runtime --timestamp=none "$app"
+  if [[ "${FRAMES_RELEASE_BUILD:-}" == 1 && "$identity" == - ]]; then echo "Release builds require Developer ID signing" >&2; return 1; fi
+  codesign --force --sign "$identity" --identifier app.frames.helper --options runtime "$timestamp" "$app/Contents/MacOS/FramesHelper"
+  codesign --force --sign "$identity" --options runtime "$timestamp" "$app"
   codesign --verify --deep --strict "$app"
+  if [[ "${FRAMES_RELEASE_BUILD:-}" == 1 ]]; then
+    codesign --verify --strict -R "anchor apple generic and identifier app.frames.desktop and certificate leaf[subject.OU] = V59Z6S9A36" "$app"
+  fi
   if [[ "$identity" == - ]]; then
     printf 'Ad-hoc signed %s; macOS privacy grants may reset after rebuilds.\n' "$app"
   else

@@ -33,11 +33,13 @@ const SWAP: usize = 0xA004;
 const REMOTE_MENU: usize = 0xA005;
 const FETCH: usize = 0xA006;
 const PHYSICAL: usize = 0xA007;
+const SHOW_HEADER: usize = 0xA008;
 const VIEW_WINDOWS: usize = 0xB001;
 const VIEW_DESKTOP: usize = 0xB002;
 const DISCONNECT: usize = 0xB003;
 const ADB_BRIDGE: usize = 0xB004;
 const USB_INFO: usize = 0xB005;
+const REMOTE_CURSOR: usize = 0xB006;
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 struct Preference {
     mode: SizingMode,
@@ -54,6 +56,7 @@ struct Proxy {
     host: String,
     icon: Option<HICON>,
     status: String,
+    command_status: Option<String>,
     pending_resize: Option<(f64, f64)>,
     last_size: Option<(i32, i32)>,
     visible: Option<bool>,
@@ -61,7 +64,12 @@ struct Proxy {
     surrogate: Option<u16>,
     renderer: Option<super::render::Renderer>,
     ready: bool,
+    user_sizing: bool,
+    maximized: bool,
     view_mode: ViewMode,
+    show_remote_cursor: bool,
+    show_header: bool,
+    changing_header: bool,
     adb_enabled: bool,
     menu_items: Vec<MenuItem>,
     menu_ids: HashMap<usize, String>,
@@ -89,9 +97,10 @@ impl Proxy {
         let _ = self.events.send(event);
     }
     fn input(&self, event: InputEvent) {
-        self.event(ClientEvent::Input {
+        self.event(ClientEvent::TimedInput {
             window: self.remote.key,
             event,
+            created: std::time::Instant::now(),
         });
     }
     fn title(&self) -> String {
@@ -108,7 +117,9 @@ impl Proxy {
             } else {
                 ""
             },
-            if self.status.is_empty() {
+            if let Some(status) = &self.command_status {
+                format!(" — {status}")
+            } else if self.status.is_empty() {
                 String::new()
             } else {
                 format!(" — {}", self.status)
@@ -190,6 +201,9 @@ unsafe extern "system" fn procedure(
                     }));
                 }
                 DISCONNECT => state.event(ClientEvent::Disconnected),
+                REMOTE_CURSOR => state.event(ClientEvent::RemoteCursor {
+                    visible: !state.show_remote_cursor,
+                }),
                 ADB_BRIDGE => state.event(ClientEvent::AdbBridge {
                     enabled: !state.adb_enabled,
                 }),
@@ -199,7 +213,8 @@ unsafe extern "system" fn procedure(
                         "Android ADB: start adb on this computer, then enable Android ADB bridge. On the host use adb -H 127.0.0.1 -P 15037. Raw USB, fastboot, DFU, and iOS passthrough require separate driver support and are not enabled.",
                     );
                 }
-                MODE_RESIZE | MODE_STRETCH | FILL | SWAP | PHYSICAL | REMOTE_MENU | FETCH => {
+                MODE_RESIZE | MODE_STRETCH | FILL | SWAP | PHYSICAL | REMOTE_MENU | FETCH
+                | SHOW_HEADER => {
                     let _ = PostMessageW(Some(hwnd), WM_SYSCOMMAND, WPARAM(command), LPARAM(0));
                 }
                 _ => {
@@ -292,6 +307,22 @@ unsafe extern "system" fn procedure(
                     DIB_RGB_COLORS,
                     SRCCOPY,
                 );
+            } else {
+                let _ = SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, COLORREF(0x00b0b0b0));
+                let mut label = wide(
+                    if state.status == "Connecting stream…" || state.status.is_empty() {
+                        "Waiting for video…"
+                    } else {
+                        &state.status
+                    },
+                );
+                DrawTextW(
+                    dc,
+                    &mut label,
+                    &mut rect,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
             }
             let _ = EndPaint(hwnd, &paint);
             return LRESULT(0);
@@ -302,11 +333,14 @@ unsafe extern "system" fn procedure(
                 state.event(ClientEvent::Disconnected);
                 return LRESULT(0);
             }
+            if state.command_status.as_deref() == Some("Closing remote window…") {
+                return LRESULT(0);
+            }
             state.event(ClientEvent::Action {
                 window: state.remote.key,
                 action: WindowAction::Close,
             });
-            state.status = "Closing remote window…".into();
+            state.command_status = Some("Closing remote window…".into());
             let _ = SetWindowTextW(hwnd, PCWSTR(wide(&state.title()).as_ptr()));
             return LRESULT(0);
         }
@@ -337,14 +371,21 @@ unsafe extern "system" fn procedure(
                 focused: false,
             });
         }
+        WM_ENTERSIZEMOVE => state.user_sizing = true,
+        WM_EXITSIZEMOVE => state.user_sizing = false,
         WM_SIZE => {
             let visible = wparam.0 != SIZE_MINIMIZED as usize;
+            let maximized = wparam.0 == SIZE_MAXIMIZED as usize;
+            let user_resize = state.user_sizing || maximized || state.maximized;
+            state.maximized = maximized;
             state.event(ClientEvent::Visibility {
                 window: state.remote.key,
                 visible,
                 focused: GetForegroundWindow() == hwnd,
             });
             if state.ready
+                && !state.changing_header
+                && user_resize
                 && visible
                 && effective_sizing(state.pref.mode, state.remote.resize)
                     == SizingMode::ResizeRemote
@@ -380,6 +421,10 @@ unsafe extern "system" fn procedure(
         | WM_MBUTTONUP => {
             let down = matches!(message, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN);
             if down {
+                if state.command_status.as_deref() != Some("Closing remote window…") {
+                    state.command_status = None;
+                    let _ = SetWindowTextW(hwnd, PCWSTR(wide(&state.title()).as_ptr()));
+                }
                 let _ = SetFocus(Some(hwnd));
                 let _ = SetCapture(hwnd);
             } else {
@@ -524,6 +569,33 @@ unsafe extern "system" fn procedure(
         _ => {}
     }
     // Custom menu IDs are intentionally not multiples of 16.
+    if message == WM_SYSCOMMAND && wparam.0 == SHOW_HEADER {
+        state.event(ClientEvent::ReleaseInput);
+        state.forwarded.clear();
+        state.surrogate = None;
+        let visible = !state.show_header;
+        state.changing_header = true;
+        let result = set_window_header(hwnd, visible);
+        if let Err(error) = result {
+            tracing::warn!(%error, "Unable to change the window header");
+        } else {
+            state.show_header = visible;
+            let items = state.menu_items.clone();
+            install_remote_menu(hwnd, state, items);
+            CheckMenuItem(
+                GetSystemMenu(hwnd, false),
+                SHOW_HEADER as u32,
+                MF_BYCOMMAND.0
+                    | if visible {
+                        MF_CHECKED.0
+                    } else {
+                        MF_UNCHECKED.0
+                    },
+            );
+        }
+        state.changing_header = false;
+        return LRESULT(0);
+    }
     if message == WM_SYSCOMMAND && wparam.0 == REMOTE_MENU {
         state.event(ClientEvent::Action {
             window: state.remote.key,
@@ -579,7 +651,7 @@ unsafe extern "system" fn procedure(
 
 pub fn run_client(
     mut host: String,
-    updates: std::sync::mpsc::Receiver<ClientUpdate>,
+    updates: crate::ClientReceiver,
     events: tokio::sync::mpsc::UnboundedSender<ClientEvent>,
 ) -> anyhow::Result<()> {
     unsafe {
@@ -595,6 +667,14 @@ pub fn run_client(
             ..Default::default()
         };
         RegisterClassW(&wc);
+        // Rust channel writes do not wake MsgWaitForMultipleObjects. Create the
+        // thread's message queue before publishing the coalesced wake callback.
+        let mut initial_message = MSG::default();
+        let _ = PeekMessageW(&mut initial_message, None, 0, 0, PM_NOREMOVE);
+        let ui_thread = windows::Win32::System::Threading::GetCurrentThreadId();
+        updates.set_waker(move || {
+            let _ = PostThreadMessageW(ui_thread, WM_APP + 43, WPARAM(0), LPARAM(0));
+        });
         let preferences: HashMap<String, Preference> = frames_core::trust::config_dir()
             .ok()
             .and_then(|dir| std::fs::read(dir.join("windows.json")).ok())
@@ -603,6 +683,7 @@ pub fn run_client(
         let mut windows = HashMap::<WindowId, HWND>::new();
         let mut running = true;
         let mut view_mode = ViewMode::Windows;
+        let mut show_remote_cursor = true;
         let mut adb_enabled = false;
         let mut session_control = super::session_control::SessionControl::new(events.clone())?;
         let mut shelf = super::files::Shelf::new(events.clone())?;
@@ -611,9 +692,20 @@ pub fn run_client(
         while running {
             for update in updates.try_iter() {
                 match update {
+                    ClientUpdate::RemoteCursor { visible } => {
+                        show_remote_cursor = visible;
+                        session_control.update(view_mode, adb_enabled, show_remote_cursor);
+                        for &hwnd in windows.values() {
+                            let state =
+                                &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Proxy);
+                            state.show_remote_cursor = visible;
+                            let items = state.menu_items.clone();
+                            install_remote_menu(hwnd, state, items);
+                        }
+                    }
                     ClientUpdate::ViewMode { mode, error } => {
                         view_mode = mode;
-                        session_control.update(view_mode, adb_enabled);
+                        session_control.update(view_mode, adb_enabled, show_remote_cursor);
                         for &hwnd in windows.values() {
                             let state =
                                 &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Proxy);
@@ -631,7 +723,7 @@ pub fn run_client(
                         error,
                     } => {
                         adb_enabled = enabled;
-                        session_control.update(view_mode, adb_enabled);
+                        session_control.update(view_mode, adb_enabled, show_remote_cursor);
                         for &hwnd in windows.values() {
                             let state =
                                 &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Proxy);
@@ -707,6 +799,7 @@ pub fn run_client(
                                 host: host.clone(),
                                 icon,
                                 status: "Connecting stream…".into(),
+                                command_status: None,
                                 pending_resize: None,
                                 last_size: None,
                                 visible: None,
@@ -714,7 +807,12 @@ pub fn run_client(
                                 surrogate: None,
                                 renderer: None,
                                 ready: false,
+                                user_sizing: false,
+                                maximized: false,
                                 view_mode,
+                                show_remote_cursor,
+                                show_header: !transient,
+                                changing_header: false,
                                 adb_enabled,
                                 menu_items: vec![],
                                 menu_ids: HashMap::new(),
@@ -778,12 +876,12 @@ pub fn run_client(
                                 ((*state).remote.bounds.width.min(1400.) * scale).min(max_width);
                             let mut picture_height =
                                 ((*state).remote.bounds.height.min(900.) * scale).min(max_height);
-                            if (*state).remote.role == WindowRole::Desktop {
-                                let fit = (picture_width / (*state).remote.bounds.width)
-                                    .min(picture_height / (*state).remote.bounds.height);
-                                picture_width = (*state).remote.bounds.width * fit;
-                                picture_height = (*state).remote.bounds.height * fit;
-                            }
+                            // Apply one scale to both axes, including app windows.
+                            // Independent caps otherwise create black letterboxing at startup.
+                            let fit = (picture_width / (*state).remote.bounds.width)
+                                .min(picture_height / (*state).remote.bounds.height);
+                            picture_width = (*state).remote.bounds.width * fit;
+                            picture_height = (*state).remote.bounds.height * fit;
                             let mut initial = RECT {
                                 left: 0,
                                 top: 0,
@@ -854,6 +952,12 @@ pub fn run_client(
                             }
                             let menu = GetSystemMenu(hwnd, false);
                             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+                            let _ = AppendMenuW(
+                                menu,
+                                MF_STRING | MF_CHECKED,
+                                SHOW_HEADER,
+                                PCWSTR(wide("Show window header").as_ptr()),
+                            );
                             let _ = AppendMenuW(
                                 menu,
                                 if (*state).remote.resize == ResizeCapability::Supported {
@@ -928,6 +1032,7 @@ pub fn run_client(
                                 &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Proxy);
                             state.status = status;
                             let _ = SetWindowTextW(hwnd, PCWSTR(wide(&state.title()).as_ptr()));
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
                     ClientUpdate::Ack(key, actual, error) => {
@@ -938,8 +1043,10 @@ pub fn run_client(
                                 state.remote = actual;
                             }
                             if let Some(error) = error {
-                                state.status = error;
+                                state.command_status = Some(error);
                             }
+                            let _ = SetWindowTextW(hwnd, PCWSTR(wide(&state.title()).as_ptr()));
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
                     ClientUpdate::Shutdown => running = false,
@@ -987,6 +1094,46 @@ fn stable_hash(value: &str) -> u64 {
         (h ^ b as u64).wrapping_mul(0x100000001b3)
     })
 }
+
+unsafe fn set_window_header(hwnd: HWND, visible: bool) -> Result<()> {
+    let mut client = RECT::default();
+    GetClientRect(hwnd, &mut client)?;
+    let mut origin = POINT::default();
+    ClientToScreen(hwnd, &mut origin).ok()?;
+    let previous = WINDOW_STYLE(GetWindowLongPtrW(hwnd, GWL_STYLE) as u32);
+    let style = if visible {
+        previous | WS_CAPTION
+    } else {
+        previous & !WS_CAPTION
+    };
+    let extended = WINDOW_EX_STYLE(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32);
+    AdjustWindowRectExForDpi(
+        &mut client,
+        style,
+        !GetMenu(hwnd).is_invalid(),
+        extended,
+        GetDpiForWindow(hwnd).max(96),
+    )?;
+    SetWindowLongPtrW(hwnd, GWL_STYLE, style.0 as isize);
+    let mut flags = SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE;
+    if IsZoomed(hwnd).as_bool() {
+        flags |= SWP_NOMOVE | SWP_NOSIZE;
+    }
+    let result = SetWindowPos(
+        hwnd,
+        None,
+        origin.x + client.left,
+        origin.y + client.top,
+        client.right - client.left,
+        client.bottom - client.top,
+        flags,
+    );
+    if result.is_err() {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, previous.0 as isize);
+    }
+    result
+}
+
 unsafe fn install_remote_menu(hwnd: HWND, state: &mut Proxy, items: Vec<MenuItem>) {
     if state.menu_open {
         state.pending_menu = Some(items);
@@ -1055,7 +1202,19 @@ unsafe fn install_remote_menu(hwnd: HWND, state: &mut Proxy, items: Vec<MenuItem
         VIEW_DESKTOP,
         PCWSTR(wide("Full desktop view").as_ptr()),
     );
+    let _ = AppendMenuW(
+        local,
+        MF_STRING | checked(state.show_remote_cursor),
+        REMOTE_CURSOR,
+        PCWSTR(wide("Show remote cursor").as_ptr()),
+    );
     let _ = AppendMenuW(local, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(
+        local,
+        MF_STRING | checked(state.show_header),
+        SHOW_HEADER,
+        PCWSTR(wide("Show window header").as_ptr()),
+    );
     for (id, title) in [
         (MODE_RESIZE, "Resize remote app"),
         (MODE_STRETCH, "Stretch locally"),

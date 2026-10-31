@@ -272,7 +272,7 @@ mod tests {
                     &RawFrame {
                         width: 128,
                         height: 128,
-                        bgra,
+                        bgra: bgra.into(),
                     },
                     rect,
                 )
@@ -290,7 +290,7 @@ mod tests {
             let _ = DestroyWindow(hwnd);
         });
         let handle = ready_rx.recv().unwrap();
-        let mut capture = super::super::capture::start(handle).unwrap();
+        let mut capture = super::super::capture::start(handle, false).unwrap();
         let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut correct = false;
         while std::time::Instant::now() < end {

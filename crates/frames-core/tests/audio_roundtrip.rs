@@ -35,7 +35,7 @@ async fn opus_stream_roundtrips_generated_pcm() {
     let _ = encoder.child.kill().await;
     let _ = decoder.child.kill().await;
     let pcm = result.expect("no decoded Opus audio");
-    assert_eq!(pcm.len(), 48000 * 2 * 4 / 50);
+    assert_eq!(pcm.len(), audio::packet_bytes(format));
     assert!(
         pcm.as_chunks::<4>()
             .0

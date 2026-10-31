@@ -101,7 +101,16 @@ impl Drop for Guard {
     }
 }
 
-pub fn start(handle: u64) -> anyhow::Result<CaptureStream> {
+#[cfg(any(test, feature = "media-diagnostics"))]
+pub fn start(handle: u64, show_cursor: bool) -> anyhow::Result<CaptureStream> {
+    start_with_options(handle, show_cursor, false)
+}
+
+pub fn start_with_options(
+    handle: u64,
+    show_cursor: bool,
+    show_header: bool,
+) -> anyhow::Result<CaptureStream> {
     let (sender, frames) = watch::channel(None);
     let stop = Arc::new(AtomicBool::new(false));
     let guard = Guard { stop: stop.clone() };
@@ -110,7 +119,16 @@ pub fn start(handle: u64) -> anyhow::Result<CaptureStream> {
     std::thread::Builder::new()
         .name("frames-wgc".into())
         .spawn(move || {
-            let result = unsafe { capture_thread(handle, sender, flag.clone(), ready_tx) };
+            let result = unsafe {
+                capture_thread(
+                    handle,
+                    show_cursor,
+                    show_header,
+                    sender,
+                    flag.clone(),
+                    ready_tx,
+                )
+            };
             if let Err(error) = result {
                 tracing::warn!(%error,handle,"window capture ended");
             }
@@ -126,6 +144,8 @@ pub fn start(handle: u64) -> anyhow::Result<CaptureStream> {
 
 unsafe fn capture_thread(
     handle: u64,
+    show_cursor: bool,
+    show_header: bool,
     sender: watch::Sender<Option<RawFrame>>,
     stop: Arc<AtomicBool>,
     ready: std::sync::mpsc::SyncSender<Result<(), String>>,
@@ -181,7 +201,7 @@ unsafe fn capture_thread(
             size,
         )?;
         let session = pool.CreateCaptureSession(&item)?;
-        let _ = session.SetIsCursorCaptureEnabled(handle == DESKTOP_HANDLE);
+        session.SetIsCursorCaptureEnabled(show_cursor)?;
         Ok((apartment, device, context, direct, pool, session))
     })();
     let (_apartment, device, context, direct, pool, session) = match setup {
@@ -231,7 +251,11 @@ unsafe fn capture_thread(
                 unsafe {
                     super::host::frame_bounds(hwnd)
                         .ok()
-                        .zip(super::host::capture_bounds(hwnd).ok())
+                        .zip(if show_header {
+                            super::host::frame_bounds(hwnd).ok()
+                        } else {
+                            super::host::capture_bounds(hwnd).ok()
+                        })
                         .and_then(|(frame, client)| {
                             client_region(
                                 frame,
@@ -294,7 +318,7 @@ unsafe fn capture_thread(
             sender.send_replace(Some(RawFrame {
                 width,
                 height,
-                bgra,
+                bgra: bgra.into(),
             }));
             if changed {
                 pool.Recreate(
@@ -337,6 +361,16 @@ mod tests {
             (region.left, region.top, region.right, region.bottom),
             (6, 52, 594, 494)
         );
+        let with_header = client_region(frame, frame, 600, 500).unwrap();
+        assert_eq!(
+            (
+                with_header.left,
+                with_header.top,
+                with_header.right,
+                with_header.bottom
+            ),
+            (0, 0, 600, 500)
+        );
         assert!(client_region(frame, client, 601, 500).is_none());
         assert!(
             client_region(
@@ -354,7 +388,7 @@ mod tests {
     #[test]
     #[ignore = "captures the primary display locally; no pixels are persisted or transmitted"]
     fn full_desktop_uses_a_display_capture_surface() {
-        let mut capture = start(DESKTOP_HANDLE).unwrap();
+        let mut capture = start(DESKTOP_HANDLE, true).unwrap();
         let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let valid =
             loop {
@@ -476,7 +510,7 @@ mod tests {
             let _ = (HWND::default(), WPARAM(0), LPARAM(0));
         });
         let (handle, width, height) = ready_rx.recv().unwrap();
-        let mut stream = start(handle).unwrap();
+        let mut stream = start(handle, false).unwrap();
         let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let frame = loop {
             if let Some(frame) = stream.frames.borrow().clone() {

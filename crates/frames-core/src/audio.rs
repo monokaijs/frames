@@ -4,6 +4,10 @@ use tokio::{
     process::Child,
     sync::mpsc,
 };
+pub const PACKET_MILLIS: usize = 10;
+pub fn packet_bytes(format: PcmFormat) -> usize {
+    format.rate as usize * format.channels as usize * 4 * PACKET_MILLIS / 1000
+}
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct PcmFormat {
     pub rate: u32,
@@ -44,11 +48,11 @@ pub async fn encode(
             "-application",
             "lowdelay",
             "-frame_duration",
-            "20",
+            "10",
             "-b:a",
             "128k",
             "-page_duration",
-            "20000",
+            "10000",
             "-flush_packets",
             "1",
             "-f",
@@ -66,7 +70,7 @@ pub async fn encode(
             }
         }
     });
-    let (tx, pages) = mpsc::channel(4);
+    let (tx, pages) = mpsc::channel(2);
     tokio::spawn(async move {
         let mut headers = Vec::new();
         loop {
@@ -138,8 +142,8 @@ pub async fn decode(format: PcmFormat) -> anyhow::Result<Decoder> {
     crate::process::track(&child)?;
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
-    let (input, mut incoming) = mpsc::channel::<Vec<u8>>(8);
-    let (tx, pcm) = mpsc::channel(8);
+    let (input, mut incoming) = mpsc::channel::<Vec<u8>>(4);
+    let (tx, pcm) = mpsc::channel(2);
     tokio::spawn(async move {
         while let Some(bytes) = incoming.recv().await {
             if stdin.write_all(&bytes).await.is_err() {
@@ -148,7 +152,7 @@ pub async fn decode(format: PcmFormat) -> anyhow::Result<Decoder> {
         }
     });
     tokio::spawn(async move {
-        let count = format.rate as usize * format.channels as usize * 4 / 50;
+        let count = packet_bytes(format);
         loop {
             let mut bytes = vec![0; count];
             if stdout.read_exact(&mut bytes).await.is_err() || tx.send(bytes).await.is_err() {

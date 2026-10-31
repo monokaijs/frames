@@ -4,33 +4,13 @@ import ApplicationServices
 import ServiceManagement
 import ScreenCaptureKit
 
-enum Wire {
-    static let lock = NSLock()
-    static let controlPermissionLabel = ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27 ? "Device Control and Data Access (Accessibility)" : "Accessibility"
-    static let diagnosticsEnabled = ProcessInfo.processInfo.environment["FRAMES_NATIVE_DIAGNOSTICS"] == "1"
-    // Metadata only: no titles, pixels, clipboard contents, or input text.
-    static func diagnostic(_ event: String, _ fields: [String: Any] = [:]) {
-        guard diagnosticsEnabled else { return }
-        var object = fields
-        object["native_event"] = event
-        guard let bytes = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { return }
-        lock.lock(); defer { lock.unlock() }
-        FileHandle.standardError.write(bytes); FileHandle.standardError.write(Data([10]))
-    }
-    static func send(_ object: [String: Any]) {
-        guard JSONSerialization.isValidJSONObject(object), let bytes = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { return }
-        lock.lock(); defer { lock.unlock() }
-        FileHandle.standardOutput.write(bytes); FileHandle.standardOutput.write(Data([10]))
-    }
-    static func permissions(screen: Bool? = nil) -> [String: Any] {
-        ["screen_capture":screen ?? CGPreflightScreenCaptureAccess(),"accessibility":AXIsProcessTrusted(),"sharing_at_login":SMAppService.agent(plistName:"app.frames.agent.plist").status == .enabled,"control_permission_name":controlPermissionLabel,"bundle_id":Bundle.main.bundleIdentifier ?? "unbundled","executable":CommandLine.arguments[0]]
-    }
-    static func failure(_ text: String) -> NSError { NSError(domain: "Frames", code: 1, userInfo: [NSLocalizedDescriptionKey: text]) }
-}
 
 @MainActor func runFrames(){
 guard frames_abi_version() == FRAMES_ABI_VERSION else { fatalError("Frames native ABI mismatch") }
 let args = CommandLine.arguments
+if let position = args.firstIndex(of: "--encode-h264") {
+    exit(NativeVideoEncoder.run(Array(args.dropFirst(position + 1))))
+}
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 
@@ -118,6 +98,14 @@ if args.contains("--network-settings"){
     app.setActivationPolicy(.regular)
     let client = NativeClient(host: args.last ?? "remote")
     app.delegate = client
+    guard let fd = ProcessInfo.processInfo.environment["FRAMES_CLIENT_MEDIA_FD"].flatMap(Int32.init) else {
+        fputs("Frames client requires a binary media socket\n", stderr)
+        exit(1)
+    }
+    let inbox = ClientVideoInbox { pending in
+        DispatchQueue.main.async { client.receiveVideo(pending.take()) }
+    }
+    DispatchQueue.global(qos: .userInteractive).async { inbox.read(fd) }
     DispatchQueue.global(qos: .userInteractive).async {
         while let line = readLine() {
             guard let bytes = line.data(using: .utf8), let message = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { continue }

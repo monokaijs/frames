@@ -7,6 +7,9 @@ mod session;
 #[allow(dead_code)]
 #[path = "../src/streaming.rs"]
 mod streaming;
+#[allow(dead_code)]
+#[path = "../src/update.rs"]
+mod update;
 
 use anyhow::{Context, ensure};
 use frames_core::{input::InputEvent, model::*};
@@ -15,7 +18,7 @@ use std::time::{Duration, Instant};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter("frames=info,frames_core=info,frames_native=info")
+        .with_env_filter("frames=info,control_probe=info,frames_core=info,frames_native=info")
         .with_writer(std::io::stderr)
         .init();
     let args: Vec<String> = std::env::args().collect();
@@ -26,8 +29,12 @@ fn main() -> anyhow::Result<()> {
     let report_path = args.get(2).context("missing report path")?;
     let capture_only = args.iter().any(|v| v == "--capture-only");
     let test_desktop = args.iter().any(|v| v == "--desktop");
+    let latency_mode = args.iter().any(|v| v == "--latency-only");
+    let focused = args.iter().any(|v| v == "--focused");
+    let skip_pause = args.iter().any(|v| v == "--skip-pause");
+    let large = args.iter().any(|v| v == "--1080p");
     let runtime = tokio::runtime::Runtime::new()?;
-    let (ui, updates) = std::sync::mpsc::sync_channel(32);
+    let (ui, updates) = frames_native::client_channel(32);
     let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
     let job = runtime.spawn(session::client(
         address,
@@ -40,21 +47,62 @@ fn main() -> anyhow::Result<()> {
     ));
     let mut passed = Vec::<String>::new();
     let mut measurements = serde_json::Map::new();
+    measurements.insert(
+        "requested_fps".into(),
+        (if focused { 60 } else { 24 }).into(),
+    );
     let result = (|| -> anyhow::Result<()> {
         let start = Instant::now();
         let mut target: Option<RemoteWindow> = None;
         let mut stage = "discover";
+        let mut reported_stage = "";
         let mut pause_until = start;
         let mut paused_at = start;
         let mut resumed_at = start;
         let mut requested_size = (0., 0.);
         let mut desktop_key = None;
+        let mut click_started = start;
+        let mut close_started = start;
+        let mut latency_samples = Vec::<u64>::new();
+        let mut next_click = start;
         let send = |event| {
             events
                 .send(event)
                 .map_err(|_| anyhow::anyhow!("session event queue closed"))
         };
         while start.elapsed() < Duration::from_secs(110) {
+            if reported_stage != stage {
+                eprintln!(
+                    "probe stage={stage} elapsed_ms={}",
+                    start.elapsed().as_millis()
+                );
+                reported_stage = stage;
+            }
+            if stage == "latency_wait" && Instant::now() >= next_click {
+                let target = target.as_ref().unwrap();
+                ensure!(
+                    target.app_id == "dev.frames.qa.fixture",
+                    "latency test only targets generated fixtures"
+                );
+                click_started = Instant::now();
+                for down in [true, false] {
+                    send(ClientEvent::Input {
+                        window: target.key,
+                        event: InputEvent::Button {
+                            button: 0,
+                            down,
+                            x: 100. / target.bounds.width,
+                            y: (target.bounds.height - if large { 216. } else { 96. })
+                                / target.bounds.height,
+                        },
+                    })?;
+                }
+                stage = "latency_video";
+            }
+            ensure!(
+                stage != "latency_video" || click_started.elapsed() < Duration::from_secs(5),
+                "no updated pixels within five seconds after the test click"
+            );
             if job.is_finished() {
                 anyhow::bail!("session ended before fixture checkpoints; inspect host/client logs");
             }
@@ -64,7 +112,7 @@ fn main() -> anyhow::Result<()> {
                 send(ClientEvent::Visibility {
                     window: target.as_ref().unwrap().key,
                     visible: true,
-                    focused: false,
+                    focused,
                 })?;
                 stage = "resuming";
             }
@@ -84,7 +132,7 @@ fn main() -> anyhow::Result<()> {
                             send(ClientEvent::Visibility {
                                 window: window.key,
                                 visible: true,
-                                focused: false,
+                                focused,
                             })?;
                             stage = "first_frame";
                         }
@@ -123,6 +171,7 @@ fn main() -> anyhow::Result<()> {
                             send(ClientEvent::ViewMode(ViewMode::Desktop))?;
                             stage = "desktop_snapshot";
                         } else {
+                            close_started = Instant::now();
                             send(ClientEvent::Action {
                                 window: target.as_ref().unwrap().key,
                                 action: WindowAction::Close,
@@ -137,7 +186,7 @@ fn main() -> anyhow::Result<()> {
                             send(ClientEvent::Visibility {
                                 window: desktop.key,
                                 visible: true,
-                                focused: false,
+                                focused,
                             })?;
                             stage = "desktop_frame";
                         }
@@ -163,23 +212,116 @@ fn main() -> anyhow::Result<()> {
                             action: WindowAction::Close,
                         })?;
                         stage = "closed";
+                        close_started = Instant::now();
                     } else if stage == "closed"
                         && windows
                             .iter()
                             .all(|w| Some(w.key) != target.as_ref().map(|w| w.key))
                     {
                         passed.push("remote close removes fixture identity".into());
+                        let millis = close_started.elapsed().as_millis() as u64;
+                        measurements.insert("close_reconciled_ms".into(), millis.into());
+                        ensure!(
+                            millis < 2000,
+                            "closing the generated window took {millis} ms"
+                        );
                         return Ok(());
+                    } else if stage == "click"
+                        && windows.iter().any(|w| {
+                            Some(w.key) == target.as_ref().map(|w| w.key)
+                                && w.title == "Frames QA source clicked"
+                        })
+                    {
+                        let millis = click_started.elapsed().as_millis() as u64;
+                        measurements.insert("click_delivered_ms".into(), millis.into());
+                        ensure!(millis < 2000, "click delivery took {millis} ms");
+                        passed.push("mouse down/up activated the generated host button".into());
+                        send(ClientEvent::Input {
+                            window: target.as_ref().unwrap().key,
+                            event: InputEvent::Text {
+                                text: "Frames Việt ✓".into(),
+                            },
+                        })?;
+                        stage = "text";
                     }
+                }
+                ClientUpdate::Status(key, status)
+                    if Some(key) == target.as_ref().map(|w| w.key) =>
+                {
+                    eprintln!(
+                        "probe codec={status} stage={stage} elapsed_ms={}",
+                        start.elapsed().as_millis()
+                    );
+                    measurements.insert("video_codec_status".into(), status.into());
                 }
                 ClientUpdate::Frame(key, frame) if Some(key) == target.as_ref().map(|w| w.key) => {
                     ensure!(frame.validate(), "invalid decoded frame");
+                    if stage == "latency_video" {
+                        let index =
+                            ((frame.height / 2 * frame.width + frame.width / 2) * 4) as usize;
+                        let green = frame.bgra[index + 1] > 150
+                            && frame.bgra[index + 2] < 100
+                            && frame.bgra[index] < 100;
+                        let red = frame.bgra[index + 2] > 150
+                            && frame.bgra[index + 1] < 100
+                            && frame.bgra[index] < 100;
+                        if (latency_samples.len().is_multiple_of(2) && green)
+                            || (!latency_samples.len().is_multiple_of(2) && red)
+                        {
+                            latency_samples.push(click_started.elapsed().as_millis() as u64);
+                            if latency_samples.len() == 20 {
+                                let mut sorted = latency_samples.clone();
+                                sorted.sort_unstable();
+                                measurements.insert(
+                                    "click_to_decoded_video_samples_ms".into(),
+                                    serde_json::json!(latency_samples),
+                                );
+                                measurements.insert(
+                                    "click_to_decoded_video_p50_ms".into(),
+                                    sorted[10].into(),
+                                );
+                                measurements.insert(
+                                    "click_to_decoded_video_p95_ms".into(),
+                                    sorted[18].into(),
+                                );
+                                passed.push(
+                                    "twenty remote clicks changed pixels in decoded video".into(),
+                                );
+                                send(ClientEvent::Action {
+                                    window: key,
+                                    action: WindowAction::Close,
+                                })?;
+                                return Ok(());
+                            }
+                            stage = "latency_wait";
+                            next_click = Instant::now() + Duration::from_millis(100);
+                        }
+                        continue;
+                    }
+                    if click_started != start
+                        && !measurements.contains_key("click_to_decoded_video_ms")
+                    {
+                        let index =
+                            ((frame.height / 2 * frame.width + frame.width / 2) * 4) as usize;
+                        if frame.bgra[index + 1] > 150
+                            && frame.bgra[index + 2] < 100
+                            && frame.bgra[index] < 100
+                        {
+                            measurements.insert(
+                                "click_to_decoded_video_ms".into(),
+                                (click_started.elapsed().as_millis() as u64).into(),
+                            );
+                            passed.push("click changed pixels in the decoded live video".into());
+                        }
+                    }
                     if stage == "first_frame" {
                         let source = target.as_ref().unwrap();
                         if source.app_id == "dev.frames.qa.fixture" {
                             ensure!(
-                                (source.bounds.width - 440.).abs() < 1.
-                                    && (source.bounds.height - 320.).abs() < 1.,
+                                (source.bounds.width - if large { 1920. } else { 440. }).abs() < 1.
+                                    && (source.bounds.height - if large { 1080. } else { 320. })
+                                        .abs()
+                                        < 1.,
                                 "Mac fixture still includes title-bar chrome: {:?}",
                                 source.bounds
                             );
@@ -213,6 +355,14 @@ fn main() -> anyhow::Result<()> {
                             "live direct-window capture decodes red source beneath blue cover"
                                 .into(),
                         );
+                        if latency_mode && skip_pause {
+                            send(ClientEvent::Action {
+                                window: key,
+                                action: WindowAction::Focus,
+                            })?;
+                            stage = "focus_for_latency";
+                            continue;
+                        }
                         send(ClientEvent::Visibility {
                             window: key,
                             visible: false,
@@ -234,6 +384,14 @@ fn main() -> anyhow::Result<()> {
                         passed.push("fresh decoded frame after resubscribe".into());
                         if capture_only {
                             return Ok(());
+                        }
+                        if latency_mode {
+                            send(ClientEvent::Action {
+                                window: key,
+                                action: WindowAction::Focus,
+                            })?;
+                            stage = "focus_for_latency";
+                            continue;
                         }
                         send(ClientEvent::Action {
                             window: key,
@@ -271,6 +429,14 @@ fn main() -> anyhow::Result<()> {
                     })?;
                     stage = "marked";
                 }
+                ClientUpdate::Ack(key, _, error)
+                    if stage == "focus_for_latency"
+                        && Some(key) == target.as_ref().map(|w| w.key) =>
+                {
+                    ensure!(error.is_none(), "latency fixture focus failed: {error:?}");
+                    stage = "latency_wait";
+                    next_click = Instant::now() + Duration::from_millis(150);
+                }
                 ClientUpdate::Ack(key, actual, error)
                     if stage == "resized" && Some(key) == target.as_ref().map(|w| w.key) =>
                 {
@@ -291,18 +457,52 @@ fn main() -> anyhow::Result<()> {
                         "resize acknowledgement differs from requested fixture size"
                     );
                     passed.push("host resize acknowledged actual dimensions".into());
+                    target = Some(actual);
                     send(ClientEvent::Action {
                         window: key,
                         action: WindowAction::Focus,
                     })?;
-                    std::thread::sleep(Duration::from_millis(250));
-                    send(ClientEvent::Input {
-                        window: key,
-                        event: InputEvent::Text {
-                            text: "Frames Việt ✓".into(),
-                        },
-                    })?;
-                    stage = "text";
+                    stage = "focus_for_click";
+                }
+                ClientUpdate::Ack(key, _, error)
+                    if stage == "focus_for_click"
+                        && Some(key) == target.as_ref().map(|w| w.key) =>
+                {
+                    ensure!(error.is_none(), "fixture focus failed: {error:?}");
+                    let actual = target.as_ref().unwrap();
+                    ensure!(
+                        actual.app_id == "dev.frames.qa.fixture",
+                        "click test only targets the generated Mac fixture"
+                    );
+                    std::thread::sleep(Duration::from_millis(150));
+                    let x = 100. / actual.bounds.width;
+                    let y = (actual.bounds.height - 96.) / actual.bounds.height;
+                    click_started = Instant::now();
+                    for down in [true, false] {
+                        send(ClientEvent::Input {
+                            window: key,
+                            event: InputEvent::Button {
+                                button: 0,
+                                down,
+                                x,
+                                y,
+                            },
+                        })?;
+                    }
+                    stage = "click";
+                }
+                ClientUpdate::Ack(key, _, error)
+                    if stage == "closed" && Some(key) == target.as_ref().map(|w| w.key) =>
+                {
+                    ensure!(error.is_none(), "host close failed: {error:?}");
+                    measurements.insert(
+                        "close_ack_ms".into(),
+                        (close_started.elapsed().as_millis() as u64).into(),
+                    );
+                    eprintln!(
+                        "probe close accepted elapsed_ms={}",
+                        start.elapsed().as_millis()
+                    );
                 }
                 ClientUpdate::Frame(key, frame)
                     if stage == "desktop_frame" && Some(key) == desktop_key =>

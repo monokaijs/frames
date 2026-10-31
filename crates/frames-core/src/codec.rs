@@ -1,8 +1,17 @@
 //! FFmpeg process adapter. Frames does not bundle the user's FFmpeg binary.
 //! Native capture remains per-window; CPU readback is explicitly reported.
 use crate::media::{MAX_FRAME_BYTES, RawFrame};
+mod avi;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, process::Stdio, time::Duration};
+use std::{
+    collections::BTreeMap,
+    process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
@@ -49,12 +58,12 @@ pub fn ffmpeg_path() -> std::ffi::OsString {
     }
     #[cfg(target_os = "macos")]
     {
-        if let Ok(executable) = std::env::current_exe() {
-            if let Some(directory) = executable.parent() {
-                let bundled = directory.join("ffmpeg");
-                if bundled.is_file() {
-                    return bundled.into_os_string();
-                }
+        if let Ok(executable) = std::env::current_exe()
+            && let Some(directory) = executable.parent()
+        {
+            let bundled = directory.join("ffmpeg");
+            if bundled.is_file() {
+                return bundled.into_os_string();
             }
         }
         for path in [
@@ -81,6 +90,121 @@ pub fn command() -> Command {
     #[cfg(windows)]
     command.creation_flags(0x08000000);
     command
+}
+
+const NATIVE_H264_ENCODER: &str = "frames_videotoolbox";
+
+fn native_h264_command(width: u32, height: u32, fps: u32) -> Option<Command> {
+    #[cfg(target_os = "macos")]
+    {
+        let executable = std::env::current_exe().ok()?;
+        let dir = executable.parent()?;
+        let helper = std::env::var_os("FRAMES_MAC_HELPER")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                [
+                    dir.join("FramesHelper"),
+                    dir.join("../Resources/FramesHelper"),
+                ]
+                .into_iter()
+                .find(|p| p.is_file())
+            })?;
+        let mut command = Command::new(helper);
+        command.args([
+            "--encode-h264",
+            &width.to_string(),
+            &height.to_string(),
+            &fps.to_string(),
+            "12000000",
+        ]);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        Some(command)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (width, height, fps);
+        None
+    }
+}
+
+async fn read_native_frame(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> std::io::Result<Vec<u8>> {
+    let size = reader.read_u32_le().await? as usize;
+    if size == 0 || size > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid native encoder packet size",
+        ));
+    }
+    let mut bytes = vec![0; size];
+    reader.read_exact(&mut bytes).await?;
+    Ok(bytes)
+}
+
+async fn probe_native_h264() -> Option<CodecCapability> {
+    let mut child = native_h264_command(128, 128, 30)?.spawn().ok()?;
+    let mut stdin = child.stdin.take()?;
+    let write = tokio::spawn(async move {
+        let blue = [220u8, 30, 20, 255].repeat(128 * 128 * 2);
+        let _ = stdin.write_all(&blue).await;
+    });
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
+    let _ = write.await;
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+    let mut source = std::io::Cursor::new(output.stdout);
+    let mut bitstream = Vec::new();
+    while source.position() < source.get_ref().len() as u64 {
+        bitstream.extend(read_native_frame(&mut source).await.ok()?);
+    }
+    probe_bitstream(Codec::H264, bitstream)
+        .await
+        .then(|| CodecCapability {
+            codec: Codec::H264,
+            encoder: Some(NATIVE_H264_ENCODER.into()),
+            decoder: true,
+            hardware: true,
+        })
+}
+
+async fn probe_bitstream(codec: Codec, output: Vec<u8>) -> bool {
+    let Ok(mut decoder) = command()
+        .args([
+            "-v",
+            "error",
+            "-f",
+            codec.demuxer(),
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgra",
+            "pipe:1",
+        ])
+        .spawn()
+    else {
+        return false;
+    };
+    let mut stdin = decoder.stdin.take().unwrap();
+    let write = tokio::spawn(async move {
+        let _ = stdin.write_all(&output).await;
+    });
+    let valid = matches!(tokio::time::timeout(Duration::from_secs(5), decoder.wait_with_output()).await,
+        Ok(Ok(ref o)) if o.status.success() && o.stdout.len() == 128 * 128 * 4);
+    let _ = write.await;
+    valid
 }
 
 fn candidates(codec: Codec) -> &'static [(&'static str, bool)] {
@@ -121,7 +245,9 @@ fn candidates(codec: Codec) -> &'static [(&'static str, bool)] {
 }
 
 fn encoder_options(encoder: &str) -> Vec<&'static str> {
-    if encoder.ends_with("_nvenc") {
+    let mut options = if matches!(encoder, "libx264" | "libx265") {
+        vec!["-preset", "ultrafast", "-tune", "zerolatency", "-bf", "0"]
+    } else if encoder.ends_with("_nvenc") {
         vec![
             "-preset",
             "p1",
@@ -132,8 +258,42 @@ fn encoder_options(encoder: &str) -> Vec<&'static str> {
             "-bf",
             "0",
         ]
+    } else if encoder.ends_with("_amf") {
+        vec![
+            "-usage",
+            "ultralowlatency",
+            "-quality",
+            "speed",
+            "-async_depth",
+            "1",
+            "-preanalysis",
+            "0",
+            "-preencode",
+            "0",
+            "-bf",
+            "0",
+        ]
+    } else if encoder.ends_with("_qsv") {
+        let mut options = vec!["-preset", "veryfast", "-async_depth", "1", "-bf", "0"];
+        options.extend(if encoder.starts_with("h264_") {
+            ["-look_ahead", "0"]
+        } else {
+            ["-look_ahead_depth", "0"]
+        });
+        options
     } else if encoder.ends_with("_videotoolbox") {
-        vec!["-realtime", "1", "-allow_sw", "0", "-bf", "0"]
+        // Real-time scheduling alone still permits encoder buffering. This
+        // flag enables VideoToolbox's one-frame-in/one-frame-out rate control.
+        vec![
+            "-realtime",
+            "1",
+            "-allow_sw",
+            "0",
+            "-bf",
+            "0",
+            "-flags",
+            "+low_delay",
+        ]
     } else if encoder.ends_with("_mf") {
         vec!["-hw_encoding", "1", "-bf", "0"]
     } else if encoder == "libvpx-vp9" {
@@ -160,13 +320,74 @@ fn encoder_options(encoder: &str) -> Vec<&'static str> {
         ]
     } else {
         vec!["-bf", "0"]
+    };
+    // AMF otherwise deliberately withholds one output picture even with no B-frames.
+    options.extend(["-flags", "+low_delay"]);
+    options
+}
+
+/// Clients need decoders only. Decode generated reference frames without probing
+/// hardware encoders, which can reset buggy GPU drivers even on a receiving PC.
+pub async fn probe_decoders() -> Vec<CodecCapability> {
+    let samples: [(Codec, &[u8]); 4] = [
+        (Codec::H264, include_bytes!("../fixtures/probe.h264")),
+        (Codec::Hevc, include_bytes!("../fixtures/probe.hevc")),
+        (Codec::Av1, include_bytes!("../fixtures/probe-av1.ivf")),
+        (Codec::Vp9, include_bytes!("../fixtures/probe-vp9.ivf")),
+    ];
+    let mut capabilities = Vec::new();
+    for (codec, sample) in samples {
+        let Ok(mut decoder) = command()
+            .args([
+                "-v",
+                "error",
+                "-c:v",
+                codec.decoder(),
+                "-f",
+                codec.demuxer(),
+                "-i",
+                "pipe:0",
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "bgra",
+                "pipe:1",
+            ])
+            .spawn()
+        else {
+            continue;
+        };
+        let mut stdin = decoder.stdin.take().unwrap();
+        let write = tokio::spawn(async move {
+            let _ = stdin.write_all(sample).await;
+        });
+        let valid = matches!(tokio::time::timeout(Duration::from_secs(5), decoder.wait_with_output()).await,
+            Ok(Ok(ref output)) if output.status.success() && output.stdout.len() == 128 * 128 * 4);
+        let _ = write.await;
+        if valid {
+            capabilities.push(CodecCapability {
+                codec,
+                encoder: None,
+                decoder: true,
+                hardware: false,
+            });
+        }
     }
+    capabilities
 }
 
 /// Encodes a real short clip and decodes it again before advertising the path.
 pub async fn probe() -> Vec<CodecCapability> {
     let mut capabilities = vec![];
     for codec in [Codec::H264, Codec::Hevc, Codec::Av1, Codec::Vp9] {
+        if codec == Codec::H264
+            && let Some(native) = probe_native_h264().await
+        {
+            capabilities.push(native);
+            continue;
+        }
         let mut found = None;
         for &(encoder, hardware) in candidates(codec) {
             let mut cmd = command();
@@ -188,6 +409,10 @@ pub async fn probe() -> Vec<CodecCapability> {
             cmd.args([
                 "-g",
                 "30",
+                // Match the live encoder: VideoToolbox low-delay rate control
+                // requires an explicit bitrate, including during this probe.
+                "-b:v",
+                "12M",
                 "-pix_fmt",
                 "yuv420p",
                 "-f",
@@ -200,34 +425,7 @@ pub async fn probe() -> Vec<CodecCapability> {
                 }
                 _ => continue,
             };
-            let mut decoder = match command()
-                .args([
-                    "-v",
-                    "error",
-                    "-f",
-                    codec.demuxer(),
-                    "-i",
-                    "pipe:0",
-                    "-frames:v",
-                    "1",
-                    "-f",
-                    "rawvideo",
-                    "-pix_fmt",
-                    "bgra",
-                    "pipe:1",
-                ])
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let mut stdin = decoder.stdin.take().unwrap();
-            let write = tokio::spawn(async move {
-                let _ = stdin.write_all(&output).await;
-            });
-            let valid = matches!(tokio::time::timeout(Duration::from_secs(5), decoder.wait_with_output()).await, Ok(Ok(ref o)) if o.status.success() && o.stdout.len() == 128*128*4);
-            let _ = write.await;
-            if valid {
+            if probe_bitstream(codec, output).await {
                 found = Some(CodecCapability {
                     codec,
                     encoder: Some(encoder.to_owned()),
@@ -281,7 +479,26 @@ pub async fn encode(
     height: u32,
     fps: u32,
     capability: &CodecCapability,
+    input: watch::Receiver<Option<RawFrame>>,
+) -> anyhow::Result<Encoder> {
+    encode_paced(
+        width,
+        height,
+        fps,
+        capability,
+        input,
+        Arc::new(AtomicU32::new(fps)),
+    )
+    .await
+}
+
+pub async fn encode_paced(
+    width: u32,
+    height: u32,
+    fps: u32,
+    capability: &CodecCapability,
     mut input: watch::Receiver<Option<RawFrame>>,
+    rate: Arc<AtomicU32>,
 ) -> anyhow::Result<Encoder> {
     anyhow::ensure!(
         width > 0 && height > 0 && width <= 8192 && height <= 8192,
@@ -292,52 +509,66 @@ pub async fn encode(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("encoding unavailable"))?;
     let size = format!("{width}x{height}");
-    let mut cmd = command();
-    cmd.args([
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "bgra",
-        "-s",
-        &size,
-        "-r",
-        &fps.to_string(),
-        "-i",
-        "pipe:0",
-        "-an",
-        "-c:v",
-        encoder,
-    ]);
-    cmd.args(encoder_options(encoder));
-    cmd.args([
-        "-g",
-        "60",
-        "-b:v",
-        "12M",
-        "-pix_fmt",
-        "yuv420p",
-        "-vf",
-        "pad=max(128\\,ceil(iw/2)*2):max(128\\,ceil(ih/2)*2)",
-    ]);
-    match capability.codec {
-        Codec::H264 => {
-            cmd.args(["-bsf:v", "h264_metadata=aud=insert"]);
+    let native = encoder == NATIVE_H264_ENCODER;
+    let mut cmd = if native {
+        native_h264_command(width, height, fps)
+            .ok_or_else(|| anyhow::anyhow!("native VideoToolbox helper missing"))?
+    } else {
+        command()
+    };
+    if !native {
+        cmd.args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-filter_threads",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgra",
+            "-s",
+            &size,
+            "-r",
+            &fps.to_string(),
+            "-i",
+            "pipe:0",
+            "-an",
+            "-c:v",
+            encoder,
+        ]);
+        cmd.args(encoder_options(encoder));
+        cmd.args([
+            "-g",
+            "60",
+            "-b:v",
+            "12M",
+            "-pix_fmt",
+            "yuv420p",
+            "-vf",
+            "pad=max(128\\,ceil(iw/2)*2):max(128\\,ceil(ih/2)*2)",
+        ]);
+        match capability.codec {
+            Codec::H264 => {
+                cmd.args(["-bsf:v", "h264_metadata=aud=insert"]);
+            }
+            Codec::Hevc => {
+                cmd.args(["-bsf:v", "hevc_metadata=aud=insert"]);
+            }
+            _ => {}
         }
-        Codec::Hevc => {
-            cmd.args(["-bsf:v", "hevc_metadata=aud=insert"]);
-        }
-        _ => {}
+        cmd.args([
+            "-flush_packets",
+            "1",
+            "-f",
+            if matches!(capability.codec, Codec::H264 | Codec::Hevc) {
+                "avi"
+            } else {
+                capability.codec.demuxer()
+            },
+            "pipe:1",
+        ]);
     }
-    cmd.args([
-        "-flush_packets",
-        "1",
-        "-f",
-        capability.codec.demuxer(),
-        "pipe:1",
-    ]);
     cmd.stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
     crate::process::track(&child)?;
@@ -354,29 +585,39 @@ pub async fn encode(
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
     let input_task = tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(Duration::from_micros(1_000_000 / fps.max(1) as u64));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut submitted: Option<tokio::time::Instant> = None;
         loop {
-            interval.tick().await;
+            let period = Duration::from_micros(
+                1_000_000 / rate.load(Ordering::Relaxed).clamp(1, 240) as u64,
+            );
+            if let Some(last) = submitted {
+                tokio::time::sleep_until(last + period).await;
+            }
             let frame = input.borrow_and_update().clone();
             if let Some(frame) = frame {
                 if frame.width != width || frame.height != height || !frame.validate() {
                     break;
                 }
+                submitted = Some(tokio::time::Instant::now());
                 if stdin.write_all(&frame.bgra).await.is_err() {
                     break;
                 }
             }
-            if input.has_changed().is_err() {
+            if input.changed().await.is_err() {
                 break;
             }
         }
     });
-    let (sender, frames) = mpsc::channel(2);
+    let (sender, frames) = mpsc::channel(1);
     let codec = capability.codec;
     tokio::spawn(async move {
-        if matches!(codec, Codec::Vp9 | Codec::Av1) {
+        if native {
+            while let Ok(frame) = read_native_frame(&mut stdout).await {
+                if sender.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        } else if matches!(codec, Codec::Vp9 | Codec::Av1) {
             let mut header = [0; 32];
             if stdout.read_exact(&mut header).await.is_err() {
                 return;
@@ -406,27 +647,16 @@ pub async fn encode(
                 }
             }
         } else {
-            let mut buffer = Vec::new();
-            let mut chunk = [0; 65536];
-            loop {
-                let n = match stdout.read(&mut chunk).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
-                };
-                buffer.extend_from_slice(&chunk[..n]);
-                while let Some(boundary) = second_aud(&buffer, codec) {
-                    let next = buffer.split_off(boundary);
-                    let frame = std::mem::replace(&mut buffer, next);
-                    if sender.send(frame).await.is_err() {
-                        return;
-                    }
-                }
-                if buffer.len() > MAX_FRAME_BYTES {
+            if avi::header(&mut stdout).await.is_err() {
+                return;
+            }
+            while let Ok(mut frame) = avi::packet(&mut stdout).await {
+                // The receiving elementary-stream parser also needs a picture
+                // boundary now, rather than waiting for a later capture.
+                append_aud(codec, &mut frame);
+                if sender.send(frame).await.is_err() {
                     break;
                 }
-            }
-            if !buffer.is_empty() {
-                let _ = sender.send(buffer).await;
             }
         }
     });
@@ -437,6 +667,15 @@ pub async fn encode(
     })
 }
 
+fn append_aud(codec: Codec, frame: &mut Vec<u8>) {
+    match codec {
+        Codec::H264 => frame.extend_from_slice(&[0, 0, 0, 1, 9, 0xf0]),
+        Codec::Hevc => frame.extend_from_slice(&[0, 0, 0, 1, 70, 1, 0x50]),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
 fn second_aud(bytes: &[u8], codec: Codec) -> Option<usize> {
     let mut found = false;
     let mut i = 0;
@@ -494,6 +733,20 @@ pub struct Decoder {
     pub child: Child,
     pub input: mpsc::Sender<Vec<u8>>,
     pub output: watch::Receiver<Option<RawFrame>>,
+    pending: Arc<AtomicUsize>,
+}
+impl Decoder {
+    pub fn in_flight(&self) -> usize {
+        self.pending.load(Ordering::Acquire)
+    }
+    pub fn try_submit(&self, frame: Vec<u8>) -> Result<(), mpsc::error::TrySendError<Vec<u8>>> {
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        if let Err(error) = self.input.try_send(frame) {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+            return Err(error);
+        }
+        Ok(())
+    }
 }
 pub async fn decode(codec: Codec, width: u32, height: u32) -> anyhow::Result<Decoder> {
     anyhow::ensure!(
@@ -505,6 +758,8 @@ pub async fn decode(codec: Codec, width: u32, height: u32) -> anyhow::Result<Dec
             "-hide_banner",
             "-loglevel",
             "error",
+            "-filter_threads",
+            "1",
             "-flags",
             "low_delay",
             "-probesize",
@@ -536,7 +791,9 @@ pub async fn decode(codec: Codec, width: u32, height: u32) -> anyhow::Result<Dec
     crate::process::track(&child)?;
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
-    let (input, mut encoded) = mpsc::channel::<Vec<u8>>(4);
+    // A cold decoder may not read its pipe immediately. Allow a bounded startup
+    // burst; ClientMedia applies the smaller live backlog limit once it renders.
+    let (input, mut encoded) = mpsc::channel::<Vec<u8>>(16);
     tokio::spawn(async move {
         while let Some(frame) = encoded.recv().await {
             if stdin.write_all(&frame).await.is_err() {
@@ -545,6 +802,8 @@ pub async fn decode(codec: Codec, width: u32, height: u32) -> anyhow::Result<Dec
         }
     });
     let (sender, output) = watch::channel(None);
+    let pending = Arc::new(AtomicUsize::new(0));
+    let completed = pending.clone();
     tokio::spawn(async move {
         loop {
             let mut bgra = vec![0; width as usize * height as usize * 4];
@@ -555,24 +814,79 @@ pub async fn decode(codec: Codec, width: u32, height: u32) -> anyhow::Result<Dec
                 .send(Some(RawFrame {
                     width,
                     height,
-                    bgra,
+                    bgra: bgra.into(),
                 }))
                 .is_err()
             {
                 break;
             }
+            let _ = completed.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                Some(n.saturating_sub(1))
+            });
         }
     });
     Ok(Decoder {
         child,
         input,
         output,
+        pending,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn native_packet_framing_handles_short_reads_and_rejects_bad_sizes() {
+        let (mut tx, mut rx) = tokio::io::duplex(16);
+        tokio::spawn(async move {
+            for byte in [3, 0, 0, 0, 10, 20, 30] {
+                tx.write_all(&[byte]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        assert_eq!(read_native_frame(&mut rx).await.unwrap(), [10, 20, 30]);
+        for size in [0u32, MAX_FRAME_BYTES as u32 + 1] {
+            let mut input = std::io::Cursor::new(size.to_le_bytes());
+            assert_eq!(
+                read_native_frame(&mut input).await.unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+        let mut truncated = std::io::Cursor::new([3, 0, 0, 0, 10]);
+        assert_eq!(
+            read_native_frame(&mut truncated).await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires built FramesHelper and physical VideoToolbox hardware"]
+    async fn native_h264_single_frame_decodes_without_another_input_or_eof() {
+        let mut child = native_h264_command(128, 128, 60).unwrap().spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        stdin
+            .write_all(&[220u8, 30, 20, 255].repeat(128 * 128))
+            .await
+            .unwrap();
+        let packet = tokio::time::timeout(Duration::from_secs(2), read_native_frame(&mut stdout))
+            .await
+            .expect("encoder buffered the only submitted frame")
+            .unwrap();
+        assert!(is_keyframe(Codec::H264, &packet, false));
+        let mut decoder = decode(Codec::H264, 128, 128).await.unwrap();
+        decoder.input.send(packet).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), decoder.output.changed())
+            .await
+            .expect("decoder waited for another access unit")
+            .unwrap();
+        let frame = decoder.output.borrow().clone().unwrap();
+        assert!(frame.bgra[0] > 140 && frame.bgra[2] < 100);
+        decoder.child.kill().await.unwrap();
+        child.kill().await.unwrap();
+        drop(stdin);
+    }
     #[test]
     fn negotiation_requires_a_mutual_path_and_honors_manual_selection() {
         let host = vec![CodecCapability {
