@@ -23,6 +23,12 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
     var axBindings:[CGWindowID:(pid:pid_t,frame:CGRect,element:AXUIElement,closeButton:AXUIElement?)]=[:]
     var lastClick:(window:CGWindowID,button:UInt8,point:CGPoint,time:TimeInterval,count:Int64)?
     var clickCounts:[UInt8:Int64]=[:]
+    var surfaceRoles:[CGWindowID:String]=[:]
+    var surfaceParents:[CGWindowID:CGWindowID]=[:]
+    var modalSurfaces:Set<CGWindowID>=[]
+    var lastInputWindow:CGWindowID?
+    var axScan:[pid_t:AXSurfaces]=[:]
+    var enumerating=false
 
     func request(_ command: String, _ data: [String: Any]) async throws -> [String: Any] {
         if ["action","input","menu","drop_files"].contains(command),let error=HostSessionState.controlError(){throw Wire.failure(error)}
@@ -167,6 +173,11 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
         var next: [CGWindowID: SCWindow] = [:]
         var result: [[String: Any]] = []
         var nextContent:[CGWindowID:CGRect]=[:]
+        axScan.removeAll()
+        enumerating=true
+        defer{axScan.removeAll();enumerating=false}
+        var nextRoles:[CGWindowID:String]=[:],nextParents:[CGWindowID:CGWindowID]=[:]
+        var nextModals:Set<CGWindowID>=[]
         let candidates = content.windows.filter { window in
             guard let owner = window.owningApplication, owner.processID != getpid(), !owner.bundleIdentifier.hasPrefix("dev.creaton.frames"), !owner.bundleIdentifier.hasPrefix("app.frames"), window.frame.width > 0, window.frame.height > 0 else { return false }
             if kill(owner.processID,0) != 0 && errno == ESRCH { return false }
@@ -183,23 +194,27 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
             // Do not retain a stale SCK surface after its live window leaves.
             guard let info=metadata[id],(info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == owner.processID else{continue}
             let layer = info[kCGWindowLayer as String] as? Int ?? 0
-            if layer < 0 || layer > 30 { continue }
-            if layer == 0 && WindowContent.isTitlebarAccessory(frame:window.frame,ownerFrames:content.windows.filter {
+            let popupLevel=Int(CGWindowLevelForKey(.popUpMenuWindow)),helpLevel=Int(CGWindowLevelForKey(.helpWindow))
+            if layer < 0 || (layer > 30 && layer != popupLevel && layer != helpLevel) { continue }
+            let ax = axWindow(window)
+            let axRole=ax.flatMap{attribute($0,kAXRoleAttribute) as? String}
+            let subrole=ax.flatMap{attribute($0,kAXSubroleAttribute) as? String}
+            if layer == 0 && axRole != "AXSheet" && axRole != "AXMenu" && WindowContent.isTitlebarAccessory(frame:window.frame,ownerFrames:content.windows.filter {
                 $0.windowID != id && $0.windowLayer == 0 && $0.owningApplication?.processID == owner.processID
             }.map(\.frame)) { continue }
-            if (window.title ?? "").isEmpty && layer == 0 { continue }
-            let ax = axWindow(window)
-            // Off-screen and transparent helper surfaces can still have titles.
-            // Floating windows need an AX window; ordinary occluded windows remain eligible.
-            if (info[kCGWindowAlpha as String] as? Double ?? 1) <= 0 || (layer > 0 && ax == nil) { continue }
             var settable = DarwinBoolean(false)
             let canResize = ax.map { AXUIElementIsAttributeSettable($0, kAXSizeAttribute as CFString, &settable) == .success && settable.boolValue }
             let minimized = ax.flatMap { attribute($0, kAXMinimizedAttribute) as? Bool } ?? false
             if minimized { continue }
-            let modal = ax.flatMap { attribute($0, kAXModalAttribute) as? Bool } ?? false
-            let rect = contentBounds(window,element:ax)
+            let modal = axRole == "AXSheet" || (ax.flatMap { attribute($0, kAXModalAttribute) as? Bool } ?? false)
+            let role=WindowSurfaces.role(layer:layer,axRole:axRole,subrole:subrole,modal:modal)
+            let parent=surfaceParent(window,element:ax,candidates:candidates,role:role)
+            // Menu/help levels may have no AXWindow at all. Require an owner
+            // within the admitted application rather than exposing helper UI.
+            guard WindowSurfaces.admitted(layer:layer,title:window.title ?? "",alpha:info[kCGWindowAlpha as String] as? Double ?? 1,
+                                          hasAX:ax != nil,role:role,parent:parent) else{continue}
+            let rect = WindowSurfaces.isPopup(role) || axRole == "AXSheet" ? window.frame:contentBounds(window,element:ax)
             let filter = SCContentFilter(desktopIndependentWindow: window)
-            let parent = layer > 0 ? candidates.first(where: { $0.windowLayer == 0 && $0.owningApplication?.processID == owner.processID })?.windowID : nil
             let running = NSRunningApplication(processIdentifier: owner.processID)
             let iconKey = "\(owner.bundleIdentifier):\(owner.processID)"
             let icon = icons[iconKey] ?? running?.icon.flatMap { image -> String? in
@@ -212,22 +227,65 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
                 "key": ["id": id, "generation": 1], "app_id": owner.bundleIdentifier,
                 "app_name": owner.applicationName, "title": window.title ?? owner.applicationName,
                 "icon_png": icon as Any? ?? NSNull(), "parent": parent.map { ["id": $0, "generation": 1] } as Any? ?? NSNull(),
-                "role": layer > 0 ? "popover" : (modal ? "dialog" : "window"),
+                "role": role,
                 "bounds": ["x": rect.minX, "y": rect.minY, "width": rect.width, "height": rect.height],
                 "scale": Double(filter.pointPixelScale), "resize": canResize.map { $0 ? "supported" : "fixed" } ?? "unknown",
                 "minimized": minimized, "visible": !minimized && !(running?.isHidden ?? false), "modal": modal,"show_header":headers.contains(id)
             ])
             next[id] = window
+            nextRoles[id]=role
+            if let parent{nextParents[id]=parent}
+            if modal{nextModals.insert(id)}
             nextContent[id]=rect
             if let capture = captures[id], capture.frame != window.frame || capture.contentFrame != rect { capture.scheduleResize(window,content:rect) }
         }
         windows = next
+        nextParents=WindowSurfaces.acyclicParents(nextParents,live:Set(next.keys))
+        // A parent may have been rejected later in the scan. Never publish an
+        // orphan popup or a dangling owner.
+        result=result.filter { value in
+            guard let key=value["key"] as? [String:Any],let id=(key["id"] as? NSNumber)?.uint32Value else{return false}
+            if nextParents[id]==nil && WindowSurfaces.isPopup(nextRoles[id] ?? "") {windows.removeValue(forKey:id);nextContent.removeValue(forKey:id);return false}
+            return true
+        }.map { value in
+            var value=value
+            if let key=value["key"] as? [String:Any],let id=(key["id"] as? NSNumber)?.uint32Value,nextParents[id]==nil {value["parent"]=NSNull()}
+            return value
+        }
+        surfaceRoles=nextRoles.filter{windows[$0.key] != nil}
+        surfaceParents=nextParents
+        modalSurfaces=nextModals.filter{windows[$0] != nil}
         contentFrames=nextContent
         contentCrops=contentCrops.filter{next[$0.key]?.owningApplication?.processID == $0.value.pid}
         headers=headers.filter{next[$0] != nil}
         axBindings=axBindings.filter{next[$0.key] != nil}
         menuActions=menuActions.filter{next[$0.key] != nil}
         return ["windows": result]
+    }
+
+    func surfaceParent(_ window:SCWindow,element:AXUIElement?,candidates:[SCWindow],role:String)->CGWindowID? {
+        guard role != "window",let pid=window.owningApplication?.processID else{return nil}
+        let index=axScan[pid] ?? AXSurfaces(pid:pid)
+        let owners=candidates.filter{$0.windowID != window.windowID && $0.windowLayer==0 && $0.owningApplication?.processID==pid}
+        func match(_ ax:AXUIElement?)->CGWindowID? {
+            guard let ax,let frame=AXSurfaces.frame(ax) else{return nil}
+            let title=attribute(ax,kAXTitleAttribute) as? String ?? ""
+            guard let i=WindowContent.matchingWindow(frame:frame,title:title,candidates:owners.map{($0.frame,$0.title ?? "")}) else{return nil}
+            return owners[i].windowID
+        }
+        if let element,let entry=index.entries.first(where:{CFEqual($0.element,element)}),let id=match(entry.parent) {return id}
+        if let element,let id=match(AXSurfaces.element(element,kAXWindowAttribute)) {return id}
+        // A sheet has a document owner. An application-modal AX dialog with
+        // no such relationship keeps parent=nil, so viewers block the whole
+        // application rather than guessing a document owner.
+        if role=="dialog",let element,attribute(element,kAXRoleAttribute) as? String != "AXSheet",
+           attribute(element,kAXModalAttribute) as? Bool == true {return nil}
+        // Keep a menu's anchor stable while hover changes AX focus/submenus.
+        if let old=surfaceParents[window.windowID],owners.contains(where:{$0.windowID==old}) {return old}
+        return WindowSurfaces.parent(owners:Set(owners.map(\.windowID)),preferred:[
+            match(AXSurfaces.element(index.application,kAXFocusedWindowAttribute)),
+            match(AXSurfaces.element(index.application,kAXMainWindowAttribute)),lastInputWindow
+        ])
     }
 
     func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
@@ -277,18 +335,10 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
         let title=window.title ?? ""
         // Captions change while typing and switching tabs without changing the
         // window's identity. Keep the verified binding through those changes.
+        let surfaces=axScan[pid] ?? AXSurfaces(pid:pid)
+        if enumerating{axScan[pid]=surfaces}
         if let cached=axBindings[window.windowID],cached.pid==pid,cached.frame==window.frame{return cached.element}
-        let application = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(application,0.2)
-        var candidates=attribute(application,kAXWindowsAttribute) as? [AXUIElement] ?? []
-        if candidates.isEmpty {
-            for name in [kAXFocusedWindowAttribute,kAXMainWindowAttribute] {
-                if let value=attribute(application,name),CFGetTypeID(value)==AXUIElementGetTypeID() {
-                    let element=value as! AXUIElement
-                    if !candidates.contains(where:{CFEqual($0,element)}){candidates.append(element)}
-                }
-            }
-        }
+        let candidates=surfaces.entries.map(\.element)
         let located = candidates.compactMap { element -> (element:AXUIElement,frame:CGRect,title:String)? in
             AXUIElementSetMessagingTimeout(element,0.2)
             guard let p = attribute(element, kAXPositionAttribute), let s = attribute(element, kAXSizeAttribute), CFGetTypeID(p) == AXValueGetTypeID(), CFGetTypeID(s) == AXValueGetTypeID() else { return nil }
@@ -315,7 +365,7 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
             if window.owningApplication?.bundleIdentifier == "dev.frames.qa.fixture" {
                 fputs("Frames QA AX mismatch: SCK=\(window.frame) live=\(String(describing:liveFrame)) AX=\(located.map{($0.frame,$0.title)})\n",stderr)
             }
-            return nil
+            return surfaces.hitTest(frame:liveFrame ?? window.frame)
         }
         let element=located[index].element
         let close=attribute(element,kAXCloseButtonAttribute)
@@ -345,7 +395,12 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
         }
         if closed(){axBindings.removeValue(forKey:id);return}
         if action["kind"] as? String == "focus",let pid=window.owningApplication?.processID {
+            lastInputWindow=id
+            // Raising any window while its native menu is tracking can cancel
+            // that menu. Popup clicks and keyboard navigation need only the app.
+            if !shouldRaiseForInput(id,window:window) {return}
             NSRunningApplication(processIdentifier:pid)?.activate(options:[])
+            if WindowSurfaces.isPopup(surfaceRoles[id] ?? "") {return}
         }
         guard let ax=axWindow(window) else {
             if closed(){return}
@@ -389,6 +444,7 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
     }
 
     func focusForInput(_ id:CGWindowID,window:SCWindow) async throws {
+        if !shouldRaiseForInput(id,window:window) {return}
         try action(id,["kind":"focus"])
         guard let pid=window.owningApplication?.processID else{throw Wire.failure("Window owner exited")}
         for _ in 0..<20 {
@@ -396,6 +452,13 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
             try await Task.sleep(nanoseconds:10_000_000)
         }
         throw Wire.failure("Mac did not activate the target application")
+    }
+
+    func shouldRaiseForInput(_ id:CGWindowID,window:SCWindow)->Bool {
+        let pid=window.owningApplication?.processID
+        let hasMenu=windows.values.contains{$0.owningApplication?.processID==pid && surfaceRoles[$0.windowID]=="menu"}
+        return WindowSurfaces.shouldRaise(frontmost:NSWorkspace.shared.frontmostApplication?.processIdentifier==pid,
+                                         role:surfaceRoles[id] ?? "window",hasMenu:hasMenu,modal:modalSurfaces.contains(id))
     }
 
     func menu(_ id:CGWindowID)async throws -> [[String:Any]] {

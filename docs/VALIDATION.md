@@ -63,6 +63,46 @@ closing the remote application.
 
 ## Remaining coverage
 
+### macOS dialogs and context menus
+
+Run `bash scripts/test_macos_window_surfaces.sh` after the Mac release build.
+The native regression fixture covers menu/help window levels, untitled AX
+dialogs, ambiguous and cyclic ownership, nested popup creation, placement beyond
+the parent edges, Retina and negative-origin geometry, local scaling/movement,
+drag routing into submenus, Escape dismissal, tooltip hit testing, document,
+application and nested modality, independent windows, hide/restore, reparenting,
+and removal.
+Build and release CI run this fixture. Header, shared-game, and content geometry
+regressions also passed against the changed Swift sources on an Apple-silicon Mac.
+
+Live capture/control acceptance is still pending: the available Mac reported
+Screen Recording and Accessibility unavailable to the test helper. To reproduce
+the remaining checks on an authorized Mac:
+
+```sh
+swiftc native/macos/Tests/WindowFixture.swift -o /tmp/frames-window-fixture
+FRAMES_QA_SURFACES=1 FRAMES_QA_NO_COVER=1 /tmp/frames-window-fixture
+```
+
+Connect in per-window mode and check both Mac and Windows viewers:
+
+- Right-click each source window, select normal/checked items, verify disabled
+  items, hover into the submenu, drag and release onto an item, and dismiss with
+  Escape or an outside click. Repeat near a screen edge.
+- Open the alert sheet and Open file panel. Verify keyboard navigation and text
+  entry, Cancel/Done, parent blocking, independent-window input, and focus return
+  after dismissal. Check that App modal alert blocks both source windows. Open
+  the untitled modeless dialog and interactive popover.
+- Move and scale the local parent, hide/restore it, minimize/restore it, switch
+  applications, and enter/leave fullscreen. Verify child placement, stacking,
+  tooltip pass-through, held-key release, and no leftover popup after closing.
+
+This work concerns per-window view. The separate Selected windows sharing
+allowlist still admits only explicitly selected window IDs; admitting transient
+descendants in that scope requires a separate authorization-policy change.
+
+### Other release checks
+
 - Controlled RustDesk/Moonlight comparison and input-to-photon measurements.
 - Long sessions, sustained packet loss, different GPUs, multi-display selection, and placement restoration across view switches.
 - Windows login/UAC secure-desktop acceptance, permission revocation during sessions, and privileged service updates.

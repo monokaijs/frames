@@ -194,6 +194,8 @@ jobs:
           FRAMES_RELEASE_BUILD: '1'
           FRAMES_SIGN_IDENTITY: ${{ vars.MACOS_SIGN_IDENTITY }}
         run: bash native/macos/build.sh
+      - name: Mac dialog and popup behavior regression checks
+        run: bash scripts/test_macos_window_surfaces.sh
       - name: Shared game macOS viewer regression checks
         run: |
           set -euo pipefail

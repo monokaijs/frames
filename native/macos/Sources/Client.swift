@@ -24,6 +24,11 @@ import ImageIO
     var needsMenu=false
     var focusAfterSwitch=false
     var pendingVideo: [String: ClientVideoFrame] = [:]
+    var surfaceOrder:[String]=[]
+    var outsideClickMonitor:Any?
+    var layingOutGroups=false
+    var nextSurfaceSerial=0
+    var dismissingMenuApps=Set<String>()
     func receiveVideo(_ frames: [ClientVideoFrame]) {
         for frame in frames {
             if pendingVideo[frame.key] == nil && pendingVideo.count >= 16, let key = pendingVideo.keys.first { pendingVideo.removeValue(forKey: key) }
@@ -46,11 +51,98 @@ import ImageIO
     // Keep the session alive until an explicit disconnect or a transport failure.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication)->Bool{false}
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply{Wire.diagnostic("client_terminate_requested");return .terminateNow}
-    func applicationDidResignActive(_ notification:Notification){for proxy in windows.values{proxy.view.releaseInput()}}
-    func applicationDidBecomeActive(_ notification:Notification){Wire.send(["event":"devices","data":["action":"focus","active":true]])}
+    func applicationDidResignActive(_ notification:Notification){dismissRemoteMenus();for proxy in windows.values{proxy.view.releaseInput()}}
+    func applicationDidBecomeActive(_ notification:Notification){dismissingMenuApps.removeAll();Wire.send(["event":"devices","data":["action":"focus","active":true]])}
     func applicationDidHide(_ notification:Notification){for proxy in windows.values{proxy.view.releaseInput()}}
     func activate(_ proxy:RemoteProxy){activeProxy=proxy;installMenu()}
-    func menuWillOpen(_ menu:NSMenu){menuTracking+=1}
+    func modalBlocker(for proxy:RemoteProxy)->RemoteProxy? {
+        let modals=windows.values.filter{$0.remote["modal"] as? Bool == true}.sorted{$0.surfaceSerial>$1.surfaceSerial}
+        func descends(_ child:RemoteProxy,from ancestor:RemoteProxy)->Bool {
+            var current=child,seen=Set<String>()
+            while let id=current.remote["parent"] as? [String:Any],seen.insert(Self.key(id)).inserted,let parent=windows[Self.key(id)] {
+                if parent === ancestor{return true};current=parent
+            }
+            return false
+        }
+        func direct(_ target:RemoteProxy)->RemoteProxy? {
+            for candidate in modals where candidate !== target {
+                if descends(candidate,from:target){return candidate}
+                if !(candidate.remote["parent"] is [String:Any]),let app=candidate.remote["app_id"] as? String,
+                   target.remote["app_id"] as? String == app,!descends(target,from:candidate),
+                   target.remote["modal"] as? Bool != true || candidate.surfaceSerial>target.surfaceSerial {return candidate}
+            }
+            return nil
+        }
+        // Follow nested modality to the final dialog so focus forwarding cannot
+        // oscillate between an outer alert and its own sheet.
+        var target=proxy,seen:Set<String>=[Self.key(proxy.id)]
+        while let next=direct(target),seen.insert(Self.key(next.id)).inserted{target=next}
+        return target === proxy ? nil:target
+    }
+    func dismissRemoteMenus() {
+        for key in surfaceOrder.reversed() {
+            guard let proxy=windows[key],proxy.remote["role"] as? String == "menu" else{continue}
+            let app=proxy.remote["app_id"] as? String ?? key
+            guard dismissingMenuApps.insert(app).inserted else{continue}
+            // Cancel each native menu session once. Repeated Escape events can
+            // reach the underlying dialog after the entire menu chain closes.
+            proxy.send("input",["input":["kind":"key","usage":41,"down":true]])
+            proxy.send("input",["input":["kind":"key","usage":41,"down":false]])
+        }
+    }
+    func installOutsideClickMonitor() {
+        guard outsideClickMonitor==nil else{return}
+        outsideClickMonitor=NSEvent.addLocalMonitorForEvents(matching:[.leftMouseDown,.rightMouseDown,.otherMouseDown]){[weak self] event in
+            MainActor.assumeIsolated {
+                guard let self else{return}
+                if let proxy=self.windows.values.first(where:{$0.window === event.window}) {
+                    if !proxy.view.bounds.contains(proxy.view.convert(event.locationInWindow,from:nil)){self.dismissRemoteMenus()}
+                }else{self.dismissRemoteMenus()}
+            }
+            return event
+        }
+    }
+    func popupTarget(at screenPoint:CGPoint)->RemoteProxy? {
+        for key in surfaceOrder.reversed() {
+            if let proxy=windows[key],proxy.isPopup,proxy.remote["role"] as? String != "tooltip",
+               proxy.window.isVisible,!proxy.hidden,proxy.window.frame.contains(screenPoint) {return proxy}
+        }
+        return nil
+    }
+    func survivingOwner(of proxy:RemoteProxy,keys:Set<String>)->RemoteProxy? {
+        var current=proxy,seen=Set<String>()
+        while let id=current.remote["parent"] as? [String:Any],seen.insert(Self.key(id)).inserted,let parent=windows[Self.key(id)] {
+            if keys.contains(Self.key(id)){return parent};current=parent
+        }
+        return nil
+    }
+    func layoutWindowGroups() {
+        guard !layingOutGroups else{return};layingOutGroups=true;defer{layingOutGroups=false}
+        for key in surfaceOrder {
+            guard let proxy=windows[key],let id=proxy.remote["parent"] as? [String:Any],let parent=windows[Self.key(id)],parent !== proxy else{continue}
+            if proxy.window.parent !== parent.window {
+                proxy.window.parent?.removeChildWindow(proxy.window)
+                parent.window.addChildWindow(proxy.window,ordered:.above)
+                proxy.attachmentBounds=nil
+            }
+            let body=parent.window.convertToScreen(parent.view.convert(parent.view.contentRect(),to:nil))
+            let source=WindowSurfaces.bounds(proxy.remote),ownerBounds=WindowSurfaces.bounds(parent.remote)
+            let rect=WindowSurfaces.attachedRect(child:source,parent:ownerBounds,displayed:body)
+            proxy.applyingGeometry=true
+            let frame=proxy.window.frameRect(forContentRect:rect)
+            // Titled dialogs remain movable locally. AppKit moves child windows
+            // with their owner; recompute their frame only when source geometry
+            // or the displayed parent scale changes. Menus stay at their anchor.
+            let changed=proxy.attachmentBounds != source || proxy.attachmentParentBounds != ownerBounds || proxy.attachmentDisplaySize != body.size
+            if (proxy.isPopup || changed) && proxy.window.frame != frame{proxy.window.setFrame(frame,display:proxy.window.isVisible)}
+            proxy.attachmentBounds=source;proxy.attachmentParentBounds=ownerBounds;proxy.attachmentDisplaySize=body.size
+            proxy.applyingGeometry=false
+            let visible = !proxy.hidden && !parent.hidden && parent.window.isVisible && !parent.window.isMiniaturized
+            if visible {if !proxy.window.isVisible{proxy.window.orderFront(nil)}}else{proxy.window.orderOut(nil)}
+            proxy.visibility()
+        }
+    }
+    func menuWillOpen(_ menu:NSMenu){if menuTracking==0{dismissRemoteMenus()};menuTracking+=1}
     func menuDidClose(_ menu:NSMenu){menuTracking=max(0,menuTracking-1);if menuTracking==0 && needsMenu{DispatchQueue.main.async{[weak self] in self?.installMenu()}}}
     func installMenu(){
         guard menuTracking==0 else{needsMenu=true;return};needsMenu=false
@@ -162,22 +254,40 @@ import ImageIO
             }
             let keys = Set(list.compactMap { ($0["key"] as? [String: Any]).map(Self.key) })
             Wire.diagnostic("window_snapshot", ["count":keys.count,"view_mode":viewMode])
-            for key in Array(windows.keys) where !keys.contains(key) { windows.removeValue(forKey: key)?.destroy() }
-            let sorted = list.sorted { ($0["parent"] is NSNull) && !($1["parent"] is NSNull) }
+            var restoreFocus:RemoteProxy?
+            if let closing=windows.values.first(where:{$0.window.isKeyWindow && !keys.contains(Self.key($0.id))}) {
+                restoreFocus=survivingOwner(of:closing,keys:keys)
+            }
+            for key in Array(windows.keys) where !keys.contains(key) {
+                if let proxy=windows.removeValue(forKey:key) {
+                    proxy.destroy()
+                }
+            }
+            let sorted = WindowSurfaces.ordered(list)
+            let menuApps=Set(list.filter{$0["role"] as? String == "menu"}.compactMap{$0["app_id"] as? String})
+            dismissingMenuApps.formIntersection(menuApps)
+            surfaceOrder=sorted.compactMap{($0["key"] as? [String:Any]).map(Self.key)}
+            installOutsideClickMonitor()
             for remote in sorted {
                 guard let id = remote["key"] as? [String: Any] else { continue }; let key = Self.key(id)
-                if let proxy = windows[key] { proxy.remote = remote; proxy.refreshTitle(); if activeProxy === proxy{installMenu()};continue }
-                let proxy = RemoteProxy(remote: remote, host: host);proxy.client=self;configureShared(proxy); windows[key] = proxy
-                if let owner = remote["parent"] as? [String: Any], let parent = windows[Self.key(owner)] {
-                    parent.window.addChildWindow(proxy.window, ordered: .above)
-                    let pr = parent.remote["bounds"] as? [String: Double] ?? [:], cr = remote["bounds"] as? [String: Double] ?? [:]
-                    let body=parent.window.convertToScreen(parent.view.convert(parent.view.bounds,to:nil))
-                    proxy.window.setFrameOrigin(NSPoint(x:body.minX+(cr["x"] ?? 0)-(pr["x"] ?? 0),y:body.maxY-((cr["y"] ?? 0)-(pr["y"] ?? 0))-proxy.view.bounds.height))
+                if let proxy = windows[key] {
+                    if remote["modal"] as? Bool == true && proxy.remote["modal"] as? Bool != true {nextSurfaceSerial+=1;proxy.surfaceSerial=nextSurfaceSerial}
+                    proxy.remote = remote;proxy.applySurfaceStyle();proxy.refreshTitle()
+                    if !(remote["parent"] is [String:Any]) {proxy.window.parent?.removeChildWindow(proxy.window)}
+                    if activeProxy === proxy{installMenu()};continue
                 }
+                let proxy = RemoteProxy(remote: remote, host: host);proxy.client=self;configureShared(proxy); windows[key] = proxy
+                nextSurfaceSerial+=1;proxy.surfaceSerial=nextSurfaceSerial
                 proxy.window.orderFront(nil); proxy.visibility()
                 let appID = remote["app_id"] as? String ?? "unknown"
-                if docks[appID] == nil { startDock(appID, remote) }
+                if !proxy.isPopup && docks[appID] == nil { startDock(appID, remote) }
             }
+            layoutWindowGroups()
+            if NSApp.isActive,let focused=windows.values.first(where:{$0.window.isKeyWindow}),let blocker=modalBlocker(for:focused) {
+                focused.view.releaseInput();restoreFocus=blocker
+            }
+            if let proxy=restoreFocus,let blocker=modalBlocker(for:proxy){restoreFocus=blocker}
+            if let proxy=restoreFocus,windows[Self.key(proxy.id)] === proxy,NSApp.isActive,!proxy.hidden{proxy.window.makeKeyAndOrderFront(nil)}
             let alive = Set(list.compactMap { $0["app_id"] as? String })
             for id in Array(docks.keys) where !alive.contains(id) { docks.removeValue(forKey: id)?.terminate() }
             presentVideo()
@@ -211,7 +321,7 @@ import ImageIO
         }
         do { try process.run(); docks[id] = process } catch { fputs("Dock proxy: \(error)\n", stderr) }
     }
-    func applicationWillTerminate(_ notification: Notification) { for proxy in windows.values{proxy.view.releaseInput()}; Wire.diagnostic("client_terminated",["window_count":windows.count]);for process in docks.values { process.terminate() }; Wire.send(["event":"release"]) }
+    func applicationWillTerminate(_ notification: Notification) {if let monitor=outsideClickMonitor{NSEvent.removeMonitor(monitor);outsideClickMonitor=nil};for proxy in windows.values{proxy.view.releaseInput()}; Wire.diagnostic("client_terminated",["window_count":windows.count]);for process in docks.values { process.terminate() }; Wire.send(["event":"release"]) }
 }
 
 final class DockEventReader: @unchecked Sendable {
@@ -255,10 +365,16 @@ final class DockEventReader: @unchecked Sendable {
     var lastSize = CGSize.zero
     var destroying = false
     var hidden = false
+    var applyingGeometry=false
+    var surfaceSerial=0
+    var attachmentBounds:CGRect?
+    var attachmentParentBounds:CGRect?
+    var attachmentDisplaySize:CGSize?
     var menuButton:NSButton?
     var showHeader:Bool{remote["show_header"] as? Bool ?? false}
     var id: [String: Any] { remote["key"] as? [String: Any] ?? [:] }
     var resizable: Bool { !shared && remote["resize"] as? String == "supported" }
+    var isPopup:Bool {WindowSurfaces.isPopup(remote["role"] as? String ?? "") && remote["parent"] is [String:Any]}
     init(remote: [String: Any], host: String) {
         self.remote = remote
         preference = "\(host):\(remote["app_id"] ?? "")"
@@ -272,7 +388,7 @@ final class DockEventReader: @unchecked Sendable {
         var width=min(1400,sourceWidth,max(320,Double(area.width)-60)),height=min(900,sourceHeight,max(240,Double(area.height)-80))
         if remote["role"] as? String == "desktop"{let fit=min(width/sourceWidth,height/sourceHeight);width=sourceWidth*fit;height=sourceHeight*fit}
         let rect = NSRect(x: 150, y: 150, width:CGFloat(width),height:CGFloat(height))
-        let transient = ["menu","tooltip","popover"].contains(remote["role"] as? String ?? "") && !(remote["parent"] is NSNull)
+        let transient = WindowSurfaces.isPopup(remote["role"] as? String ?? "") && remote["parent"] is [String:Any]
         window = ProxyWindow(contentRect:rect,styleMask: transient ? [.borderless] : [.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
         view = RemoteView(frame:NSRect(origin:.zero,size:rect.size))
         super.init(); window.acceptsFocus = !transient;view.proxy = self; window.contentView = view; window.delegate = self; window.isReleasedWhenClosed = false; window.acceptsMouseMovedEvents = true; window.title = remote["title"] as? String ?? "Remote window"
@@ -284,16 +400,31 @@ final class DockEventReader: @unchecked Sendable {
             accessory.view=button;window.addTitlebarAccessoryViewController(accessory);menuButton=button
         }
         refreshTitle()
+        applySurfaceStyle()
     }
-    @objc func openConnectionMenu(_ button:NSButton){view.releaseInput();client?.connectionMenu(for:self).popUp(positioning:nil,at:NSPoint(x:0,y:button.bounds.minY),in:button)}
+    func applySurfaceStyle() {
+        window.acceptsFocus = !isPopup
+        window.ignoresMouseEvents = remote["role"] as? String == "tooltip"
+        window.hidesOnDeactivate=isPopup
+        if isPopup {if window.styleMask != [.borderless]{window.styleMask = [.borderless]};window.collectionBehavior = [.fullScreenAuxiliary];mode="stretch_local";fill=true}
+        else if window.styleMask == [.borderless] {window.styleMask = [.titled,.closable,.miniaturizable,.resizable];window.collectionBehavior = [.managed,.fullScreenPrimary]}
+    }
+    @objc func openConnectionMenu(_ button:NSButton){client?.dismissRemoteMenus();view.releaseInput();client?.connectionMenu(for:self).popUp(positioning:nil,at:NSPoint(x:0,y:button.bounds.minY),in:button)}
     @objc func hideWindow(){setShown(false)}
     func setShown(_ shown:Bool) {
         hidden = !shown
         if shown {NSApp.activate(ignoringOtherApps:true);window.makeKeyAndOrderFront(nil)}
         else {view.releaseInput();resizeWork?.cancel();window.orderOut(nil);view.redraw()}
-        visibility();client?.installMenu()
+        client?.layoutWindowGroups();visibility();client?.installMenu()
     }
-    func send(_ event: String, _ fields: [String: Any] = [:]) { var value = fields;value["event"] = event;value["window"] = id;Wire.send(value) }
+    func send(_ event: String, _ fields: [String: Any] = [:]) {
+        if (event=="input" || event=="action"),let blocker=client?.modalBlocker(for:self) {
+            if event=="action",(fields["action"] as? [String:Any])?["kind"] as? String == "focus" {blocker.send(event,fields)}
+            if NSApp.isActive{blocker.hidden=false;client?.layoutWindowGroups();blocker.window.makeKeyAndOrderFront(nil)}
+            return
+        }
+        var value = fields;value["event"] = event;value["window"] = id;Wire.send(value)
+    }
     func visibility() { send("visibility",["visible":!hidden && window.isVisible && !window.isMiniaturized && window.occlusionState.contains(.visible),"focused":window.isKeyWindow]) }
     func refreshTitle() { let detail=commandError ?? (shared ? [sharedStatus,sharedNotice].compactMap{$0}.joined(separator:" / ") : status);let title = "\(remote["title"] ?? "Remote window") — \(mode == "resize_remote" && resizable ? "Resize remote" : "Stretch locally")\(physical ? " / Physical keys":"")\(detail.isEmpty ? "" : " — "+detail)";if window.title != title { window.title=title } }
     func save() { if shared{refreshTitle();view.redraw();return};UserDefaults.standard.set(mode,forKey:preference+":mode");UserDefaults.standard.set(fill,forKey:preference+":fill");UserDefaults.standard.set(swap,forKey:preference+":swap");UserDefaults.standard.set(physical,forKey:preference+":physical");refreshTitle();view.redraw() }
@@ -316,14 +447,15 @@ final class DockEventReader: @unchecked Sendable {
         return build(items,0)
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool { if destroying { return true };if shared || remote["role"] as? String == "desktop"{view.releaseInput();client?.disconnect()}else{send("action",["action":["kind":"close"]])};return false }
-    func destroy() { if shared{view.releaseInput()};destroying=true;resizeWork?.cancel();window.close() }
-    func windowDidBecomeKey(_ notification: Notification) { client?.activate(self);if shared{send("resume")}else{send("action",["action":["kind":"focus"]]);if remote["role"] as? String != "desktop"{remoteMenu()}};visibility() }
+    func destroy() {if shared || window.isKeyWindow{view.releaseInput()};destroying=true;resizeWork?.cancel();window.parent?.removeChildWindow(window);window.close() }
+    func windowDidBecomeKey(_ notification: Notification) { client?.activate(self);if shared{send("resume")}else{send("action",["action":["kind":"focus"]]);if remote["role"] as? String != "desktop" && !isPopup{remoteMenu()}};visibility() }
     func windowDidResignKey(_ notification: Notification) { view.releaseInput();visibility() }
-    func windowDidMiniaturize(_ notification: Notification) { visibility() }
-    func windowDidDeminiaturize(_ notification: Notification) { visibility() }
+    func windowDidMiniaturize(_ notification: Notification) {client?.layoutWindowGroups();visibility() }
+    func windowDidDeminiaturize(_ notification: Notification) {client?.layoutWindowGroups();visibility() }
+    func windowDidMove(_ notification:Notification) {if !applyingGeometry{client?.layoutWindowGroups()}}
     func windowDidChangeOcclusionState(_ notification: Notification) { visibility() }
     func windowDidResize(_ notification: Notification) {
-        view.redraw();guard resizable,mode=="resize_remote",let size=window.contentView?.bounds.size,size != lastSize else{return};lastSize=size;resizeWork?.cancel()
+        view.redraw();if !applyingGeometry{client?.layoutWindowGroups()};guard !applyingGeometry,resizable,mode=="resize_remote",let size=window.contentView?.bounds.size,size != lastSize else{return};lastSize=size;resizeWork?.cancel()
         let work=DispatchWorkItem{[weak self] in self?.send("action",["action":["kind":"resize","width":size.width,"height":size.height]])};resizeWork=work;DispatchQueue.main.asyncAfter(deadline:.now()+0.05,execute:work)
     }
 }
@@ -342,9 +474,10 @@ final class DockEventReader: @unchecked Sendable {
     static let emptyCursor=NSCursor(image:NSImage(size:NSSize(width:1,height:1)),hotSpot:.zero)
     var optionPointer = false
     override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event:NSEvent?)->Bool{proxy?.isPopup == true}
     override init(frame:NSRect) { super.init(frame:frame);wantsLayer=true;cursorOverlay.imageScaling = .scaleAxesIndependently;addSubview(cursorOverlay);registerForDraggedTypes([.fileURL]);addTrackingArea(NSTrackingArea(rect:.zero,options:[.activeAlways,.inVisibleRect,.mouseMoved],owner:self,userInfo:nil)) }
     required init?(coder:NSCoder) { fatalError("not used") }
-    func display(_ frame:ClientVideoFrame) { if renderer==nil{renderer=try? MetalPicture(view:self)};picture=CGSize(width:frame.width,height:frame.height);renderer?.upload(frame);redraw() }
+    func display(_ frame:ClientVideoFrame) { if renderer==nil{renderer=try? MetalPicture(view:self)};let changed=picture != CGSize(width:frame.width,height:frame.height);picture=CGSize(width:frame.width,height:frame.height);renderer?.upload(frame);redraw();if changed{proxy?.client?.layoutWindowGroups()} }
     func display(_ bytes:Data,width:Int,height:Int) { if renderer==nil{renderer=try? MetalPicture(view:self)};picture=CGSize(width:width,height:height);renderer?.upload(bytes,width:width,height:height);redraw() }
     func redraw() { renderer?.draw(size:convertToBacking(bounds).size,fill:proxy?.fill ?? false,visible:window?.isVisible == true && window?.isMiniaturized != true) }
     override func layout() { super.layout();redraw();positionVirtualCursor() }
@@ -381,11 +514,34 @@ final class DockEventReader: @unchecked Sendable {
         proxy?.send("input",["input":["kind":"relative_motion","dx":max(-1000000,min(1000000,dx)),"dy":max(-1000000,min(1000000,dy))]])
     }
     func position(_ event:NSEvent)->[String:Any] {
-        let p=convert(event.locationInWindow,from:nil);var rect=bounds
-        if !(proxy?.fill ?? false) { let aspect=picture.width/picture.height;if rect.width/rect.height>aspect{let width=rect.height*aspect;rect.origin.x=(rect.width-width)/2;rect.size.width=width}else{let height=rect.width/aspect;rect.origin.y=(rect.height-height)/2;rect.size.height=height} }
+        position(point:convert(event.locationInWindow,from:nil))
+    }
+    func position(point p:CGPoint)->[String:Any] {
+        let rect=contentRect()
         return ["x":min(1,max(0,(p.x-rect.minX)/max(1,rect.width))),"y":min(1,max(0,1-(p.y-rect.minY)/max(1,rect.height)))]
     }
-    func pointer(_ event:NSEvent,kind:String,button:Int?=nil,down:Bool?=nil) { if relative && kind=="pointer"{relativeMotion(event);return};if down == true{if proxy?.shared == true{proxy?.send("resume")};optionPointer=true;synchronizeModifiers()};var value=position(event);value["kind"]=relative && kind=="button" ? "relative_button":kind;if relative && kind=="button"{value.removeValue(forKey:"x");value.removeValue(forKey:"y")};if let button{value["button"]=button};if let down{value["down"]=down};if kind=="button"{Wire.diagnostic("pointer_button",["window":proxy?.id ?? [:],"x":value["x"] ?? 0,"y":value["y"] ?? 0,"view_width":bounds.width,"view_height":bounds.height,"picture_width":picture.width,"picture_height":picture.height,"down":down ?? false])};proxy?.send("input",["input":value]) }
+    func pointerDestination(_ event:NSEvent)->(RemoteProxy?,[String:Any]) {
+        // AppKit keeps delivering a drag to the original mouse-down window,
+        // even after a native remote submenu opens beneath the pointer.
+        if proxy?.shared != true,let window {
+            let screen=window.convertPoint(toScreen:event.locationInWindow)
+            if let target=proxy?.client?.popupTarget(at:screen) {
+                let local=target.view.convert(target.window.convertPoint(fromScreen:screen),from:nil)
+                return (target,target.view.position(point:local))
+            }
+        }
+        return (proxy,position(event))
+    }
+    func pointer(_ event:NSEvent,kind:String,button:Int?=nil,down:Bool?=nil) {
+        if relative && kind=="pointer"{relativeMotion(event);return}
+        if down == true{if let app=proxy?.remote["app_id"] as? String{proxy?.client?.dismissingMenuApps.remove(app)};if proxy?.shared == true{proxy?.send("resume")};optionPointer=true;synchronizeModifiers()}
+        let (target,position)=pointerDestination(event)
+        var value=position;value["kind"]=relative && kind=="button" ? "relative_button":kind
+        if relative && kind=="button"{value.removeValue(forKey:"x");value.removeValue(forKey:"y")}
+        if let button{value["button"]=button};if let down{value["down"]=down}
+        if kind=="button"{Wire.diagnostic("pointer_button",["window":target?.id ?? [:],"x":value["x"] ?? 0,"y":value["y"] ?? 0,"view_width":bounds.width,"view_height":bounds.height,"picture_width":picture.width,"picture_height":picture.height,"down":down ?? false])}
+        target?.send("input",["input":value])
+    }
     override func mouseMoved(with event:NSEvent){pointer(event,kind:"pointer")}
     override func mouseDragged(with event:NSEvent){pointer(event,kind:"pointer")}
     override func rightMouseDragged(with event:NSEvent){pointer(event,kind:"pointer")}
@@ -396,7 +552,7 @@ final class DockEventReader: @unchecked Sendable {
     override func rightMouseUp(with event:NSEvent){pointer(event,kind:"button",button:1,down:false)}
     override func otherMouseDown(with event:NSEvent){if (2...4).contains(event.buttonNumber){pointer(event,kind:"button",button:event.buttonNumber,down:true)}}
     override func otherMouseUp(with event:NSEvent){if (2...4).contains(event.buttonNumber){pointer(event,kind:"button",button:event.buttonNumber,down:false)}}
-    override func scrollWheel(with event:NSEvent){optionPointer=true;synchronizeModifiers();var value=position(event);value["kind"]="scroll";value["dx"]=event.scrollingDeltaX/20;value["dy"] = -event.scrollingDeltaY/20;proxy?.send("input",["input":value])}
+    override func scrollWheel(with event:NSEvent){optionPointer=true;synchronizeModifiers();let(target,position)=pointerDestination(event);var value=position;value["kind"]="scroll";value["dx"]=event.scrollingDeltaX/20;value["dy"] = -event.scrollingDeltaY/20;target?.send("input",["input":value])}
     func key(_ usage:UInt16,down:Bool){var mapped=usage;if proxy?.swap == true && proxy?.physical != true{mapped=[UInt16(0xe0):0xe3,0xe3:0xe0,0xe4:0xe7,0xe7:0xe4][usage] ?? usage};proxy?.send("input",["input":["kind":"key","usage":mapped,"down":down]])}
     func synchronizeModifiers(suspend:Bool=false){for(usage,down)in modifiers.synchronize(physical:proxy?.physical == true,optionShortcut:!forwarded.isEmpty || optionPointer,suspend:suspend){key(usage,down:down)}}
     func releaseInput(){releaseRelative();proxy?.send("release");forwarded.removeAll();modifiers.reset();optionPointer=false;marked=NSAttributedString(string:"");inputContext?.discardMarkedText()}
