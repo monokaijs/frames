@@ -2,6 +2,50 @@ use frames_core::{codec, media::RawFrame};
 use std::time::Duration;
 
 #[tokio::test]
+async fn recovery_keyframes_reuse_the_encoder_and_need_no_new_capture() {
+    for capability in codec::probe().await {
+        let (_capture, frames) = tokio::sync::watch::channel(Some(RawFrame {
+            media_generation: 0,
+            #[cfg(windows)]
+            gpu: None,
+            captured_at: std::time::Instant::now(),
+            frame_number: 0,
+            width: 128,
+            height: 128,
+            bgra: [20, 30, 220, 255].repeat(128 * 128).into(),
+        }));
+        let mut encoder = codec::encode(128, 128, 60, &capability, frames)
+            .await
+            .unwrap();
+        let worker = encoder.worker.id();
+        encoder.frames.recv().await.unwrap();
+        for _ in 0..3 {
+            encoder.request_keyframe();
+            let packet = tokio::time::timeout(Duration::from_secs(3), encoder.frames.recv())
+                .await
+                .expect("keyframe request must wake an idle encoder")
+                .unwrap();
+            assert!(
+                codec::is_keyframe(capability.codec, &packet, false),
+                "{:?} did not force a keyframe",
+                capability.encoder
+            );
+            assert_eq!(encoder.worker.id(), worker);
+            // Recovery must be independently decodable after packet loss.
+            let mut decoder = codec::decode(capability.codec, 128, 128).await.unwrap();
+            decoder.input.send(packet).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), decoder.output.changed())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(decoder.output.borrow().is_some());
+            decoder.shutdown().await;
+        }
+        encoder.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn receiving_client_probes_all_decoders_without_an_encoder() {
     let capabilities = codec::probe_decoders().await;
     assert_eq!(
@@ -41,6 +85,11 @@ async fn every_advertised_codec_roundtrips_a_live_window_frame() {
                 });
             }
             let (tx, rx) = tokio::sync::watch::channel(Some(RawFrame {
+                media_generation: 0,
+                #[cfg(windows)]
+                gpu: None,
+                captured_at: std::time::Instant::now(),
+                frame_number: 0,
                 width: width as u32,
                 height: height as u32,
                 bgra: pixels.into(),
@@ -96,6 +145,11 @@ async fn one_capture_encodes_and_decodes_without_a_later_capture_or_eof() {
     for capability in codec::probe().await {
         let codec = capability.codec;
         let (tx, rx) = tokio::sync::watch::channel(Some(RawFrame {
+            media_generation: 0,
+            #[cfg(windows)]
+            gpu: None,
+            captured_at: std::time::Instant::now(),
+            frame_number: 0,
             width: 128,
             height: 128,
             bgra: [20, 30, 220, 255].repeat(128 * 128).into(),

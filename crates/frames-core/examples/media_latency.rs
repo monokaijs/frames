@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
         for index in 0..40 {
             let red = index % 2 == 0;
             let pixel = if red { [20, 30, 220, 255] } else { [20, 220, 30, 255] };
-            let frame = RawFrame { width, height, bgra: pixel.repeat((width * height) as usize).into() };
+            let frame = RawFrame { media_generation: 0, #[cfg(windows)] gpu: None, captured_at: std::time::Instant::now(), frame_number: 0, width, height, bgra: pixel.repeat((width * height) as usize).into() };
             let start = Instant::now();
             source.send_replace(Some(frame));
             let packet = tokio::time::timeout(Duration::from_secs(5), encoder.frames.recv()).await?.ok_or_else(|| anyhow::anyhow!("encoder stopped"))?;

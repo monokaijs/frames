@@ -87,7 +87,7 @@ pub async fn serve_local(
     .await
 }
 async fn serve_at(
-    mut send: quinn::SendStream,
+    send: quinn::SendStream,
     mut receive: quinn::RecvStream,
     address: SocketAddr,
 ) -> anyhow::Result<()> {
@@ -98,6 +98,25 @@ async fn serve_at(
     )
     .await??;
     anyhow::ensure!(&magic == MAGIC, "unknown device bridge stream");
+    serve_after_magic(send, receive, address).await
+}
+/// The session stream router has already validated the ADB magic and opt-in.
+pub async fn serve_local_after_magic(
+    send: quinn::SendStream,
+    receive: quinn::RecvStream,
+) -> anyhow::Result<()> {
+    serve_after_magic(
+        send,
+        receive,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, LOCAL_ADB_PORT)),
+    )
+    .await
+}
+async fn serve_after_magic(
+    mut send: quinn::SendStream,
+    receive: quinn::RecvStream,
+    address: SocketAddr,
+) -> anyhow::Result<()> {
     let socket = match tokio::time::timeout(
         std::time::Duration::from_secs(2),
         TcpStream::connect(address),

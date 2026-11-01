@@ -1,17 +1,19 @@
 //! In-process codecs with complete packets and dedicated blocking workers.
-//! Capture and presentation currently use CPU BGRA buffers.
+//! CPU frames and pinned D3D11 surfaces share packet identity and bounded workers.
 use crate::{media::RawFrame, worker::Worker};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     sync::{
         Arc,
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot, watch};
 pub(crate) mod runtime;
+#[cfg(windows)]
+pub use runtime::GpuConverter;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,12 +56,30 @@ pub fn licenses() -> &'static str {
         include_str!("../../../licenses/GPL-3.txt"),
         "\n\n",
         include_str!("../../../licenses/Opus-BSD.txt"),
+        "\n--- Reed-Solomon SIMD ---\n",
+        include_str!("../../../licenses/Reed-Solomon-SIMD.txt"),
         "\n\n",
         include_str!("../../../licenses/libvpx-BSD.txt"),
         "\n\n",
         include_str!("../../../licenses/libaom-BSD.txt"),
         "\n\n",
         include_str!("../../../licenses/dav1d-BSD.txt"),
+        "\n\n",
+        include_str!("../../../licenses/SDL3-zlib.txt"),
+        "\n\n",
+        include_str!("../../../licenses/sdl3-rs.txt"),
+        "\n\n",
+        include_str!("../../../licenses/vigem-client-MIT.txt"),
+        "\n\n",
+        include_str!("../../../licenses/vigem-bus.txt"),
+        "\n\n",
+        include_str!("../../../licenses/usbip-win2.txt"),
+        "\n--- ProtoInput ---\n",
+        include_str!("../../../licenses/ProtoInput-MIT.txt"),
+        "\n--- EasyHook ---\n",
+        include_str!("../../../licenses/EasyHook-MIT.txt"),
+        "\n--- udis86 ---\n",
+        include_str!("../../../licenses/udis86-BSD.txt"),
     )
 }
 fn sample(codec: Codec) -> Vec<u8> {
@@ -109,6 +129,11 @@ pub async fn probe() -> Vec<CodecCapability> {
             tokio::task::spawn_blocking(|| {
                 let mut result = Vec::new();
                 let frame = RawFrame {
+                    media_generation: 0,
+                    #[cfg(windows)]
+                    gpu: None,
+                    captured_at: std::time::Instant::now(),
+                    frame_number: 0,
                     width: 128,
                     height: 128,
                     bgra: [220, 30, 20, 255].repeat(128 * 128).into(),
@@ -216,11 +241,60 @@ pub fn negotiate(
         .ok_or_else(|| anyhow::anyhow!("no mutually supported codec; run frames doctor"))
 }
 
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct HardwareLease(*mut std::ffi::c_void);
+#[cfg(windows)]
+unsafe impl Send for HardwareLease {}
+#[cfg(windows)]
+unsafe impl Sync for HardwareLease {}
+#[cfg(windows)]
+impl HardwareLease {
+    pub(crate) unsafe fn new(pointer: *mut std::ffi::c_void) -> Self {
+        Self(pointer)
+    }
+}
+#[cfg(windows)]
+impl Drop for HardwareLease {
+    fn drop(&mut self) {
+        unsafe {
+            runtime::frames_surface_release(self.0);
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub struct EncodedPacket {
+    pub generation: u32,
+    pub surface_encoded: bool,
+    pub encode_micros: u32,
+    pub number: u64,
+    pub captured_at: Instant,
+    pub encoded_at: Instant,
+    pub keyframe: bool,
+    pub bytes: Vec<u8>,
+}
+impl std::ops::Deref for EncodedPacket {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateUpdate {
+    Applied,
+    RestartRequired,
+}
 pub struct Encoder {
     pub worker: Worker,
-    pub frames: mpsc::Receiver<Vec<u8>>,
+    pub frames: mpsc::Receiver<EncodedPacket>,
+    keyframes: watch::Sender<u64>,
+    pub bitrate: Arc<AtomicU32>,
 }
 impl Encoder {
+    pub fn request_keyframe(&self) {
+        self.keyframes
+            .send_modify(|serial| *serial = serial.wrapping_add(1));
+    }
     pub async fn shutdown(&mut self) {
         self.worker.shutdown().await;
     }
@@ -259,6 +333,9 @@ pub async fn encode_paced(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Encoding unavailable"))?;
     let (tx, frames) = mpsc::channel(1);
+    let bitrate = Arc::new(AtomicU32::new(12_000_000));
+    let target_bitrate = bitrate.clone();
+    let (keyframes, mut requested_keyframe) = watch::channel(0u64);
     let (stop, mut stopping) = watch::channel(false);
     let (ready, started) = oneshot::channel();
     let handle = tokio::runtime::Handle::current();
@@ -274,11 +351,15 @@ pub async fn encode_paced(
             }
         };
         let mut first = true;
+        let mut number = 0;
+        let mut current_bitrate = 12_000_000;
+        let mut current_rate = fps;
+        let mut keyframe_serial = 0;
         let mut next = Instant::now();
         loop {
             let frame=handle.block_on(async{
                 if !first || input.borrow().is_none() {
-                    tokio::select!{biased;_=stopping.changed()=>return None,r=input.changed()=>if r.is_err(){return None}}
+                    tokio::select!{biased;_=stopping.changed()=>return None,r=requested_keyframe.changed()=>if r.is_err(){return None},r=input.changed()=>if r.is_err(){return None}}
                 }
                 if Instant::now()<next {
                     tokio::select!{biased;_=stopping.changed()=>return None,_=tokio::time::sleep_until(next.into())=>{}}
@@ -287,8 +368,43 @@ pub async fn encode_paced(
             });
             let Some(frame) = frame else { break };
             first = false;
+            let requested = *requested_keyframe.borrow_and_update();
+            if requested != keyframe_serial {
+                context.request_keyframe();
+                keyframe_serial = requested;
+            }
             let rate = rate.load(Ordering::Relaxed).clamp(1, fps);
             next = Instant::now() + Duration::from_secs_f64(1.0 / rate as f64);
+            let target = target_bitrate
+                .load(Ordering::Relaxed)
+                .clamp(128_000, 100_000_000);
+            if target != current_bitrate || rate != current_rate {
+                match context.set_rate(target, rate) {
+                    Ok(RateUpdate::Applied) => {}
+                    Ok(RateUpdate::RestartRequired) => {
+                        tracing::debug!(target, "encoder requires a rate-control restart");
+                        match runtime::Context::encoder_at_rate(&name, width, height, rate, target)
+                        {
+                            Ok(mut replacement) => {
+                                let _ = replacement.set_rate(target, rate);
+                                replacement.request_keyframe();
+                                context = replacement;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "encoder rate-control restart failed");
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "encoder rate control failed");
+                        break;
+                    }
+                }
+                current_bitrate = target;
+                current_rate = rate;
+            }
+            let encoding_started = Instant::now();
             let packets = match context.encode(&frame) {
                 Ok(p) => p,
                 Err(e) => {
@@ -297,7 +413,26 @@ pub async fn encode_paced(
                 }
             };
             let mut closed = false;
-            for packet in packets {
+            for bytes in packets {
+                let packet = EncodedPacket {
+                    surface_encoded: context.gpu_encoder_active(),
+                    encode_micros: encoding_started.elapsed().as_micros().min(u32::MAX as u128)
+                        as u32,
+                    generation: 0,
+                    number,
+                    captured_at: frame.captured_at,
+                    encoded_at: Instant::now(),
+                    keyframe: bytes.first() == Some(&1),
+                    bytes,
+                };
+                tracing::trace!(
+                    capture = frame.frame_number,
+                    frame = number,
+                    encode_us = packet.encode_micros,
+                    keyframe = packet.keyframe,
+                    "video encoded"
+                );
+                number += 1;
                 if !handle.block_on(async {
                     tokio::select! {biased;_=stopping.changed()=>false,r=tx.send(packet)=>r.is_ok()}
                 }) {
@@ -312,28 +447,158 @@ pub async fn encode_paced(
     });
     let worker = Worker::new(stop, task);
     started.await??;
-    Ok(Encoder { worker, frames })
+    Ok(Encoder {
+        worker,
+        frames,
+        keyframes,
+        bitrate,
+    })
 }
 
-/// Every protocol-5 packet carries the encoder's actual keyframe flag, including AV1/VP9.
+/// Every protocol-6 packet carries the encoder's actual keyframe flag, including AV1/VP9.
 pub fn is_keyframe(_codec: Codec, packet: &[u8], _first: bool) -> bool {
     packet.first() == Some(&1)
 }
 
+#[derive(Default)]
+pub struct DecodeMetrics {
+    pub decoded: AtomicU64,
+    retained: std::sync::Mutex<std::collections::HashMap<(u32, u64), usize>>,
+    pub failed: AtomicBool,
+    pub histogram: std::sync::Mutex<crate::media::LatencyHistogram>,
+    floor: AtomicU64,
+    generation: AtomicU32,
+    external_pending: std::sync::Mutex<std::collections::VecDeque<u64>>,
+}
 pub struct Decoder {
     pub worker: Worker,
-    pub input: mpsc::Sender<Vec<u8>>,
+    pub input: mpsc::Sender<EncodedPacket>,
     pub output: watch::Receiver<Option<RawFrame>>,
     pending: Arc<AtomicUsize>,
+    pub metrics: Arc<DecodeMetrics>,
+    external: bool,
 }
 impl Decoder {
+    pub fn set_generation(&self, generation: u32) {
+        self.metrics.floor.store(0, Ordering::Release);
+        self.metrics.generation.store(generation, Ordering::Release);
+    }
+    pub fn is_external(&self) -> bool {
+        self.external
+    }
+    pub fn discard_before(&self, number: u64) {
+        self.metrics.floor.fetch_max(number, Ordering::Release);
+        if self.external {
+            self.metrics
+                .retained
+                .lock()
+                .unwrap()
+                .retain(|(_, n), _| *n >= number);
+            let mut ids = self.metrics.external_pending.lock().unwrap();
+            ids.retain(|n| *n >= number);
+            self.pending.store(ids.len(), Ordering::Release);
+        }
+    }
+    pub fn acknowledge_external(&self, number: u64, micros: u64) {
+        if !self.external {
+            return;
+        }
+        let mut ids = self.metrics.external_pending.lock().unwrap();
+        if !ids.contains(&number) {
+            return;
+        }
+        ids.retain(|n| *n > number);
+        self.metrics
+            .retained
+            .lock()
+            .unwrap()
+            .retain(|(_, n), _| *n > number);
+        self.pending.store(ids.len(), Ordering::Release);
+        self.metrics.decoded.fetch_add(1, Ordering::Relaxed);
+        self.metrics.histogram.lock().unwrap().record(micros);
+    }
+    pub fn external(
+        mut submit: impl FnMut(EncodedPacket) -> anyhow::Result<()> + Send + 'static,
+    ) -> Self {
+        let (input, mut incoming) = mpsc::channel::<EncodedPacket>(2);
+        let (output_sender, output) = watch::channel(None);
+        let (stop, mut stopping) = watch::channel(false);
+        let metrics = Arc::new(DecodeMetrics::default());
+        let worker_metrics = metrics.clone();
+        let task = tokio::spawn(async move {
+            let _output_sender = output_sender;
+            loop {
+                let packet = tokio::select! { _ = stopping.changed() => break, packet = incoming.recv() => { let Some(packet) = packet else { break; }; packet } };
+                if packet.generation != worker_metrics.generation.load(Ordering::Acquire)
+                    || packet.number < worker_metrics.floor.load(Ordering::Acquire)
+                {
+                    continue;
+                }
+                if let Err(error) = submit(packet) {
+                    tracing::warn!(%error, "native decode submission failed");
+                    worker_metrics.failed.store(true, Ordering::Release);
+                }
+            }
+        });
+        Self {
+            worker: Worker::new(stop, task),
+            input,
+            output,
+            pending: Arc::new(AtomicUsize::new(0)),
+            metrics,
+            external: true,
+        }
+    }
+    pub fn retained_bytes(&self) -> usize {
+        self.metrics.retained.lock().unwrap().values().sum()
+    }
     pub fn in_flight(&self) -> usize {
         self.pending.load(Ordering::Acquire)
     }
-    pub fn try_submit(&self, frame: Vec<u8>) -> Result<(), mpsc::error::TrySendError<Vec<u8>>> {
+    pub fn try_submit(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<(), mpsc::error::TrySendError<EncodedPacket>> {
+        self.try_submit_packet(EncodedPacket {
+            surface_encoded: false,
+            encode_micros: 0,
+            generation: 0,
+            number: 0,
+            captured_at: Instant::now(),
+            encoded_at: Instant::now(),
+            keyframe: bytes.first() == Some(&1),
+            bytes,
+        })
+    }
+    pub fn try_submit_packet(
+        &self,
+        packet: EncodedPacket,
+    ) -> Result<(), mpsc::error::TrySendError<EncodedPacket>> {
+        if self.external {
+            let mut ids = self.metrics.external_pending.lock().unwrap();
+            if ids.len() >= 2 {
+                return Err(mpsc::error::TrySendError::Full(packet));
+            }
+            ids.push_back(packet.number);
+        }
+        let number = packet.number;
+        let key = (packet.generation, number);
+        self.metrics
+            .retained
+            .lock()
+            .unwrap()
+            .insert(key, packet.bytes.len());
         self.pending.fetch_add(1, Ordering::AcqRel);
-        if let Err(e) = self.input.try_send(frame) {
+        if let Err(e) = self.input.try_send(packet) {
+            self.metrics.retained.lock().unwrap().remove(&key);
             self.pending.fetch_sub(1, Ordering::AcqRel);
+            if self.external {
+                self.metrics
+                    .external_pending
+                    .lock()
+                    .unwrap()
+                    .retain(|n| *n != number);
+            }
             return Err(e);
         }
         Ok(())
@@ -343,22 +608,51 @@ impl Decoder {
     }
 }
 pub async fn decode(codec: Codec, width: u32, height: u32) -> anyhow::Result<Decoder> {
+    decode_inner(codec, width, height, false, true).await
+}
+pub async fn decode_for_presentation(
+    codec: Codec,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<Decoder> {
+    decode_inner(
+        codec,
+        width,
+        height,
+        std::env::var("FRAMES_GPU").as_deref() != Ok("0"),
+        true,
+    )
+    .await
+}
+pub async fn decode_software(codec: Codec, width: u32, height: u32) -> anyhow::Result<Decoder> {
+    decode_inner(codec, width, height, false, false).await
+}
+async fn decode_inner(
+    codec: Codec,
+    width: u32,
+    height: u32,
+    surfaces: bool,
+    allow_hardware: bool,
+) -> anyhow::Result<Decoder> {
     anyhow::ensure!(
         width > 0 && height > 0 && width <= 8192 && height <= 8192,
         "Invalid decoder dimensions"
     );
-    let (input, mut incoming) = mpsc::channel::<Vec<u8>>(2);
+    let (input, mut incoming) = mpsc::channel::<EncodedPacket>(2);
     let (sender, output) = watch::channel(None);
     let pending = Arc::new(AtomicUsize::new(0));
     let completed = pending.clone();
+    let metrics = Arc::new(DecodeMetrics::default());
+    let worker_metrics = metrics.clone();
     let (stop, mut stopping) = watch::channel(false);
     let (ready, started) = oneshot::channel();
     let handle = tokio::runtime::Handle::current();
     let task = tokio::task::spawn_blocking(move || {
         // No frame threading: it deliberately queues pictures. Hardware fallback
         // is tested with a complete reference packet before touching live state.
-        let hardware =
-            cfg!(target_os = "macos") && std::env::var("FRAMES_HW_DECODE").as_deref() != Ok("0");
+        let hardware = allow_hardware
+            && cfg!(any(target_os = "macos", windows))
+            && std::env::var("FRAMES_HW_DECODE").as_deref() != Ok("0");
         let hw_works = hardware
             && (|| -> anyhow::Result<bool> {
                 let mut test = runtime::Context::decoder(codec.decoder(), 128, 128, true)?;
@@ -381,25 +675,81 @@ pub async fn decode(codec: Codec, width: u32, height: u32) -> anyhow::Result<Dec
             hardware = hw_works,
             "In-process video decoder started"
         );
+        let mut hardware_active = hw_works;
+        let mut awaiting_keyframe = false;
         loop {
             let packet = handle.block_on(async {
                 tokio::select! {biased;_=stopping.changed()=>None,p=incoming.recv()=>p}
             });
             let Some(packet) = packet else { break };
-            let decoded = context.decode(&packet);
+            if packet.generation != worker_metrics.generation.load(Ordering::Acquire)
+                || packet.number < worker_metrics.floor.load(Ordering::Acquire)
+                || (awaiting_keyframe && !packet.keyframe)
+            {
+                worker_metrics
+                    .retained
+                    .lock()
+                    .unwrap()
+                    .remove(&(packet.generation, packet.number));
+                let _ = completed.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    Some(n.saturating_sub(1))
+                });
+                continue;
+            }
+            if packet.keyframe && awaiting_keyframe {
+                context.flush_decoder();
+                awaiting_keyframe = false;
+            }
+            let started = Instant::now();
+            let decoded = if surfaces {
+                context.decode_presentable(&packet)
+            } else {
+                context.decode(&packet)
+            };
+            worker_metrics
+                .histogram
+                .lock()
+                .unwrap()
+                .record(started.elapsed().as_micros() as u64);
             let _ = completed.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 Some(n.saturating_sub(1))
             });
+            worker_metrics
+                .retained
+                .lock()
+                .unwrap()
+                .remove(&(packet.generation, packet.number));
             match decoded {
-                Ok(Some(frame)) => {
+                Ok(Some(mut frame)) => {
+                    if packet.generation != worker_metrics.generation.load(Ordering::Acquire)
+                        || packet.number < worker_metrics.floor.load(Ordering::Acquire)
+                    {
+                        continue;
+                    }
+                    worker_metrics.decoded.fetch_add(1, Ordering::Relaxed);
+                    frame.media_generation = packet.generation;
+                    frame.frame_number = packet.number;
+                    frame.captured_at = packet.captured_at;
                     if sender.send(Some(frame)).is_err() {
                         break;
                     }
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::warn!(error=%e,"Video decoder failed");
-                    break;
+                    tracing::warn!(error=%e,"Video decoder failed; awaiting an independent picture");
+                    worker_metrics.failed.store(true, Ordering::Release);
+                    awaiting_keyframe = true;
+                    if hardware_active {
+                        hardware_active = false;
+                        tracing::warn!("performing one software decoder fallback");
+                        match runtime::Context::decoder(codec.decoder(), width, height, false) {
+                            Ok(replacement) => context = replacement,
+                            Err(error) => {
+                                tracing::warn!(%error, "software decoder fallback failed");
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -411,6 +761,8 @@ pub async fn decode(codec: Codec, width: u32, height: u32) -> anyhow::Result<Dec
         input,
         output,
         pending,
+        metrics,
+        external: false,
     })
 }
 #[cfg(test)]

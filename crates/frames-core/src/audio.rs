@@ -187,3 +187,149 @@ pub async fn decode(format: PcmFormat) -> anyhow::Result<Decoder> {
     started.await??;
     Ok(Decoder { worker, input, pcm })
 }
+
+/// Codec-independent redundancy also protects CELT music packets, where Opus
+/// in-band FEC is not available. Lengths are checked before taking any slice.
+pub fn packet_with_previous(
+    current: &[u8],
+    previous: Option<&[u8]>,
+    capacity: usize,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        !current.is_empty() && current.len() <= 4000,
+        "invalid Opus packet"
+    );
+    let previous = previous
+        .filter(|p| p.len() <= 4000 && 6 + current.len() + p.len() <= capacity)
+        .unwrap_or_default();
+    let mut packet = Vec::with_capacity(6 + current.len() + previous.len());
+    packet.extend_from_slice(b"A6");
+    packet.extend_from_slice(&(current.len() as u16).to_be_bytes());
+    packet.extend_from_slice(&(previous.len() as u16).to_be_bytes());
+    packet.extend_from_slice(current);
+    packet.extend_from_slice(previous);
+    Ok(packet)
+}
+pub fn split_packet(packet: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
+    if packet.len() < 7 || &packet[..2] != b"A6" {
+        return None;
+    }
+    let current = u16::from_be_bytes(packet[2..4].try_into().ok()?) as usize;
+    let previous = u16::from_be_bytes(packet[4..6].try_into().ok()?) as usize;
+    if current == 0 || current > 4000 || previous > 4000 || packet.len() != 6 + current + previous {
+        return None;
+    }
+    Some((
+        &packet[6..6 + current],
+        if previous == 0 {
+            None
+        } else {
+            Some(&packet[6 + current..])
+        },
+    ))
+}
+
+/// Sequence-aware, bounded reordering. No more than two 10 ms PLC packets are
+/// emitted after a gap; long outages jump to fresh audio instead of replaying it.
+#[derive(Default)]
+pub struct JitterBuffer {
+    pending: std::collections::BTreeMap<u64, Vec<u8>>,
+    pub next: u64,
+    pub received: u64,
+    pub concealed: u64,
+    pub deadline: Option<std::time::Instant>,
+}
+impl JitterBuffer {
+    pub fn retained_bytes(&self) -> usize {
+        self.pending.values().map(Vec::len).sum()
+    }
+    pub fn skip_before(&mut self, number: u64) {
+        self.next = self.next.max(number);
+        self.pending.retain(|n, _| *n >= self.next);
+        self.deadline = None;
+    }
+    pub fn push(&mut self, number: u64, current: &[u8], previous: Option<&[u8]>) {
+        if number < self.next || self.pending.contains_key(&number) {
+            return;
+        }
+        self.received += 1;
+        if let Some(previous) = previous
+            && number > 0
+            && number > self.next
+            && self.pending.len() < 4
+        {
+            self.pending
+                .entry(number - 1)
+                .or_insert_with(|| previous.to_vec());
+        }
+        if self.pending.len() < 4 {
+            self.pending.insert(number, current.to_vec());
+        }
+    }
+    pub fn drain(&mut self, now: std::time::Instant, mut submit: impl FnMut(Vec<u8>)) {
+        loop {
+            while let Some(packet) = self.pending.remove(&self.next) {
+                submit(packet);
+                self.next += 1;
+                self.deadline = None;
+            }
+            let Some((&first, _)) = self.pending.first_key_value() else {
+                return;
+            };
+            let deadline = *self
+                .deadline
+                .get_or_insert(now + std::time::Duration::from_millis(10));
+            if now < deadline && self.pending.len() < 3 {
+                return;
+            }
+            for _ in 0..first.saturating_sub(self.next).min(2) {
+                submit(Vec::new());
+                self.concealed += 1;
+            }
+            self.next = first;
+            self.deadline = None;
+        }
+    }
+}
+#[cfg(test)]
+mod redundancy_tests {
+    use super::*;
+    #[test]
+    fn reordering_duplicates_redundancy_and_outage_never_replay_old_audio() {
+        let now = std::time::Instant::now();
+        let mut jitter = JitterBuffer::default();
+        let mut played = Vec::new();
+        jitter.push(1, &[11], None);
+        jitter.drain(now, |p| played.push(p));
+        assert!(played.is_empty());
+        jitter.push(0, &[10], None);
+        jitter.drain(now, |p| played.push(p));
+        assert_eq!(played, vec![vec![10], vec![11]]);
+        jitter.push(1, &[11], None);
+        jitter.push(3, &[13], Some(&[12]));
+        jitter.drain(now, |p| played.push(p));
+        assert_eq!(played, vec![vec![10], vec![11], vec![12], vec![13]]);
+        jitter.push(100, &[100], None);
+        jitter.drain(now, |p| played.push(p));
+        jitter.drain(now + std::time::Duration::from_millis(10), |p| {
+            played.push(p)
+        });
+        assert_eq!(jitter.concealed, 2);
+        assert_eq!(jitter.next, 101);
+        assert_eq!(&played[4..], &[vec![], vec![], vec![100]]);
+        jitter.skip_before(110);
+        jitter.push(109, &[109], None);
+        assert_eq!(jitter.retained_bytes(), 0);
+    }
+    #[test]
+    fn audio_redundancy_fits_mtu_and_rejects_truncation() {
+        let packet = packet_with_previous(&[1, 2, 3], Some(&[4, 5]), 1200).unwrap();
+        assert_eq!(
+            split_packet(&packet),
+            Some((&[1, 2, 3][..], Some(&[4, 5][..])))
+        );
+        let packet = packet_with_previous(&[1, 2, 3], Some(&[4, 5]), 9).unwrap();
+        assert_eq!(split_packet(&packet), Some((&[1, 2, 3][..], None)));
+        assert!(split_packet(&packet[..packet.len() - 1]).is_none());
+    }
+}

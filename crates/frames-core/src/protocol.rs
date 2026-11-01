@@ -2,6 +2,7 @@ use crate::{codec::CodecCapability, input::InputEvent, model::*};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_CONTROL_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_DEVICE_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
@@ -11,6 +12,8 @@ pub struct Hello {
     pub platform: String,
     pub codecs: Vec<CodecCapability>,
     #[serde(default)]
+    pub shared_game: Option<crate::shared_game::Capabilities>,
+    #[serde(default)]
     pub purpose: SessionPurpose,
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,11 +22,41 @@ pub enum SessionPurpose {
     #[default]
     Control,
     Transfer,
+    Preview,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Message {
+    PreviewRequest {
+        include_image: bool,
+    },
+    DevicePreview {
+        png_base64: Option<String>,
+    },
+    SharedResume {
+        generation: u64,
+        elapsed_ms: u64,
+    },
+    SessionPolicy {
+        shared: Option<crate::shared_game::SharedSession>,
+    },
+    SharedState(crate::shared_game::SharedSession),
+    SharedCursor {
+        window: WindowId,
+        generation: u64,
+        cursor: crate::shared_game::Cursor,
+    },
+    SharedInput {
+        window: WindowId,
+        generation: u64,
+        event: InputEvent,
+        elapsed_ms: u64,
+    },
+    SharedHeartbeat {
+        generation: u64,
+    },
+    Device(crate::devices::DeviceMessage),
     SetRemoteCursor {
         visible: bool,
     },
@@ -125,8 +158,20 @@ pub enum Message {
     Feedback {
         window: WindowId,
         generation: u32,
-        lost: u32,
-        decoded: u32,
+        stats: crate::adaptive::Feedback,
+    },
+    ClockProbe {
+        client_us: u64,
+    },
+    ClockReply {
+        client_us: u64,
+        received_us: u64,
+        sent_us: u64,
+    },
+    MediaStatus {
+        window: WindowId,
+        generation: u32,
+        number: u64,
     },
     Clipboard {
         origin: String,
@@ -158,6 +203,10 @@ pub struct StreamConfig {
     pub hardware: bool,
     pub fps: u32,
     pub cpu_readback: bool,
+    pub fec: crate::media::FecProfile,
+    pub target_bitrate: u32,
+    pub source_width: u32,
+    pub source_height: u32,
 }
 
 pub async fn send_json<W: tokio::io::AsyncWrite + Unpin>(
@@ -186,4 +235,22 @@ pub async fn recv_json<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> anyho
     let mut bytes = vec![0; size];
     reader.read_exact(&mut bytes).await?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+pub async fn recv_device<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> anyhow::Result<crate::devices::DeviceMessage> {
+    use tokio::io::AsyncReadExt;
+    let size = reader.read_u32().await? as usize;
+    anyhow::ensure!(
+        size > 0 && size <= MAX_DEVICE_BYTES,
+        "Invalid device message length"
+    );
+    let mut bytes = vec![0; size];
+    reader.read_exact(&mut bytes).await?;
+    let Message::Device(message) = serde_json::from_slice(&bytes)? else {
+        anyhow::bail!("Invalid device stream message");
+    };
+    message.validate()?;
+    Ok(message)
 }

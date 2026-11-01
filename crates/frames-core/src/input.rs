@@ -4,6 +4,14 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InputEvent {
+    RelativeButton {
+        button: u8,
+        down: bool,
+    },
+    RelativeMotion {
+        dx: i32,
+        dy: i32,
+    },
     Pointer {
         x: f64,
         y: f64,
@@ -27,6 +35,58 @@ pub enum InputEvent {
     Text {
         text: String,
     },
+}
+
+impl InputEvent {
+    pub fn valid(&self) -> bool {
+        match self {
+            Self::RelativeButton { button, .. } => *button <= 4,
+            Self::Pointer { x, y } | Self::Button { x, y, .. } => {
+                x.is_finite()
+                    && y.is_finite()
+                    && (0.0..=1.0).contains(x)
+                    && (0.0..=1.0).contains(y)
+                    && !matches!(self,Self::Button{button,..} if *button > 4)
+            }
+            Self::Scroll { dx, dy, x, y } => {
+                dx.is_finite()
+                    && dy.is_finite()
+                    && dx.abs() <= 32767.0
+                    && dy.abs() <= 32767.0
+                    && x.is_finite()
+                    && y.is_finite()
+                    && (0.0..=1.0).contains(x)
+                    && (0.0..=1.0).contains(y)
+            }
+            Self::RelativeMotion { dx, dy } => {
+                dx.unsigned_abs() <= 1_000_000 && dy.unsigned_abs() <= 1_000_000
+            }
+            Self::Key { usage, .. } => hid_pc_scan(*usage).is_some(),
+            Self::Text { text } => text.len() <= 4096 && !text.contains('\0'),
+        }
+    }
+    /// Coalesce only consecutive motion of the same kind; transitions remain barriers.
+    pub fn coalesce(&mut self, newer: &Self) -> bool {
+        match (self, newer) {
+            (Self::Pointer { x, y }, Self::Pointer { x: nx, y: ny }) => {
+                *x = *nx;
+                *y = *ny;
+                true
+            }
+            (Self::RelativeMotion { dx, dy }, Self::RelativeMotion { dx: nx, dy: ny }) => {
+                let (Some(x), Some(y)) = (dx.checked_add(*nx), dy.checked_add(*ny)) else {
+                    return false;
+                };
+                if x.unsigned_abs() > 1_000_000 || y.unsigned_abs() > 1_000_000 {
+                    return false;
+                }
+                *dx = x;
+                *dy = y;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// USB HID usages, independent of local scan-code and layout conventions.
@@ -96,7 +156,8 @@ impl PressedInput {
                     self.keys.remove(&usage);
                 }
             }
-            InputEvent::Button { button, down, .. } => {
+            InputEvent::Button { button, down, .. }
+            | InputEvent::RelativeButton { button, down } => {
                 if down {
                     self.buttons.insert(button);
                 } else {
@@ -126,6 +187,32 @@ impl PressedInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_input_rejects_unbounded_motion_and_keeps_button_zero_valid() {
+        assert!(
+            InputEvent::Button {
+                button: 0,
+                down: true,
+                x: 0.5,
+                y: 0.5
+            }
+            .valid()
+        );
+        assert!(
+            !InputEvent::RelativeMotion {
+                dx: i32::MAX,
+                dy: 0
+            }
+            .valid()
+        );
+        assert!(!InputEvent::Pointer { x: f64::NAN, y: 0. }.valid());
+        let mut delta = InputEvent::RelativeMotion { dx: 3, dy: 4 };
+        assert!(delta.coalesce(&InputEvent::RelativeMotion { dx: 2, dy: -8 }));
+        assert!(matches!(
+            delta,
+            InputEvent::RelativeMotion { dx: 5, dy: -4 }
+        ));
+    }
     #[test]
     fn physical_mapping_distinguishes_keypad_and_extended_modifiers() {
         assert_eq!(pc_scan_hid(0x10), Some(0x14)); // Physical Q position, regardless of layout.
@@ -160,7 +247,12 @@ mod tests {
             usage: 0x06,
             down: true,
         });
-        assert_eq!(input.release_all().len(), 2);
+        input.track(&InputEvent::RelativeButton {
+            button: 4,
+            down: true,
+        });
+        assert!(input.button_is_down(4));
+        assert_eq!(input.release_all().len(), 3);
         assert!(input.release_all().is_empty());
     }
 }

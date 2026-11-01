@@ -97,7 +97,7 @@ fn transport() -> Arc<quinn::TransportConfig> {
     config.keep_alive_interval(Some(Duration::from_secs(5)));
     config.max_idle_timeout(Some(Duration::from_secs(20).try_into().unwrap()));
     config.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
-    config.datagram_send_buffer_size(1024 * 1024);
+    config.datagram_send_buffer_size(crate::media::DATAGRAM_SEND_BUFFER_BYTES);
     config.max_concurrent_bidi_streams(16u32.into());
     config.max_concurrent_uni_streams(32u32.into());
     Arc::new(config)

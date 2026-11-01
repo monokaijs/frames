@@ -29,6 +29,7 @@ fn main() {
     }
     let mut generated = String::new();
     if windows {
+        println!("cargo:rustc-link-lib=dxguid");
         let mut files: Vec<_> = fs::read_dir(sdk.join("bin"))
             .unwrap()
             .map(|f| f.unwrap().path())

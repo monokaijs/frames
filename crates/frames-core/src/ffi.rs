@@ -65,9 +65,9 @@ pub unsafe extern "C" fn frames_string_free(string: *mut c_char) {
 mod tests {
     use super::*;
     #[test]
-    fn native_abi_one_accepts_desktop_snapshots_and_rejects_update_gaps() {
+    fn native_abi_two_accepts_desktop_snapshots_and_rejects_update_gaps() {
         unsafe {
-            assert_eq!(frames_abi_version(), 1);
+            assert_eq!(frames_abi_version(), 2);
             let session = frames_session_new();
             let message=CString::new(r#"{"type":"snapshot","data":{"sequence":1,"windows":[{"key":{"id":1,"generation":1},"app_id":"fixture","app_name":"Fixture","title":"Desktop","icon_png":null,"parent":null,"role":"desktop","bounds":{"x":0,"y":0,"width":1920,"height":1080},"scale":1,"resize":"fixed","minimized":false,"visible":true,"modal":false}]}}"#).unwrap();
             let result = frames_session_apply(session, message.as_ptr());

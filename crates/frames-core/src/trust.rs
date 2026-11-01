@@ -167,6 +167,9 @@ pub struct TrustedPeer {
 pub fn incoming_needs_approval(peer: Option<&TrustedPeer>, unattended: bool) -> bool {
     !unattended || !peer.is_some_and(|p| p.allow_control && p.unattended)
 }
+pub fn allows_preview(peer: Option<&TrustedPeer>) -> bool {
+    peer.is_some_and(|peer| peer.allow_control)
+}
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct TrustStore {
     pub peers: BTreeMap<String, TrustedPeer>,
@@ -246,10 +249,13 @@ mod tests {
         assert!(incoming_needs_approval(Some(&pin), true));
         let allowed = TrustedPeer {
             allow_control: true,
-            ..pin
+            ..pin.clone()
         };
         assert!(!incoming_needs_approval(Some(&allowed), true));
         assert!(incoming_needs_approval(Some(&allowed), false));
         assert!(incoming_needs_approval(None, true));
+        assert!(!allows_preview(None));
+        assert!(!allows_preview(Some(&pin)));
+        assert!(allows_preview(Some(&allowed)));
     }
 }
