@@ -1,13 +1,22 @@
+mod caption;
 mod capture;
 mod client;
+mod devices;
+pub(crate) mod dialogs;
 mod drag;
 mod files;
 mod host;
 pub mod launcher;
 mod menus;
+#[cfg(frames_shared_input)]
+pub(crate) mod process_audio;
 mod render;
 mod secure;
 mod session_control;
+#[cfg(frames_shared_input)]
+pub(crate) mod shared_game;
+pub mod tray;
+mod virtual_cursor;
 pub use client::run_client;
 pub use host::Host;
 #[cfg(feature = "media-diagnostics")]

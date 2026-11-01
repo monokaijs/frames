@@ -2,6 +2,24 @@
 //! Only intended for interactive LAN acceptance tests; closes after five minutes.
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
+    #[link(name = "winmm")]
+    unsafe extern "system" {
+        fn timeBeginPeriod(period: u32) -> u32;
+        fn timeEndPeriod(period: u32) -> u32;
+    }
+    struct Timer;
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            unsafe {
+                timeEndPeriod(1);
+            }
+        }
+    }
+    unsafe {
+        timeBeginPeriod(1);
+    }
+    let _timer = Timer;
+    static MOTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     use windows::{
         Win32::{
             Foundation::*,
@@ -25,6 +43,17 @@ fn main() -> anyhow::Result<()> {
                 let brush = CreateSolidBrush(COLORREF(if is_cover { 0xd90d0d } else { 0x0d0dd9 }));
                 FillRect(dc, &rect, brush);
                 let _ = DeleteObject(brush.into());
+                let motion = MOTION.load(std::sync::atomic::Ordering::Relaxed);
+                if !is_cover && motion > 0 {
+                    let x = ((motion * 13) % rect.right.max(1) as u64) as i32;
+                    let moving = RECT {
+                        left: x,
+                        top: 0,
+                        right: (x + 160).min(rect.right),
+                        bottom: rect.bottom,
+                    };
+                    FillRect(dc, &moving, HBRUSH(GetStockObject(WHITE_BRUSH).0));
+                }
                 let pen = CreatePen(PS_SOLID, 2, COLORREF(0xffffff));
                 let old = SelectObject(dc, pen.into());
                 let (x, y) = (rect.right / 2, rect.bottom / 2);
@@ -121,6 +150,29 @@ fn main() -> anyhow::Result<()> {
             None,
         )?;
         let _ = ShowWindow(source, SW_SHOW);
+        if std::env::args().any(|arg| arg == "--1080p") {
+            let mut bounds = RECT {
+                right: 1920,
+                bottom: 1080,
+                ..Default::default()
+            };
+            AdjustWindowRectExForDpi(
+                &mut bounds,
+                WS_OVERLAPPEDWINDOW,
+                true,
+                WINDOW_EX_STYLE(0),
+                GetDpiForWindow(source),
+            )?;
+            SetWindowPos(
+                source,
+                None,
+                0,
+                0,
+                bounds.right - bounds.left,
+                bounds.bottom - bounds.top,
+                SWP_NOMOVE | SWP_NOZORDER,
+            )?;
+        }
         let _ = SetFocus(Some(edit));
         let _ = UpdateWindow(source);
         let mut client = RECT::default();
@@ -161,10 +213,20 @@ fn main() -> anyhow::Result<()> {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(300)
-            .clamp(30, 3660);
+            .clamp(30, 7260);
         let end = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        let motion = std::env::args().any(|arg| arg == "--motion");
+        let mut next_frame = std::time::Instant::now();
         let mut msg = MSG::default();
         while std::time::Instant::now() < end {
+            if motion && std::time::Instant::now() >= next_frame {
+                MOTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = InvalidateRect(Some(source), None, false);
+                next_frame += std::time::Duration::from_micros(16_667);
+                if next_frame < std::time::Instant::now() {
+                    next_frame = std::time::Instant::now();
+                }
+            }
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 if msg.message == WM_QUIT {
                     let _ = DestroyWindow(cover);
@@ -191,7 +253,7 @@ fn main() -> anyhow::Result<()> {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_millis(if motion { 1 } else { 5 }));
         }
         println!("{{\"fixture_event\":\"timeout\"}}");
         let _ = DestroyWindow(cover);

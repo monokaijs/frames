@@ -26,6 +26,31 @@ use windows::{
     },
     core::Interface,
 };
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn QueryPerformanceCounter(value: *mut i64) -> i32;
+    fn QueryPerformanceFrequency(value: *mut i64) -> i32;
+}
+fn captured_at(relative_100ns: i64) -> std::time::Instant {
+    static FREQUENCY: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    let frequency = *FREQUENCY.get_or_init(|| {
+        let mut value = 0;
+        unsafe {
+            QueryPerformanceFrequency(&mut value);
+        };
+        value
+    });
+    let now = std::time::Instant::now();
+    let mut counter = 0;
+    if frequency <= 0 || unsafe { QueryPerformanceCounter(&mut counter) } == 0 {
+        return now;
+    }
+    let age = counter as i128 * 10_000_000 / frequency as i128 - relative_100ns as i128;
+    if !(0..10_000_000).contains(&age) {
+        return now;
+    }
+    now - std::time::Duration::from_nanos(age as u64 * 100)
+}
 pub const DESKTOP_HANDLE: u64 = u64::MAX - 1;
 
 // Select only the client area from this window's own WGC texture, never from a
@@ -111,6 +136,21 @@ pub fn start_with_options(
     show_cursor: bool,
     show_header: bool,
 ) -> anyhow::Result<CaptureStream> {
+    start_mode(handle, show_cursor, show_header, false)
+}
+pub fn start_gpu(
+    handle: u64,
+    show_cursor: bool,
+    show_header: bool,
+) -> anyhow::Result<CaptureStream> {
+    start_mode(handle, show_cursor, show_header, true)
+}
+fn start_mode(
+    handle: u64,
+    show_cursor: bool,
+    show_header: bool,
+    gpu: bool,
+) -> anyhow::Result<CaptureStream> {
     let (sender, frames) = watch::channel(None);
     let stop = Arc::new(AtomicBool::new(false));
     let guard = Guard { stop: stop.clone() };
@@ -124,6 +164,7 @@ pub fn start_with_options(
                     handle,
                     show_cursor,
                     show_header,
+                    gpu,
                     sender,
                     flag.clone(),
                     ready_tx,
@@ -146,6 +187,7 @@ unsafe fn capture_thread(
     handle: u64,
     show_cursor: bool,
     show_header: bool,
+    gpu: bool,
     sender: watch::Sender<Option<RawFrame>>,
     stop: Arc<AtomicBool>,
     ready: std::sync::mpsc::SyncSender<Result<(), String>>,
@@ -178,6 +220,10 @@ unsafe fn capture_thread(
         }
         let device = device.unwrap();
         let context = context.unwrap();
+        let threading: windows::Win32::Graphics::Direct3D10::ID3D10Multithread = context.cast()?;
+        unsafe {
+            let _ = threading.SetMultithreadProtected(true);
+        }
         let dxgi: IDXGIDevice = device.cast()?;
         let direct: IDirect3DDevice =
             unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi)?.cast()? };
@@ -212,18 +258,37 @@ unsafe fn capture_thread(
         }
     };
     // Readback uses a staging texture. It never reads or crops the desktop.
+    let pixels = frames_core::media::PixelPool::default();
     let mut texture = None::<ID3D11Texture2D>;
     let mut dims = (0u32, 0u32);
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::sync_channel(1);
+    let arrived =
+        pool.FrameArrived(&windows::Foundation::TypedEventHandler::new(move |_, _| {
+            let _ = arrived_tx.try_send(());
+            Ok(())
+        }))?;
+    let mut surfaces: Vec<Arc<frames_core::media::WindowsFrame>> = Vec::new();
+    let mut capture_number = 0u64;
     session.StartCapture()?;
     let _ = ready.send(Ok(()));
     while !stop.load(Ordering::Acquire) {
-        let frame = match pool.TryGetNextFrame() {
+        let mut frame = match pool.TryGetNextFrame() {
             Ok(frame) => frame,
             Err(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                let _ = arrived_rx.recv_timeout(std::time::Duration::from_millis(100));
                 continue;
             }
         };
+        while let Ok(newer) = pool.TryGetNextFrame() {
+            let _ = frame.Close();
+            frame = newer;
+        }
+        capture_number = capture_number.wrapping_add(1);
+        tracing::trace!(handle, capture = capture_number, "window surface captured");
+        let captured = frame
+            .SystemRelativeTime()
+            .map(|time| captured_at(time.Duration))
+            .unwrap_or_else(|_| std::time::Instant::now());
         let result = (|| -> windows::core::Result<()> {
             let content = frame.ContentSize()?;
             if content.Width <= 0 || content.Height <= 0 {
@@ -282,6 +347,70 @@ unsafe fn capture_thread(
                 return Ok(());
             };
             let (width, height) = (region.right - region.left, region.bottom - region.top);
+            if gpu {
+                if dims != (width, height) {
+                    surfaces.clear();
+                    let owned = D3D11_TEXTURE2D_DESC {
+                        Width: width,
+                        Height: height,
+                        MipLevels: 1,
+                        ArraySize: 1,
+                        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        SampleDesc: desc.SampleDesc,
+                        Usage: D3D11_USAGE_DEFAULT,
+                        BindFlags: (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET).0 as u32,
+                        ..Default::default()
+                    };
+                    for _ in 0..3 {
+                        let mut texture = None;
+                        unsafe {
+                            device.CreateTexture2D(&owned, None, Some(&mut texture))?;
+                        }
+                        surfaces.push(Arc::new(frames_core::media::WindowsFrame {
+                            texture: texture.unwrap(),
+                            subresource: 0,
+                            matrix_709: true,
+                            full_range: true,
+                            lease: None,
+                        }));
+                    }
+                    dims = (width, height);
+                }
+                if let Some(surface) = surfaces.iter().find(|s| Arc::strong_count(s) == 1) {
+                    unsafe {
+                        context.CopySubresourceRegion(
+                            &surface.texture,
+                            0,
+                            0,
+                            0,
+                            0,
+                            &source,
+                            0,
+                            Some(&region),
+                        );
+                        context.Flush();
+                    }
+                    sender.send_replace(Some(RawFrame {
+                        media_generation: 0,
+                        gpu: Some(surface.clone()),
+                        captured_at: captured,
+                        frame_number: capture_number,
+                        width,
+                        height,
+                        bgra: Default::default(),
+                    }));
+                }
+                frame.Close()?;
+                if changed {
+                    pool.Recreate(
+                        &direct,
+                        DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                        2,
+                        content,
+                    )?;
+                }
+                return Ok(());
+            }
             if dims != (width, height) {
                 desc.Width = width;
                 desc.Height = height;
@@ -301,7 +430,7 @@ unsafe fn capture_thread(
                 context.CopySubresourceRegion(target, 0, 0, 0, 0, &source, 0, Some(&region));
                 context.Map(target, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
             }
-            let mut bgra = vec![0; width as usize * height as usize * 4];
+            let mut bgra = pixels.acquire(width as usize * height as usize * 4);
             for row in 0..height as usize {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -316,9 +445,14 @@ unsafe fn capture_thread(
             }
             frame.Close()?;
             sender.send_replace(Some(RawFrame {
+                media_generation: 0,
+                #[cfg(windows)]
+                gpu: None,
+                captured_at: captured,
+                frame_number: capture_number,
                 width,
                 height,
-                bgra: bgra.into(),
+                bgra: bgra.into_bytes(),
             }));
             if changed {
                 pool.Recreate(
@@ -335,6 +469,7 @@ unsafe fn capture_thread(
         }
     }
     session.Close()?;
+    let _ = pool.RemoveFrameArrived(arrived);
     pool.Close()?;
     Ok(())
 }

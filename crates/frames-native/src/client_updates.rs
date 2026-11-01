@@ -20,6 +20,7 @@ struct State {
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 struct Shared {
+    native_video: std::sync::atomic::AtomicBool,
     state: Mutex<State>,
     ready: Condvar,
     space: Condvar,
@@ -44,6 +45,7 @@ pub struct ClientReceiver(Arc<Shared>);
 
 pub fn client_channel(capacity: usize) -> (ClientSender, ClientReceiver) {
     let shared = Arc::new(Shared {
+        native_video: std::sync::atomic::AtomicBool::new(false),
         state: Mutex::new(State {
             queue: VecDeque::new(),
             frames: HashMap::new(),
@@ -78,6 +80,18 @@ impl Drop for ClientSender {
     }
 }
 impl ClientSender {
+    pub fn supports_native_video(&self) -> bool {
+        self.0
+            .native_video
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    #[cfg(target_os = "macos")]
+    pub fn enable_native_video(&self) {
+        self.0
+            .native_video
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     fn push(&self, update: ClientUpdate, blocking: bool) -> Result<(), ClientSendError> {
         let mut state = self.0.state.lock().unwrap();
         if !matches!(update, ClientUpdate::Frame(..)) {
@@ -130,6 +144,12 @@ impl ClientSender {
     }
 }
 impl ClientReceiver {
+    #[cfg(target_os = "macos")]
+    pub fn enable_native_video(&self) {
+        self.0
+            .native_video
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
     pub fn set_waker(&self, wake: impl Fn() + Send + Sync + 'static) {
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
         let pending = {
@@ -218,6 +238,11 @@ mod tests {
                 generation: 1,
             },
             RawFrame {
+                media_generation: 0,
+                #[cfg(windows)]
+                gpu: None,
+                captured_at: std::time::Instant::now(),
+                frame_number: 0,
                 width: 1,
                 height: 1,
                 bgra: vec![value; 4].into(),

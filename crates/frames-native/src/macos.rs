@@ -37,11 +37,19 @@ fn helper_path() -> anyhow::Result<std::path::PathBuf> {
     }
     anyhow::bail!("FramesHelper missing; run native/macos/build.sh or set FRAMES_MAC_HELPER")
 }
-pub fn confirm_pairing(name: &str, code: &str, reason: &str) -> anyhow::Result<bool> {
-    Ok(Command::new(helper_path()?)
+pub fn confirm_pairing(
+    name: &str,
+    code: &str,
+    reason: &str,
+) -> anyhow::Result<crate::ConnectionDecision> {
+    let status = Command::new(helper_path()?)
         .args(["--approve", name, code, reason])
-        .status()?
-        .success())
+        .status()?;
+    Ok(match status.code() {
+        Some(0) => crate::ConnectionDecision::Trust,
+        Some(2) => crate::ConnectionDecision::Accept,
+        _ => crate::ConnectionDecision::Decline,
+    })
 }
 pub fn launcher() -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -135,6 +143,7 @@ struct Bridge {
     pending: Arc<Mutex<HashMap<u64, std::sync::mpsc::SyncSender<Value>>>>,
     frames: Arc<Mutex<HashMap<u64, watch::Sender<Option<RawFrame>>>>>,
     audio: Arc<Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>>,
+    encoded: Arc<Mutex<HashMap<u64, tokio::sync::mpsc::Sender<crate::NativeEncodedFrame>>>>,
     next: AtomicU64,
 }
 impl Drop for Bridge {
@@ -154,17 +163,29 @@ impl Bridge {
         // Media must never hold up acknowledgements or input on stdout.
         let (media_read, media_write) = UnixStream::pair()?;
         let media_fd = media_write.as_raw_fd();
+        let (encoded_read, encoded_write) = UnixStream::pair()?;
+        let encoded_fd = encoded_write.as_raw_fd();
+        let (audio_read, audio_write) = UnixStream::pair()?;
+        let audio_fd = audio_write.as_raw_fd();
         let mut command = Command::new(helper_path()?);
         command
             .arg("--host")
             .env("FRAMES_MEDIA_FD", "198")
+            .env("FRAMES_ENCODED_FD", "199")
+            .env("FRAMES_AUDIO_FD", "200")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         // SAFETY: only async-signal-safe descriptor operations run after fork.
         unsafe {
             command.pre_exec(move || {
-                if libc::dup2(media_fd, 198) < 0 || libc::fcntl(198, libc::F_SETFD, 0) < 0 {
+                if libc::dup2(encoded_fd, 199) < 0
+                    || libc::fcntl(199, libc::F_SETFD, 0) < 0
+                    || libc::dup2(audio_fd, 200) < 0
+                    || libc::fcntl(200, libc::F_SETFD, 0) < 0
+                    || libc::dup2(media_fd, 198) < 0
+                    || libc::fcntl(198, libc::F_SETFD, 0) < 0
+                {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -172,6 +193,8 @@ impl Bridge {
         }
         let mut child = command.spawn()?;
         drop(media_write);
+        drop(encoded_write);
+        drop(audio_write);
         let input = child.stdin.take().unwrap();
         let output = child.stdout.take().unwrap();
         let pending = Arc::new(Mutex::new(
@@ -181,7 +204,12 @@ impl Bridge {
             HashMap::<u64, watch::Sender<Option<RawFrame>>>::new(),
         ));
         let audio = Arc::new(Mutex::new(None::<tokio::sync::mpsc::Sender<Vec<u8>>>));
+        let encoded = Arc::new(Mutex::new(HashMap::<
+            u64,
+            tokio::sync::mpsc::Sender<crate::NativeEncodedFrame>,
+        >::new()));
         {
+            let failed_encoded = encoded.clone();
             let replies = pending.clone();
             let streams = frames.clone();
             std::thread::spawn(move || {
@@ -201,19 +229,113 @@ impl Bridge {
                     {
                         tracing::warn!(handle,error=?value["error"].as_str(),"macOS window capture stopped");
                         streams.lock().remove(&handle);
+                        failed_encoded.lock().remove(&handle);
                     }
                 }
             });
         }
+        let encoded_frames = encoded.clone();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(encoded_read);
+            while let Ok(packet) = crate::native_media::read_packet(&mut reader) {
+                if packet.kind != 3
+                    || packet.bytes.len() <= crate::native_media::ENCODED_METADATA_BYTES
+                {
+                    continue;
+                }
+                if let Some(sender) = encoded_frames.lock().get(&packet.handle).cloned() {
+                    let p = &packet.bytes;
+                    let number = u64::from_le_bytes(p[9..17].try_into().unwrap());
+                    let captured_ns = u64::from_le_bytes(p[17..25].try_into().unwrap());
+                    let encode_micros = u32::from_le_bytes(p[25..29].try_into().unwrap());
+                    let encoded_ns = u64::from_le_bytes(p[29..37].try_into().unwrap());
+                    let mut clock = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    };
+                    let valid =
+                        unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut clock) } == 0;
+                    let uptime_ns = (clock.tv_sec as u64)
+                        .saturating_mul(1_000_000_000)
+                        .saturating_add(clock.tv_nsec as u64);
+                    let age = if valid {
+                        uptime_ns.saturating_sub(captured_ns) / 1000
+                    } else {
+                        0
+                    }
+                    .min(10_000_000);
+                    let encoded_age = if valid {
+                        uptime_ns.saturating_sub(encoded_ns) / 1000
+                    } else {
+                        0
+                    }
+                    .min(10_000_000);
+                    let mut bytes = vec![p[0]];
+                    bytes.extend_from_slice(&p[crate::native_media::ENCODED_METADATA_BYTES..]);
+                    let now = std::time::Instant::now();
+                    let _ = sender.try_send(crate::NativeEncodedFrame {
+                        width: packet.width,
+                        height: packet.height,
+                        source_width: u32::from_le_bytes(p[1..5].try_into().unwrap()),
+                        source_height: u32::from_le_bytes(p[5..9].try_into().unwrap()),
+                        packet: frames_core::codec::EncodedPacket {
+                            surface_encoded: true,
+                            encode_micros,
+                            generation: 0,
+                            number,
+                            captured_at: now - std::time::Duration::from_micros(age),
+                            encoded_at: now - std::time::Duration::from_micros(encoded_age),
+                            keyframe: p[0] == 1,
+                            bytes,
+                        },
+                    });
+                }
+            }
+            encoded_frames.lock().clear();
+        });
+        let captured_audio = audio.clone();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(audio_read);
+            while let Ok(packet) = crate::native_media::read_packet(&mut reader) {
+                if packet.kind == 2 {
+                    if let Some(sender) = captured_audio.lock().as_ref() {
+                        let _ = sender.try_send(packet.bytes);
+                    }
+                }
+            }
+        });
         let media_frames = frames.clone();
         let media_audio = audio.clone();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(media_read);
             loop {
                 match crate::native_media::read_packet(&mut reader) {
-                    Ok(packet) if packet.kind == 1 => {
+                    Ok(packet) if packet.kind == 1 || packet.kind == 4 => {
+                        let now = std::time::Instant::now();
+                        let mut clock = libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 0,
+                        };
+                        let valid =
+                            unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut clock) } == 0;
+                        let uptime = (clock.tv_sec as u64)
+                            .saturating_mul(1_000_000_000)
+                            .saturating_add(clock.tv_nsec as u64);
+                        let captured = if valid && packet.captured_ns > 0 {
+                            now.checked_sub(std::time::Duration::from_nanos(
+                                uptime.saturating_sub(packet.captured_ns),
+                            ))
+                            .unwrap_or(now)
+                        } else {
+                            now
+                        };
                         if let Some(sender) = media_frames.lock().get(&packet.handle).cloned() {
                             sender.send_replace(Some(RawFrame {
+                                media_generation: 0,
+                                #[cfg(windows)]
+                                gpu: None,
+                                captured_at: captured,
+                                frame_number: packet.number,
                                 width: packet.width,
                                 height: packet.height,
                                 bgra: packet.bytes.into(),
@@ -241,6 +363,7 @@ impl Bridge {
             pending,
             frames,
             audio,
+            encoded,
             next: AtomicU64::new(1),
         }))
     }
@@ -313,6 +436,7 @@ struct Guard {
 impl Capture for Guard {
     fn stop(&mut self) {
         self.bridge.frames.lock().remove(&self.handle);
+        self.bridge.encoded.lock().remove(&self.handle);
         let _ = self.bridge.request("stop", json!({"handle":self.handle}));
     }
 }
@@ -334,6 +458,15 @@ impl Drop for AudioGuard {
     }
 }
 impl Desktop for Host {
+    fn local_window_handle(&self, key: WindowId) -> anyhow::Result<u64> {
+        self.handle(key)
+    }
+    fn preview_image(&self, window: Option<WindowId>) -> anyhow::Result<Option<Vec<u8>>> {
+        let handle = window.map(|key| self.handle(key)).transpose()?;
+        let result = self.bridge.request("preview", json!({"handle":handle}))?;
+        let png = result["png"].as_str().context("missing preview image")?;
+        Ok(Some(base64::engine::general_purpose::STANDARD.decode(png)?))
+    }
     fn check_health(&self) -> anyhow::Result<()> {
         self.bridge.check_health()
     }
@@ -374,6 +507,62 @@ impl Desktop for Host {
             frames,
             guard: Box::new(guard),
         })
+    }
+    fn encoded_capture(
+        &self,
+        key: WindowId,
+        cursor: bool,
+        capability: &frames_core::codec::CodecCapability,
+        fps: u32,
+    ) -> anyhow::Result<Option<crate::NativeEncodedCapture>> {
+        if std::env::var("FRAMES_GPU").as_deref() == Ok("0")
+            || !capability.hardware
+            || !matches!(
+                capability.codec,
+                frames_core::codec::Codec::H264 | frames_core::codec::Codec::Hevc
+            )
+        {
+            return Ok(None);
+        }
+        let handle = self.handle(key)?;
+        let (sender, packets) = tokio::sync::mpsc::channel(2);
+        self.bridge.encoded.lock().insert(handle, sender);
+        let guard = Guard {
+            bridge: self.bridge.clone(),
+            handle,
+        };
+        self.bridge.request(
+            "capture_encoded",
+            json!({"handle":handle,"show_cursor":cursor,"codec":capability.codec,"fps":fps}),
+        )?;
+        let (control, commands) = std::sync::mpsc::sync_channel(4);
+        let bridge = self.bridge.clone();
+        std::thread::spawn(move || {
+            while let Ok(command) = commands.recv() {
+                let result = match command {
+                    crate::NativeEncoderCommand::Keyframe => {
+                        bridge.request("encoder_keyframe", json!({"handle":handle}))
+                    }
+                    crate::NativeEncoderCommand::Configure {
+                        bitrate,
+                        fps,
+                        scale,
+                    } => bridge.request(
+                        "encoder_configure",
+                        json!({"handle":handle,"bitrate":bitrate,"fps":fps,"scale":scale}),
+                    ),
+                };
+                if let Err(error) = result {
+                    tracing::warn!(%error,"native encoder command failed");
+                    break;
+                }
+            }
+        });
+        Ok(Some(crate::NativeEncodedCapture {
+            packets,
+            control,
+            guard: Box::new(guard),
+        }))
     }
     fn clipboard(&self) -> anyhow::Result<Option<String>> {
         Ok(self.bridge.request("clipboard", json!({}))?["text"]
@@ -464,16 +653,36 @@ pub fn run_client(
         });
     }
     let mut child = command.spawn()?;
+    updates.enable_native_video();
     drop(media_read);
     // A blocked video socket must never block control updates to the helper.
     let shutdown_media = media_write.try_clone()?;
     let (video_tx, video_rx) = crate::client_channel(16);
     let video_writer = std::thread::spawn(move || {
         for update in video_rx {
-            if let ClientUpdate::Frame(window, frame) = update
-                && let Err(error) =
+            let result = match update {
+                ClientUpdate::Frame(window, frame) => {
                     crate::native_media::write_video(&mut media_write, window, &frame)
-            {
+                }
+                ClientUpdate::EncodedVideo {
+                    window,
+                    generation,
+                    codec,
+                    width,
+                    height,
+                    packet,
+                } => crate::native_media::write_encoded(
+                    &mut media_write,
+                    window,
+                    generation,
+                    codec,
+                    width,
+                    height,
+                    &packet,
+                ),
+                _ => Ok(()),
+            };
+            if let Err(error) = result {
                 tracing::warn!(%error, "Mac client media socket closed");
                 break;
             }
@@ -481,6 +690,7 @@ pub fn run_client(
     });
     let mut input = child.stdin.take().unwrap();
     let output = child.stdout.take().unwrap();
+    let media_events = events.clone();
     let reader = std::thread::spawn(move || {
         for line in BufReader::new(output).lines() {
             let Ok(line) = line else {
@@ -500,6 +710,9 @@ pub fn run_client(
                 Some("adb_bridge") => Some(ClientEvent::AdbBridge {
                     enabled: value["enabled"].as_bool().unwrap_or(false),
                 }),
+                Some("devices") => serde_json::from_value(value["data"].clone())
+                    .ok()
+                    .map(ClientEvent::Devices),
                 Some("disconnect") => Some(ClientEvent::Disconnected),
                 Some("cancel_transfers") => Some(ClientEvent::CancelTransfers),
                 Some("send_files") => window.map(|window| ClientEvent::SendFiles {
@@ -530,6 +743,36 @@ pub fn run_client(
                             created: std::time::Instant::now(),
                         })
                 }),
+                Some("presented") => window.map(|window| ClientEvent::Presented {
+                    window,
+                    generation: value["generation"].as_u64().unwrap_or(0) as u32,
+                    number: value["number"].as_u64().unwrap_or(0),
+                    at: std::time::Instant::now(),
+                }),
+                Some("decoded") => window.map(|window| ClientEvent::Decoded {
+                    window,
+                    generation: value["generation"].as_u64().unwrap_or(0) as u32,
+                    number: value["number"].as_u64().unwrap_or(0),
+                    micros: value["micros"].as_u64().unwrap_or(0),
+                }),
+                Some("media_recovery") => window.map(|window| ClientEvent::MediaRecovery {
+                    window,
+                    generation: value["generation"].as_u64().unwrap_or(0) as u32,
+                }),
+                Some("decoder_failed") => window.map(|window| ClientEvent::DecoderFailed {
+                    window,
+                    generation: value["generation"].as_u64().unwrap_or(0) as u32,
+                    reason: value["reason"]
+                        .as_str()
+                        .unwrap_or("native decoder failed")
+                        .into(),
+                }),
+                Some("shared_alive") => Some(ClientEvent::SharedAlive {
+                    created: std::time::Instant::now(),
+                }),
+                Some("resume") => Some(ClientEvent::ResumeInput {
+                    created: std::time::Instant::now(),
+                }),
                 Some("release") => Some(ClientEvent::ReleaseInput),
                 _ => None,
             };
@@ -540,8 +783,40 @@ pub fn run_client(
         tracing::info!("Mac client helper event pipe closed");
         let _ = events.send(ClientEvent::Disconnected);
     });
+    let mut recovering_video = std::collections::HashSet::new();
     for update in updates {
         let value = match update {
+            ClientUpdate::SharedSession(session) => {
+                json!({"type":"shared_session","data":session,"compatibility_text":session.compatibility.description()})
+            }
+            ClientUpdate::SharedCursor(cursor) => json!({"type":"shared_cursor","data":cursor}),
+            ClientUpdate::Devices(list) => json!({"type":"devices","data":list}),
+            encoded @ ClientUpdate::EncodedVideo { .. } => {
+                let (window, generation, keyframe) = if let ClientUpdate::EncodedVideo {
+                    window,
+                    generation,
+                    packet,
+                    ..
+                } = &encoded
+                {
+                    (*window, *generation, packet.keyframe)
+                } else {
+                    unreachable!()
+                };
+                let identity = (window, generation);
+                if recovering_video.contains(&identity) && !keyframe {
+                    continue;
+                }
+                if video_tx.try_send(encoded).is_err() {
+                    if recovering_video.insert(identity) {
+                        let _ =
+                            media_events.send(ClientEvent::MediaRecovery { window, generation });
+                    }
+                } else if keyframe {
+                    recovering_video.remove(&identity);
+                }
+                continue;
+            }
             ClientUpdate::RemoteCursor { visible } => {
                 json!({"type":"remote_cursor","visible":visible})
             }
@@ -596,7 +871,15 @@ pub fn run_client(
     drop(video_tx);
     let _ = shutdown_media.shutdown(std::net::Shutdown::Both);
     drop(input);
-    let _ = child.kill();
+    // EOF lets AppKit release capture/render resources and terminate its Dock
+    // proxies. Keep cleanup bounded if a helper/driver has stopped responding.
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    while child.try_wait()?.is_none() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if child.try_wait()?.is_none() {
+        let _ = child.kill();
+    }
     let _ = child.wait();
     let _ = reader.join();
     let _ = video_writer.join();

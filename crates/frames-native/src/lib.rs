@@ -3,9 +3,19 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 pub mod audio;
 mod client_updates;
+mod device_name;
+mod window_selection;
+pub use window_selection::{
+    SharingWindow, WindowSelection, parse_selection, selected_desktop, sharing_windows,
+};
+pub mod gamepad;
+pub mod usb;
 pub use client_updates::{ClientReceiver, ClientSendError, ClientSender, client_channel};
+pub use device_name::{device_name, device_name_override, set_device_name, system_device_name};
 #[cfg(all(windows, feature = "media-diagnostics"))]
 pub use windows::diagnostic_capture_window;
+#[cfg(windows)]
+pub use windows::tray::{Tray, TrayGlyph, TrayItem};
 
 #[cfg(target_os = "macos")]
 pub fn permission_status(request: bool) -> anyhow::Result<serde_json::Value> {
@@ -41,7 +51,82 @@ pub struct CaptureStream {
     pub frames: watch::Receiver<Option<RawFrame>>,
     pub guard: Box<dyn Capture>,
 }
+pub struct NativeEncodedFrame {
+    pub packet: frames_core::codec::EncodedPacket,
+    pub width: u32,
+    pub height: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+}
+pub enum NativeEncoderCommand {
+    Keyframe,
+    Configure { bitrate: u32, fps: u32, scale: u32 },
+}
+pub struct NativeEncodedCapture {
+    pub packets: mpsc::Receiver<NativeEncodedFrame>,
+    pub control: std::sync::mpsc::SyncSender<NativeEncoderCommand>,
+    pub guard: Box<dyn Capture>,
+}
 pub trait Desktop: Send + Sync {
+    /// Local picker identity; never transmitted in the remote window graph.
+    fn local_window_handle(&self, _key: WindowId) -> anyhow::Result<u64> {
+        anyhow::bail!("Window selection hosting currently requires Windows")
+    }
+    fn allow_desktop(&self) -> bool {
+        true
+    }
+    /// A one-shot PNG capture, independent of active video streams when available.
+    fn preview_image(&self, _window: Option<WindowId>) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    fn preview_capture(&self, window: Option<WindowId>) -> anyhow::Result<CaptureStream> {
+        let key = match window {
+            Some(key) => key,
+            None => {
+                self.surfaces(if self.shared_session().is_some() {
+                    ViewMode::Windows
+                } else {
+                    ViewMode::Desktop
+                })?
+                .into_iter()
+                .find(|w| w.visible && !w.minimized)
+                .ok_or_else(|| anyhow::anyhow!("no screen available for preview"))?
+                .key
+            }
+        };
+        self.capture(key, false)
+    }
+    fn shared_session(&self) -> Option<frames_core::shared_game::SharedSession> {
+        None
+    }
+    fn begin_control(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn prepare_control(&self) -> anyhow::Result<Option<frames_core::shared_game::SharedSession>> {
+        Ok(None)
+    }
+    fn end_control(&self) {}
+    fn shared_heartbeat(&self, _generation: u64) -> anyhow::Result<()> {
+        anyhow::bail!("shared input unavailable")
+    }
+    fn shared_resume(&self, _generation: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn shared_input(
+        &self,
+        _key: WindowId,
+        _generation: u64,
+        _event: &InputEvent,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("shared input unavailable")
+    }
+    fn shared_release(&self, _generation: u64) {}
+    fn shared_cursor(&self) -> anyhow::Result<Option<frames_core::shared_game::Cursor>> {
+        Ok(None)
+    }
+    fn allow_clipboard(&self) -> bool {
+        true
+    }
     /// Detect a lost native backend even when no remote session is connected.
     fn check_health(&self) -> anyhow::Result<()> {
         Ok(())
@@ -63,6 +148,23 @@ pub trait Desktop: Send + Sync {
     fn input(&self, key: WindowId, event: &InputEvent) -> anyhow::Result<()>;
     fn release_input(&self);
     fn capture(&self, key: WindowId, show_cursor: bool) -> anyhow::Result<CaptureStream>;
+    fn encoded_capture(
+        &self,
+        _key: WindowId,
+        _cursor: bool,
+        _capability: &frames_core::codec::CodecCapability,
+        _fps: u32,
+    ) -> anyhow::Result<Option<NativeEncodedCapture>> {
+        Ok(None)
+    }
+    fn capture_for_encoding(
+        &self,
+        key: WindowId,
+        show_cursor: bool,
+        _hardware: bool,
+    ) -> anyhow::Result<CaptureStream> {
+        self.capture(key, show_cursor)
+    }
     fn clipboard(&self) -> anyhow::Result<Option<String>>;
     fn set_clipboard(&self, text: &str) -> anyhow::Result<()>;
     fn clipboard_image(&self) -> anyhow::Result<Option<Vec<u8>>> {
@@ -93,6 +195,34 @@ pub trait Desktop: Send + Sync {
 
 #[derive(Clone, Debug)]
 pub enum ClientEvent {
+    SharedAlive {
+        created: std::time::Instant,
+    },
+    ResumeInput {
+        created: std::time::Instant,
+    },
+    Devices(frames_core::devices::DeviceAction),
+    Decoded {
+        window: WindowId,
+        generation: u32,
+        number: u64,
+        micros: u64,
+    },
+    DecoderFailed {
+        window: WindowId,
+        generation: u32,
+        reason: String,
+    },
+    MediaRecovery {
+        window: WindowId,
+        generation: u32,
+    },
+    Presented {
+        window: WindowId,
+        generation: u32,
+        number: u64,
+        at: std::time::Instant,
+    },
     TimedInput {
         window: WindowId,
         event: InputEvent,
@@ -132,6 +262,18 @@ pub enum ClientEvent {
     },
 }
 pub enum ClientUpdate {
+    SharedSession(Box<frames_core::shared_game::SharedSession>),
+    SharedCursor(frames_core::shared_game::Cursor),
+    Devices(frames_core::devices::DeviceList),
+    #[cfg(target_os = "macos")]
+    EncodedVideo {
+        window: WindowId,
+        generation: u32,
+        codec: frames_core::codec::Codec,
+        width: u32,
+        height: u32,
+        packet: frames_core::codec::EncodedPacket,
+    },
     RemoteCursor {
         visible: bool,
     },
@@ -203,27 +345,56 @@ pub fn run_client(
     }
 }
 
-pub fn confirm_pairing(name: &str, code: &str, reason: &str) -> anyhow::Result<bool> {
+pub fn shared_desktop(
+    exclusions: Vec<String>,
+    hwnd: Option<u64>,
+) -> anyhow::Result<Arc<dyn Desktop>> {
+    #[cfg(all(windows, frames_shared_input))]
+    {
+        windows::shared_game::create(exclusions, hwnd)
+    }
+    #[cfg(not(all(windows, frames_shared_input)))]
+    {
+        let _ = (exclusions, hwnd);
+        anyhow::bail!("Shared game hosting requires Windows x64 with the MSVC adapter")
+    }
+}
+pub fn shared_selected_desktop(
+    exclusions: Vec<String>,
+    argument: String,
+) -> anyhow::Result<Arc<dyn Desktop>> {
+    let (id, marker) = parse_selection(&argument)?;
+    #[cfg(all(windows, frames_shared_input))]
+    {
+        windows::shared_game::create_marked(exclusions, id, marker)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (id, marker);
+        selected_desktop(exclusions, vec![argument])
+    }
+    #[cfg(not(any(all(windows, frames_shared_input), target_os = "macos")))]
+    {
+        let _ = (id, marker, exclusions);
+        anyhow::bail!("Isolated window control requires Windows x64 with the MSVC adapter")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionDecision {
+    Decline,
+    Accept,
+    Trust,
+}
+
+pub fn confirm_pairing(name: &str, code: &str, reason: &str) -> anyhow::Result<ConnectionDecision> {
     #[cfg(windows)]
     {
-        use ::windows::{Win32::UI::WindowsAndMessaging::*, core::PCWSTR};
         let name: String = name.chars().filter(|c| !c.is_control()).take(80).collect();
         let message = format!(
             "{reason}\n\nVerification code: {code}\n\nDevice: {name}\n\nApprove only if the other device shows this same code."
         );
-        let text: Vec<_> = message.encode_utf16().chain(Some(0)).collect();
-        let title: Vec<_> = "Frames device pairing"
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
-        Ok(unsafe {
-            MessageBoxW(
-                None,
-                PCWSTR(text.as_ptr()),
-                PCWSTR(title.as_ptr()),
-                MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION,
-            )
-        } == IDYES)
+        windows::dialogs::connection(&name, &message)
     }
     #[cfg(target_os = "macos")]
     {
@@ -253,17 +424,8 @@ pub fn launcher() -> anyhow::Result<()> {
 pub fn show_error(title: &str, message: &str) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
-        use ::windows::{Win32::UI::WindowsAndMessaging::*, core::PCWSTR};
-        let title: Vec<_> = title.encode_utf16().chain(Some(0)).collect();
-        let message: Vec<_> = message.encode_utf16().chain(Some(0)).collect();
-        unsafe {
-            MessageBoxW(
-                None,
-                PCWSTR(message.as_ptr()),
-                PCWSTR(title.as_ptr()),
-                MB_OK | MB_ICONERROR,
-            );
-        }
+        use ::windows::Win32::UI::WindowsAndMessaging::*;
+        windows::dialogs::message(title, message, MB_OK | MB_ICONERROR);
         Ok(())
     }
     #[cfg(target_os = "macos")]

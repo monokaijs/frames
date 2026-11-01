@@ -70,6 +70,11 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             RawFrame {
+                media_generation: 0,
+                #[cfg(windows)]
+                gpu: None,
+                captured_at: std::time::Instant::now(),
+                frame_number: 0,
                 width: 640,
                 height: 400,
                 bgra: bgra.into(),
@@ -96,7 +101,15 @@ fn main() -> anyhow::Result<()> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(180);
         let end = std::time::Instant::now() + std::time::Duration::from_secs(duration);
+        let refresh = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut refreshed = false;
         while std::time::Instant::now() < end {
+            if !refreshed && std::time::Instant::now() >= refresh {
+                let mut next = frame();
+                next.frame_number = 1;
+                let _ = tx.send(ClientUpdate::Frame(window.key, next));
+                refreshed = true;
+            }
             match actions.try_recv() {
                 Ok(ClientEvent::Disconnected) => break,
                 Ok(ClientEvent::ViewMode(next)) => {

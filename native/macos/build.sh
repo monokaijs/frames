@@ -17,7 +17,7 @@ swiftc -O -swift-version 5 -target arm64-apple-macos14.2 \
   native/macos/Sources/*.swift \
   target/aarch64-apple-darwin/release/libframes_core.a \
   -framework AppKit -framework ScreenCaptureKit -framework Metal -framework QuartzCore \
-  -framework VideoToolbox -framework Security -framework CoreGraphics -framework ServiceManagement -framework UniformTypeIdentifiers -framework AudioToolbox \
+  -framework VideoToolbox -framework Security -framework CoreGraphics -framework ServiceManagement -framework UniformTypeIdentifiers -framework AudioToolbox -framework CoreImage -framework CoreVideo -framework CoreMedia -framework ImageIO \
   -o dist/macos/Frames.app/Contents/MacOS/FramesHelper
 # Retire the previous bundle's executable and login item when rebuilding in place.
 # Do this before copying Frames: macOS volumes are usually case-insensitive.

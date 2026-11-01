@@ -28,6 +28,24 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
         if ["action","input","menu","drop_files"].contains(command),let error=HostSessionState.controlError(){throw Wire.failure(error)}
         let id = CGWindowID((data["handle"] as? NSNumber)?.uint32Value ?? 0)
         switch command {
+        case "preview":
+            if let error=HostSessionState.controlError(){throw Wire.failure(error)}
+            let content=try await SCShareableContent.excludingDesktopWindows(false,onScreenWindowsOnly:true)
+            let filter:SCContentFilter
+            let size:CGSize
+            if id != 0 && id != desktopCaptureID {
+                guard let window=content.windows.first(where:{$0.windowID==id}) else{throw Wire.failure("Window is unavailable")}
+                filter=SCContentFilter(desktopIndependentWindow:window);size=window.frame.size
+            } else {
+                guard let display=content.displays.first(where:{$0.displayID==CGMainDisplayID()}) ?? content.displays.first else{throw Wire.failure("No display is available")}
+                filter=SCContentFilter(display:display,excludingWindows:[]);size=CGSize(width:display.width,height:display.height)
+            }
+            let scale=min(480/max(1,size.width),270/max(1,size.height))
+            let configuration=SCStreamConfiguration()
+            configuration.width=max(1,Int(size.width*scale));configuration.height=max(1,Int(size.height*scale));configuration.showsCursor=false
+            let image=try await SCScreenshotManager.captureImage(contentFilter:filter,configuration:configuration)
+            guard let png=NSBitmapImageRep(cgImage:image).representation(using:.png,properties:[:]) else{throw Wire.failure("Preview encoding failed")}
+            return ["png":png.base64EncodedString()]
         case "desktop":
             guard CGPreflightScreenCaptureAccess() else{throw Wire.failure("Screen Recording permission is required")}
             let content=try await SCShareableContent.excludingDesktopWindows(false,onScreenWindowsOnly:false)
@@ -36,13 +54,16 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
             let rect=CGDisplayBounds(display.displayID)
             return ["windows":[["key":["id":desktopCaptureID,"generation":1],"app_id":"app.frames.desktop-view","app_name":"Remote desktop","title":"Remote desktop — primary display","icon_png":NSNull(),"parent":NSNull(),"role":"desktop","bounds":["x":rect.minX,"y":rect.minY,"width":rect.width,"height":rect.height],"scale":Double(display.width)/max(1,Double(rect.width)),"resize":"fixed","minimized":false,"visible":true,"modal":false]]]
         case "windows": return try await enumerate(exclusions: data["exclude"] as? [String] ?? [])
-        case "capture":
+        case "encoder_keyframe": captures[id]?.hardwareEncoder?.keyframe();return [:]
+        case "encoder_configure": captures[id]?.hardwareEncoder?.configure(bitrate:data["bitrate"] as? Int ?? 12_000_000,fps:data["fps"] as? Int ?? 60,scale:data["scale"] as? Int ?? 100);return [:]
+        case "capture", "capture_encoded":
             let showCursor=data["show_cursor"] as? Bool ?? true
             if captures[id] == nil {
                 let capture:WindowCapture
                 if id==desktopCaptureID,let display=desktopDisplay{capture=WindowCapture(display:display,cursor:showCursor)}
                 else if let window=windows[id]{capture=WindowCapture(window:window,content:contentFrames[id] ?? window.frame,cursor:showCursor)}
                 else{throw Wire.failure("Window or display no longer exists")}
+                if command == "capture_encoded" { capture.hardwareEncoder = try NativeVideoEncoder(handle:UInt64(id),codec:data["codec"] as? String ?? "h264",fps:data["fps"] as? Int ?? 60) }
                 captures[id] = capture
                 do { try await capture.start() }
                 catch {
@@ -466,8 +487,10 @@ final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     @MainActor private var resizing=false
     let id: CGWindowID; var frame: CGRect; var contentFrame:CGRect;var stream: SCStream?; var configuration: SCStreamConfiguration
     private let geometryLock=NSLock()
+    var hardwareEncoder:NativeVideoEncoder?
     private var pixelRegion=CGRect.zero
     private var pixelSize=CGSize.zero
+    private var captureNumber:UInt64=0
     let queue = DispatchQueue(label: "app.frames.capture", qos: .userInteractive)
     convenience init(window: SCWindow,content:CGRect,cursor:Bool=true) { self.init(id:window.windowID,frame:window.frame,content:content,filter:SCContentFilter(desktopIndependentWindow:window),cursor:cursor,children:false) }
     convenience init(display: SCDisplay,cursor:Bool=true) { let rect=CGDisplayBounds(display.displayID);self.init(id:desktopCaptureID,frame:rect,content:rect,filter:SCContentFilter(display:display,excludingWindows:[]),cursor:cursor,children:false) }
@@ -493,6 +516,7 @@ final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     func stop() async {
         guard let stream else { return }
         self.stream=nil
+        hardwareEncoder?.stop()
         try? stream.removeStreamOutput(self,type:.screen)
         try? await stream.stopCapture()
     }
@@ -517,18 +541,24 @@ final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         guard type == .screen, sampleBuffer.isValid, let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         guard let attachments=CMSampleBufferGetSampleAttachmentsArray(sampleBuffer,createIfNecessary:false) as? [[SCStreamFrameInfo:Any]],
               let rawStatus=attachments.first?[.status] as? Int,SCFrameStatus(rawValue:rawStatus) == .complete else{return}
-        CVPixelBufferLockBaseAddress(buffer, .readOnly); defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return }
         let fullWidth=CVPixelBufferGetWidth(buffer),fullHeight=CVPixelBufferGetHeight(buffer),stride=CVPixelBufferGetBytesPerRow(buffer)
         geometryLock.lock();let expected=pixelSize,region=pixelRegion;geometryLock.unlock()
         guard fullWidth==Int(expected.width),fullHeight==Int(expected.height) else{return}
         let left=Int(region.minX),top=Int(region.minY),width=Int(region.width),height=Int(region.height)
         guard left>=0,top>=0,width>0,height>0,width<=8192,height<=8192,left+width<=fullWidth,top+height<=fullHeight else{return}
+        captureNumber &+= 1
+        let time=CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let nanos=time.isNumeric ? CMTimeConvertScale(time,timescale:1_000_000_000,method:.default).value:0
+        if let hardwareEncoder {
+            hardwareEncoder.submit(buffer,region:region,captured:nanos>0 ? UInt64(nanos):DispatchTime.now().uptimeNanoseconds);return
+        }
+        CVPixelBufferLockBaseAddress(buffer, .readOnly);defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base=CVPixelBufferGetBaseAddress(buffer) else { return }
         var data = Data(capacity: width*height*4)
         // ScreenCaptureKit ignores sourceRect for independent-window streams.
         // Remove only verified chrome from that window's buffer before encoding.
         for row in 0..<height { data.append(base.advanced(by:(top+row)*stride+left*4).assumingMemoryBound(to: UInt8.self), count: width*4) }
-        Wire.sendFrame(handle:UInt64(id),width:UInt32(width),height:UInt32(height),bytes:data)
+        Wire.sendFrame(handle:UInt64(id),width:UInt32(width),height:UInt32(height),bytes:data,number:captureNumber,captured:nanos>0 ? UInt64(nanos):DispatchTime.now().uptimeNanoseconds)
         }
     }
     func stream(_ stream: SCStream, didStopWithError error: Error) {

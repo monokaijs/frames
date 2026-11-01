@@ -76,7 +76,7 @@ impl Host {
             headers: Default::default(),
         })
     }
-    fn hwnd(&self, key: WindowId) -> anyhow::Result<HWND> {
+    pub(super) fn hwnd(&self, key: WindowId) -> anyhow::Result<HWND> {
         self.registry
             .lock()
             .handle(key)
@@ -178,6 +178,21 @@ unsafe extern "system" fn enumerate(hwnd: HWND, param: LPARAM) -> BOOL {
 }
 
 impl Desktop for Host {
+    fn local_window_handle(&self, key: WindowId) -> anyhow::Result<u64> {
+        Ok(self.hwnd(key)?.0 as u64)
+    }
+    fn preview_capture(&self, window: Option<WindowId>) -> anyhow::Result<CaptureStream> {
+        anyhow::ensure!(
+            !super::secure::active(),
+            "Preview unavailable on the secure desktop"
+        );
+        match window {
+            Some(key) => self.capture(key, false),
+            None => {
+                super::capture::start_with_options(super::capture::DESKTOP_HANDLE, false, false)
+            }
+        }
+    }
     fn menu(&self, key: WindowId) -> anyhow::Result<Vec<MenuItem>> {
         self.menus.read(key, self.hwnd(key)?)
     }
@@ -504,6 +519,9 @@ impl Desktop for Host {
             };
             let mut inputs = vec![];
             match event {
+                InputEvent::RelativeMotion { .. } | InputEvent::RelativeButton { .. } => {
+                    anyhow::bail!("Relative mouse input requires the shared-game input backend")
+                }
                 InputEvent::Pointer { x, y } => position(*x, *y)?,
                 InputEvent::Button { button, down, x, y } => {
                     if !*down && !self.pressed.lock().button_is_down(*button) {
@@ -604,6 +622,25 @@ impl Desktop for Host {
             let show_header = self.headers.lock().contains(&key);
             super::capture::start_with_options(self.hwnd(key)?.0 as u64, show_cursor, show_header)
         }
+    }
+    fn capture_for_encoding(
+        &self,
+        key: WindowId,
+        show_cursor: bool,
+        hardware: bool,
+    ) -> anyhow::Result<CaptureStream> {
+        if !hardware
+            || std::env::var("FRAMES_GPU").as_deref() == Ok("0")
+            || self.registry.lock().handle(key) == Some(super::secure::HANDLE)
+        {
+            return self.capture(key, show_cursor);
+        }
+        let handle = if self.registry.lock().handle(key) == Some(super::capture::DESKTOP_HANDLE) {
+            super::capture::DESKTOP_HANDLE
+        } else {
+            self.hwnd(key)?.0 as u64
+        };
+        super::capture::start_gpu(handle, show_cursor, self.headers.lock().contains(&key))
     }
     fn clipboard(&self) -> anyhow::Result<Option<String>> {
         unsafe {

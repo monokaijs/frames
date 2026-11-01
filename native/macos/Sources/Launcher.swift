@@ -58,7 +58,7 @@ import ApplicationServices
         guard !endpoints.isEmpty else{status.stringValue="No nearby hosts found. Enter a LAN or VPN address manually.";return}
         let alert=NSAlert();alert.messageText="Nearby Frames devices";alert.informativeText="Select a host. Verify its pairing code when connecting.";alert.addButton(withTitle:"Connect");alert.addButton(withTitle:"Cancel")
         let choices=NSPopUpButton(frame:NSRect(x:0,y:0,width:440,height:28));choices.addItems(withTitles:labels);alert.accessoryView=choices
-        if alert.runModal() == .alertFirstButtonReturn,choices.indexOfSelectedItem>=0{address.stringValue=endpoints[choices.indexOfSelectedItem];connect()}
+        if runFramesAlert(alert) == .alertFirstButtonReturn,choices.indexOfSelectedItem>=0{address.stringValue=endpoints[choices.indexOfSelectedItem];connect()}
         else{status.stringValue="Found \(devices.count) nearby hosts."}
     }
     @objc func loginItem(){do{try SMAppService.agent(plistName:"dev.creaton.frames.agent.plist").register();status.stringValue="Sharing registered for login. Approve it in Login Items if requested."}catch{status.stringValue=error.localizedDescription}}

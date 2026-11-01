@@ -30,6 +30,7 @@ fn spawn(args: &[&str]) -> anyhow::Result<Child> {
     Ok(Command::new(std::env::current_exe()?)
         .args(args)
         .env("FRAMES_GUI_CHILD", "1")
+        .env("FRAMES_LAUNCHER_PID", std::process::id().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

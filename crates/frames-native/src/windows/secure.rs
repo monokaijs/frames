@@ -216,6 +216,11 @@ unsafe fn run(
                 }
                 context.Unmap(staging, 0);
                 tx.send_replace(Some(RawFrame {
+                    media_generation: 0,
+                    #[cfg(windows)]
+                    gpu: None,
+                    captured_at: std::time::Instant::now(),
+                    frame_number: 0,
                     width: desc.Width,
                     height: desc.Height,
                     bgra: bgra.into(),

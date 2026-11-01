@@ -25,12 +25,12 @@ if args.contains("--network-settings"){
     alert.informativeText="Background sharing is \(enabled ? "registered" : "off"). Only devices already approved for unattended control can connect. Manage background sharing in System Settings → General → Login Items."
     alert.addButton(withTitle:enabled ? "Disable sharing at login" : "Enable sharing at login")
     alert.addButton(withTitle:"Cancel");alert.addButton(withTitle:"Open System Settings")
-    let response=alert.runModal()
+    let response=runFramesAlert(alert)
     do{
         if response == .alertFirstButtonReturn{if enabled{try service.unregister()}else{try service.register()}}
         else if response == .alertThirdButtonReturn{SMAppService.openSystemSettingsLoginItems()}
     }catch{
-        let failure=NSAlert();failure.messageText="Couldn't update the login item";failure.informativeText=error.localizedDescription;failure.runModal();exit(1)
+        let failure=NSAlert();failure.messageText="Couldn't update the login item";failure.informativeText=error.localizedDescription;_ = runFramesAlert(failure);exit(1)
     }
 }else if args.contains("--permissions"){
     let wantsScreen=args.contains("--request") || args.contains("--request-screen")
@@ -63,13 +63,15 @@ if args.contains("--network-settings"){
         Wire.send(Wire.permissions())
     }
 }else if args.contains("--error"){
-    app.setActivationPolicy(.regular);app.activate(ignoringOtherApps:true);let alert=NSAlert();alert.messageText=args.count>2 ? args[2]:"Frames";alert.informativeText=args.count>3 ? args[3]:"Unknown error";alert.alertStyle = .critical;alert.runModal()
+    app.setActivationPolicy(.regular);let alert=NSAlert();alert.messageText=args.count>2 ? args[2]:"Frames";alert.informativeText=args.count>3 ? args[3]:"Unknown error";alert.alertStyle = .critical;_ = runFramesAlert(alert)
 }else if args.contains("--approve"){
     app.setActivationPolicy(.regular);app.activate(ignoringOtherApps:true)
     let alert=NSAlert();alert.messageText=args.count>4 ? args[4]:"Approve pairing"
     let name=args.count>2 ? args[2].components(separatedBy:.controlCharacters).joined():"Remote device"
     alert.informativeText="Verification code: \(args.count>3 ? args[3]:"")\n\nDevice: \(name)\n\nApprove only if the other device shows the same code."
-    alert.addButton(withTitle:"Reject");alert.addButton(withTitle:"Approve");exit(alert.runModal() == .alertSecondButtonReturn ? 0:1)
+    alert.informativeText += "\n\nAccept allows this session only. Accept and trust also saves the device for future connections."
+    alert.addButton(withTitle:"Decline connection");alert.addButton(withTitle:"Accept and trust");alert.addButton(withTitle:"Accept")
+    let decision=runFramesAlert(alert);exit(decision == .alertSecondButtonReturn ? 0 : decision == .alertThirdButtonReturn ? 2 : 1)
 } else if args.contains("--launcher"){
     app.setActivationPolicy(.regular);let launcher=FramesLauncher();app.delegate=launcher;withExtendedLifetime(launcher){app.run()}
 } else if args.contains("--host") {
@@ -99,14 +101,18 @@ if args.contains("--network-settings"){
         fputs("Frames client requires a binary media socket\n", stderr)
         exit(1)
     }
-    let inbox = ClientVideoInbox { pending in
+    let decoders = NativeVideoDecoders()
+    let inbox = ClientVideoInbox(encoded:{ frame,inbox in decoders.decode(frame,into:inbox) }) { pending in
         DispatchQueue.main.async { client.receiveVideo(pending.take()) }
     }
     DispatchQueue.global(qos: .userInteractive).async { inbox.read(fd) }
+    let controls=ClientControlInbox { pending in
+        DispatchQueue.main.async { for message in pending.take(){client.update(message)} }
+    }
     DispatchQueue.global(qos: .userInteractive).async {
         while let line = readLine() {
             guard let bytes = line.data(using: .utf8), let message = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { continue }
-            DispatchQueue.main.async { client.update(message) }
+            if !controls.push(message){break}
         }
         Wire.diagnostic("client_stdin_closed")
         DispatchQueue.main.async { app.terminate(nil) }

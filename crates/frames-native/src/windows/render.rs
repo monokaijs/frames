@@ -12,7 +12,7 @@ use windows::{
     },
     core::*,
 };
-pub struct Renderer {
+struct RendererCore {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     swap: IDXGISwapChain,
@@ -24,48 +24,88 @@ pub struct Renderer {
     vertex: ID3D11VertexShader,
     pixel: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
+    flip: bool,
+    gpu_input: bool,
+    converter: Option<frames_core::codec::GpuConverter>,
 }
-impl Renderer {
-    pub unsafe fn new(hwnd: HWND) -> anyhow::Result<Self> {
+impl RendererCore {
+    unsafe fn new(hwnd: HWND) -> anyhow::Result<Self> {
+        Self::new_on_device(hwnd, None)
+    }
+    unsafe fn new_on_device(hwnd: HWND, existing: Option<ID3D11Device>) -> anyhow::Result<Self> {
         unsafe {
-            let mut device = None;
-            let mut context = None;
-            let mut swap = None;
-            let desc = DXGI_SWAP_CHAIN_DESC {
-                BufferDesc: DXGI_MODE_DESC {
-                    Width: 1,
-                    Height: 1,
-                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    ..Default::default()
-                },
+            let device = if let Some(device) = existing {
+                device
+            } else {
+                let mut device = None;
+                D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    None,
+                )?;
+                device.unwrap()
+            };
+            let context = device.GetImmediateContext()?;
+            let threading: windows::Win32::Graphics::Direct3D10::ID3D10Multithread =
+                context.cast()?;
+            let _ = threading.SetMultithreadProtected(true);
+            let adapter = device.cast::<IDXGIDevice>()?.GetAdapter()?;
+            let factory: IDXGIFactory2 = adapter.GetParent()?;
+            let desc = DXGI_SWAP_CHAIN_DESC1 {
+                Width: 1,
+                Height: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
                 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: 1,
-                OutputWindow: hwnd,
-                Windowed: TRUE,
-                // Compatibility presentation path for virtual-display adapters.
-                SwapEffect: DXGI_SWAP_EFFECT_DISCARD,
+                BufferCount: 2,
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
                 ..Default::default()
             };
-            D3D11CreateDeviceAndSwapChain(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&desc),
-                Some(&mut swap),
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )?;
-            let device = device.unwrap();
-            let context = context.unwrap();
-            let swap = swap.unwrap();
+            let fast = if std::env::var("FRAMES_PRESENTATION_COMPAT").as_deref() == Ok("1") {
+                None
+            } else {
+                factory
+                    .CreateSwapChainForHwnd(&device, hwnd, &desc, None, None)
+                    .ok()
+            };
+            let (swap, flip): (IDXGISwapChain, bool) = if let Some(swap) = fast {
+                let latency: IDXGISwapChain2 = swap.cast()?;
+                latency.SetMaximumFrameLatency(1)?;
+                (swap.cast()?, true)
+            } else {
+                tracing::info!("using compatibility swap chain for this adapter");
+                let desc = DXGI_SWAP_CHAIN_DESC {
+                    BufferDesc: DXGI_MODE_DESC {
+                        Width: 1,
+                        Height: 1,
+                        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        ..Default::default()
+                    },
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                    BufferCount: 1,
+                    OutputWindow: hwnd,
+                    Windowed: TRUE,
+                    SwapEffect: DXGI_SWAP_EFFECT_DISCARD,
+                    ..Default::default()
+                };
+                let mut swap = None;
+                factory.CreateSwapChain(&device, &desc, &mut swap).ok()?;
+                (swap.unwrap(), false)
+            };
             let source=b"Texture2D picture:register(t0);SamplerState linearSampler:register(s0);struct V{float4 p:SV_Position;float2 uv:TEXCOORD0;};V vs(uint id:SV_VertexID){float2 p[4]={float2(-1,-1),float2(-1,1),float2(1,-1),float2(1,1)};V v;v.p=float4(p[id],0,1);v.uv=float2((p[id].x+1)/2,(1-p[id].y)/2);return v;}float4 ps(V v):SV_Target{return picture.Sample(linearSampler,v.uv);}";
             let compile =
                 |entry: PCSTR, target: PCSTR| -> anyhow::Result<Vec<u8>> {
@@ -122,6 +162,9 @@ impl Renderer {
                 vertex: vertex.unwrap(),
                 pixel: pixel.unwrap(),
                 sampler: sampler.unwrap(),
+                flip,
+                gpu_input: false,
+                converter: None,
             })
         }
     }
@@ -132,6 +175,19 @@ impl Renderer {
         content: RECT,
     ) -> anyhow::Result<()> {
         unsafe {
+            if let Some(surface) = &frame.gpu {
+                let device = surface.texture.GetDevice()?;
+                if device.as_raw() != self.device.as_raw() {
+                    *self = Self::new_on_device(hwnd, Some(device))?;
+                }
+            }
+            if self.flip {
+                let swap: IDXGISwapChain2 = self.swap.cast()?;
+                let handle = swap.GetFrameLatencyWaitableObject();
+                if !handle.is_invalid() {
+                    let _ = windows::Win32::System::Threading::WaitForSingleObject(handle, 16);
+                }
+            }
             let mut rect = RECT::default();
             GetClientRect(hwnd, &mut rect)?;
             let size = (rect.right.max(0) as u32, rect.bottom.max(0) as u32);
@@ -146,14 +202,22 @@ impl Renderer {
                     size.0,
                     size.1,
                     DXGI_FORMAT_UNKNOWN,
-                    DXGI_SWAP_CHAIN_FLAG(0),
+                    if self.flip {
+                        DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+                    } else {
+                        DXGI_SWAP_CHAIN_FLAG(0)
+                    },
                 )?;
                 let buffer: ID3D11Texture2D = self.swap.GetBuffer(0)?;
                 self.device
                     .CreateRenderTargetView(&buffer, None, Some(&mut self.target))?;
                 self.size = size;
             }
-            if self.dimensions != (frame.width, frame.height) {
+            if self.dimensions != (frame.width, frame.height)
+                || self.gpu_input != frame.gpu.is_some()
+            {
+                self.gpu_input = frame.gpu.is_some();
+                self.converter = None;
                 self.view = None;
                 self.texture = None;
                 let desc = D3D11_TEXTURE2D_DESC {
@@ -166,9 +230,21 @@ impl Renderer {
                         Count: 1,
                         Quality: 0,
                     },
-                    Usage: D3D11_USAGE_DYNAMIC,
-                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                    CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                    Usage: if self.gpu_input {
+                        D3D11_USAGE_DEFAULT
+                    } else {
+                        D3D11_USAGE_DYNAMIC
+                    },
+                    BindFlags: if self.gpu_input {
+                        (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET).0 as u32
+                    } else {
+                        D3D11_BIND_SHADER_RESOURCE.0 as u32
+                    },
+                    CPUAccessFlags: if self.gpu_input {
+                        0
+                    } else {
+                        D3D11_CPU_ACCESS_WRITE.0 as u32
+                    },
                     ..Default::default()
                 };
                 self.device
@@ -181,17 +257,34 @@ impl Renderer {
                 self.dimensions = (frame.width, frame.height);
             }
             let texture = self.texture.as_ref().unwrap();
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context
-                .Map(texture, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
-            for row in 0..frame.height as usize {
-                std::ptr::copy_nonoverlapping(
-                    frame.bgra.as_ptr().add(row * frame.width as usize * 4),
-                    (mapped.pData as *mut u8).add(row * mapped.RowPitch as usize),
-                    frame.width as usize * 4,
-                );
+            if let Some(surface) = &frame.gpu {
+                if self.converter.is_none() {
+                    self.converter = Some(frames_core::codec::GpuConverter::new(
+                        &surface.texture,
+                        frame.width,
+                        frame.height,
+                    )?);
+                }
+                self.converter.as_mut().unwrap().convert(
+                    surface,
+                    texture,
+                    frame.width,
+                    frame.height,
+                )?;
+            } else {
+                anyhow::ensure!(frame.validate(), "invalid presentation frame");
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                self.context
+                    .Map(texture, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+                for row in 0..frame.height as usize {
+                    std::ptr::copy_nonoverlapping(
+                        frame.bgra.as_ptr().add(row * frame.width as usize * 4),
+                        (mapped.pData as *mut u8).add(row * mapped.RowPitch as usize),
+                        frame.width as usize * 4,
+                    );
+                }
+                self.context.Unmap(texture, 0);
             }
-            self.context.Unmap(texture, 0);
             self.context
                 .ClearRenderTargetView(self.target.as_ref().unwrap(), &[0., 0., 0., 1.]);
             self.context
@@ -213,9 +306,135 @@ impl Renderer {
             self.context
                 .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             self.context.Draw(4, 0);
-            self.swap.Present(0, DXGI_PRESENT(0)).ok()?;
+            self.swap
+                .Present(if self.flip { 1 } else { 0 }, DXGI_PRESENT(0))
+                .ok()?;
             Ok(())
         }
+    }
+}
+
+// The native UI only replaces this slot. GPU waits and presentation own a worker.
+pub struct Renderer {
+    shared: std::sync::Arc<(std::sync::Mutex<RenderState>, std::sync::Condvar)>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+struct RenderState {
+    frame: Option<(RawFrame, RECT)>,
+    stopped: bool,
+    error: Option<String>,
+    feedback: Option<(
+        frames_core::model::WindowId,
+        tokio::sync::mpsc::UnboundedSender<crate::ClientEvent>,
+    )>,
+}
+impl Renderer {
+    pub unsafe fn new(hwnd: HWND) -> anyhow::Result<Self> {
+        let shared = std::sync::Arc::new((
+            std::sync::Mutex::new(RenderState {
+                frame: None,
+                stopped: false,
+                error: None,
+                feedback: None,
+            }),
+            std::sync::Condvar::new(),
+        ));
+        let state = shared.clone();
+        let handle = hwnd.0 as usize;
+        let worker = std::thread::Builder::new()
+            .name("frames-present".into())
+            .spawn(move || {
+                let hwnd = HWND(handle as *mut _);
+                let mut renderer = match unsafe { RendererCore::new(hwnd) } {
+                    Ok(renderer) => renderer,
+                    Err(error) => {
+                        let mut slot = state.0.lock().unwrap();
+                        slot.error = Some(error.to_string());
+                        if let (Some((window, events)), Some((frame, _))) =
+                            (&slot.feedback, &slot.frame)
+                        {
+                            let _ = events.send(crate::ClientEvent::DecoderFailed {
+                                window: *window,
+                                generation: frame.media_generation,
+                                reason: error.to_string(),
+                            });
+                        }
+                        return;
+                    }
+                };
+                loop {
+                    let (frame, content, feedback) = {
+                        let mut slot = state.0.lock().unwrap();
+                        while slot.frame.is_none() && !slot.stopped {
+                            slot = state.1.wait(slot).unwrap();
+                        }
+                        if slot.stopped {
+                            break;
+                        }
+                        let (frame, content) = slot.frame.take().unwrap();
+                        (frame, content, slot.feedback.clone())
+                    };
+                    let result = unsafe { renderer.draw(hwnd, &frame, content) };
+                    match result {
+                        Ok(()) => {
+                            if let Some((window, events)) = feedback {
+                                let _ = events.send(crate::ClientEvent::Presented {
+                                    window,
+                                    generation: frame.media_generation,
+                                    number: frame.frame_number,
+                                    at: std::time::Instant::now(),
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            if let Some((window, events)) = feedback {
+                                let _ = events.send(crate::ClientEvent::DecoderFailed {
+                                    window,
+                                    generation: frame.media_generation,
+                                    reason: error.to_string(),
+                                });
+                            }
+                            state.0.lock().unwrap().error = Some(error.to_string());
+                            break;
+                        }
+                    }
+                }
+            })?;
+        Ok(Self {
+            shared,
+            worker: Some(worker),
+        })
+    }
+    pub fn set_feedback(
+        &self,
+        window: frames_core::model::WindowId,
+        events: tokio::sync::mpsc::UnboundedSender<crate::ClientEvent>,
+    ) {
+        self.shared.0.lock().unwrap().feedback = Some((window, events));
+    }
+    pub unsafe fn draw(
+        &mut self,
+        _hwnd: HWND,
+        frame: &RawFrame,
+        content: RECT,
+    ) -> anyhow::Result<()> {
+        let mut slot = self.shared.0.lock().unwrap();
+        if let Some(error) = &slot.error {
+            anyhow::bail!("{error}");
+        }
+        slot.frame = Some((frame.clone(), content));
+        drop(slot);
+        self.shared.1.notify_one();
+        Ok(())
+    }
+}
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        self.shared.0.lock().unwrap().stopped = true;
+        self.shared.1.notify_one();
+        // A device removal or driver stall must not block the window thread.
+        // The worker owns its resources and exits after its current driver call.
+        self.worker.take();
     }
 }
 
@@ -270,6 +489,11 @@ mod tests {
                 .draw(
                     hwnd,
                     &RawFrame {
+                        media_generation: 0,
+                        #[cfg(windows)]
+                        gpu: None,
+                        captured_at: std::time::Instant::now(),
+                        frame_number: 0,
                         width: 128,
                         height: 128,
                         bgra: bgra.into(),

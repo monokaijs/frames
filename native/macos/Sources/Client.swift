@@ -1,6 +1,8 @@
 import AppKit
 import Metal
 import QuartzCore
+import CoreVideo
+import ImageIO
 
 @MainActor final class NativeClient: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var host: String
@@ -10,9 +12,13 @@ import QuartzCore
     var sequence = 0
     var fileShelf: FileShelf?
     weak var activeProxy:RemoteProxy?
+    var sharedSession:[String:Any]?
+    var compatibilityText="Untested"
+    var virtualCursor:[String:Any]=[:]
     var viewMode="windows"
     var showRemoteCursor=true
     var adbEnabled=false
+    var deviceData:[String:Any]=[:]
     var menuTracking=0
     var needsMenu=false
     var focusAfterSwitch=false
@@ -27,19 +33,20 @@ import QuartzCore
     func presentVideo() {
         for key in Array(pendingVideo.keys) {
             guard let proxy = windows[key], let frame = pendingVideo.removeValue(forKey: key) else { continue }
-            proxy.view.display(frame.bytes, width: frame.width, height: frame.height)
+            proxy.view.display(frame)
             if !proxy.status.isEmpty { proxy.status = ""; proxy.refreshTitle() }
         }
     }
     init(host: String) { self.host = host; super.init() }
     deinit { if let session { frames_session_free(session) } }
     static func key(_ object: [String: Any]) -> String { "\(object["id"] ?? 0):\(object["generation"] ?? 0)" }
-    func applicationDidFinishLaunching(_ notification:Notification){Wire.diagnostic("client_started",["pid":ProcessInfo.processInfo.processIdentifier]);installMenu()}
+    func applicationDidFinishLaunching(_ notification:Notification){let timer=Timer(timeInterval:0.1,repeats:true){[weak self] _ in Task { @MainActor in if self?.sharedSession != nil{Wire.send(["event":"shared_alive"])} }};RunLoop.main.add(timer,forMode:.common);Wire.diagnostic("client_started",["pid":ProcessInfo.processInfo.processIdentifier]);installMenu()}
     // A host can temporarily have no shared windows during graph reconciliation.
     // Keep the session alive until an explicit disconnect or a transport failure.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication)->Bool{false}
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply{Wire.diagnostic("client_terminate_requested");return .terminateNow}
     func applicationDidResignActive(_ notification:Notification){for proxy in windows.values{proxy.view.releaseInput()}}
+    func applicationDidBecomeActive(_ notification:Notification){Wire.send(["event":"devices","data":["action":"focus","active":true]])}
     func applicationDidHide(_ notification:Notification){for proxy in windows.values{proxy.view.releaseInput()}}
     func activate(_ proxy:RemoteProxy){activeProxy=proxy;installMenu()}
     func menuWillOpen(_ menu:NSMenu){menuTracking+=1}
@@ -50,6 +57,11 @@ import QuartzCore
         let local=NSMenu();local.autoenablesItems=false;local.delegate=self
         let appItem=NSMenuItem(title:"Frames",action:nil,keyEquivalent:"");appItem.submenu=local;bar.addItem(appItem)
         func add(_ title:String,_ action:Selector,_ state:Bool?=nil){let item=NSMenuItem(title:title,action:action,keyEquivalent:"");item.target=self;if let state{item.state=state ? .on:.off};local.addItem(item)}
+        if sharedSession != nil {
+            add("Toggle relative mouse (Control+Option+F11)",#selector(toggleRelative))
+            add("Show virtual cursor",#selector(toggleRemoteCursor),showRemoteCursor)
+            add("Window compatibility",#selector(showCompatibility));local.addItem(.separator());add("Disconnect",#selector(disconnect));NSApp.mainMenu=bar;return
+        }
         add("Per-window view",#selector(windowsView),viewMode=="windows");add("Full desktop view",#selector(desktopView),viewMode=="desktop")
         add("Show remote cursor",#selector(toggleRemoteCursor),showRemoteCursor)
         local.addItem(.separator())
@@ -65,21 +77,49 @@ import QuartzCore
         }
         local.addItem(.separator());add("Disconnect",#selector(disconnect))
         let devices=NSMenu();devices.autoenablesItems=false;devices.delegate=self
+        appendDeviceMenus(devices)
         let adb=NSMenuItem(title:"Android ADB bridge",action:#selector(toggleAdb),keyEquivalent:"");adb.target=self;adb.state=adbEnabled ? .on:.off;devices.addItem(adb)
         let support=NSMenuItem(title:"Device forwarding support...",action:#selector(deviceSupport),keyEquivalent:"");support.target=self;devices.addItem(support)
         let deviceItem=NSMenuItem(title:"Devices",action:nil,keyEquivalent:"");deviceItem.submenu=devices;bar.addItem(deviceItem)
         NSApp.mainMenu=bar
         Wire.diagnostic("menu_installed", ["top_level_items":bar.items.count,"remote_top_level_items":activeProxy?.remoteMenuItems.count ?? 0,"activation_policy":NSApp.activationPolicy().rawValue])
     }
+    @objc func toggleRelative(){activeProxy?.view.toggleRelative()}
+    @objc func showCompatibility(){error("Window compatibility",compatibilityText)}
+    func configureShared(_ proxy:RemoteProxy){
+        guard let sharedSession else{return};proxy.physical=true;proxy.swap=false;proxy.mode="stretch_local";proxy.sharedStatus=sharedSession["detail"] as? String
+        if sharedSession["phase"] as? String != "active"{proxy.view.releaseInput()}
+        proxy.window.invalidateCursorRects(for:proxy.view);proxy.view.updateVirtualCursor(virtualCursor);proxy.refreshTitle()
+    }
     @objc func windowsView(){Wire.send(["event":"release"]);Wire.send(["event":"view_mode","mode":"windows"])}
     @objc func desktopView(){Wire.send(["event":"release"]);Wire.send(["event":"view_mode","mode":"desktop"])}
-    @objc func disconnect(){Wire.diagnostic("client_disconnect_requested");Wire.send(["event":"release"]);Wire.send(["event":"disconnect"])}
+    @objc func disconnect(){for proxy in windows.values{proxy.view.releaseInput()};Wire.diagnostic("client_disconnect_requested");Wire.send(["event":"release"]);Wire.send(["event":"disconnect"])}
     @objc func toggleAdb(){Wire.send(["event":"adb_bridge","enabled":!adbEnabled])}
+    @objc func deviceAction(_ item:NSMenuItem){if let action=item.representedObject as? [String:Any]{Wire.send(["event":"devices","data":action])}}
+    func appendDeviceMenus(_ devices:NSMenu){
+        func item(_ menu:NSMenu,_ title:String,_ action:[String:Any]?=nil,_ checked:Bool=false){let entry=NSMenuItem(title:title,action:action == nil ? nil:#selector(deviceAction(_:)),keyEquivalent:"");entry.target=self;entry.representedObject=action;entry.isEnabled=action != nil;entry.state=checked ? .on:.off;menu.addItem(entry)}
+        let gamepads=NSMenu();gamepads.autoenablesItems=false;gamepads.delegate=self
+        let pads=deviceData["gamepads"] as? [[String:Any]] ?? []
+        if pads.isEmpty{item(gamepads,"No mapped gamepads found")}
+        for pad in pads.prefix(32){guard let id=pad["id"] as? String else{continue};let active=pad["forwarded"] as? Bool ?? false;let suffix=(pad["status"] as? String).map{" — \($0)"} ?? "";item(gamepads,(pad["name"] as? String ?? "Gamepad")+suffix,["action":"gamepad","id":id,"enabled":!active],active)}
+        if let caps=deviceData["capabilities"] as? [String:Any],let error=caps["gamepad_error"] as? String{item(gamepads,error)}
+        item(gamepads,"Set up gamepad driver on Windows host...",["action":"setup","target":"gamepad"])
+        let padItem=NSMenuItem(title:"Gamepads",action:nil,keyEquivalent:"");padItem.submenu=gamepads;devices.addItem(padItem)
+        let usb=NSMenu();usb.autoenablesItems=false;item(usb,"USB passthrough is Windows → Windows in this release")
+        let usbItem=NSMenuItem(title:"USB devices",action:nil,keyEquivalent:"");usbItem.submenu=usb;devices.addItem(usbItem)
+        item(devices,"Refresh devices",["action":"refresh"])
+    }
     @objc func toggleRemoteCursor(){Wire.send(["event":"remote_cursor","visible":!showRemoteCursor])}
-    @objc func deviceSupport(){let alert=NSAlert();alert.messageText="Device forwarding";alert.informativeText="Android ADB: start adb on this computer, then enable Android ADB bridge. On the host use adb -H 127.0.0.1 -P 15037. Raw USB, fastboot, DFU, and iOS passthrough require separate driver support and are not enabled.";alert.runModal()}
-    func error(_ title:String,_ message:String){let alert=NSAlert();alert.messageText=title;alert.informativeText=message;alert.runModal()}
+    @objc func deviceSupport(){let alert=NSAlert();alert.messageText="Device forwarding";alert.informativeText="Gamepads: pair a controller locally over USB or Bluetooth, then choose it under Devices → Gamepads. Receiving requires a Windows host with ViGEmBus. Standard controls and rumble are supported. Generic USB passthrough is available between Windows computers. The Android ADB bridge remains available on both platforms.";runFramesAlert(alert)}
+    func error(_ title:String,_ message:String){let alert=NSAlert();alert.messageText=title;alert.informativeText=message;runFramesAlert(alert)}
     func update(_ message: [String: Any]) {
         switch message["type"] as? String {
+        case "shared_session":sharedSession=message["data"] as? [String:Any];compatibilityText=message["compatibility_text"] as? String ?? "Untested";for proxy in windows.values{configureShared(proxy)};installMenu()
+        case "shared_cursor":
+            var cursor=message["data"] as? [String:Any] ?? [:]
+            if !(cursor["png_base64"] is String){cursor["png_base64"]=virtualCursor["png_base64"]}
+            virtualCursor=cursor;for proxy in windows.values{proxy.view.updateVirtualCursor(cursor)}
+        case "devices":deviceData=message["data"] as? [String:Any] ?? [:];if let error=deviceData["error"] as? String{self.error("Device forwarding",error)};installMenu()
         case "remote_cursor":showRemoteCursor=message["visible"] as? Bool ?? true;installMenu()
         case "view_mode":viewMode=message["mode"] as? String ?? "windows";if let error=message["error"] as? String{self.error("Frames view mode",error)}else{focusAfterSwitch=true};installMenu()
         case "adb_bridge":adbEnabled=message["enabled"] as? Bool ?? false;if let error=message["error"] as? String{self.error("Android ADB bridge",error)};installMenu()
@@ -101,7 +141,7 @@ import QuartzCore
             for remote in sorted {
                 guard let id = remote["key"] as? [String: Any] else { continue }; let key = Self.key(id)
                 if let proxy = windows[key] { proxy.remote = remote; proxy.refreshTitle(); if activeProxy === proxy{installMenu()};continue }
-                let proxy = RemoteProxy(remote: remote, host: host);proxy.client=self; windows[key] = proxy
+                let proxy = RemoteProxy(remote: remote, host: host);proxy.client=self;configureShared(proxy); windows[key] = proxy
                 if let owner = remote["parent"] as? [String: Any], let parent = windows[Self.key(owner)] {
                     parent.window.addChildWindow(proxy.window, ordered: .above)
                     let pr = parent.remote["bounds"] as? [String: Double] ?? [:], cr = remote["bounds"] as? [String: Double] ?? [:]
@@ -116,7 +156,7 @@ import QuartzCore
             for id in Array(docks.keys) where !alive.contains(id) { docks.removeValue(forKey: id)?.terminate() }
             presentVideo()
             if focusAfterSwitch,let proxy=windows.values.first{focusAfterSwitch=false;NSApp.activate(ignoringOtherApps:true);proxy.window.makeKeyAndOrderFront(nil)}
-        case "status": if let id = message["window"] as? [String: Any], let proxy = windows[Self.key(id)] { proxy.status = message["status"] as? String ?? ""; proxy.refreshTitle() }
+        case "status": if let id = message["window"] as? [String: Any], let proxy = windows[Self.key(id)] { if proxy.shared{proxy.sharedNotice=message["status"] as? String}else{proxy.status=message["status"] as? String ?? ""}; proxy.refreshTitle() }
         case "ack": if let id = message["window"] as? [String: Any], let proxy = windows[Self.key(id)] {
             if let actual = message["actual"] as? [String: Any] { proxy.remote = actual }
             proxy.commandError = message["error"] as? String
@@ -145,7 +185,7 @@ import QuartzCore
         }
         do { try process.run(); docks[id] = process } catch { fputs("Dock proxy: \(error)\n", stderr) }
     }
-    func applicationWillTerminate(_ notification: Notification) { Wire.diagnostic("client_terminated",["window_count":windows.count]);for process in docks.values { process.terminate() }; Wire.send(["event":"release"]) }
+    func applicationWillTerminate(_ notification: Notification) { for proxy in windows.values{proxy.view.releaseInput()}; Wire.diagnostic("client_terminated",["window_count":windows.count]);for process in docks.values { process.terminate() }; Wire.send(["event":"release"]) }
 }
 
 final class DockEventReader: @unchecked Sendable {
@@ -180,6 +220,9 @@ final class DockEventReader: @unchecked Sendable {
     var fill: Bool
     var swap: Bool
     var physical: Bool
+    var sharedStatus:String?
+    var sharedNotice:String?
+    var shared:Bool{client?.sharedSession != nil}
     var status = "Connecting stream…"
     var commandError:String?
     var resizeWork: DispatchWorkItem?
@@ -187,7 +230,7 @@ final class DockEventReader: @unchecked Sendable {
     var destroying = false
     var showHeader:Bool{remote["show_header"] as? Bool ?? false}
     var id: [String: Any] { remote["key"] as? [String: Any] ?? [:] }
-    var resizable: Bool { remote["resize"] as? String == "supported" }
+    var resizable: Bool { !shared && remote["resize"] as? String == "supported" }
     init(remote: [String: Any], host: String) {
         self.remote = remote
         preference = "\(host):\(remote["app_id"] ?? "")"
@@ -211,29 +254,29 @@ final class DockEventReader: @unchecked Sendable {
     }
     func send(_ event: String, _ fields: [String: Any] = [:]) { var value = fields;value["event"] = event;value["window"] = id;Wire.send(value) }
     func visibility() { send("visibility",["visible":window.isVisible && !window.isMiniaturized && window.occlusionState.contains(.visible),"focused":window.isKeyWindow]) }
-    func refreshTitle() { let detail=commandError ?? status;window.title = "\(remote["title"] ?? "Remote window") — \(mode == "resize_remote" && resizable ? "Resize remote" : "Stretch locally")\(physical ? " / Physical keys":"")\(detail.isEmpty ? "" : " — "+detail)" }
-    func save() { UserDefaults.standard.set(mode,forKey:preference+":mode");UserDefaults.standard.set(fill,forKey:preference+":fill");UserDefaults.standard.set(swap,forKey:preference+":swap");UserDefaults.standard.set(physical,forKey:preference+":physical");refreshTitle();view.redraw() }
+    func refreshTitle() { let detail=commandError ?? (shared ? [sharedStatus,sharedNotice].compactMap{$0}.joined(separator:" / ") : status);let title = "\(remote["title"] ?? "Remote window") — \(mode == "resize_remote" && resizable ? "Resize remote" : "Stretch locally")\(physical ? " / Physical keys":"")\(detail.isEmpty ? "" : " — "+detail)";if window.title != title { window.title=title } }
+    func save() { if shared{refreshTitle();view.redraw();return};UserDefaults.standard.set(mode,forKey:preference+":mode");UserDefaults.standard.set(fill,forKey:preference+":fill");UserDefaults.standard.set(swap,forKey:preference+":swap");UserDefaults.standard.set(physical,forKey:preference+":physical");refreshTitle();view.redraw() }
     @objc func setResize() { if resizable { mode="resize_remote";save() } }
     @objc func setStretch() { mode="stretch_local";save() }
     @objc func toggleFill() { fill.toggle();save() }
-    @objc func toggleSwap() { view.releaseInput();swap.toggle();save() }
-    @objc func togglePhysical() { view.releaseInput();physical.toggle();save() }
+    @objc func toggleSwap() { guard !shared else{return};view.releaseInput();swap.toggle();save() }
+    @objc func togglePhysical() { guard !shared else{return};view.releaseInput();physical.toggle();save() }
     @objc func toggleHeader() {
-        guard remote["role"] as? String != "desktop" else{return}
+        guard !shared,remote["role"] as? String != "desktop" else{return}
         view.releaseInput()
         resizeWork?.cancel()
         send("action",["action":["kind":"set_header","visible":!showHeader]])
     }
-    @objc func remoteMenu(){send("action",["action":["kind":"menu"]])}
-    @objc func fetchFile(){let alert=NSAlert();alert.messageText="Fetch remote file";alert.informativeText="Enter a path relative to the remote user's home folder.";let input=NSTextField(frame:NSRect(x:0,y:0,width:400,height:24));input.stringValue="Downloads/";alert.accessoryView=input;alert.addButton(withTitle:"Download");alert.addButton(withTitle:"Cancel");if alert.runModal() == .alertFirstButtonReturn{send("download_file",["path":input.stringValue])}}
-    @objc func pressMenu(_ item:NSMenuItem){if let id=item.representedObject as? String{send("action",["action":["kind":"menu_item","id":id]])}}
+    @objc func remoteMenu(){guard !shared else{return};send("action",["action":["kind":"menu"]])}
+    @objc func fetchFile(){guard !shared else{return};let alert=NSAlert();alert.messageText="Fetch remote file";alert.informativeText="Enter a path relative to the remote user's home folder.";let input=NSTextField(frame:NSRect(x:0,y:0,width:400,height:24));input.stringValue="Downloads/";alert.accessoryView=input;alert.addButton(withTitle:"Download");alert.addButton(withTitle:"Cancel");if runFramesAlert(alert) == .alertFirstButtonReturn{send("download_file",["path":input.stringValue])}}
+    @objc func pressMenu(_ item:NSMenuItem){guard !shared else{return};if let id=item.representedObject as? String{send("action",["action":["kind":"menu_item","id":id]])}}
     func makeMenu(_ items:[[String:Any]])->NSMenu{
         func build(_ items:[[String:Any]],_ depth:Int)->NSMenu{let menu=NSMenu();menu.autoenablesItems=false;menu.delegate=client;guard depth<8 else{return menu};for value in items.prefix(200){let title=(value["title"] as? String ?? "").components(separatedBy:"\t")[0].replacingOccurrences(of:"&",with:"");if title.isEmpty{menu.addItem(.separator());continue};let item=NSMenuItem(title:title,action:#selector(pressMenu(_:)),keyEquivalent:"");item.target=self;item.representedObject=value["id"];item.isEnabled=value["enabled"] as? Bool ?? true;item.state=(value["checked"] as? Bool ?? false) ? .on:.off;if let children=value["children"] as? [[String:Any]],!children.isEmpty{item.submenu=build(children,depth+1)};menu.addItem(item)};return menu}
         return build(items,0)
     }
-    func windowShouldClose(_ sender: NSWindow) -> Bool { if destroying { return true };if remote["role"] as? String == "desktop"{client?.disconnect()}else{send("action",["action":["kind":"close"]])};return false }
-    func destroy() { destroying=true;resizeWork?.cancel();window.close() }
-    func windowDidBecomeKey(_ notification: Notification) { client?.activate(self);send("action",["action":["kind":"focus"]]);if remote["role"] as? String != "desktop"{remoteMenu()};visibility() }
+    func windowShouldClose(_ sender: NSWindow) -> Bool { if destroying { return true };if shared || remote["role"] as? String == "desktop"{view.releaseInput();client?.disconnect()}else{send("action",["action":["kind":"close"]])};return false }
+    func destroy() { if shared{view.releaseInput()};destroying=true;resizeWork?.cancel();window.close() }
+    func windowDidBecomeKey(_ notification: Notification) { client?.activate(self);if shared{send("resume")}else{send("action",["action":["kind":"focus"]]);if remote["role"] as? String != "desktop"{remoteMenu()}};visibility() }
     func windowDidResignKey(_ notification: Notification) { view.releaseInput();visibility() }
     func windowDidMiniaturize(_ notification: Notification) { visibility() }
     func windowDidDeminiaturize(_ notification: Notification) { visibility() }
@@ -244,6 +287,7 @@ final class DockEventReader: @unchecked Sendable {
     }
 }
 
+@MainActor final class VirtualCursorView:NSImageView {override func hitTest(_ point:NSPoint)->NSView?{nil}}
 @MainActor final class RemoteView: NSView {
     weak var proxy: RemoteProxy?
     var renderer: MetalPicture?
@@ -251,19 +295,56 @@ final class DockEventReader: @unchecked Sendable {
     var marked = NSAttributedString(string:"")
     var forwarded: Set<UInt16> = []
     var modifiers = KeyboardModifiers()
+    var relative=false
+    let cursorOverlay=VirtualCursorView(frame:.zero)
+    var cursorState:[String:Any]=[:]
+    static let emptyCursor=NSCursor(image:NSImage(size:NSSize(width:1,height:1)),hotSpot:.zero)
     var optionPointer = false
     override var acceptsFirstResponder: Bool { true }
-    override init(frame:NSRect) { super.init(frame:frame);wantsLayer=true;renderer=try? MetalPicture(view:self);registerForDraggedTypes([.fileURL]);addTrackingArea(NSTrackingArea(rect:.zero,options:[.activeAlways,.inVisibleRect,.mouseMoved],owner:self,userInfo:nil)) }
+    override init(frame:NSRect) { super.init(frame:frame);wantsLayer=true;cursorOverlay.imageScaling = .scaleAxesIndependently;addSubview(cursorOverlay);registerForDraggedTypes([.fileURL]);addTrackingArea(NSTrackingArea(rect:.zero,options:[.activeAlways,.inVisibleRect,.mouseMoved],owner:self,userInfo:nil)) }
     required init?(coder:NSCoder) { fatalError("not used") }
-    func display(_ bytes:Data,width:Int,height:Int) { picture=CGSize(width:width,height:height);renderer?.upload(bytes,width:width,height:height);redraw() }
-    func redraw() { renderer?.draw(size:convertToBacking(bounds).size,fill:proxy?.fill ?? false) }
-    override func layout() { super.layout();redraw() }
+    func display(_ frame:ClientVideoFrame) { if renderer==nil{renderer=try? MetalPicture(view:self)};picture=CGSize(width:frame.width,height:frame.height);renderer?.upload(frame);redraw() }
+    func display(_ bytes:Data,width:Int,height:Int) { if renderer==nil{renderer=try? MetalPicture(view:self)};picture=CGSize(width:width,height:height);renderer?.upload(bytes,width:width,height:height);redraw() }
+    func redraw() { renderer?.draw(size:convertToBacking(bounds).size,fill:proxy?.fill ?? false,visible:window?.isVisible == true && window?.isMiniaturized != true) }
+    override func layout() { super.layout();redraw();positionVirtualCursor() }
+    override func resetCursorRects(){if proxy?.shared == true{addCursorRect(bounds,cursor:Self.emptyCursor)}else{super.resetCursorRects()}}
+    func contentRect()->NSRect{
+        var rect=bounds
+        if !(proxy?.fill ?? false){let aspect=picture.width/max(1,picture.height);if rect.width/max(1,rect.height)>aspect{let width=rect.height*aspect;rect.origin.x=(rect.width-width)/2;rect.size.width=width}else{let height=rect.width/aspect;rect.origin.y=(rect.height-height)/2;rect.size.height=height}}
+        return rect
+    }
+    func updateVirtualCursor(_ state:[String:Any]){
+        cursorState=state
+        if let encoded=state["png_base64"] as? String,encoded.utf8.count<=131072,let data=Data(base64Encoded:encoded),let source=CGImageSourceCreateWithData(data as CFData,nil),let properties=CGImageSourceCopyPropertiesAtIndex(source,0,nil) as? [CFString:Any],let width=properties[kCGImagePropertyPixelWidth] as? NSNumber,let height=properties[kCGImagePropertyPixelHeight] as? NSNumber,width.intValue<=128,height.intValue<=128{cursorOverlay.image=NSImage(data:data)}
+        positionVirtualCursor()
+    }
+    func positionVirtualCursor(){
+        guard cursorState["visible"] as? Bool == true,let image=cursorOverlay.image,let proxy else{cursorOverlay.isHidden=true;return}
+        let rect=contentRect(),remoteBounds=proxy.remote["bounds"] as? [String:Double] ?? [:],scale=(proxy.remote["scale"] as? NSNumber)?.doubleValue ?? 1
+        let sx=rect.width/CGFloat(max(1,(remoteBounds["width"] ?? 1)*scale)),sy=rect.height/CGFloat(max(1,(remoteBounds["height"] ?? 1)*scale))
+        let width=image.size.width*sx,height=image.size.height*sy,x=(cursorState["x"] as? NSNumber)?.doubleValue ?? 0,y=(cursorState["y"] as? NSNumber)?.doubleValue ?? 0,hx=(cursorState["hotspot_x"] as? NSNumber)?.doubleValue ?? 0,hy=(cursorState["hotspot_y"] as? NSNumber)?.doubleValue ?? 0
+        cursorOverlay.frame=NSRect(x:rect.minX+rect.width*CGFloat(x)-CGFloat(hx)*sx,y:rect.maxY-rect.height*CGFloat(y)+CGFloat(hy)*sy-height,width:width,height:height);cursorOverlay.isHidden=false
+    }
+    func toggleRelative(){
+        guard proxy?.shared == true else{return}
+        if relative{releaseInput();return}
+        releaseInput()
+        guard let window else{return};window.makeFirstResponder(self)
+        let center=window.convertPoint(toScreen:convert(NSPoint(x:bounds.midX,y:bounds.midY),to:nil)),height=NSScreen.screens.first?.frame.height ?? 0
+        CGWarpMouseCursorPosition(CGPoint(x:center.x,y:height-center.y))
+        if CGAssociateMouseAndMouseCursorPosition(0) == .success{relative=true;NSCursor.hide();proxy?.send("resume")}
+    }
+    func releaseRelative(){if relative{relative=false;CGAssociateMouseAndMouseCursorPosition(1);NSCursor.unhide()}}
+    func relativeMotion(_ event:NSEvent){
+        let dx=event.cgEvent?.getIntegerValueField(.mouseEventDeltaX) ?? Int64(event.deltaX.rounded()),dy=event.cgEvent?.getIntegerValueField(.mouseEventDeltaY) ?? Int64(event.deltaY.rounded())
+        proxy?.send("input",["input":["kind":"relative_motion","dx":max(-1000000,min(1000000,dx)),"dy":max(-1000000,min(1000000,dy))]])
+    }
     func position(_ event:NSEvent)->[String:Any] {
         let p=convert(event.locationInWindow,from:nil);var rect=bounds
         if !(proxy?.fill ?? false) { let aspect=picture.width/picture.height;if rect.width/rect.height>aspect{let width=rect.height*aspect;rect.origin.x=(rect.width-width)/2;rect.size.width=width}else{let height=rect.width/aspect;rect.origin.y=(rect.height-height)/2;rect.size.height=height} }
         return ["x":min(1,max(0,(p.x-rect.minX)/max(1,rect.width))),"y":min(1,max(0,1-(p.y-rect.minY)/max(1,rect.height)))]
     }
-    func pointer(_ event:NSEvent,kind:String,button:Int?=nil,down:Bool?=nil) { if down == true{optionPointer=true;synchronizeModifiers()};var value=position(event);value["kind"]=kind;if let button{value["button"]=button};if let down{value["down"]=down};if kind=="button"{Wire.diagnostic("pointer_button",["window":proxy?.id ?? [:],"x":value["x"] ?? 0,"y":value["y"] ?? 0,"view_width":bounds.width,"view_height":bounds.height,"picture_width":picture.width,"picture_height":picture.height,"down":down ?? false])};proxy?.send("input",["input":value]) }
+    func pointer(_ event:NSEvent,kind:String,button:Int?=nil,down:Bool?=nil) { if relative && kind=="pointer"{relativeMotion(event);return};if down == true{if proxy?.shared == true{proxy?.send("resume")};optionPointer=true;synchronizeModifiers()};var value=position(event);value["kind"]=relative && kind=="button" ? "relative_button":kind;if relative && kind=="button"{value.removeValue(forKey:"x");value.removeValue(forKey:"y")};if let button{value["button"]=button};if let down{value["down"]=down};if kind=="button"{Wire.diagnostic("pointer_button",["window":proxy?.id ?? [:],"x":value["x"] ?? 0,"y":value["y"] ?? 0,"view_width":bounds.width,"view_height":bounds.height,"picture_width":picture.width,"picture_height":picture.height,"down":down ?? false])};proxy?.send("input",["input":value]) }
     override func mouseMoved(with event:NSEvent){pointer(event,kind:"pointer")}
     override func mouseDragged(with event:NSEvent){pointer(event,kind:"pointer")}
     override func rightMouseDragged(with event:NSEvent){pointer(event,kind:"pointer")}
@@ -272,17 +353,18 @@ final class DockEventReader: @unchecked Sendable {
     override func mouseUp(with event:NSEvent){pointer(event,kind:"button",button:0,down:false)}
     override func rightMouseDown(with event:NSEvent){pointer(event,kind:"button",button:1,down:true)}
     override func rightMouseUp(with event:NSEvent){pointer(event,kind:"button",button:1,down:false)}
-    override func otherMouseDown(with event:NSEvent){if event.buttonNumber==2{pointer(event,kind:"button",button:2,down:true)}}
-    override func otherMouseUp(with event:NSEvent){if event.buttonNumber==2{pointer(event,kind:"button",button:2,down:false)}}
+    override func otherMouseDown(with event:NSEvent){if (2...4).contains(event.buttonNumber){pointer(event,kind:"button",button:event.buttonNumber,down:true)}}
+    override func otherMouseUp(with event:NSEvent){if (2...4).contains(event.buttonNumber){pointer(event,kind:"button",button:event.buttonNumber,down:false)}}
     override func scrollWheel(with event:NSEvent){optionPointer=true;synchronizeModifiers();var value=position(event);value["kind"]="scroll";value["dx"]=event.scrollingDeltaX/20;value["dy"] = -event.scrollingDeltaY/20;proxy?.send("input",["input":value])}
     func key(_ usage:UInt16,down:Bool){var mapped=usage;if proxy?.swap == true && proxy?.physical != true{mapped=[UInt16(0xe0):0xe3,0xe3:0xe0,0xe4:0xe7,0xe7:0xe4][usage] ?? usage};proxy?.send("input",["input":["kind":"key","usage":mapped,"down":down]])}
     func synchronizeModifiers(suspend:Bool=false){for(usage,down)in modifiers.synchronize(physical:proxy?.physical == true,optionShortcut:!forwarded.isEmpty || optionPointer,suspend:suspend){key(usage,down:down)}}
-    func releaseInput(){proxy?.send("release");forwarded.removeAll();modifiers.reset();optionPointer=false;marked=NSAttributedString(string:"");inputContext?.discardMarkedText()}
+    func releaseInput(){releaseRelative();proxy?.send("release");forwarded.removeAll();modifiers.reset();optionPointer=false;marked=NSAttributedString(string:"");inputContext?.discardMarkedText()}
     override func keyDown(with event:NSEvent){
         optionPointer=false
         if event.modifierFlags.contains(.command),[48,49].contains(event.keyCode){releaseInput();return} // Local app switching / Spotlight.
         guard let usage=usageToMac.first(where:{$0.value==event.keyCode})?.key else{return}
-        if event.keyCode==111,event.modifierFlags.contains([.control,.option]){releaseInput();window?.miniaturize(nil);return}
+        if proxy?.shared == true,event.keyCode==103,event.modifierFlags.contains([.control,.option]){toggleRelative();return}
+        if event.keyCode==111,event.modifierFlags.contains([.control,.option]){releaseInput();if proxy?.shared != true{window?.miniaturize(nil)};return}
         let printable=(4...39).contains(usage)||(44...56).contains(usage)
         if proxy?.physical == true || event.modifierFlags.contains(.command) || event.modifierFlags.contains(.control) || !printable {
             forwarded.insert(usage)
@@ -316,8 +398,8 @@ final class DockEventReader: @unchecked Sendable {
     func firstRect(forCharacterRange range:NSRange,actualRange:NSRangePointer?)->NSRect{window?.convertToScreen(convert(bounds,to:nil)) ?? .zero}
     func characterIndex(for point:NSPoint)->Int{0}
     override func doCommand(by selector:Selector){}
-    override func draggingEntered(_ sender:NSDraggingInfo)->NSDragOperation{.copy}
-    override func performDragOperation(_ sender:NSDraggingInfo)->Bool{guard let urls=sender.draggingPasteboard.readObjects(forClasses:[NSURL.self],options:[.urlReadingFileURLsOnly:true]) as? [URL],!urls.isEmpty else{return false};let point=convert(sender.draggingLocation,from:nil);proxy?.send("send_files",["paths":urls.map(\.path),"x":min(1,max(0,point.x/max(1,bounds.width))),"y":min(1,max(0,1-point.y/max(1,bounds.height)))]);return true}
+    override func draggingEntered(_ sender:NSDraggingInfo)->NSDragOperation{proxy?.shared == true ? []:.copy}
+    override func performDragOperation(_ sender:NSDraggingInfo)->Bool{guard proxy?.shared != true,let urls=sender.draggingPasteboard.readObjects(forClasses:[NSURL.self],options:[.urlReadingFileURLsOnly:true]) as? [URL],!urls.isEmpty else{return false};let point=convert(sender.draggingLocation,from:nil);proxy?.send("send_files",["paths":urls.map(\.path),"x":min(1,max(0,point.x/max(1,bounds.width))),"y":min(1,max(0,1-point.y/max(1,bounds.height)))]);return true}
 }
 
 #if compiler(>=6.0)
@@ -327,45 +409,121 @@ extension RemoteView: NSTextInputClient {}
 #endif
 
 @MainActor final class MetalPicture {
-    let device:MTLDevice;let queue:MTLCommandQueue;let layer:CAMetalLayer;let pipeline:MTLRenderPipelineState
-    var texture:MTLTexture?
-    let diagnosticID = UUID().uuidString
-    var diagnosticPending = true
-    init(view:NSView)throws{
-        guard let device=MTLCreateSystemDefaultDevice(),let queue=device.makeCommandQueue()else{throw Wire.failure("Metal unavailable")};self.device=device;self.queue=queue
-        layer=CAMetalLayer();layer.device=device;layer.pixelFormat = .bgra8Unorm;layer.framebufferOnly=true;view.layer=layer
+    private let presenter:MetalPresenter
+    init(view:NSView)throws { presenter=try MetalPresenter(hardware:true);view.layer=presenter.layer;presenter.start() }
+    deinit { presenter.stop() }
+    func upload(_ data:Data,width:Int,height:Int) { upload(ClientVideoFrame(id:0,generation:0,width:width,height:height,bytes:data)) }
+    func upload(_ frame:ClientVideoFrame) { presenter.upload(frame) }
+    func draw(size:CGSize,fill:Bool,visible:Bool=true) { presenter.layout(size:size,fill:fill,visible:visible) }
+}
+
+private final class MetalPresenter:NSObject,CAMetalDisplayLinkDelegate,@unchecked Sendable {
+    let layer:CAMetalLayer
+    private let device:MTLDevice,queue:MTLCommandQueue
+    private var pipeline:MTLRenderPipelineState?
+    private var initializationError:String?,initializationReported=false
+    private let lock=NSLock(),inFlight=DispatchSemaphore(value:1)
+    private var pending:ClientVideoFrame?,current:ClientVideoFrame?
+    private var size=CGSize.zero,fill=false,visible=true,dirty=false,stopped=false
+    private var loop:CFRunLoop?,link:CAMetalDisplayLink?
+    private var texture:MTLTexture?,mapped:CVMetalTexture?,cache:CVMetalTextureCache?
+    private var diagnosticPending=true
+    private var presentedCount=0
+    private var lastPresentedNs:UInt64=0
+    private let diagnosticID=UUID().uuidString
+    init(hardware:Bool)throws {
+        guard let device=MTLCreateSystemDefaultDevice(),let queue=device.makeCommandQueue() else{throw Wire.failure("Metal unavailable")}
+        self.device=device;self.queue=queue
+        layer=CAMetalLayer();layer.device=device;layer.pixelFormat = .bgra8Unorm;layer.framebufferOnly=true;layer.maximumDrawableCount=2;layer.allowsNextDrawableTimeout=true
+        super.init()
+        guard CVMetalTextureCacheCreate(nil,nil,device,nil,&cache) == kCVReturnSuccess else{throw Wire.failure("Cannot create Metal surface cache")}
+    }
+    private func preparePipeline() throws {
         let source="""
         #include <metal_stdlib>
         using namespace metal;
-        struct V { float4 p [[position]]; float2 uv; };
-        vertex V vertexMain(uint id [[vertex_id]], constant float2 &scale [[buffer(0)]]) {
+        struct V { float4 p [[position]];float2 uv; };
+        vertex V vertexMain(uint id [[vertex_id]],constant float4 &s [[buffer(0)]]) {
           float2 p[4]={float2(-1,-1),float2(1,-1),float2(-1,1),float2(1,1)};
-          V v; v.p=float4(p[id]*scale,0,1); v.uv=float2((p[id].x+1)*0.5,(1-p[id].y)*0.5);return v;
+          V v;v.p=float4(p[id]*s.xy,0,1);v.uv=float2((p[id].x+1)*0.5,(1-p[id].y)*0.5)*s.zw;return v;
         }
-        fragment float4 fragmentMain(V v [[stage_in]], texture2d<float> picture [[texture(0)]]) {
+        fragment float4 fragmentMain(V v [[stage_in]],texture2d<float> picture [[texture(0)]]) {
           constexpr sampler s(filter::linear);return picture.sample(s,v.uv);
         }
         """
-        let library=try device.makeLibrary(source:source,options:nil);let descriptor=MTLRenderPipelineDescriptor();descriptor.vertexFunction=library.makeFunction(name:"vertexMain");descriptor.fragmentFunction=library.makeFunction(name:"fragmentMain");descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm;pipeline=try device.makeRenderPipelineState(descriptor:descriptor)
+        let library=try device.makeLibrary(source:source,options:nil),descriptor=MTLRenderPipelineDescriptor()
+        descriptor.vertexFunction=library.makeFunction(name:"vertexMain");descriptor.fragmentFunction=library.makeFunction(name:"fragmentMain");descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+        pipeline=try device.makeRenderPipelineState(descriptor:descriptor)
     }
-    func upload(_ data:Data,width:Int,height:Int){
-        if texture?.width != width||texture?.height != height{let desc=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.bgra8Unorm,width:width,height:height,mipmapped:false);desc.usage = .shaderRead;desc.storageMode = .shared;texture=device.makeTexture(descriptor:desc);diagnosticPending=true}
-        data.withUnsafeBytes{bytes in if let base=bytes.baseAddress{texture?.replace(region:MTLRegionMake2D(0,0,width,height),mipmapLevel:0,withBytes:base,bytesPerRow:width*4)}}
-    }
-    func draw(size:CGSize,fill:Bool){
-        guard size.width>0,size.height>0,let texture else{return};layer.drawableSize=size
-        guard let drawable=layer.nextDrawable(),let buffer=queue.makeCommandBuffer()else{return};let pass=MTLRenderPassDescriptor();pass.colorAttachments[0].texture=drawable.texture;pass.colorAttachments[0].loadAction = .clear;pass.colorAttachments[0].storeAction = .store;pass.colorAttachments[0].clearColor=MTLClearColorMake(0,0,0,1)
-        guard let encoder=buffer.makeRenderCommandEncoder(descriptor:pass)else{return};var scale=SIMD2<Float>(1,1)
-        if !fill{let aspect=Float(texture.width)/Float(texture.height),screen=Float(size.width/size.height);if screen>aspect{scale.x=aspect/screen}else{scale.y=screen/aspect}}
-        encoder.setRenderPipelineState(pipeline);encoder.setVertexBytes(&scale,length:MemoryLayout<SIMD2<Float>>.size,index:0);encoder.setFragmentTexture(texture,index:0);encoder.drawPrimitives(type:.triangleStrip,vertexStart:0,vertexCount:4);encoder.endEncoding()
-        if Wire.diagnosticsEnabled && diagnosticPending {
-            diagnosticPending=false
-            let id=diagnosticID,width=texture.width,height=texture.height
-            buffer.addCompletedHandler { completed in
-                Wire.diagnostic("metal_present_completed", ["renderer":id,"width":width,"height":height,"success":completed.status == .completed,"error":completed.error?.localizedDescription ?? ""])
-            }
+    func start() {
+        Thread.detachNewThread { [self] in
+            do {try preparePipeline()}catch{lock.lock();initializationError=error.localizedDescription;let frame=pending;lock.unlock();if let frame{reportInitializationFailure(frame)};return}
+            lock.lock();loop=CFRunLoopGetCurrent();let shouldStop=stopped;lock.unlock();if shouldStop{return}
+            // Pausing the display link on an idle desktop must not let its
+            // otherwise empty run loop exit before the next decoded picture.
+            let keepAlive=Port();RunLoop.current.add(keepAlive,forMode:.common)
+            defer{keepAlive.invalidate()}
+            let link=CAMetalDisplayLink(metalLayer:layer);self.link=link;link.delegate=self;link.preferredFrameLatency=1
+            link.preferredFrameRateRange=CAFrameRateRange(minimum:30,maximum:120,preferred:60)
+            link.add(to:.current,forMode:.common);CFRunLoopRun();link.invalidate();self.link=nil
         }
-        buffer.present(drawable);buffer.commit()
+    }
+    func stop(){lock.lock();stopped=true;let loop=loop;lock.unlock();if let loop{CFRunLoopPerformBlock(loop,CFRunLoopMode.commonModes.rawValue){CFRunLoopStop(loop)};CFRunLoopWakeUp(loop)}}
+    private func wake(){lock.lock();let loop=loop;lock.unlock();if let loop{CFRunLoopPerformBlock(loop,CFRunLoopMode.commonModes.rawValue){[weak self] in guard let self else{return};self.lock.lock();let size=self.size;self.lock.unlock();if size.width>0 && size.height>0{self.layer.drawableSize=size};self.link?.isPaused=false};CFRunLoopWakeUp(loop)}}
+    private func reportInitializationFailure(_ frame:ClientVideoFrame){
+        lock.lock();let reason=initializationError,report = !initializationReported;initializationReported=true;lock.unlock()
+        if report,let reason{Wire.send(["event":"decoder_failed","window":["id":frame.id,"generation":frame.generation],"generation":frame.streamGeneration,"reason":reason])}
+    }
+    func upload(_ frame:ClientVideoFrame){lock.lock();let failed=initializationError != nil;pending=frame;dirty=true;lock.unlock();if failed{reportInitializationFailure(frame)}else{wake()}}
+    func layout(size:CGSize,fill:Bool,visible:Bool){lock.lock();if self.size != size || self.fill != fill || self.visible != visible{self.size=size;self.fill=fill;self.visible=visible;dirty=true};lock.unlock();wake()}
+    func metalDisplayLink(_ link:CAMetalDisplayLink,needsUpdate update:CAMetalDisplayLink.Update){
+        lock.lock()
+        guard !stopped,visible,dirty,size.width>0,size.height>0 else{lock.unlock();link.isPaused=true;return}
+        guard inFlight.wait(timeout:.now()) == .success else{lock.unlock();return}
+        let next=pending,size=size,fill=fill;pending=nil;dirty=false;lock.unlock()
+        if let next{current=next;do{try uploadTexture(next)}catch{inFlight.signal();Wire.send(["event":"decoder_failed","window":["id":next.id,"generation":next.generation],"generation":next.streamGeneration,"reason":error.localizedDescription]);return}}
+        guard let current,let texture,let pipeline,let buffer=queue.makeCommandBuffer() else{inFlight.signal();return}
+        let pass=MTLRenderPassDescriptor();pass.colorAttachments[0].texture=update.drawable.texture;pass.colorAttachments[0].loadAction = .clear;pass.colorAttachments[0].storeAction = .store;pass.colorAttachments[0].clearColor=MTLClearColorMake(0,0,0,1)
+        guard let encoder=buffer.makeRenderCommandEncoder(descriptor:pass)else{inFlight.signal();return}
+        var parameters=SIMD4<Float>(1,1,Float(current.width)/Float(texture.width),Float(current.height)/Float(texture.height))
+        if !fill{let aspect=Float(current.width)/Float(current.height),screen=Float(size.width/size.height);if screen>aspect{parameters.x=aspect/screen}else{parameters.y=screen/aspect}}
+        encoder.setRenderPipelineState(pipeline);encoder.setVertexBytes(&parameters,length:MemoryLayout<SIMD4<Float>>.size,index:0);encoder.setFragmentTexture(texture,index:0);encoder.drawPrimitives(type:.triangleStrip,vertexStart:0,vertexCount:4);encoder.endEncoding()
+        let retainedSurface=current.pixelBuffer,retainedMapping=mapped,signal=inFlight
+        let diagnostic=diagnosticPending;diagnosticPending=false;let diagnosticID=diagnosticID
+        buffer.addCompletedHandler{completed in
+            withExtendedLifetime((retainedSurface,retainedMapping)){}
+            if Wire.diagnosticsEnabled && diagnostic{Wire.diagnostic("metal_present_completed",["renderer":diagnosticID,"width":current.width,"height":current.height,"success":completed.status == .completed,"error":completed.error?.localizedDescription ?? ""])}
+            signal.signal()
+        }
+        presentedCount += 1
+        let reportTiming=Wire.diagnosticsEnabled && presentedCount.isMultiple(of:60)
+        let budgetMs=(update.targetTimestamp-CACurrentMediaTime())*1000,targetMs=(update.targetPresentationTimestamp-CACurrentMediaTime())*1000
+        if current.id != 0{update.drawable.addPresentedHandler{[weak self] _ in
+            Wire.send(["event":"presented","window":["id":current.id,"generation":current.generation],"generation":current.streamGeneration,"number":current.number])
+            if let self,Wire.diagnosticsEnabled{
+                let now=DispatchTime.now().uptimeNanoseconds;self.lock.lock();let previous=self.lastPresentedNs;self.lastPresentedNs=now;self.lock.unlock()
+                if previous>0 && now>previous+50_000_000{Wire.diagnostic("presentation_gap",["gap_us":(now-previous)/1000,"unix_us":Int64(Date().timeIntervalSince1970*1_000_000),"number":current.number,"generation":current.streamGeneration])}
+            }
+            if reportTiming && current.decodedAt>0{Wire.diagnostic("metal_frame_timing",["number":current.number,"decode_present_us":(DispatchTime.now().uptimeNanoseconds-current.decodedAt)/1000,"delegate_budget_ms":budgetMs,"target_delay_ms":targetMs])}
+        }}
+        // CAMetalDisplayLink supplies and schedules this drawable; explicit atTime
+        // presentation raises CAMetalDrawableInvalidOperation.
+        buffer.present(update.drawable);buffer.commit()
+    }
+    private func uploadTexture(_ frame:ClientVideoFrame)throws{
+        if let pixel=frame.pixelBuffer {
+            guard let cache else{throw Wire.failure("Missing Metal surface cache")}
+            var result:CVMetalTexture?
+            guard CVMetalTextureCacheCreateTextureFromImage(nil,cache,pixel,nil,.bgra8Unorm,CVPixelBufferGetWidth(pixel),CVPixelBufferGetHeight(pixel),0,&result) == kCVReturnSuccess,let result,let texture=CVMetalTextureGetTexture(result) else{throw Wire.failure("Decoded surface is not Metal compatible")}
+            mapped=result;self.texture=texture
+        }else{
+            guard frame.bytes.count==frame.width*frame.height*4 else{throw Wire.failure("Invalid CPU video picture")}
+            if texture?.width != frame.width || texture?.height != frame.height || mapped != nil{
+                let descriptor=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.bgra8Unorm,width:frame.width,height:frame.height,mipmapped:false);descriptor.usage = .shaderRead;descriptor.storageMode = .shared
+                texture=device.makeTexture(descriptor:descriptor);mapped=nil;diagnosticPending=true
+            }
+            frame.bytes.withUnsafeBytes{bytes in if let base=bytes.baseAddress{texture?.replace(region:MTLRegionMake2D(0,0,frame.width,frame.height),mipmapLevel:0,withBytes:base,bytesPerRow:frame.width*4)}}
+        }
     }
 }
 

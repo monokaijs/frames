@@ -18,7 +18,7 @@ use windows::{
         },
         UI::{
             HiDpi::*,
-            Input::KeyboardAndMouse::*,
+            Input::{KeyboardAndMouse::*, *},
             Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow},
             WindowsAndMessaging::*,
         },
@@ -40,6 +40,8 @@ const DISCONNECT: usize = 0xB003;
 const ADB_BRIDGE: usize = 0xB004;
 const USB_INFO: usize = 0xB005;
 const REMOTE_CURSOR: usize = 0xB006;
+const RELATIVE_MOUSE: usize = 0xB007;
+const COMPATIBILITY: usize = 0xB008;
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 struct Preference {
     mode: SizingMode,
@@ -49,6 +51,13 @@ struct Preference {
     physical: bool,
 }
 struct Proxy {
+    hidden: bool,
+    header: HWND,
+    compatibility: frames_core::shared_game::CompatibilityInfo,
+    shared: bool,
+    relative: bool,
+    virtual_cursor: Option<super::virtual_cursor::VirtualCursor>,
+    devices: super::devices::DeviceMenu,
     remote: RemoteWindow,
     frame: Option<RawFrame>,
     events: tokio::sync::mpsc::UnboundedSender<ClientEvent>,
@@ -56,20 +65,21 @@ struct Proxy {
     host: String,
     icon: Option<HICON>,
     status: String,
+    last_title: String,
     command_status: Option<String>,
+    shared_notice: Option<String>,
     pending_resize: Option<(f64, f64)>,
     last_size: Option<(i32, i32)>,
     visible: Option<bool>,
     forwarded: std::collections::BTreeSet<u16>,
     surrogate: Option<u16>,
     renderer: Option<super::render::Renderer>,
+    renderer_failed: bool,
     ready: bool,
     user_sizing: bool,
     maximized: bool,
     view_mode: ViewMode,
     show_remote_cursor: bool,
-    show_header: bool,
-    changing_header: bool,
     adb_enabled: bool,
     menu_items: Vec<MenuItem>,
     menu_ids: HashMap<usize, String>,
@@ -77,7 +87,192 @@ struct Proxy {
     pending_menu: Option<Vec<MenuItem>>,
 }
 impl Proxy {
+    fn tray_window(&self) -> super::session_control::SessionWindow {
+        use super::tray::{TrayGlyph as G, TrayItem as Item};
+        let item = |id: usize, title: &str, glyph| Item::new(id as u32, title, glyph);
+        let mut options = vec![item(FILL, "Fill window", G::Display).checked(self.pref.fill)];
+        if self.shared {
+            options.push(
+                item(RELATIVE_MOUSE, "Relative mouse · Ctrl+Alt+F11", G::Cursor)
+                    .checked(self.relative),
+            );
+            options.push(item(COMPATIBILITY, "Window compatibility", G::Info));
+        } else {
+            options.extend([
+                item(SHOW_HEADER, "Show remote window header", G::Window)
+                    .checked(self.remote.show_header)
+                    .enabled(self.remote.role != WindowRole::Desktop),
+                item(MODE_RESIZE, "Resize remote app", G::Display)
+                    .checked(self.pref.mode == SizingMode::ResizeRemote)
+                    .enabled(self.remote.resize == ResizeCapability::Supported),
+                item(MODE_STRETCH, "Stretch locally", G::Display)
+                    .checked(self.pref.mode == SizingMode::StretchLocal),
+                item(SWAP, "Swap Control / Command", G::Keyboard).checked(self.pref.swap),
+                item(PHYSICAL, "Physical keys", G::Keyboard).checked(self.pref.physical),
+                item(REMOTE_MENU, "Refresh application menus", G::Refresh)
+                    .enabled(self.remote.role != WindowRole::Desktop),
+                item(FETCH, "Fetch remote file…", G::Folder),
+            ]);
+            fn remote_items(
+                items: &[MenuItem],
+                ids: &HashMap<usize, String>,
+                depth: usize,
+            ) -> Vec<Item> {
+                if depth >= 8 {
+                    return vec![];
+                }
+                items
+                    .iter()
+                    .take(200)
+                    .map(|entry| {
+                        if entry.title.is_empty() {
+                            return Item::separator();
+                        }
+                        let id = ids
+                            .iter()
+                            .find(|(_, value)| **value == entry.id)
+                            .map_or(0, |(id, _)| *id as u32);
+                        Item::new(id, &entry.title, G::Window)
+                            .checked(entry.checked)
+                            .enabled(entry.enabled)
+                            .children(remote_items(&entry.children, ids, depth + 1))
+                    })
+                    .collect()
+            }
+            if !self.menu_items.is_empty() {
+                options.push(
+                    Item::new(0, "Application menu", G::Window).children(remote_items(
+                        &self.menu_items,
+                        &self.menu_ids,
+                        0,
+                    )),
+                );
+            }
+        }
+        super::session_control::SessionWindow {
+            key: self.remote.key,
+            title: if self.remote.title.is_empty() {
+                self.remote.app_name.clone()
+            } else {
+                format!("{} · {}", self.remote.title, self.remote.app_name)
+            },
+            shown: !self.hidden,
+            options,
+        }
+    }
+    unsafe fn set_shown(&mut self, hwnd: HWND, shown: bool) {
+        if self.hidden != shown {
+            return;
+        }
+        self.hidden = !shown;
+        if !shown {
+            self.release_mouse();
+            self.event(ClientEvent::ReleaseInput);
+            self.forwarded.clear();
+            self.surrogate = None;
+            self.pending_resize = None;
+            let _ = KillTimer(Some(hwnd), 2);
+            self.frame = None;
+            self.renderer = None;
+            self.visible = Some(false);
+            self.event(ClientEvent::Visibility {
+                window: self.remote.key,
+                visible: false,
+                focused: false,
+            });
+            if !self.header.is_invalid() {
+                let _ = ShowWindow(self.header, SW_HIDE);
+            }
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        } else {
+            self.status = "Resuming stream…".into();
+            self.renderer = None;
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = SetForegroundWindow(hwnd);
+            super::caption::layout(hwnd, self.header);
+            self.visible = Some(true);
+            self.event(ClientEvent::Visibility {
+                window: self.remote.key,
+                visible: true,
+                focused: true,
+            });
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+    unsafe fn release_mouse(&mut self) {
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        if self.relative {
+            unsafe {
+                let _ = ClipCursor(None);
+                let device = RAWINPUTDEVICE {
+                    usUsagePage: 1,
+                    usUsage: 2,
+                    dwFlags: RIDEV_REMOVE,
+                    hwndTarget: HWND::default(),
+                };
+                let _ = RegisterRawInputDevices(
+                    &[device],
+                    std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+                );
+            }
+            self.relative = false;
+        }
+    }
+    unsafe fn toggle_relative(&mut self, hwnd: HWND) {
+        if self.relative {
+            unsafe {
+                self.release_mouse();
+            }
+            self.event(ClientEvent::ReleaseInput);
+            return;
+        }
+        if !self.shared {
+            return;
+        }
+        unsafe {
+            let device = RAWINPUTDEVICE {
+                usUsagePage: 1,
+                usUsage: 2,
+                dwFlags: RAWINPUTDEVICE_FLAGS(0),
+                hwndTarget: hwnd,
+            };
+            if RegisterRawInputDevices(&[device], std::mem::size_of::<RAWINPUTDEVICE>() as u32)
+                .is_err()
+            {
+                return;
+            }
+            let mut rect = self.content(hwnd);
+            let _ = MapWindowPoints(
+                Some(hwnd),
+                None,
+                std::slice::from_raw_parts_mut((&mut rect as *mut RECT).cast::<POINT>(), 2),
+            );
+            let _ = ClipCursor(Some(&rect));
+            let _ = SetCapture(hwnd);
+            self.relative = true;
+        }
+        self.event(ClientEvent::ResumeInput {
+            created: std::time::Instant::now(),
+        });
+    }
+    unsafe fn cursor_geometry(&self, hwnd: HWND) -> (RECT, (f64, f64)) {
+        let rect = unsafe { self.content(hwnd) };
+        (
+            rect,
+            (
+                (rect.right - rect.left) as f64
+                    / (self.remote.bounds.width * self.remote.scale).max(1.),
+                (rect.bottom - rect.top) as f64
+                    / (self.remote.bounds.height * self.remote.scale).max(1.),
+            ),
+        )
+    }
     fn save(&self) {
+        if self.shared {
+            return;
+        }
         if let Ok(dir) = frames_core::trust::config_dir() {
             let path = dir.join("windows.json");
             let mut prefs: HashMap<String, Preference> = std::fs::read(&path)
@@ -96,6 +291,27 @@ impl Proxy {
     fn event(&self, event: ClientEvent) {
         let _ = self.events.send(event);
     }
+    unsafe fn update_remote(&mut self, hwnd: HWND, remote: RemoteWindow) {
+        let header_changed =
+            self.remote.show_header != remote.show_header || self.remote.role != remote.role;
+        self.remote = remote;
+        if header_changed {
+            let menu = GetSystemMenu(hwnd, false);
+            CheckMenuItem(
+                menu,
+                SHOW_HEADER as u32,
+                MF_BYCOMMAND.0 | (header_menu_flags(self) & MF_CHECKED).0,
+            );
+            let _ = EnableMenuItem(
+                menu,
+                SHOW_HEADER as u32,
+                MF_BYCOMMAND | (header_menu_flags(self) & MF_GRAYED),
+            );
+            let items = self.menu_items.clone();
+            install_remote_menu(hwnd, self, items);
+        }
+        self.refresh_title(hwnd);
+    }
     fn input(&self, event: InputEvent) {
         self.event(ClientEvent::TimedInput {
             window: self.remote.key,
@@ -104,7 +320,7 @@ impl Proxy {
         });
     }
     fn title(&self) -> String {
-        format!(
+        let mut title = format!(
             "{} — {}{}{}",
             self.remote.title,
             if effective_sizing(self.pref.mode, self.remote.resize) == SizingMode::ResizeRemote {
@@ -124,7 +340,21 @@ impl Proxy {
             } else {
                 format!(" — {}", self.status)
             }
-        )
+        );
+        if let Some(notice) = &self.shared_notice {
+            title.push_str(" · ");
+            title.push_str(notice);
+        }
+        title
+    }
+    unsafe fn refresh_title(&mut self, hwnd: HWND) {
+        let title = self.title();
+        if title != self.last_title && SetWindowTextW(hwnd, PCWSTR(wide(&title).as_ptr())).is_ok() {
+            self.last_title = title;
+            if !self.header.is_invalid() {
+                let _ = InvalidateRect(Some(self.header), None, false);
+            }
+        }
     }
     unsafe fn content(&self, hwnd: HWND) -> RECT {
         let mut rect = RECT::default();
@@ -134,14 +364,14 @@ impl Proxy {
         {
             let aspect = frame.width as f64 / frame.height as f64;
             let w = rect.right as f64;
-            let h = rect.bottom as f64;
+            let h = (rect.bottom - rect.top) as f64;
             if h > 0.0 && w / h > aspect {
                 let width = (h * aspect) as i32;
                 rect.left = (rect.right - width) / 2;
                 rect.right = rect.left + width;
             } else if aspect > 0.0 {
                 let height = (w / aspect) as i32;
-                rect.top = (rect.bottom - height) / 2;
+                rect.top += ((h as i32) - height) / 2;
                 rect.bottom = rect.top + height;
             }
         }
@@ -179,6 +409,26 @@ unsafe extern "system" fn procedure(
     }
     let state = &mut *pointer;
     match message {
+        super::caption::LAYOUT => {
+            super::caption::layout(hwnd, state.header);
+            return LRESULT(0);
+        }
+        WM_WINDOWPOSCHANGED | WM_SHOWWINDOW | WM_NCACTIVATE => {
+            let _ = PostMessageW(Some(hwnd), super::caption::LAYOUT, WPARAM(0), LPARAM(0));
+        }
+        WM_DPICHANGED => {
+            let rect = &*(lparam.0 as *const RECT);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            super::caption::layout(hwnd, state.header);
+        }
         WM_ENTERMENULOOP => {
             state.menu_open = true;
         }
@@ -191,7 +441,23 @@ unsafe extern "system" fn procedure(
         }
         WM_COMMAND if wparam.0 >> 16 == 0 => {
             let command = wparam.0 & 0xffff;
+            if state.devices.action(command, &state.events) {
+                return LRESULT(0);
+            }
             match command {
+                super::caption::HIDE => state.set_shown(hwnd, false),
+                RELATIVE_MOUSE => {
+                    state.event(ClientEvent::ReleaseInput);
+                    state.forwarded.clear();
+                    state.toggle_relative(hwnd);
+                }
+                COMPATIBILITY => {
+                    super::dialogs::message(
+                        "Window compatibility",
+                        &state.compatibility.description(),
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                }
                 VIEW_WINDOWS | VIEW_DESKTOP => {
                     state.event(ClientEvent::ReleaseInput);
                     state.event(ClientEvent::ViewMode(if command == VIEW_DESKTOP {
@@ -210,7 +476,7 @@ unsafe extern "system" fn procedure(
                 USB_INFO => {
                     let _ = crate::show_error(
                         "Frames device forwarding",
-                        "Android ADB: start adb on this computer, then enable Android ADB bridge. On the host use adb -H 127.0.0.1 -P 15037. Raw USB, fastboot, DFU, and iOS passthrough require separate driver support and are not enabled.",
+                        "Choose a locally connected USB/Bluetooth controller under Devices > Gamepads. Receiving requires ViGEmBus on the Windows host. For generic wired USB between Windows computers, set up the local exporter and host receiver under Devices > USB devices, refresh, then select a device. USB audio/video is excluded. The Android ADB bridge remains available.",
                     );
                 }
                 MODE_RESIZE | MODE_STRETCH | FILL | SWAP | PHYSICAL | REMOTE_MENU | FETCH
@@ -263,7 +529,17 @@ unsafe extern "system" fn procedure(
             let mut rect = RECT::default();
             let _ = GetClientRect(hwnd, &mut rect);
             let content = state.content(hwnd);
+            if state.renderer.is_none() && state.frame.is_some() && !state.renderer_failed {
+                match super::render::Renderer::new(hwnd) {
+                    Ok(renderer) => state.renderer = Some(renderer),
+                    Err(error) => {
+                        state.renderer_failed = true;
+                        tracing::warn!(%error,"presentation worker unavailable");
+                    }
+                }
+            }
             if let (Some(renderer), Some(frame)) = (&mut state.renderer, &state.frame) {
+                renderer.set_feedback(state.remote.key, state.events.clone());
                 match renderer.draw(hwnd, frame, content) {
                     Ok(()) => {
                         let _ = EndPaint(hwnd, &paint);
@@ -271,9 +547,23 @@ unsafe extern "system" fn procedure(
                     }
                     Err(error) => {
                         tracing::warn!(%error,"D3D11 presentation unavailable; using GDI");
+                        state.renderer_failed = true;
+                        state.event(ClientEvent::DecoderFailed {
+                            window: state.remote.key,
+                            generation: frame.media_generation,
+                            reason: error.to_string(),
+                        });
                         state.renderer = None;
                     }
                 }
+            }
+            if state
+                .frame
+                .as_ref()
+                .is_some_and(|frame| frame.bgra.is_empty())
+            {
+                let _ = EndPaint(hwnd, &paint);
+                return LRESULT(0);
             }
             // Avoid queued GDI fills overpainting the D3D presentation at EndPaint.
             FillRect(dc, &rect, HBRUSH(GetStockObject(BLACK_BRUSH).0));
@@ -329,7 +619,8 @@ unsafe extern "system" fn procedure(
         }
         WM_ERASEBKGND => return LRESULT(1),
         WM_CLOSE => {
-            if state.remote.role == WindowRole::Desktop {
+            if state.shared || state.remote.role == WindowRole::Desktop {
+                state.release_mouse();
                 state.event(ClientEvent::Disconnected);
                 return LRESULT(0);
             }
@@ -341,20 +632,30 @@ unsafe extern "system" fn procedure(
                 action: WindowAction::Close,
             });
             state.command_status = Some("Closing remote window…".into());
-            let _ = SetWindowTextW(hwnd, PCWSTR(wide(&state.title()).as_ptr()));
+            state.refresh_title(hwnd);
             return LRESULT(0);
         }
         WM_SETFOCUS => {
-            state.event(ClientEvent::Action {
-                window: state.remote.key,
-                action: WindowAction::Focus,
-            });
+            if state.hidden {
+                return LRESULT(0);
+            }
+            if state.shared {
+                state.event(ClientEvent::ResumeInput {
+                    created: std::time::Instant::now(),
+                });
+            }
+            if !state.shared {
+                state.event(ClientEvent::Action {
+                    window: state.remote.key,
+                    action: WindowAction::Focus,
+                });
+            }
             state.event(ClientEvent::Visibility {
                 window: state.remote.key,
                 visible: true,
                 focused: true,
             });
-            if state.remote.role != WindowRole::Desktop {
+            if !state.shared && state.remote.role != WindowRole::Desktop {
                 state.event(ClientEvent::Action {
                     window: state.remote.key,
                     action: WindowAction::Menu,
@@ -362,19 +663,27 @@ unsafe extern "system" fn procedure(
             }
         }
         WM_KILLFOCUS => {
+            state.release_mouse();
             state.event(ClientEvent::ReleaseInput);
             state.forwarded.clear();
             state.surrogate = None;
             state.event(ClientEvent::Visibility {
                 window: state.remote.key,
-                visible: !IsIconic(hwnd).as_bool(),
+                visible: !state.hidden
+                    && IsWindowVisible(hwnd).as_bool()
+                    && !IsIconic(hwnd).as_bool(),
                 focused: false,
             });
         }
         WM_ENTERSIZEMOVE => state.user_sizing = true,
         WM_EXITSIZEMOVE => state.user_sizing = false,
         WM_SIZE => {
-            let visible = wparam.0 != SIZE_MINIMIZED as usize;
+            super::caption::layout(hwnd, state.header);
+            if state.relative {
+                state.release_mouse();
+                state.event(ClientEvent::ReleaseInput);
+            }
+            let visible = !state.hidden && wparam.0 != SIZE_MINIMIZED as usize;
             let maximized = wparam.0 == SIZE_MAXIMIZED as usize;
             let user_resize = state.user_sizing || maximized || state.maximized;
             state.maximized = maximized;
@@ -383,8 +692,8 @@ unsafe extern "system" fn procedure(
                 visible,
                 focused: GetForegroundWindow() == hwnd,
             });
-            if state.ready
-                && !state.changing_header
+            if !state.shared
+                && state.ready
                 && user_resize
                 && visible
                 && effective_sizing(state.pref.mode, state.remote.resize)
@@ -400,6 +709,10 @@ unsafe extern "system" fn procedure(
                 }
             }
             let _ = InvalidateRect(Some(hwnd), None, false);
+            let (rect, scale) = state.cursor_geometry(hwnd);
+            if let Some(overlay) = state.virtual_cursor.as_mut() {
+                let _ = overlay.reposition(rect, scale);
+            }
         }
         WM_TIMER => {
             if wparam.0 == 2 {
@@ -412,32 +725,84 @@ unsafe extern "system" fn procedure(
                 }
             }
         }
+        WM_INPUT if state.shared && state.relative => {
+            let mut raw = RAWINPUT::default();
+            let mut bytes = std::mem::size_of::<RAWINPUT>() as u32;
+            if GetRawInputData(
+                HRAWINPUT(lparam.0 as *mut _),
+                RID_INPUT,
+                Some((&mut raw as *mut RAWINPUT).cast()),
+                &mut bytes,
+                std::mem::size_of::<RAWINPUTHEADER>() as u32,
+            ) != u32::MAX
+                && raw.header.dwType == RIM_TYPEMOUSE.0
+            {
+                let mouse = raw.data.mouse;
+                if mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0 == 0 {
+                    state.input(InputEvent::RelativeMotion {
+                        dx: mouse.lLastX,
+                        dy: mouse.lLastY,
+                    });
+                }
+            }
+            return DefWindowProcW(hwnd, message, wparam, lparam);
+        }
+        WM_SETCURSOR if state.shared && (lparam.0 as u16 as u32) == HTCLIENT => {
+            let _ = SetCursor(None);
+            return LRESULT(1);
+        }
         WM_MOUSEMOVE => {
+            if state.relative {
+                return LRESULT(0);
+            }
             let (x, y) = state.coords(hwnd, lparam, false);
             state.input(InputEvent::Pointer { x, y });
             return LRESULT(0);
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONUP
-        | WM_MBUTTONUP => {
-            let down = matches!(message, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN);
+        | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
+            let down = matches!(
+                message,
+                WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+            );
             if down {
+                if state.shared {
+                    state.event(ClientEvent::ResumeInput {
+                        created: std::time::Instant::now(),
+                    });
+                }
                 if state.command_status.as_deref() != Some("Closing remote window…") {
                     state.command_status = None;
-                    let _ = SetWindowTextW(hwnd, PCWSTR(wide(&state.title()).as_ptr()));
+                    state.refresh_title(hwnd);
                 }
                 let _ = SetFocus(Some(hwnd));
                 let _ = SetCapture(hwnd);
-            } else {
+            } else if !state.relative {
                 let _ = ReleaseCapture();
             }
             let button = match message {
                 WM_LBUTTONDOWN | WM_LBUTTONUP => 0,
                 WM_RBUTTONDOWN | WM_RBUTTONUP => 1,
+                WM_XBUTTONDOWN | WM_XBUTTONUP => {
+                    if wparam.0 >> 16 == XBUTTON1 as usize {
+                        3
+                    } else {
+                        4
+                    }
+                }
                 _ => 2,
             };
             let (x, y) = state.coords(hwnd, lparam, false);
-            state.input(InputEvent::Button { button, down, x, y });
-            return LRESULT(0);
+            state.input(if state.relative {
+                InputEvent::RelativeButton { button, down }
+            } else {
+                InputEvent::Button { button, down, x, y }
+            });
+            return LRESULT(if message == WM_XBUTTONDOWN || message == WM_XBUTTONUP {
+                1
+            } else {
+                0
+            });
         }
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
             let (x, y) = state.coords(hwnd, lparam, true);
@@ -464,11 +829,20 @@ unsafe extern "system" fn procedure(
             let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
             let alt = GetKeyState(VK_MENU.0 as i32) < 0;
             let altgr = GetKeyState(VK_RMENU.0 as i32) < 0;
+            if state.shared && down && vk == VK_F11.0 && ctrl && alt {
+                state.event(ClientEvent::ReleaseInput);
+                state.forwarded.clear();
+                state.toggle_relative(hwnd);
+                return LRESULT(0);
+            }
             if down && vk == VK_F12.0 && ctrl && alt {
+                state.release_mouse();
                 state.event(ClientEvent::ReleaseInput);
                 state.forwarded.clear();
                 state.surrogate = None;
-                let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                if !state.shared {
+                    let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                }
                 return LRESULT(0);
             }
             if alt && vk == VK_TAB.0 {
@@ -570,30 +944,27 @@ unsafe extern "system" fn procedure(
     }
     // Custom menu IDs are intentionally not multiples of 16.
     if message == WM_SYSCOMMAND && wparam.0 == SHOW_HEADER {
+        if state.shared || state.remote.role == WindowRole::Desktop {
+            return LRESULT(0);
+        }
         state.event(ClientEvent::ReleaseInput);
         state.forwarded.clear();
         state.surrogate = None;
-        let visible = !state.show_header;
-        state.changing_header = true;
-        let result = set_window_header(hwnd, visible);
-        if let Err(error) = result {
-            tracing::warn!(%error, "Unable to change the window header");
-        } else {
-            state.show_header = visible;
-            let items = state.menu_items.clone();
-            install_remote_menu(hwnd, state, items);
-            CheckMenuItem(
-                GetSystemMenu(hwnd, false),
-                SHOW_HEADER as u32,
-                MF_BYCOMMAND.0
-                    | if visible {
-                        MF_CHECKED.0
-                    } else {
-                        MF_UNCHECKED.0
-                    },
-            );
-        }
-        state.changing_header = false;
+        state.event(ClientEvent::Action {
+            window: state.remote.key,
+            action: WindowAction::SetHeader {
+                visible: !state.remote.show_header,
+            },
+        });
+        return LRESULT(0);
+    }
+    if state.shared
+        && message == WM_SYSCOMMAND
+        && matches!(
+            wparam.0,
+            MODE_RESIZE | SWAP | PHYSICAL | REMOTE_MENU | FETCH | SHOW_HEADER
+        )
+    {
         return LRESULT(0);
     }
     if message == WM_SYSCOMMAND && wparam.0 == REMOTE_MENU {
@@ -635,11 +1006,12 @@ unsafe extern "system" fn procedure(
         state.save();
         let items = state.menu_items.clone();
         install_remote_menu(hwnd, state, items);
-        let _ = SetWindowTextW(hwnd, PCWSTR(wide(&state.title()).as_ptr()));
+        state.refresh_title(hwnd);
         let _ = InvalidateRect(Some(hwnd), None, false);
         return LRESULT(0);
     }
     if message == WM_NCDESTROY {
+        state.release_mouse();
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         let owned = Box::from_raw(pointer);
         if let Some(icon) = owned.icon {
@@ -682,16 +1054,78 @@ pub fn run_client(
             .unwrap_or_default();
         let mut windows = HashMap::<WindowId, HWND>::new();
         let mut running = true;
+        let mut shared: Option<frames_core::shared_game::SharedSession> = None;
+        let mut shared_cursor = frames_core::shared_game::Cursor::default();
         let mut view_mode = ViewMode::Windows;
         let mut show_remote_cursor = true;
         let mut adb_enabled = false;
+        let mut device_list = frames_core::devices::DeviceList::default();
         let mut session_control = super::session_control::SessionControl::new(events.clone())?;
         let mut shelf = super::files::Shelf::new(events.clone())?;
         let timer = SetTimer(None, 0, 16, None);
         let mut last_visibility = std::time::Instant::now();
+        let mut last_shared_alive = std::time::Instant::now();
         while running {
+            if shared.is_some()
+                && last_shared_alive.elapsed() >= std::time::Duration::from_millis(100)
+            {
+                let _ = events.send(ClientEvent::SharedAlive {
+                    created: std::time::Instant::now(),
+                });
+                last_shared_alive = std::time::Instant::now();
+            }
             for update in updates.try_iter() {
                 match update {
+                    ClientUpdate::SharedSession(info) => {
+                        let info = *info;
+                        shared = Some(info.clone());
+                        session_control.set_shared(true);
+                        for &hwnd in windows.values() {
+                            let state =
+                                &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Proxy);
+                            state.shared = true;
+                            state.compatibility = info.compatibility.clone();
+                            if info.phase != frames_core::shared_game::Phase::Active {
+                                state.release_mouse();
+                                state.event(ClientEvent::ReleaseInput);
+                                state.forwarded.clear();
+                            }
+                            state.pref.physical = true;
+                            state.pref.swap = false;
+                            state.pref.mode = SizingMode::StretchLocal;
+                            state.command_status = Some(info.detail.clone());
+                            state.refresh_title(hwnd);
+                        }
+                    }
+                    ClientUpdate::SharedCursor(cursor) => {
+                        let mut latest = cursor.clone();
+                        if latest.png_base64.is_none() {
+                            latest.png_base64 = shared_cursor.png_base64.clone();
+                        }
+                        shared_cursor = latest;
+                        for &hwnd in windows.values() {
+                            let state =
+                                &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Proxy);
+                            let (rect, scale) = state.cursor_geometry(hwnd);
+                            if let Some(overlay) = state.virtual_cursor.as_mut() {
+                                let _ = overlay.update(&cursor, rect, scale);
+                            }
+                        }
+                    }
+                    ClientUpdate::Devices(list) => {
+                        device_list = list.clone();
+                        session_control.update_devices(list.clone());
+                        if let Some(error) = &list.error {
+                            let _ = crate::show_error("Device forwarding", error);
+                        }
+                        for &hwnd in windows.values() {
+                            let state =
+                                &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Proxy);
+                            state.devices.state = list.clone();
+                            let items = state.menu_items.clone();
+                            install_remote_menu(hwnd, state, items);
+                        }
+                    }
                     ClientUpdate::RemoteCursor { visible } => {
                         show_remote_cursor = visible;
                         session_control.update(view_mode, adb_enabled, show_remote_cursor);
@@ -743,8 +1177,11 @@ pub fn run_client(
                     ClientUpdate::Peer {
                         platform,
                         device_id,
-                        ..
-                    } => host = format!("{platform}:{device_id}"),
+                        name,
+                    } => {
+                        host = format!("{platform}:{device_id}");
+                        session_control.set_peer(name);
+                    }
                     ClientUpdate::Menu { window, items } => {
                         if let Some(&hwnd) = windows.get(&window) {
                             let state =
@@ -770,8 +1207,7 @@ pub fn run_client(
                             if let Some(&hwnd) = windows.get(&remote.key) {
                                 let state =
                                     &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Proxy);
-                                state.remote = remote;
-                                let _ = SetWindowTextW(hwnd, PCWSTR(wide(&state.title()).as_ptr()));
+                                state.update_remote(hwnd, remote);
                                 continue;
                             }
                             let key = remote.key;
@@ -781,7 +1217,7 @@ pub fn run_client(
                                     remote.role,
                                     WindowRole::Menu | WindowRole::Tooltip | WindowRole::Popover
                                 );
-                            let pref = preferences
+                            let mut pref = preferences
                                 .get(&format!("{host}:{}", remote.app_id))
                                 .cloned()
                                 .unwrap_or_else(|| Preference {
@@ -791,7 +1227,22 @@ pub fn run_client(
                             let width = remote.bounds.width.min(1400.0) as i32;
                             let height = remote.bounds.height.min(900.0) as i32;
                             let icon = remote.icon_png.as_deref().and_then(|s| make_icon(s).ok());
+                            if shared.is_some() {
+                                pref.physical = true;
+                                pref.swap = false;
+                                pref.mode = SizingMode::StretchLocal;
+                            }
                             let state = Box::new(Proxy {
+                                hidden: false,
+                                header: HWND::default(),
+                                shared: shared.is_some(),
+                                relative: false,
+                                virtual_cursor: None,
+                                compatibility: shared
+                                    .as_ref()
+                                    .map(|s| s.compatibility.clone())
+                                    .unwrap_or_default(),
+                                devices: super::devices::DeviceMenu::new(device_list.clone()),
                                 remote,
                                 frame: None,
                                 events: events.clone(),
@@ -799,20 +1250,21 @@ pub fn run_client(
                                 host: host.clone(),
                                 icon,
                                 status: "Connecting stream…".into(),
-                                command_status: None,
+                                last_title: String::new(),
+                                command_status: shared.as_ref().map(|s| s.detail.clone()),
+                                shared_notice: None,
                                 pending_resize: None,
                                 last_size: None,
                                 visible: None,
                                 forwarded: Default::default(),
                                 surrogate: None,
                                 renderer: None,
+                                renderer_failed: false,
                                 ready: false,
                                 user_sizing: false,
                                 maximized: false,
                                 view_mode,
                                 show_remote_cursor,
-                                show_header: !transient,
-                                changing_header: false,
                                 adb_enabled,
                                 menu_items: vec![],
                                 menu_ids: HashMap::new(),
@@ -837,7 +1289,7 @@ pub fn run_client(
                                 if transient {
                                     WS_POPUP | WS_BORDER
                                 } else {
-                                    WS_OVERLAPPEDWINDOW
+                                    WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN
                                 },
                                 CW_USEDEFAULT,
                                 CW_USEDEFAULT,
@@ -855,6 +1307,14 @@ pub fn run_client(
                                 }
                             };
                             assign_appid(hwnd, &app_id);
+                            if (*state).shared {
+                                (*state).virtual_cursor =
+                                    super::virtual_cursor::VirtualCursor::new(hwnd).ok();
+                                let (rect, scale) = (*state).cursor_geometry(hwnd);
+                                if let Some(overlay) = (*state).virtual_cursor.as_mut() {
+                                    let _ = overlay.update(&shared_cursor, rect, scale);
+                                }
+                            }
                             if !transient {
                                 install_remote_menu(hwnd, &mut *state, vec![]);
                             }
@@ -893,7 +1353,7 @@ pub fn run_client(
                                 if transient {
                                     WS_POPUP | WS_BORDER
                                 } else {
-                                    WS_OVERLAPPEDWINDOW
+                                    WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN
                                 },
                                 !transient,
                                 if transient {
@@ -934,8 +1394,8 @@ pub fn run_client(
                                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
                                 );
                             }
-                            (*state).renderer = super::render::Renderer::new(hwnd).ok();
-                            windows::Win32::UI::Shell::DragAcceptFiles(hwnd, true);
+
+                            windows::Win32::UI::Shell::DragAcceptFiles(hwnd, !(*state).shared);
                             if let Some(icon) = (*state).icon {
                                 SendMessageW(
                                     hwnd,
@@ -950,60 +1410,23 @@ pub fn run_client(
                                     Some(LPARAM(icon.0 as isize)),
                                 );
                             }
-                            let menu = GetSystemMenu(hwnd, false);
-                            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-                            let _ = AppendMenuW(
-                                menu,
-                                MF_STRING | MF_CHECKED,
-                                SHOW_HEADER,
-                                PCWSTR(wide("Show window header").as_ptr()),
-                            );
-                            let _ = AppendMenuW(
-                                menu,
-                                if (*state).remote.resize == ResizeCapability::Supported {
-                                    MF_STRING
-                                } else {
-                                    MF_STRING | MF_GRAYED
-                                },
-                                MODE_RESIZE,
-                                PCWSTR(wide("Resize remote app").as_ptr()),
-                            );
-                            let _ = AppendMenuW(
-                                menu,
-                                MF_STRING,
-                                MODE_STRETCH,
-                                PCWSTR(wide("Stretch locally").as_ptr()),
-                            );
-                            let _ = AppendMenuW(
-                                menu,
-                                MF_STRING,
-                                FILL,
-                                PCWSTR(wide("Toggle aspect fit / fill").as_ptr()),
-                            );
-                            let _ = AppendMenuW(
-                                menu,
-                                MF_STRING,
-                                SWAP,
-                                PCWSTR(wide("Toggle Control / Command swap").as_ptr()),
-                            );
-                            let _ = AppendMenuW(
-                                menu,
-                                MF_STRING,
-                                PHYSICAL,
-                                PCWSTR(wide("Toggle physical keys (terminal)").as_ptr()),
-                            );
-                            let _ = AppendMenuW(
-                                menu,
-                                MF_STRING,
-                                REMOTE_MENU,
-                                PCWSTR(wide("Remote application menu…").as_ptr()),
-                            );
-                            let _ = AppendMenuW(
-                                menu,
-                                MF_STRING,
-                                FETCH,
-                                PCWSTR(wide("Fetch remote file…").as_ptr()),
-                            );
+                            if !transient {
+                                (*state).header = super::caption::create(hwnd)?;
+                                let _ = SetWindowPos(
+                                    hwnd,
+                                    None,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    SWP_FRAMECHANGED
+                                        | SWP_NOMOVE
+                                        | SWP_NOSIZE
+                                        | SWP_NOZORDER
+                                        | SWP_NOACTIVATE,
+                                );
+                            }
+
                             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                             (*state).ready = true;
                             windows.insert(key, hwnd);
@@ -1018,10 +1441,13 @@ pub fn run_client(
                         if let Some(&hwnd) = windows.get(&key) {
                             let state =
                                 &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Proxy);
+                            if state.hidden {
+                                continue;
+                            }
                             state.frame = Some(frame);
                             if !state.status.is_empty() {
                                 state.status.clear();
-                                let _ = SetWindowTextW(hwnd, PCWSTR(wide(&state.title()).as_ptr()));
+                                state.refresh_title(hwnd);
                             }
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
@@ -1030,8 +1456,12 @@ pub fn run_client(
                         if let Some(&hwnd) = windows.get(&key) {
                             let state =
                                 &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Proxy);
-                            state.status = status;
-                            let _ = SetWindowTextW(hwnd, PCWSTR(wide(&state.title()).as_ptr()));
+                            if state.shared {
+                                state.shared_notice = Some(status);
+                            } else {
+                                state.status = status;
+                            }
+                            state.refresh_title(hwnd);
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
@@ -1040,12 +1470,12 @@ pub fn run_client(
                             let state =
                                 &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Proxy);
                             if let Some(actual) = actual {
-                                state.remote = actual;
+                                state.update_remote(hwnd, actual);
                             }
                             if let Some(error) = error {
                                 state.command_status = Some(error);
                             }
-                            let _ = SetWindowTextW(hwnd, PCWSTR(wide(&state.title()).as_ptr()));
+                            state.refresh_title(hwnd);
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
@@ -1068,6 +1498,43 @@ pub fn run_client(
                             focused: visible && GetForegroundWindow() == hwnd,
                         });
                     }
+                }
+                session_control.sync_windows(
+                    windows
+                        .values()
+                        .map(|&hwnd| {
+                            (&*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Proxy))
+                                .tray_window()
+                        })
+                        .collect(),
+                );
+            }
+            let tray_windows: Vec<_> = windows
+                .values()
+                .map(|&hwnd| {
+                    (&*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Proxy)).tray_window()
+                })
+                .collect();
+            for action in session_control.poll(&tray_windows) {
+                use super::session_control::SessionAction;
+                match action {
+                    SessionAction::Visibility(key, shown) => {
+                        if let Some(&hwnd) = windows.get(&key) {
+                            (&mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Proxy))
+                                .set_shown(hwnd, shown);
+                        }
+                    }
+                    SessionAction::WindowCommand(key, command) => {
+                        if let Some(&hwnd) = windows.get(&key) {
+                            let _ = PostMessageW(
+                                Some(hwnd),
+                                WM_COMMAND,
+                                WPARAM(command as usize),
+                                LPARAM(0),
+                            );
+                        }
+                    }
+                    SessionAction::Device(action) => session_control.dispatch_device(action),
                 }
             }
             let mut msg = MSG::default();
@@ -1095,193 +1562,43 @@ fn stable_hash(value: &str) -> u64 {
     })
 }
 
-unsafe fn set_window_header(hwnd: HWND, visible: bool) -> Result<()> {
-    let mut client = RECT::default();
-    GetClientRect(hwnd, &mut client)?;
-    let mut origin = POINT::default();
-    ClientToScreen(hwnd, &mut origin).ok()?;
-    let previous = WINDOW_STYLE(GetWindowLongPtrW(hwnd, GWL_STYLE) as u32);
-    let style = if visible {
-        previous | WS_CAPTION
-    } else {
-        previous & !WS_CAPTION
-    };
-    let extended = WINDOW_EX_STYLE(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32);
-    AdjustWindowRectExForDpi(
-        &mut client,
-        style,
-        !GetMenu(hwnd).is_invalid(),
-        extended,
-        GetDpiForWindow(hwnd).max(96),
-    )?;
-    SetWindowLongPtrW(hwnd, GWL_STYLE, style.0 as isize);
-    let mut flags = SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE;
-    if IsZoomed(hwnd).as_bool() {
-        flags |= SWP_NOMOVE | SWP_NOSIZE;
-    }
-    let result = SetWindowPos(
-        hwnd,
-        None,
-        origin.x + client.left,
-        origin.y + client.top,
-        client.right - client.left,
-        client.bottom - client.top,
-        flags,
-    );
-    if result.is_err() {
-        SetWindowLongPtrW(hwnd, GWL_STYLE, previous.0 as isize);
-    }
-    result
+fn header_menu_flags(state: &Proxy) -> MENU_ITEM_FLAGS {
+    MF_STRING
+        | if state.remote.show_header {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        }
+        | if state.shared || state.remote.role == WindowRole::Desktop {
+            MF_GRAYED
+        } else {
+            MF_ENABLED
+        }
 }
 
-unsafe fn install_remote_menu(hwnd: HWND, state: &mut Proxy, items: Vec<MenuItem>) {
-    if state.menu_open {
-        state.pending_menu = Some(items);
-        return;
-    }
-    let Ok(bar) = CreateMenu() else {
-        return;
-    };
-    let mut ids = HashMap::new();
-    let mut next = 0x100usize;
-    unsafe fn remote_items(
-        menu: HMENU,
+unsafe fn install_remote_menu(_hwnd: HWND, state: &mut Proxy, items: Vec<MenuItem>) {
+    fn collect(
         items: &[MenuItem],
-        ids: &mut HashMap<usize, String>,
         next: &mut usize,
+        ids: &mut HashMap<usize, String>,
         depth: usize,
     ) {
         if depth >= 8 {
             return;
         }
         for item in items.iter().take(200) {
-            if item.title.is_empty() {
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-                continue;
-            }
-            let flags = MF_STRING
-                | if item.enabled {
-                    MENU_ITEM_FLAGS(0)
-                } else {
-                    MF_GRAYED
-                }
-                | if item.checked {
-                    MF_CHECKED
-                } else {
-                    MENU_ITEM_FLAGS(0)
-                };
-            if !item.children.is_empty() {
-                if let Ok(child) = CreatePopupMenu() {
-                    remote_items(child, &item.children, ids, next, depth + 1);
-                    let _ = AppendMenuW(
-                        menu,
-                        flags | MF_POPUP,
-                        child.0 as usize,
-                        PCWSTR(wide(&item.title).as_ptr()),
-                    );
-                }
-            } else if *next < 0x7000 {
-                let id = *next;
+            if item.children.is_empty() && !item.title.is_empty() && *next < 0x7000 {
+                ids.insert(*next, item.id.clone());
                 *next += 1;
-                ids.insert(id, item.id.clone());
-                let _ = AppendMenuW(menu, flags, id, PCWSTR(wide(&item.title).as_ptr()));
+            } else {
+                collect(&item.children, next, ids, depth + 1);
             }
         }
     }
-    let local = CreatePopupMenu().unwrap();
-    let checked = |yes| if yes { MF_CHECKED } else { MENU_ITEM_FLAGS(0) };
-    let _ = AppendMenuW(
-        local,
-        MF_STRING | checked(state.view_mode == ViewMode::Windows),
-        VIEW_WINDOWS,
-        PCWSTR(wide("Per-window view").as_ptr()),
-    );
-    let _ = AppendMenuW(
-        local,
-        MF_STRING | checked(state.view_mode == ViewMode::Desktop),
-        VIEW_DESKTOP,
-        PCWSTR(wide("Full desktop view").as_ptr()),
-    );
-    let _ = AppendMenuW(
-        local,
-        MF_STRING | checked(state.show_remote_cursor),
-        REMOTE_CURSOR,
-        PCWSTR(wide("Show remote cursor").as_ptr()),
-    );
-    let _ = AppendMenuW(local, MF_SEPARATOR, 0, PCWSTR::null());
-    let _ = AppendMenuW(
-        local,
-        MF_STRING | checked(state.show_header),
-        SHOW_HEADER,
-        PCWSTR(wide("Show window header").as_ptr()),
-    );
-    for (id, title) in [
-        (MODE_RESIZE, "Resize remote app"),
-        (MODE_STRETCH, "Stretch locally"),
-        (FILL, "Toggle aspect fit / fill"),
-        (SWAP, "Toggle Control / Command swap"),
-        (PHYSICAL, "Toggle physical keys (terminal)"),
-        (REMOTE_MENU, "Refresh application menus"),
-        (FETCH, "Fetch remote file..."),
-    ] {
-        let disabled = (id == MODE_RESIZE && state.remote.resize != ResizeCapability::Supported)
-            || (id == REMOTE_MENU && state.remote.role == WindowRole::Desktop);
-        let _ = AppendMenuW(
-            local,
-            MF_STRING
-                | if disabled {
-                    MF_GRAYED
-                } else {
-                    MENU_ITEM_FLAGS(0)
-                },
-            id,
-            PCWSTR(wide(title).as_ptr()),
-        );
-    }
-    let _ = AppendMenuW(local, MF_SEPARATOR, 0, PCWSTR::null());
-    let _ = AppendMenuW(
-        local,
-        MF_STRING,
-        DISCONNECT,
-        PCWSTR(wide("Disconnect").as_ptr()),
-    );
-    let _ = AppendMenuW(
-        bar,
-        MF_POPUP,
-        local.0 as usize,
-        PCWSTR(wide("Frames").as_ptr()),
-    );
-    remote_items(bar, &items, &mut ids, &mut next, 0);
-    let devices = CreatePopupMenu().unwrap();
-    let _ = AppendMenuW(
-        devices,
-        MF_STRING | checked(state.adb_enabled),
-        ADB_BRIDGE,
-        PCWSTR(wide("Android ADB bridge").as_ptr()),
-    );
-    let _ = AppendMenuW(
-        devices,
-        MF_STRING,
-        USB_INFO,
-        PCWSTR(wide("Device forwarding support...").as_ptr()),
-    );
-    let _ = AppendMenuW(
-        bar,
-        MF_POPUP,
-        devices.0 as usize,
-        PCWSTR(wide("Devices").as_ptr()),
-    );
-    let old = GetMenu(hwnd);
-    if SetMenu(hwnd, Some(bar)).is_ok() {
-        state.menu_items = items;
-        state.menu_ids = ids;
-        if !old.is_invalid() {
-            let _ = DestroyMenu(old);
-        }
-        let _ = DrawMenuBar(hwnd);
-    } else {
-        let _ = DestroyMenu(bar);
-    }
+    let mut ids = HashMap::new();
+    collect(&items, &mut 0x100usize, &mut ids, 0);
+    state.menu_items = items;
+    state.menu_ids = ids;
 }
 
 unsafe fn assign_appid(hwnd: HWND, id: &str) {
@@ -1411,4 +1728,173 @@ unsafe fn make_icon(png: &str) -> anyhow::Result<HICON> {
     let _ = DeleteObject(bitmap.into());
     let _ = DeleteObject(mask.into());
     Ok(icon?)
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    #[test]
+    fn header_toggle_changes_remote_capture_and_preserves_local_window() {
+        unsafe {
+            let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let mut state = Box::new(Proxy {
+                hidden: false,
+                header: HWND::default(),
+                shared: false,
+                compatibility: Default::default(),
+                relative: false,
+                virtual_cursor: None,
+                devices: Default::default(),
+                remote: RemoteWindow {
+                    key: WindowId {
+                        id: 42,
+                        generation: 1,
+                    },
+                    app_id: "test".into(),
+                    app_name: "Test".into(),
+                    title: "Remote window".into(),
+                    icon_png: None,
+                    parent: None,
+                    role: WindowRole::Window,
+                    bounds: Bounds {
+                        width: 440.,
+                        height: 320.,
+                        ..Default::default()
+                    },
+                    scale: 1.,
+                    resize: ResizeCapability::Supported,
+                    minimized: false,
+                    visible: true,
+                    modal: false,
+                    show_header: false,
+                },
+                frame: None,
+                events,
+                pref: Default::default(),
+                host: "test".into(),
+                icon: None,
+                status: String::new(),
+                last_title: String::new(),
+                command_status: None,
+                shared_notice: None,
+                pending_resize: None,
+                last_size: None,
+                visible: None,
+                forwarded: Default::default(),
+                surrogate: None,
+                renderer: None,
+                renderer_failed: false,
+                ready: false,
+                user_sizing: false,
+                maximized: false,
+                view_mode: ViewMode::Windows,
+                show_remote_cursor: true,
+                adb_enabled: false,
+                menu_items: vec![],
+                menu_ids: HashMap::new(),
+                menu_open: false,
+                pending_menu: None,
+            });
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                windows::core::w!("STATIC"),
+                windows::core::w!("Header regression"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                640,
+                480,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&mut *state as *mut Proxy) as isize);
+            install_remote_menu(hwnd, &mut state, vec![]);
+            let system = GetSystemMenu(hwnd, false);
+            AppendMenuW(
+                system,
+                header_menu_flags(&state),
+                SHOW_HEADER,
+                windows::core::w!("Show remote window header"),
+            )
+            .unwrap();
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            let mut frame = RECT::default();
+            GetWindowRect(hwnd, &mut frame).unwrap();
+            for visible in [true, false] {
+                state.forwarded.insert(4);
+                state.surrogate = Some(0xd800);
+                procedure(hwnd, WM_SYSCOMMAND, WPARAM(SHOW_HEADER), LPARAM(0));
+                assert!(matches!(
+                    received.try_recv().unwrap(),
+                    ClientEvent::ReleaseInput
+                ));
+                assert!(matches!(received.try_recv().unwrap(), ClientEvent::Action {
+                    window, action: WindowAction::SetHeader { visible: value }
+                } if window == state.remote.key && value == visible));
+                assert!(state.forwarded.is_empty() && state.surrogate.is_none());
+                // The host acknowledgement, rather than the click, owns the checkmark.
+                assert_eq!(state.remote.show_header, !visible);
+                let mut actual = state.remote.clone();
+                actual.show_header = visible;
+                state.update_remote(hwnd, actual);
+                {
+                    let menu = system;
+                    assert_eq!(
+                        GetMenuState(menu, SHOW_HEADER as u32, MF_BYCOMMAND) & MF_CHECKED.0,
+                        if visible { MF_CHECKED.0 } else { 0 }
+                    );
+                }
+                assert_eq!(GetWindowLongPtrW(hwnd, GWL_STYLE), style);
+                let mut after = RECT::default();
+                GetWindowRect(hwnd, &mut after).unwrap();
+                assert_eq!(
+                    (after.left, after.top, after.right, after.bottom),
+                    (frame.left, frame.top, frame.right, frame.bottom)
+                );
+            }
+            for shared in [false, true] {
+                state.shared = shared;
+                let mut actual = state.remote.clone();
+                actual.role = if shared {
+                    WindowRole::Window
+                } else {
+                    WindowRole::Desktop
+                };
+                state.update_remote(hwnd, actual);
+                assert_ne!(header_menu_flags(&state) & MF_GRAYED, MENU_ITEM_FLAGS(0));
+                procedure(hwnd, WM_SYSCOMMAND, WPARAM(SHOW_HEADER), LPARAM(0));
+                assert!(received.try_recv().is_err());
+            }
+            // Shared viewers never emit remote window actions, even if stale
+            // normal-mode preferences still request remote resizing.
+            state.shared = true;
+            state.ready = true;
+            state.user_sizing = true;
+            state.pref.mode = SizingMode::ResizeRemote;
+            state.forwarded.insert(0x1a);
+            procedure(hwnd, WM_SETFOCUS, WPARAM(0), LPARAM(0));
+            procedure(hwnd, WM_SIZE, WPARAM(0), LPARAM((320 << 16) | 440));
+            procedure(hwnd, WM_KILLFOCUS, WPARAM(0), LPARAM(0));
+            procedure(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+            let events: Vec<_> = std::iter::from_fn(|| received.try_recv().ok()).collect();
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !matches!(event, ClientEvent::Action { .. }))
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, ClientEvent::Disconnected))
+            );
+            assert!(state.forwarded.is_empty());
+            assert!(state.pending_resize.is_none());
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            DestroyWindow(hwnd).unwrap();
+        }
+    }
 }

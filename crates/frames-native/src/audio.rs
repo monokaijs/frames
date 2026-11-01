@@ -4,7 +4,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -49,9 +49,15 @@ pub fn loopback() -> anyhow::Result<AudioCapture> {
                     channels: config.channels(),
                 };
                 let stream = match config.sample_format() {
-                    cpal::SampleFormat::F32 => capture::<f32>(&device, config.into(), tx)?,
-                    cpal::SampleFormat::I16 => capture::<i16>(&device, config.into(), tx)?,
-                    cpal::SampleFormat::I32 => capture::<i32>(&device, config.into(), tx)?,
+                    cpal::SampleFormat::F32 => {
+                        capture::<f32>(&device, config.into(), tx, flag.clone())?
+                    }
+                    cpal::SampleFormat::I16 => {
+                        capture::<i16>(&device, config.into(), tx, flag.clone())?
+                    }
+                    cpal::SampleFormat::I32 => {
+                        capture::<i32>(&device, config.into(), tx, flag.clone())?
+                    }
                     _ => anyhow::bail!("unsupported system audio format"),
                 };
                 stream.play()?;
@@ -85,26 +91,62 @@ fn capture<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    stop: Arc<AtomicBool>,
 ) -> anyhow::Result<cpal::Stream>
 where
     T: cpal::SizedSample + cpal::Sample,
     f32: cpal::FromSample<T>,
 {
+    let maximum = config.sample_rate as usize * config.channels as usize * 400 / 1000;
+    let ring = Arc::new((
+        std::sync::Mutex::new(VecDeque::<f32>::with_capacity(maximum)),
+        std::sync::Condvar::new(),
+    ));
+    let worker = ring.clone();
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Acquire) {
+            let mut samples = worker.0.lock().unwrap();
+            while samples.is_empty() && !stop.load(Ordering::Acquire) {
+                samples = worker
+                    .1
+                    .wait_timeout(samples, std::time::Duration::from_millis(100))
+                    .unwrap()
+                    .0;
+            }
+            let bytes: Vec<u8> = samples.drain(..).flat_map(f32::to_le_bytes).collect();
+            drop(samples);
+            if !bytes.is_empty() {
+                let _ = tx.try_send(bytes);
+            }
+        }
+    });
     Ok(device.build_input_stream(
         config,
         move |samples: &[T], _| {
-            let bytes = samples
-                .iter()
-                .flat_map(|&value| cpal::Sample::to_sample::<f32>(value).to_le_bytes())
-                .collect();
-            let _ = tx.try_send(bytes);
+            if samples.len() > maximum {
+                return;
+            }
+            if let Ok(mut queue) = ring.0.try_lock() {
+                let excess = (queue.len() + samples.len()).saturating_sub(maximum);
+                queue.drain(..excess);
+                queue.extend(samples.iter().map(|&v| cpal::Sample::to_sample::<f32>(v)));
+                drop(queue);
+                ring.1.notify_one();
+            }
         },
         |error| tracing::warn!(%error,"audio capture"),
         None,
     )?)
 }
 
+#[derive(Default)]
+pub struct PlaybackStats {
+    pub underruns: AtomicU64,
+    pub dropped_samples: AtomicU64,
+}
+
 pub struct Playback {
+    pub stats: Arc<PlaybackStats>,
     pub format: PcmFormat,
     queue: Arc<parking_lot::Mutex<PlaybackQueue>>,
     _guard: Guard,
@@ -114,10 +156,16 @@ pub struct Playback {
 struct PlaybackQueue {
     samples: VecDeque<f32>,
     callback_samples: usize,
+    channels: usize,
+    phase: f64,
+    step: f64,
+    integral: f64,
+    stats: Arc<PlaybackStats>,
 }
 impl PlaybackQueue {
     fn push(&mut self, pcm: &[u8], format: PcmFormat) {
         let channels = format.channels as usize;
+        self.channels = channels;
         // Preserve whole interleaved frames, including when trimming a backlog.
         let frames = pcm.len() / (channels * 4);
         self.samples.extend(
@@ -129,14 +177,43 @@ impl PlaybackQueue {
         let max = self.callback_samples + jitter;
         let excess = self.samples.len().saturating_sub(max).div_ceil(channels) * channels;
         self.samples.drain(..excess);
+        self.stats
+            .dropped_samples
+            .fetch_add(excess as u64, Ordering::Relaxed);
+        let target = (self.callback_samples + jitter / 2).max(channels);
+        let error = (self.samples.len() as f64 - target as f64) / target as f64;
+        self.integral = (self.integral + error * 0.000001).clamp(-0.0008, 0.0008);
+        self.step = 1.0 + (error * 0.0004 + self.integral).clamp(-0.001, 0.001);
     }
 
     fn fill<T: cpal::Sample + cpal::FromSample<f32>>(&mut self, output: &mut [T]) {
         // Device callbacks may be longer than 20 ms. Retain enough audio for
         // their next request as well as the bounded network jitter allowance.
         self.callback_samples = self.callback_samples.max(output.len());
-        for sample in output {
-            *sample = cpal::Sample::from_sample(self.samples.pop_front().unwrap_or(0.0));
+        let channels = self.channels.max(1);
+        let mut underrun = false;
+        for frame in output.chunks_mut(channels) {
+            if self.samples.len() < channels {
+                for sample in frame {
+                    *sample = cpal::Sample::from_sample(0.0);
+                }
+                underrun = true;
+                continue;
+            }
+            for (channel, sample) in frame.iter_mut().enumerate() {
+                let a = self.samples[channel];
+                let b = self.samples.get(channels + channel).copied().unwrap_or(a);
+                *sample = cpal::Sample::from_sample(a + (b - a) * self.phase as f32);
+            }
+            self.phase += if self.step == 0.0 { 1.0 } else { self.step };
+            let consume = self.phase.floor() as usize;
+            self.phase -= consume as f64;
+            for _ in 0..consume.min(2) * channels {
+                self.samples.pop_front();
+            }
+        }
+        if underrun {
+            self.stats.underruns.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -145,6 +222,7 @@ impl Playback {
     pub fn new() -> anyhow::Result<Self> {
         let queue = Arc::new(parking_lot::Mutex::new(PlaybackQueue::default()));
         let samples = queue.clone();
+        let stats = queue.lock().stats.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));
         let guard = Guard(stop.clone());
@@ -159,6 +237,13 @@ impl Playback {
                     rate: config.sample_rate(),
                     channels: config.channels(),
                 };
+                {
+                    let mut queue = samples.lock();
+                    queue.channels = format.channels as usize;
+                    queue.samples = VecDeque::with_capacity(
+                        format.rate as usize * format.channels as usize / 4,
+                    );
+                }
                 let stream = match config.sample_format() {
                     cpal::SampleFormat::F32 => output::<f32>(&device, config.into(), samples)?,
                     cpal::SampleFormat::I16 => output::<i16>(&device, config.into(), samples)?,
@@ -185,6 +270,7 @@ impl Playback {
             .recv_timeout(std::time::Duration::from_secs(5))?
             .map_err(anyhow::Error::msg)?;
         Ok(Self {
+            stats,
             format,
             queue,
             _guard: guard,
@@ -202,10 +288,16 @@ fn output<T>(
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {
+    let stats = queue.lock().stats.clone();
     Ok(device.build_output_stream(
         config,
         move |samples: &mut [T], _| {
-            queue.lock().fill(samples);
+            if let Some(mut queue) = queue.try_lock() {
+                queue.fill(samples);
+            } else {
+                samples.fill(cpal::Sample::from_sample(0.0));
+                stats.underruns.fetch_add(1, Ordering::Relaxed);
+            }
         },
         |error| tracing::warn!(%error,"audio output"),
         None,
@@ -215,6 +307,43 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn playback_clock_tracks_faster_and_slower_devices_without_growing_a_backlog() {
+        let format = PcmFormat {
+            rate: 48_000,
+            channels: 2,
+        };
+        let pcm = |frames: usize| {
+            (0..frames)
+                .flat_map(|_| [0.25f32, -0.25])
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>()
+        };
+        let normal = pcm(480);
+        let faster = pcm(481);
+        let slower = pcm(479);
+        for changed in [&faster, &slower] {
+            let mut queue = PlaybackQueue::default();
+            let mut output = [0f32; 960];
+            queue.fill(&mut output);
+            queue.push(&normal, format);
+            queue.push(&normal, format);
+            let dropped = queue.stats.dropped_samples.load(Ordering::Relaxed);
+            let underruns = queue.stats.underruns.load(Ordering::Relaxed);
+            for n in 0..20_000 {
+                queue.fill(&mut output);
+                assert!(
+                    output
+                        .chunks_exact(2)
+                        .all(|p| p[0] == 0.25 && p[1] == -0.25)
+                );
+                queue.push(if n % 10 == 0 { changed } else { &normal }, format);
+            }
+            assert_eq!(queue.stats.dropped_samples.load(Ordering::Relaxed), dropped);
+            assert_eq!(queue.stats.underruns.load(Ordering::Relaxed), underruns);
+            assert!((960..=2880).contains(&queue.samples.len()));
+        }
+    }
 
     #[test]
     fn playback_retains_audio_for_callbacks_longer_than_twenty_milliseconds() {
