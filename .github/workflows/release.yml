@@ -81,7 +81,8 @@ jobs:
           python scripts/test_shared_lifecycle.py
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & target/shared-input/native/Release/shared_ipc_fixture.exe
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked -- --nocapture
+        timeout-minutes: 20
       - name: Shared game production session and network lease
         run: |
           cargo build -p frames --bin frames --example shared_probe --locked
@@ -145,7 +146,8 @@ jobs:
         run: python scripts/test_prepare_media_macos_deps.py
       - name: Prepare bundled media SDK
         run: bash scripts/prepare_media_macos.sh
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked -- --nocapture
+        timeout-minutes: 20
       - name: Swift checks
         run: |
           set -euo pipefail

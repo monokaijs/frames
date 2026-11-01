@@ -1,8 +1,13 @@
 use frames_core::{codec, media::RawFrame};
 use std::time::Duration;
 
+// These tests allocate multiple native encoder/decoder sessions. Run them
+// exclusively so a limited hardware codec service is not oversubscribed.
+static CODEC_SESSIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn recovery_keyframes_reuse_the_encoder_and_need_no_new_capture() {
+    let _sessions = CODEC_SESSIONS.lock().await;
     for capability in codec::probe().await {
         let (_capture, frames) = tokio::sync::watch::channel(Some(RawFrame {
             media_generation: 0,
@@ -62,6 +67,7 @@ async fn receiving_client_probes_all_decoders_without_an_encoder() {
 
 #[tokio::test]
 async fn every_advertised_codec_roundtrips_a_live_window_frame() {
+    let _sessions = CODEC_SESSIONS.lock().await;
     let capabilities = codec::probe().await;
     assert!(
         !capabilities.is_empty(),
@@ -142,6 +148,7 @@ async fn every_advertised_codec_roundtrips_a_live_window_frame() {
 
 #[tokio::test]
 async fn one_capture_encodes_and_decodes_without_a_later_capture_or_eof() {
+    let _sessions = CODEC_SESSIONS.lock().await;
     for capability in codec::probe().await {
         let codec = capability.codec;
         eprintln!("Single capture: {codec:?} with {:?}", capability.encoder);
