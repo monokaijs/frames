@@ -12,9 +12,22 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn release_native(desktop: &dyn Desktop, generation: Option<u64>) {
+    if let Some(generation) = generation {
+        desktop.shared_release(generation)
+    } else {
+        desktop.release_input()
+    }
+}
+
 enum Work {
+    Resume {
+        generation: u64,
+        deadline: Instant,
+    },
     Input {
         window: WindowId,
+        generation: Option<u64>,
         event: InputEvent,
         deadline: Instant,
     },
@@ -28,17 +41,6 @@ enum Work {
     },
     Release,
 }
-impl Work {
-    fn pointer(&self) -> bool {
-        matches!(
-            self,
-            Self::Input {
-                event: InputEvent::Pointer { .. },
-                ..
-            }
-        )
-    }
-}
 #[derive(Default)]
 struct Queue {
     items: VecDeque<Work>,
@@ -47,14 +49,44 @@ struct Queue {
 impl Queue {
     fn push(&mut self, work: Work) -> anyhow::Result<()> {
         anyhow::ensure!(!self.closed, "input worker stopped");
-        if work.pointer() && self.items.back().is_some_and(Work::pointer) {
-            self.items.pop_back();
+        if let (
+            Some(Work::Input {
+                window: old_window,
+                generation: old_generation,
+                event: old,
+                deadline: old_deadline,
+            }),
+            Work::Input {
+                window,
+                generation,
+                event,
+                deadline,
+            },
+        ) = (self.items.back_mut(), &work)
+        {
+            let old_relative = matches!(old, InputEvent::RelativeMotion { .. });
+            if old_window == window
+                && old_generation == generation
+                && (!old_relative || *old_deadline > Instant::now())
+                && old.coalesce(event)
+            {
+                *old_deadline = if old_relative {
+                    (*old_deadline).min(*deadline)
+                } else {
+                    *deadline
+                };
+                return Ok(());
+            }
         }
         if matches!(work, Work::Release) {
             self.items
                 .retain(|item| matches!(item, Work::Action { .. }));
         }
-        anyhow::ensure!(self.items.len() < 128, "host input queue overloaded");
+        if self.items.len() >= 128 {
+            self.items.clear();
+            self.items.push_back(Work::Release);
+            anyhow::bail!("host input queue overloaded; input paused");
+        }
         self.items.push_back(work);
         Ok(())
     }
@@ -72,6 +104,7 @@ impl Dispatcher {
     ) -> anyhow::Result<Self> {
         let shared = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
         let worker = shared.clone();
+        let session_generation = desktop.shared_session().map(|s| s.generation);
         std::thread::Builder::new()
             .name("frames-input".into())
             .spawn(move || {
@@ -89,12 +122,21 @@ impl Dispatcher {
                         queue.items.pop_front().unwrap()
                     };
                     match work {
+                        Work::Resume {
+                            generation,
+                            deadline,
+                        } => {
+                            if Instant::now() <= deadline {
+                                let _ = desktop.shared_resume(generation);
+                            }
+                        }
                         Work::Release => {
-                            desktop.release_input();
+                            release_native(desktop.as_ref(), session_generation);
                             pressed.release_all();
                         }
                         Work::Input {
                             window,
+                            generation,
                             event,
                             deadline,
                         } => {
@@ -102,9 +144,10 @@ impl Dispatcher {
                                 if matches!(
                                     event,
                                     InputEvent::Button { down: false, .. }
+                                        | InputEvent::RelativeButton { down: false, .. }
                                         | InputEvent::Key { down: false, .. }
                                 ) {
-                                    desktop.release_input();
+                                    release_native(desktop.as_ref(), session_generation);
                                     pressed.release_all();
                                 }
                                 continue;
@@ -113,15 +156,24 @@ impl Dispatcher {
                                 button,
                                 down: false,
                                 ..
+                            }
+                            | InputEvent::RelativeButton {
+                                button,
+                                down: false,
                             } = event
                                 && !pressed.button_is_down(button)
                             {
                                 continue;
                             }
-                            match desktop.input(window, &event) {
+                            let result = if let Some(generation) = generation {
+                                desktop.shared_input(window, generation, &event)
+                            } else {
+                                desktop.input(window, &event)
+                            };
+                            match result {
                                 Ok(()) => pressed.track(&event),
                                 Err(error) => {
-                                    desktop.release_input();
+                                    release_native(desktop.as_ref(), session_generation);
                                     pressed.release_all();
                                     let _ = out.blocking_send(Message::Ack {
                                         request: 0,
@@ -169,7 +221,7 @@ impl Dispatcher {
                     }
                 }
                 if release_on_close {
-                    desktop.release_input();
+                    release_native(desktop.as_ref(), session_generation);
                 }
             })?;
         Ok(Self {
@@ -187,9 +239,9 @@ impl Dispatcher {
     }
     fn push(&self, work: Work) -> anyhow::Result<()> {
         let (lock, ready) = &*self.shared;
-        lock.lock().unwrap().push(work)?;
+        let result = lock.lock().unwrap().push(work);
         ready.notify_one();
-        Ok(())
+        result
     }
     pub fn input(
         &self,
@@ -197,12 +249,35 @@ impl Dispatcher {
         event: InputEvent,
         elapsed_ms: u64,
     ) -> anyhow::Result<()> {
+        self.enqueue(window, None, event, elapsed_ms)
+    }
+    pub fn shared_input(
+        &self,
+        window: WindowId,
+        generation: u64,
+        event: InputEvent,
+        elapsed_ms: u64,
+    ) -> anyhow::Result<()> {
+        self.enqueue(window, Some(generation), event, elapsed_ms)
+    }
+    fn enqueue(
+        &self,
+        window: WindowId,
+        generation: Option<u64>,
+        event: InputEvent,
+        elapsed_ms: u64,
+    ) -> anyhow::Result<()> {
         let now = Instant::now();
-        let ttl = Duration::from_millis(if matches!(event, InputEvent::Pointer { .. }) {
-            150
-        } else {
-            750
-        });
+        let ttl = Duration::from_millis(
+            if matches!(
+                event,
+                InputEvent::Pointer { .. } | InputEvent::RelativeMotion { .. }
+            ) {
+                150
+            } else {
+                750
+            },
+        );
         let Some(epoch) = self.epoch else {
             return Ok(());
         };
@@ -214,6 +289,7 @@ impl Dispatcher {
         };
         self.push(Work::Input {
             window,
+            generation,
             event,
             deadline: deadline.min(now + ttl),
         })
@@ -238,6 +314,20 @@ impl Dispatcher {
     pub fn release(&self) -> anyhow::Result<()> {
         self.push(Work::Release)
     }
+    pub fn resume(&self, generation: u64, elapsed_ms: u64) -> anyhow::Result<()> {
+        let ttl = Duration::from_millis(300);
+        let Some(deadline) = self
+            .epoch
+            .and_then(|epoch| epoch.checked_add(Duration::from_millis(elapsed_ms)))
+            .and_then(|sent| sent.checked_add(ttl))
+        else {
+            return Ok(());
+        };
+        self.push(Work::Resume {
+            generation,
+            deadline: deadline.min(Instant::now() + ttl),
+        })
+    }
 }
 impl Drop for Dispatcher {
     fn drop(&mut self) {
@@ -252,8 +342,72 @@ impl Drop for Dispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn relative_motion_sums_only_within_one_target_generation_and_transition() {
+        let window = WindowId {
+            id: 1,
+            generation: 1,
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let relative = |generation| Work::Input {
+            window,
+            generation: Some(generation),
+            event: InputEvent::RelativeMotion { dx: 3, dy: -2 },
+            deadline,
+        };
+        let mut queue = Queue::default();
+        queue.push(relative(1)).unwrap();
+        queue.push(relative(1)).unwrap();
+        assert!(matches!(
+            queue.items.front(),
+            Some(Work::Input {
+                event: InputEvent::RelativeMotion { dx: 6, dy: -4 },
+                ..
+            })
+        ));
+        queue.push(relative(2)).unwrap();
+        assert_eq!(queue.items.len(), 2);
+        queue
+            .push(Work::Input {
+                window,
+                generation: Some(2),
+                event: InputEvent::Key {
+                    usage: 4,
+                    down: true,
+                },
+                deadline,
+            })
+            .unwrap();
+        queue.push(relative(2)).unwrap();
+        assert_eq!(queue.items.len(), 4);
+        queue.push(Work::Release).unwrap();
+        assert!(matches!(queue.items.front(), Some(Work::Release)));
+    }
+    #[test]
+    fn overload_discards_pending_presses_and_admits_release() {
+        let mut queue = Queue::default();
+        for _ in 0..128 {
+            queue
+                .push(Work::Resume {
+                    generation: 1,
+                    deadline: Instant::now(),
+                })
+                .unwrap();
+        }
+        assert!(
+            queue
+                .push(Work::Resume {
+                    generation: 1,
+                    deadline: Instant::now()
+                })
+                .is_err()
+        );
+        assert_eq!(queue.items.len(), 1);
+        assert!(matches!(queue.items.front(), Some(Work::Release)));
+    }
     fn motion(x: f64) -> Work {
         Work::Input {
+            generation: None,
             window: WindowId {
                 id: 1,
                 generation: 1,
@@ -274,6 +428,7 @@ mod tests {
         );
         queue
             .push(Work::Input {
+                generation: None,
                 window: WindowId {
                     id: 1,
                     generation: 1,
@@ -295,7 +450,7 @@ mod tests {
         assert!(matches!(queue.items.front(), Some(Work::Release)));
     }
     #[test]
-    fn stalled_native_call_does_not_replay_old_mouse_or_clicks() {
+    fn stalled_native_call_does_not_replay_old_mouse_clicks_or_resume() {
         struct Fake {
             entered: std::sync::mpsc::Sender<()>,
             seen: std::sync::mpsc::Sender<InputEvent>,
@@ -322,6 +477,14 @@ mod tests {
                 Ok(())
             }
             fn release_input(&self) {}
+            fn shared_resume(&self, generation: u64) -> anyhow::Result<()> {
+                self.seen
+                    .send(InputEvent::Text {
+                        text: format!("resume {generation}"),
+                    })
+                    .unwrap();
+                Ok(())
+            }
             fn capture(
                 &self,
                 _: WindowId,
@@ -342,6 +505,9 @@ mod tests {
         let (control, _rx) = tokio::sync::mpsc::channel(8);
         let (bulk, _bulk_rx) = tokio::sync::mpsc::channel(8);
         let out = Outbound {
+            devices: frames_core::devices::channel().0,
+            media: None,
+            realtime: control.clone(),
             input: control.clone(),
             control,
             bulk,
@@ -373,6 +539,7 @@ mod tests {
             .unwrap();
         waiting.recv_timeout(Duration::from_secs(1)).unwrap();
         dispatch.epoch = Instant::now().checked_sub(Duration::from_secs(2));
+        dispatch.resume(7, 0).unwrap();
         dispatch
             .input(window, InputEvent::Pointer { x: 0.1, y: 0.1 }, 0)
             .unwrap();
@@ -400,6 +567,7 @@ mod tests {
                 2000,
             )
             .unwrap();
+        dispatch.resume(7, 2000).unwrap();
         dispatch
             .input(window, InputEvent::Pointer { x: 0.8, y: 0.8 }, 2000)
             .unwrap();
@@ -409,6 +577,9 @@ mod tests {
         assert_eq!(dispatch.epoch, epoch);
         *gate.0.lock().unwrap() = true;
         gate.1.notify_one();
+        assert!(
+            matches!(received.recv_timeout(Duration::from_secs(1)).unwrap(), InputEvent::Text { text } if text == "resume 7")
+        );
         assert!(
             matches!(received.recv_timeout(Duration::from_secs(1)).unwrap(),InputEvent::Pointer{x,y} if x==0.8&&y==0.8)
         );

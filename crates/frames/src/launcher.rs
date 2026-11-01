@@ -18,6 +18,15 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[path = "device_catalog.rs"]
+mod device_catalog;
+#[path = "launcher_close.rs"]
+mod launcher_close;
+#[cfg(windows)]
+#[path = "launcher_tray.rs"]
+mod launcher_tray;
+#[path = "sharing_picker.rs"]
+mod sharing_picker;
 #[path = "window_style.rs"]
 mod window_style;
 
@@ -29,6 +38,33 @@ struct Preferences {
     #[serde(flatten)]
     options: SessionOptions,
     recent: Vec<Recent>,
+    close_behavior: CloseBehavior,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CloseBehavior {
+    #[default]
+    Ask,
+    Hide,
+    Quit,
+}
+impl CloseBehavior {
+    fn index(self) -> i32 {
+        match self {
+            Self::Ask => 0,
+            Self::Hide => 1,
+            Self::Quit => 2,
+        }
+    }
+    fn from_index(index: i32) -> Option<Self> {
+        match index {
+            0 => Some(Self::Ask),
+            1 => Some(Self::Hide),
+            2 => Some(Self::Quit),
+            _ => None,
+        }
+    }
 }
 /// Saved defaults are also used to build the CLI arguments for supervised sessions.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -133,6 +169,9 @@ impl Preferences {
     }
     fn save(&self) -> Result<()> {
         let path = Self::path()?;
+        self.save_to(&path)
+    }
+    fn save_to(&self, path: &std::path::Path) -> Result<()> {
         let temporary = path.with_extension("tmp");
         fs::write(&temporary, serde_json::to_vec_pretty(self)?)?;
         fs::rename(temporary, path)?;
@@ -172,13 +211,17 @@ fn endpoint(value: &str) -> Result<SocketAddr> {
     anyhow::bail!("Enter a numeric IP address, such as 192.168.1.10:47990 or [::1]:47990.")
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Device {
     name: String,
     address: String,
     detail: String,
     fingerprint: String,
     trusted: bool,
+    online: bool,
+    can_trust: bool,
+    preview_live: bool,
+    preview: Vec<u8>,
 }
 impl From<Device> for DeviceRow {
     fn from(value: Device) -> Self {
@@ -188,6 +231,10 @@ impl From<Device> for DeviceRow {
             detail: value.detail.into(),
             fingerprint: value.fingerprint.into(),
             trusted: value.trusted,
+            online: value.online,
+            can_trust: value.can_trust,
+            preview_live: value.preview_live,
+            preview: device_catalog::image(&value.preview),
         }
     }
 }
@@ -207,11 +254,12 @@ fn recent_rows(prefs: &Preferences) -> Vec<Device> {
                 _ => format!("{} days ago", minutes / 1440),
             };
             Device {
-                name: item.address.clone(),
+                name: "Remote device".into(),
                 address: item.address.clone(),
                 detail: when,
                 fingerprint: String::new(),
                 trusted: false,
+                ..Default::default()
             }
         })
         .collect()
@@ -233,27 +281,38 @@ fn trusted_rows() -> Result<Vec<Device>> {
             .into(),
             fingerprint: id,
             trusted: true,
+            ..Default::default()
         })
         .collect())
 }
 
 // Keep Slint types on the UI thread; only plain Rust values cross channels.
 enum Action {
-    Connect(String, bool, bool),
+    LoadShareWindows(u64),
+    CancelWindowPicker,
+    ShareWindows(i32, Vec<String>),
+    Connect(String, String, bool, bool),
     ToggleSharing,
     SaveSettings(SessionOptions),
+    SaveDeviceName(String),
+    SaveCloseBehavior(CloseBehavior, bool),
     Stop(i32),
     Discover,
     Refresh,
     Permission(String),
     Revoke(String),
+    Trust(String),
     ClearHistory,
     LoginItem,
     Shutdown,
 }
 enum Event {
+    ShareWindows(u64, Result<Vec<frames_native::SharingWindow>, String>),
+    ShareWindowPreview(u64, String, Option<Vec<u8>>),
     Notice(String, bool),
-    SettingsSaved(Result<(), String>),
+    SettingsSaved(SessionOptions, Result<(), String>),
+    DeviceNameSaved(String, Result<(), String>),
+    CloseBehaviorSaved(CloseBehavior, bool, Result<(), String>),
     Update(crate::update::Status),
     #[cfg(target_os = "macos")]
     SharingBlocked(String),
@@ -263,9 +322,49 @@ enum Event {
     Permissions(Result<serde_json::Value, String>),
     Sessions(Vec<(i32, String, String, bool)>),
 }
+
+fn bind_settings_autosave(ui: &Launcher, actions: mpsc::Sender<Action>) {
+    let weak = ui.as_weak();
+    ui.on_settings_edited(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_settings_status("".into());
+            ui.set_settings_error(false);
+            if actions
+                .send(Action::SaveSettings(SessionOptions::from_ui(&ui)))
+                .is_err()
+            {
+                ui.set_settings_error(true);
+                ui.set_settings_status(
+                    "Couldn't save settings: settings worker unavailable.".into(),
+                );
+            }
+        }
+    });
+}
+
+fn apply_settings_result(ui: &Launcher, options: &SessionOptions, result: Result<(), String>) {
+    // Edits remain available while saving; older results must not replace current feedback.
+    if *options != SessionOptions::from_ui(ui) {
+        return;
+    }
+    match result {
+        Ok(()) => {
+            ui.set_audio(options.audio);
+            ui.set_desktop(options.desktop);
+            ui.set_settings_error(false);
+            ui.set_settings_status("".into());
+        }
+        Err(error) => {
+            ui.set_settings_error(true);
+            ui.set_settings_status(format!("Couldn't save settings: {error}").into());
+        }
+    }
+}
+
 struct Session {
     id: i32,
     name: String,
+    address: String,
     detail: String,
     host: bool,
     child: Child,
@@ -278,14 +377,19 @@ impl Drop for Session {
     }
 }
 struct Worker {
+    sharing_choices: Vec<frames_native::SharingWindow>,
+    sharing_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     sessions: Vec<Session>,
     next_id: i32,
     preferences: Preferences,
     events: mpsc::Sender<Event>,
     discovering: bool,
+    devices: Vec<Device>,
+    last_discovery: std::time::Instant,
+    last_history_refresh: std::time::Instant,
     requested_permissions: BTreeSet<String>,
-    discovery_done: mpsc::Receiver<()>,
-    discovery_tx: mpsc::Sender<()>,
+    discovery_done: mpsc::Receiver<Result<Vec<Device>, String>>,
+    discovery_tx: mpsc::Sender<Result<Vec<Device>, String>>,
 }
 impl Worker {
     fn notice(&self, message: impl Into<String>, error: bool) {
@@ -299,13 +403,20 @@ impl Worker {
                 .collect(),
         ));
     }
-    fn refresh(&self) {
-        match trusted_rows() {
-            Ok(rows) => {
-                let _ = self.events.send(Event::Trusted(rows));
-            }
-            Err(error) => self.notice(format!("Couldn't load trusted devices: {error:#}"), true),
+    fn publish_devices(&self) {
+        if let Ok(nearby) = device_catalog::nearby(&self.devices) {
+            let _ = self.events.send(Event::Nearby(Ok(nearby)));
         }
+        match device_catalog::rows(&self.preferences, &self.devices) {
+            Ok((recent, trusted)) => {
+                let _ = self.events.send(Event::Recent(recent));
+                let _ = self.events.send(Event::Trusted(trusted));
+            }
+            Err(error) => self.notice(format!("Couldn't load devices: {error:#}"), true),
+        }
+    }
+    fn refresh(&self) {
+        self.publish_devices();
         #[cfg(target_os = "macos")]
         {
             let events = self.events.clone();
@@ -319,7 +430,14 @@ impl Worker {
             serde_json::json!({"screen_capture":true,"accessibility":true}),
         )));
     }
-    fn spawn(&mut self, args: &[String], name: String, host: bool, detail: String) -> Result<()> {
+    fn spawn(
+        &mut self,
+        args: &[String],
+        name: String,
+        host: bool,
+        detail: String,
+        expected_id: &str,
+    ) -> Result<()> {
         let id = self.next_id;
         self.next_id += 1;
         let log = frames_core::trust::config_dir()?.join(if host {
@@ -331,9 +449,14 @@ impl Worker {
         command
             .args(args)
             .env_remove("FRAMES_GUI_CHILD")
+            .env("FRAMES_LAUNCHER_PID", std::process::id().to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(fs::File::create(&log)?);
+        command.env_remove("FRAMES_EXPECTED_DEVICE_ID");
+        if !expected_id.is_empty() {
+            command.env("FRAMES_EXPECTED_DEVICE_ID", expected_id);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -343,6 +466,11 @@ impl Worker {
         self.sessions.push(Session {
             id,
             name,
+            address: if host {
+                String::new()
+            } else {
+                args.get(1).cloned().unwrap_or_default()
+            },
             detail,
             host,
             child,
@@ -353,22 +481,83 @@ impl Worker {
     }
     fn handle(&mut self, action: Action) -> Result<()> {
         match action {
-            Action::Connect(value, audio, desktop) => {
+            Action::LoadShareWindows(request) => sharing_picker::load(self, request),
+            Action::CancelWindowPicker => {
+                self.sharing_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                if !self.sessions.iter().any(|s| s.host) {
+                    self.sharing_choices.clear();
+                }
+            }
+            Action::ShareWindows(mode, windows) => {
+                anyhow::ensure!(
+                    !self.sessions.iter().any(|s| s.host),
+                    "Stop the current sharing session first"
+                );
+                anyhow::ensure!(
+                    (mode == 1 && !windows.is_empty() && windows.len() <= 32)
+                        || (mode == 2 && windows.len() == 1),
+                    "Choose the windows to share"
+                );
+                anyhow::ensure!(
+                    windows
+                        .iter()
+                        .all(|argument| self.sharing_choices.iter().any(|choice| choice
+                            .selection
+                            .as_ref()
+                            .is_some_and(|selection| selection.argument() == *argument))),
+                    "Refresh the window selection before sharing"
+                );
+                let mut args = self.preferences.options.sharing_args();
+                if mode == 2 {
+                    args.push("--one-window".into());
+                }
+                for argument in windows {
+                    args.extend(["--share-window".into(), argument]);
+                }
+                self.spawn(
+                    &args,
+                    "This device".into(),
+                    true,
+                    if mode == 2 {
+                        "One window"
+                    } else {
+                        "Selected windows"
+                    }
+                    .into(),
+                    "",
+                )?;
+                self.notice("Sharing started with the windows you selected.", false);
+            }
+            Action::Connect(value, expected_id, audio, desktop) => {
                 let address = endpoint(&value)?;
                 anyhow::ensure!(
                     !self
                         .sessions
                         .iter()
-                        .any(|s| !s.host && s.name == address.to_string()),
+                        .any(|s| !s.host && s.address == address.to_string()),
                     "A connection to this address is already running. Manage it under Your sessions."
                 );
                 let mut options = self.preferences.options.clone();
                 options.audio = audio;
                 options.desktop = desktop;
                 let args = options.connection_args(address);
+                let name = self
+                    .devices
+                    .iter()
+                    .find(|d| d.address == address.to_string())
+                    .map(|d| d.name.clone())
+                    .or_else(|| {
+                        crate::connection_history::load()
+                            .ok()?
+                            .into_iter()
+                            .find(|c| c.address == address.to_string())
+                            .map(|c| c.name)
+                    })
+                    .unwrap_or_else(|| "Remote device".into());
                 self.spawn(
                     &args,
-                    address.to_string(),
+                    name,
                     false,
                     format!(
                         "Starting · {}{}",
@@ -379,11 +568,10 @@ impl Worker {
                         },
                         if audio { " · host audio" } else { "" }
                     ),
+                    &expected_id,
                 )?;
                 self.preferences.remember(address);
-                let _ = self
-                    .events
-                    .send(Event::Recent(recent_rows(&self.preferences)));
+                self.publish_devices();
                 if let Err(error) = self.preferences.save() {
                     self.notice(
                         format!("Session started, but history couldn't be saved: {error:#}"),
@@ -397,13 +585,31 @@ impl Worker {
                 let result = (|| -> Result<()> {
                     options.validate()?;
                     let mut preferences = self.preferences.clone();
-                    preferences.options = options;
+                    preferences.options = options.clone();
                     preferences.save()?;
                     self.preferences = preferences;
                     Ok(())
                 })()
                 .map_err(|error| format!("{error:#}"));
-                let _ = self.events.send(Event::SettingsSaved(result));
+                let _ = self.events.send(Event::SettingsSaved(options, result));
+            }
+            Action::SaveDeviceName(name) => {
+                let result =
+                    frames_native::set_device_name(&name).map_err(|error| format!("{error:#}"));
+                let _ = self.events.send(Event::DeviceNameSaved(name, result));
+            }
+            Action::SaveCloseBehavior(behavior, close_after) => {
+                let result = (|| -> Result<()> {
+                    let mut preferences = self.preferences.clone();
+                    preferences.close_behavior = behavior;
+                    preferences.save()?;
+                    self.preferences = preferences;
+                    Ok(())
+                })()
+                .map_err(|error| format!("{error:#}"));
+                let _ = self
+                    .events
+                    .send(Event::CloseBehaviorSaved(behavior, close_after, result));
             }
             Action::ToggleSharing => {
                 if let Some(index) = self.sessions.iter().position(|s| s.host) {
@@ -441,6 +647,7 @@ impl Worker {
                             "Ask to connect"
                         }
                         .into(),
+                        "",
                     )?;
                     self.notice("Sharing started. New devices must be approved with a matching pairing code.", false);
                 }
@@ -458,53 +665,10 @@ impl Worker {
                     return Ok(());
                 }
                 self.discovering = true;
-                let events = self.events.clone();
+                self.last_discovery = std::time::Instant::now();
                 let done = self.discovery_tx.clone();
                 std::thread::spawn(move || {
-                    let result = (|| -> Result<Vec<Device>> {
-                        let runtime = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()?;
-                        let services = runtime.block_on(frames_core::discovery::browse(3))?;
-                        let mut devices = Vec::new();
-                        for service in services {
-                            let name = service["name"]
-                                .as_str()
-                                .unwrap_or("Frames device")
-                                .trim_end_matches("._frames._udp.local.")
-                                .to_owned();
-                            let Some(port) =
-                                service["port"].as_u64().and_then(|p| u16::try_from(p).ok())
-                            else {
-                                continue;
-                            };
-                            if let Some(addresses) = service["addresses"].as_array() {
-                                for value in addresses {
-                                    if let Some(ip) =
-                                        value.as_str().and_then(|s| s.parse::<IpAddr>().ok())
-                                    {
-                                        devices.push(Device {
-                                            name: name.clone(),
-                                            address: SocketAddr::new(ip, port).to_string(),
-                                            detail: "Nearby · verify pairing before connecting"
-                                                .into(),
-                                            fingerprint: service["device"]
-                                                .as_str()
-                                                .unwrap_or_default()
-                                                .into(),
-                                            trusted: false,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        devices.sort_by(|a, b| a.name.cmp(&b.name).then(a.address.cmp(&b.address)));
-                        devices.dedup_by(|a, b| a.address == b.address);
-                        Ok(devices)
-                    })()
-                    .map_err(|e| format!("{e:#}"));
-                    let _ = events.send(Event::Nearby(result));
-                    let _ = done.send(());
+                    let _ = done.send(device_catalog::scan().map_err(|e| format!("{e:#}")));
                 });
             }
             Action::Refresh => self.refresh(),
@@ -525,12 +689,30 @@ impl Worker {
                     "That device is no longer in the trust store."
                 );
                 self.refresh();
+                if let Ok(path) = crate::connection_history::preview_path(&id, false) {
+                    let _ = fs::remove_file(path);
+                }
                 self.notice(
                     "Device access revoked. Disconnect any running session separately.",
                     false,
                 );
             }
+            Action::Trust(id) => {
+                let connection = crate::connection_history::load()?
+                    .into_iter()
+                    .find(|c| c.device_id == id)
+                    .context("Connect and verify this device before saving trust.")?;
+                TrustStore::load()?.approve(
+                    id,
+                    connection.name,
+                    self.preferences.options.unattended,
+                    connection.incoming,
+                )?;
+                self.refresh();
+                self.notice("Device saved as trusted.", false);
+            }
             Action::ClearHistory => {
+                crate::connection_history::clear()?;
                 let mut preferences = self.preferences.clone();
                 preferences.recent.clear();
                 preferences.save()?;
@@ -557,10 +739,43 @@ impl Worker {
         Ok(())
     }
     fn poll(&mut self) {
-        if self.discovery_done.try_recv().is_ok() {
+        if let Ok(result) = self.discovery_done.try_recv() {
             self.discovering = false;
+            match result {
+                Ok(devices) => {
+                    self.devices = devices;
+                    let _ = self.events.send(Event::Nearby(Ok(self
+                        .devices
+                        .iter()
+                        .filter(|d| d.online)
+                        .cloned()
+                        .collect())));
+                    self.publish_devices();
+                }
+                Err(error) => {
+                    let _ = self.events.send(Event::Nearby(Err(error)));
+                }
+            }
+        }
+        if !self.discovering && self.last_discovery.elapsed() >= Duration::from_secs(12) {
+            let _ = self.handle(Action::Discover);
         }
         let mut changed = false;
+        if self.last_history_refresh.elapsed() >= Duration::from_secs(2) {
+            self.last_history_refresh = std::time::Instant::now();
+            if let Ok(history) = crate::connection_history::load() {
+                for session in &mut self.sessions {
+                    if !session.host
+                        && let Some(peer) = history.iter().find(|p| p.address == session.address)
+                        && session.name != peer.name
+                    {
+                        session.name = peer.name.clone();
+                        changed = true;
+                    }
+                }
+            }
+            self.publish_devices();
+        }
         let mut index = 0;
         while index < self.sessions.len() {
             match self.sessions[index].child.try_wait() {
@@ -685,6 +900,8 @@ fn local_address() -> String {
 pub fn run() -> Result<()> {
     window_style::initialize()?;
     let ui = Launcher::new()?;
+    #[cfg(windows)]
+    let mut tray = launcher_tray::LauncherTray::new()?;
     ui.set_app_version(env!("CARGO_PKG_VERSION").into());
     ui.on_filter_devices(|rows, query| {
         let query = query.trim().to_lowercase();
@@ -699,19 +916,13 @@ pub fn run() -> Result<()> {
         )
     });
     ui.set_mac(cfg!(target_os = "macos"));
-    ui.set_device_name(
-        std::env::var("COMPUTERNAME")
-            .or_else(|_| std::env::var("HOSTNAME"))
-            .unwrap_or_else(|_| {
-                if cfg!(target_os = "macos") {
-                    "This Mac"
-                } else {
-                    "This PC"
-                }
-                .into()
-            })
+    ui.set_device_name(frames_native::device_name().into());
+    ui.set_device_name_edit(
+        frames_native::device_name_override()?
+            .unwrap_or_default()
             .into(),
     );
+    ui.set_system_device_name(frames_native::system_device_name().into());
     ui.set_local_address(local_address().into());
     let preferences = match Preferences::load() {
         Ok(prefs) => prefs,
@@ -742,6 +953,7 @@ pub fn run() -> Result<()> {
     ));
     let (actions, action_rx) = mpsc::channel();
     let (events, event_rx) = mpsc::channel();
+    let close_behavior = launcher_close::bind(&ui, preferences.close_behavior, actions.clone());
     let update_events = events.clone();
     let update_requests = crate::update::start(move |status| {
         let _ = update_events.send(Event::Update(status));
@@ -767,11 +979,16 @@ pub fn run() -> Result<()> {
     let worker = std::thread::spawn(move || {
         let (discovery_tx, discovery_done) = mpsc::channel();
         let mut worker = Worker {
+            sharing_choices: Vec::new(),
+            sharing_generation: sharing_picker::generation(),
             sessions: Vec::new(),
             next_id: 1,
             preferences,
             events,
             discovering: false,
+            devices: Vec::new(),
+            last_discovery: std::time::Instant::now() - Duration::from_secs(12),
+            last_history_refresh: std::time::Instant::now(),
             requested_permissions: BTreeSet::new(),
             discovery_tx,
             discovery_done,
@@ -804,6 +1021,7 @@ pub fn run() -> Result<()> {
         if let Some(ui) = weak.upgrade() {
             let _ = tx.send(Action::Connect(
                 address.to_string(),
+                String::new(),
                 ui.get_audio(),
                 ui.get_desktop(),
             ));
@@ -811,15 +1029,50 @@ pub fn run() -> Result<()> {
     });
     let weak = ui.as_weak();
     let tx = actions.clone();
-    ui.on_save_settings(move || {
+    ui.on_connect_device(move |address, id| {
         if let Some(ui) = weak.upgrade() {
-            ui.set_settings_saving(true);
-            let _ = tx.send(Action::SaveSettings(SessionOptions::from_ui(&ui)));
+            let _ = tx.send(Action::Connect(
+                address.to_string(),
+                id.to_string(),
+                ui.get_audio(),
+                ui.get_desktop(),
+            ));
+        }
+    });
+    bind_settings_autosave(&ui, actions.clone());
+    let tx = actions.clone();
+    let weak = ui.as_weak();
+    ui.on_device_name_edited(move || {
+        if let Some(ui) = weak.upgrade() {
+            let name = ui.get_device_name_edit();
+            let weak = weak.clone();
+            let tx = tx.clone();
+            slint::Timer::single_shot(Duration::from_millis(450), move || {
+                if let Some(ui) = weak.upgrade()
+                    && ui.get_device_name_edit() == name
+                {
+                    let _ = tx.send(Action::SaveDeviceName(name.to_string()));
+                }
+            });
         }
     });
     let tx = actions.clone();
+    ui.on_trust(move |id| {
+        let _ = tx.send(Action::Trust(id.to_string()));
+    });
+    let tx = actions.clone();
+    sharing_picker::bind(&ui, actions.clone());
+    let weak = ui.as_weak();
     ui.on_toggle_sharing(move || {
-        let _ = tx.send(Action::ToggleSharing);
+        if let Some(ui) = weak.upgrade() {
+            if ui.get_sharing() || ui.get_share_mode() == 0 {
+                let _ = tx.send(Action::ToggleSharing);
+            } else {
+                ui.set_window_picker_open(true);
+                ui.set_share_search("".into());
+                ui.invoke_load_share_windows();
+            }
+        }
     });
     let weak = ui.as_weak();
     let tx = actions.clone();
@@ -855,11 +1108,15 @@ pub fn run() -> Result<()> {
     });
     let weak = ui.as_weak();
     let timer = slint::Timer::default();
+    #[cfg(windows)]
+    let tray_actions = actions.clone();
     let mut permission_notice = false;
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(100), move || {
         let Some(ui) = weak.upgrade() else { return; };
         for event in event_rx.try_iter() {
             match event {
+                Event::ShareWindows(request,result)=>sharing_picker::apply_windows(&ui,request,result),
+                Event::ShareWindowPreview(request,id,bytes)=>sharing_picker::apply_preview(&ui,request,id,bytes),
                 Event::Update(status) => {
                     use crate::update::Status;
                     ui.set_update_busy(matches!(status, Status::Checking | Status::Downloading(..)));
@@ -883,22 +1140,16 @@ pub fn run() -> Result<()> {
                     ui.set_status(if error { "Action needed — see the message above" } else { "Ready · direct encrypted connections" }.into());
                     ui.set_status_error(error);
                 }
-                Event::SettingsSaved(result) => {
-                    ui.set_settings_saving(false);
-                    match result {
-                        Ok(()) => {
-                            ui.set_audio(ui.get_default_audio());
-                            ui.set_desktop(ui.get_default_desktop());
-                            ui.set_settings_dirty(false);
-                            ui.set_settings_error(false);
-                            ui.set_settings_status("Saved. Changes apply to new sessions.".into());
-                        }
-                        Err(error) => {
-                            ui.set_settings_error(true);
-                            ui.set_settings_status(format!("Couldn't save settings: {error}").into());
+                Event::SettingsSaved(options, result) => apply_settings_result(&ui, &options, result),
+                Event::CloseBehaviorSaved(behavior,close_after,result)=>launcher_close::apply_saved(&ui,&close_behavior,behavior,close_after,result),
+                Event::DeviceNameSaved(name,result)=>{
+                    if ui.get_device_name_edit().as_str()==name {
+                        match result {
+                            Ok(())=>{ui.set_device_name(frames_native::device_name().into());ui.set_settings_status("".into());ui.set_settings_error(false);}
+                            Err(error)=>{ui.set_settings_status(format!("Couldn't save device name: {error}").into());ui.set_settings_error(true);}
                         }
                     }
-                }
+                },
                 #[cfg(target_os = "macos")]
                 Event::SharingBlocked(message) => {
                     permission_notice = true;
@@ -912,7 +1163,6 @@ pub fn run() -> Result<()> {
                     ui.set_discovering(false);
                     match result {
                         Ok(rows) => {
-                            if rows.is_empty() { ui.set_notice("No nearby hosts found. Start sharing on the other device, or enter its IP address.".into()); ui.set_notice_error(false); }
                             ui.set_nearby(model(rows.into_iter().map(Into::into).collect()));
                         }
                         Err(error) => { ui.set_notice(format!("Network discovery failed: {error}").into()); ui.set_notice_error(true); }
@@ -951,7 +1201,12 @@ pub fn run() -> Result<()> {
                 }
             }
         }
+        #[cfg(windows)]
+        tray.poll(&ui, &tray_actions);
     });
+    #[cfg(windows)]
+    let result = ui.show().and_then(|_| slint::run_event_loop_until_quit());
+    #[cfg(not(windows))]
     let result = ui.run();
     let _ = actions.send(Action::Shutdown);
     let _ = worker.join();
@@ -964,7 +1219,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registered_but_stopped_login_sharing_allows_unattended_settings() {
+    fn settings_autosave_and_respect_running_sharing() {
         struct Headless;
         impl slint::platform::Platform for Headless {
             fn create_window_adapter(
@@ -979,6 +1234,34 @@ mod tests {
         }
         slint::platform::set_platform(Box::new(Headless)).unwrap();
         let ui = Launcher::new().unwrap();
+        let (actions, saves) = mpsc::channel();
+        bind_settings_autosave(&ui, actions);
+        ui.set_default_audio(true);
+        ui.invoke_settings_edited();
+        let Action::SaveSettings(first) = saves.try_recv().unwrap() else {
+            panic!("Every settings edit must immediately queue a save");
+        };
+        assert!(first.audio);
+        ui.set_default_desktop(true);
+        ui.invoke_settings_edited();
+        let Action::SaveSettings(latest) = saves.try_recv().unwrap() else {
+            panic!("Further edits must remain available while saving");
+        };
+        assert!(latest.audio && latest.desktop);
+        apply_settings_result(&ui, &first, Err("outdated failure".into()));
+        assert!(ui.get_settings_status().is_empty());
+        apply_settings_result(&ui, &latest, Err("disk full".into()));
+        assert!(ui.get_settings_error());
+        assert!(ui.get_settings_status().contains("disk full"));
+        apply_settings_result(&ui, &first, Ok(()));
+        assert!(
+            ui.get_settings_error(),
+            "Older saves must not clear current errors"
+        );
+        apply_settings_result(&ui, &latest, Ok(()));
+        assert!(ui.get_audio() && ui.get_desktop());
+        assert!(!ui.get_settings_error());
+        assert!(ui.get_settings_status().is_empty());
         ui.set_background_sharing_registered(true);
         ui.set_background_sharing_running(false);
         assert!(ui.get_unattended_editable());
@@ -1018,11 +1301,29 @@ mod tests {
         assert_eq!(preferences.options.codec, "auto");
         assert_eq!(preferences.options.max_streams, 8);
         assert_eq!(preferences.recent.len(), 1);
+        assert_eq!(preferences.close_behavior, CloseBehavior::Ask);
         preferences.options.validate().unwrap();
         let restored: Preferences =
             serde_json::from_slice(&serde_json::to_vec(&preferences).unwrap()).unwrap();
         assert_eq!(restored.options, preferences.options);
         assert_eq!(restored.recent[0].address, preferences.recent[0].address);
+    }
+
+    #[test]
+    fn close_behavior_is_saved_with_existing_connection_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("launcher.json");
+        let mut preferences = Preferences::default();
+        preferences.options.audio = true;
+        preferences.remember("127.0.0.1:47990".parse().unwrap());
+        for behavior in [CloseBehavior::Hide, CloseBehavior::Quit, CloseBehavior::Ask] {
+            preferences.close_behavior = behavior;
+            preferences.save_to(&path).unwrap();
+            let restored: Preferences = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(restored.close_behavior, behavior);
+            assert!(restored.options.audio);
+            assert_eq!(restored.recent[0].address, "127.0.0.1:47990");
+        }
     }
 
     #[test]

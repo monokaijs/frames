@@ -1,8 +1,134 @@
 import { LineEdit, ScrollView, ComboBox, SpinBox } from "std-widgets.slint";
-import { Theme, Glyph, AppButton, AppSwitch, AppCheckBox, NavItem, TabItem, Badge, Card, SectionTitle, MutedText } from "components.slint";
+import { Theme, Glyph, AppButton, AppSwitch, AppCheckBox, NavItem, TabItem, Badge, Card, SectionTitle, MutedText, ModalFocus } from "components.slint";
 
-export struct DeviceRow { name: string, address: string, detail: string, fingerprint: string, trusted: bool }
+export struct DeviceRow { name: string, address: string, detail: string, fingerprint: string, trusted: bool, online: bool, can-trust: bool, preview: image, preview-live: bool }
 export struct SessionRow { id: int, name: string, detail: string, hosting: bool }
+export struct ShareWindowRow { id: string, title: string, app: string, detail: string, preview: image, selected: bool, available: bool }
+
+component ShareWindowGrid inherits Rectangle {
+    in property <[ShareWindowRow]> windows;
+    callback toggle(string);
+    private property <int> columns: root.width > 720px ? 3 : 2;
+    private property <length> card-width: (root.width - (root.columns - 1) * 14px) / root.columns;
+    private property <length> preview-height: root.card-width * 9 / 16;
+    private property <length> card-height: root.preview-height + 58px;
+    height: ceil(root.windows.length / root.columns) * (root.card-height + 14px);
+    for item[index] in root.windows: Rectangle {
+        x: mod(index,root.columns) * (root.card-width + 14px); y: floor(index/root.columns) * (root.card-height + 14px);
+        width: root.card-width; height: root.card-height;
+        background: item.selected ? #f0f2f6 : white;
+        border-width: item.selected ? 2px : 1px; border-color: item.selected ? #30343b : Theme.line; border-radius: 8px;
+        Rectangle {
+            x: 3px; y: 3px; width: parent.width - 6px; height: root.preview-height - 4px; background: #edf0f4;
+            if item.preview.width > 0: Image { width: parent.width; height: parent.height; source: item.preview; image-fit: contain; }
+            if item.preview.width == 0: VerticalLayout { alignment: center; spacing: 8px;
+                HorizontalLayout { alignment: center; Glyph { source: @image-url("icons/display.svg"); width: 26px; height: 26px; colorize: #a0a7b2; } }
+                Text { text: item.detail; color: Theme.muted; font-size: 11px; horizontal-alignment: center; }
+            }
+        }
+        VerticalLayout { x: 12px; y: root.preview-height + 6px; width: parent.width - 50px; height: 40px; spacing: 3px;
+            Text { text: item.title; color: Theme.ink; font-size: 12px; font-weight: 600; overflow: elide; }
+            Text { text: item.app; color: Theme.muted; font-size: 11px; overflow: elide; }
+        }
+        Rectangle { x: parent.width - 30px; y: root.preview-height + 15px; width: 16px; height: 16px; border-radius: 4px; border-width: 1px; border-color: item.selected ? #30343b : #b9bec8; background: item.selected ? #30343b : white;
+            if item.selected: Glyph { x: 2px; y: 2px; width: 12px; height: 12px; source: @image-url("icons/check.svg"); colorize: white; }
+        }
+        focus := FocusScope { enabled: item.available; key-pressed(event) => { if event.text == " " || event.text == Key.Return { root.toggle(item.id); return accept; } return reject; } }
+        TouchArea { enabled: item.available; mouse-cursor: pointer; clicked => { focus.focus(); root.toggle(item.id); } }
+        accessible-role: checkbox; accessible-checkable: true; accessible-label: item.app + ": " + item.title; accessible-checked: item.selected;
+    }
+}
+
+component DeviceGrid inherits Rectangle {
+    in property <[DeviceRow]> devices;
+    callback connect(string, string);
+    callback trust(string);
+    callback revoke(string, string);
+    private property <int> columns: root.width > 720px ? 3 : root.width > 440px ? 2 : 1;
+    private property <length> card-width: (root.width - (root.columns - 1) * 14px) / root.columns;
+    private property <length> preview-height: (root.card-width - 2px) * 9 / 16;
+    private property <length> card-height: root.preview-height + 58px;
+    height: root.devices.length == 0 ? 0px : ceil(root.devices.length / root.columns) * (root.card-height + 14px) - 14px;
+    for device[index] in root.devices: Card {
+        x: mod(index, root.columns) * (root.card-width + 14px);
+        y: floor(index / root.columns) * (root.card-height + 14px);
+        width: root.card-width;
+        height: root.card-height;
+        border-radius: 8px;
+        clip: true;
+        Rectangle {
+            x: 1px; y: 1px; width: parent.width - 2px; height: root.preview-height;
+            background: #354151;
+            if device.preview.width > 0: Image {
+                x: 0px; y: 0px; source: device.preview;
+                image-fit: cover; width: parent.width; height: parent.height;
+            }
+            if device.preview.width == 0: Glyph {
+                source: @image-url("icons/display.svg"); colorize: #ffffff70;
+                width: 28px; height: 28px;
+                x: (parent.width - self.width) / 2;
+                y: max(12px, (parent.height - 64px - self.height) / 2);
+            }
+            Rectangle {
+                x: 0px; y: 0px; width: parent.width; height: parent.height;
+                background: @linear-gradient(0deg, #10151df0 0%, #10151d90 35%, #10151d00 80%);
+            }
+            VerticalLayout {
+                x: 12px; y: parent.height - 56px; width: parent.width - 24px; height: 44px;
+                spacing: 4px;
+                Text { height: 22px; text: device.name; color: white; font-size: 14px; font-weight: 600; overflow: elide; vertical-alignment: center; }
+                Rectangle {
+                    height: 18px;
+                    Rectangle { x: 0px; y: (parent.height - 6px) / 2; width: 6px; height: 6px; border-radius: 3px; background: device.online ? #69dda6 : #c2c9d2; }
+                    Text { x: 12px; y: 0px; height: parent.height; width: self.preferred-width; text: device.online ? "Online" : "Offline"; color: #ffffffde; font-size: 11px; vertical-alignment: center; }
+                    Text { x: parent.width - self.width; y: 0px; height: parent.height; width: self.preferred-width; text: device.trusted ? "Trusted" : device.can-trust ? "Session only" : "New device"; color: #ffffffb8; font-size: 10px; vertical-alignment: center; }
+                }
+            }
+        }
+        Rectangle {
+            x: 1px; y: root.preview-height + 1px; width: parent.width - 2px; height: 56px;
+            background: white;
+            HorizontalLayout {
+                x: 12px; y: 12px; width: parent.width - 24px; height: 32px;
+                spacing: 8px;
+                AppButton { label: "Connect"; enabled: device.address != ""; clicked => { root.connect(device.address, device.fingerprint); } }
+                Rectangle { horizontal-stretch: 1; }
+                if device.can-trust: AppButton { label: "Trust device"; quiet: true; clicked => { root.trust(device.fingerprint); } }
+                if device.trusted: AppButton { label: "Revoke"; quiet: true; danger: true; clicked => { root.revoke(device.fingerprint, device.name); } }
+            }
+        }
+        // The software renderer does not round child clips. Keep the same
+        // corner outline there, then draw the card border above the preview.
+        Image {
+            x: 0px; y: 0px; width: 8px; height: 8px;
+            source: @image-url("icons/card-corner-top-left.svg");
+            colorize: Theme.canvas;
+        }
+        Image {
+            x: parent.width - 8px; y: 0px; width: 8px; height: 8px;
+            source: @image-url("icons/card-corner-top-right.svg");
+            colorize: Theme.canvas;
+        }
+        Rectangle {
+            x: 0px; y: 0px; width: parent.width; height: parent.height;
+            background: transparent; border-radius: 8px;
+            border-width: 1px; border-color: Theme.line;
+        }
+    }
+}
+
+component EmptyState inherits Rectangle {
+    in property <image> icon;
+    in property <string> title;
+    in property <string> detail;
+    min-height: 128px;
+    VerticalLayout {
+        padding-top: 16px; padding-bottom: 16px; spacing: 8px; alignment: center;
+        HorizontalLayout { alignment: center; Glyph { source: root.icon; width: 28px; height: 28px; colorize: #9ba3b0; } }
+        Text { text: root.title; color: Theme.ink; font-size: 12px; horizontal-alignment: center; }
+        if root.detail != "": MutedText { text: root.detail; font-size: 11px; horizontal-alignment: center; }
+    }
+}
 
 component PermissionRow inherits Rectangle {
     in property <image> icon;
@@ -22,9 +148,22 @@ component PermissionRow inherits Rectangle {
     Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: Theme.line; }
 }
 
+component SettingsSection inherits VerticalLayout {
+    in property <string> title;
+    spacing: 8px;
+    SectionTitle { text: root.title; height: 22px; font-size: 13px; font-weight: 600; }
+    Card {
+        VerticalLayout {
+            padding-left: 18px; padding-right: 18px; spacing: 0px;
+            @children
+        }
+    }
+}
+
 component SettingRow inherits Rectangle {
     in property <string> title;
     in property <string> detail;
+    in property <bool> divider: true;
     min-height: 66px;
     HorizontalLayout {
         spacing: 24px;
@@ -35,7 +174,7 @@ component SettingRow inherits Rectangle {
         }
         VerticalLayout { horizontal-stretch: 0; alignment: center; @children }
     }
-    Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: Theme.line; }
+    if root.divider: Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: Theme.line; }
 }
 
 export component Launcher inherits Window {
@@ -59,12 +198,30 @@ export component Launcher inherits Window {
     in-out property <bool> clipboard: true;
     in-out property <int> codec: 0;
     in-out property <int> max-streams: 8;
-    in-out property <bool> settings-dirty: false;
-    in-out property <bool> settings-saving: false;
     in-out property <string> settings-status;
     in-out property <bool> settings-error: false;
+    in-out property <int> close-behavior: 0;
+    in-out property <bool> close-prompt-open: false;
+    in-out property <bool> remember-close: false;
+    in-out property <bool> close-busy: false;
+    in-out property <string> close-error;
+    callback close-behavior-edited(int);
+    callback close-choice(int, bool);
     in-out property <bool> permissions-open: false;
     in property <bool> sharing: false;
+    in-out property <int> share-mode: 0;
+    in-out property <bool> window-picker-open: false;
+    in-out property <int> window-picker-generation: 0;
+    in property <bool> window-picker-loading: false;
+    in property <string> window-picker-error;
+    in property <[ShareWindowRow]> share-windows;
+    in property <int> share-selected-count: 0;
+    in-out property <string> share-search;
+    callback load-share-windows();
+    callback toggle-share-window(string);
+    callback confirm-share-windows();
+    callback cancel-share-windows();
+    pure callback filter-share-windows([ShareWindowRow],string)->[ShareWindowRow];
     in property <bool> background-sharing-registered: false;
     in property <bool> background-sharing-running: false;
     out property <bool> unattended-editable: !root.sharing && !root.background-sharing-running;
@@ -74,6 +231,10 @@ export component Launcher inherits Window {
     in property <int> control-permission: -1;
     in property <string> control-label: "Accessibility";
     in property <string> device-name: "This device";
+    in-out property <string> device-name-edit;
+    in property <string> system-device-name;
+    callback device-name-edited();
+    callback trust(string);
     in property <string> local-address;
     in-out property <string> status;
     in-out property <bool> status-error: false;
@@ -91,15 +252,13 @@ export component Launcher inherits Window {
     in-out property <string> search;
     in-out property <string> revoke-id;
     in-out property <string> revoke-name;
-    private property <string> expanded-device;
     private property <string> settings-help;
     callback settings-edited();
-    settings-edited => { root.settings-dirty = true; root.settings-status = ""; }
-    callback save-settings();
     callback show-permissions();
     show-permissions => { root.settings-help = ""; root.permissions-open = true; root.refresh(); }
     pure callback filter-devices([DeviceRow], string) -> [DeviceRow];
     callback connect(string);
+    callback connect-device(string, string);
     callback toggle-sharing();
     callback discover();
     callback stop-session(int);
@@ -112,7 +271,7 @@ export component Launcher inherits Window {
     callback restart-update();
 
     FocusScope {
-        enabled: root.revoke-id == "" && !root.permissions-open && !root.settings-saving;
+        enabled: root.revoke-id == "" && !root.permissions-open && !root.close-prompt-open && !root.window-picker-open;
         HorizontalLayout {
             spacing: 0px;
             Rectangle { width: 56px; }
@@ -124,7 +283,7 @@ export component Launcher inherits Window {
                         padding-left: 24px; padding-right: 20px; spacing: 12px;
                         Text { text: root.page == 0 ? "Connections" : root.page == 1 ? "Devices" : "Settings"; color: Theme.ink; font-size: 16px; font-weight: 600; vertical-alignment: center; }
                         Rectangle { horizontal-stretch: 1; }
-                        Glyph { source: @image-url("icons/display.svg"); width: 16px; colorize: #9ca2ad; }
+                        if root.mac: Glyph { source: @image-url("icons/display.svg"); width: 16px; colorize: #9ca2ad; }
                     }
                     Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: Theme.line; }
                 }
@@ -143,6 +302,7 @@ export component Launcher inherits Window {
                         if root.page == 0: VerticalLayout {
                             spacing: 20px;
                             HorizontalLayout {
+                                spacing: 8px;
                                 TabItem { label: "Connect"; selected: root.connection-tab == 0; clicked => { root.connection-tab = 0; } }
                                 TabItem { label: root.sessions.length > 0 ? "Sessions (" + root.sessions.length + ")" : "Sessions"; selected: root.connection-tab == 1; clicked => { root.connection-tab = 1; } }
                                 Rectangle { horizontal-stretch: 1; }
@@ -160,12 +320,14 @@ export component Launcher inherits Window {
                                                 height: 70px; background: #f6f7f9; border-radius: 6px;
                                                 VerticalLayout {
                                                     padding: 14px; spacing: 6px;
-                                                    MutedText { text: "This device"; font-size: 11px; }
-                                                    TextInput { text: root.local-address; read-only: true; single-line: true; font-size: 17px; color: Theme.ink; accessible-label: "This device's address"; }
+                                                    Text { text: root.device-name; font-size: 16px; font-weight: 500; color: Theme.ink; overflow: elide; }
+                                                    TextInput { text: root.local-address; read-only: true; single-line: true; font-size: 11px; color: Theme.muted; accessible-label: "This device's address"; }
                                                 }
                                             }
                                             HorizontalLayout {
-                                                AppButton { label: root.background-sharing-running ? "Manage sharing" : root.sharing ? "Stop sharing" : "Start sharing"; clicked => { if root.background-sharing-running { root.login-settings(); } else { root.toggle-sharing(); } } }
+                                                spacing: 8px;
+                                                AppButton { label: root.background-sharing-running ? "Manage sharing" : root.sharing ? "Stop sharing" : "Start sharing"; danger: root.sharing && !root.background-sharing-running; clicked => { if root.background-sharing-running { root.login-settings(); } else { root.toggle-sharing(); } } }
+                                                ComboBox { width: 154px; height: 32px; model: ["Everything", "Selected windows", "One window"]; current-index <=> root.share-mode; enabled: !root.sharing && !root.background-sharing-running; accessible-label: "What to share"; }
                                                 Rectangle { horizontal-stretch: 1; }
                                             }
                                         }
@@ -191,31 +353,31 @@ export component Launcher inherits Window {
                                 VerticalLayout {
                                     spacing: 0px;
                                     HorizontalLayout {
-                                        height: 36px;
+                                        height: 36px; spacing: 8px;
                                         SectionTitle { text: "Nearby"; font-size: 13px; }
                                         Rectangle { horizontal-stretch: 1; }
                                         AppButton { label: root.discovering ? "Scanning…" : ""; icon: @image-url("icons/refresh.svg"); a11y-label: "Scan nearby devices"; quiet: true; enabled: !root.discovering; clicked => { root.discover(); } }
                                     }
                                     Rectangle { height: 1px; background: Theme.line; }
-                                    if root.nearby.length == 0 && !root.discovering: Rectangle {
-                                        height: 48px;
-                                        MutedText { text: "No devices found"; vertical-alignment: center; }
+                                    if root.nearby.length == 0: EmptyState {
+                                        icon: @image-url("icons/devices.svg");
+                                        title: root.discovering ? "Looking for devices" : "No nearby devices";
+                                        detail: root.discovering ? "" : "Start sharing on another device, or enter its address.";
                                     }
-                                    for device in root.nearby: Rectangle {
-                                        height: 52px;
-                                        HorizontalLayout {
-                                            spacing: 12px;
-                                            Glyph { source: @image-url("icons/display.svg"); width: 18px; }
-                                            VerticalLayout { horizontal-stretch: 1; spacing: 3px; alignment: center; Text { text: device.name; color: Theme.ink; font-size: 12px; overflow: elide; } MutedText { text: device.address; font-size: 11px; } }
-                                            VerticalLayout { horizontal-stretch: 0; alignment: center; AppButton { label: "Connect"; quiet: true; clicked => { root.address = device.address; root.connect(device.address); } } }
-                                        }
-                                        Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: Theme.line; }
+                                    DeviceGrid {
+                                        devices: root.nearby;
+                                        connect(address, id) => { root.address = address; root.connect-device(address, id); }
+                                        trust(id) => { root.trust(id); }
+                                        revoke(id, name) => { root.revoke-id = id; root.revoke-name = name; }
                                     }
                                 }
                             }
                             if root.connection-tab == 1: VerticalLayout {
                                 spacing: 0px;
-                                if root.sessions.length == 0: Rectangle { height: 72px; MutedText { text: "No active sessions"; vertical-alignment: center; } }
+                                if root.sessions.length == 0: EmptyState {
+                                    icon: @image-url("icons/connections.svg"); title: "No active sessions";
+                                    detail: "Connect to a device or start sharing.";
+                                }
                                 for session in root.sessions: Rectangle {
                                     height: 56px;
                                     HorizontalLayout {
@@ -229,76 +391,42 @@ export component Launcher inherits Window {
                             }
                         }
                         if root.page == 1: VerticalLayout {
-                            spacing: 16px;
+                            spacing: 18px;
                             HorizontalLayout {
-                                TabItem { label: "Recent"; selected: root.device-tab == 0; clicked => { root.device-tab = 0; } }
+                                spacing: 8px;
+                                TabItem { label: "Recent"; selected: root.device-tab == 0; clicked => { root.device-tab = 0; root.refresh(); } }
                                 TabItem { label: "Trusted"; selected: root.device-tab == 1; clicked => { root.device-tab = 1; root.refresh(); } }
                                 Rectangle { horizontal-stretch: 1; }
-                                LineEdit { height: 32px; width: 190px; text <=> root.search; placeholder-text: "Search devices"; accessible-label: "Search devices"; }
+                                LineEdit { height: 32px; width: 180px; text <=> root.search; placeholder-text: "Search devices"; accessible-label: "Search devices"; }
                                 if root.device-tab == 0 && root.recent.length > 0: AppButton { label: "Clear"; a11y-label: "Clear recent connections"; quiet: true; clicked => { root.clear-history(); } }
-                                if root.device-tab == 1: AppButton { icon: @image-url("icons/refresh.svg"); a11y-label: "Refresh trusted devices"; quiet: true; clicked => { root.refresh(); } }
+                                AppButton { icon: @image-url("icons/refresh.svg"); a11y-label: "Refresh devices"; quiet: true; enabled: !root.discovering; clicked => { root.refresh(); root.discover(); } }
                             }
-                            VerticalLayout {
-                                spacing: 0px;
-                                Rectangle { height: 1px; background: Theme.line; }
-                                if root.filter-devices(root.device-tab == 0 ? root.recent : root.trusted, root.search).length == 0: Rectangle {
-                                    height: 64px;
-                                    MutedText { text: root.search != "" ? "No matches" : root.device-tab == 0 ? "No recent connections" : "No trusted devices"; vertical-alignment: center; }
-                                }
-                                if root.device-tab == 0: VerticalLayout {
-                                    spacing: 0px;
-                                    for device in root.filter-devices(root.recent, root.search): Rectangle {
-                                        height: 52px;
-                                        HorizontalLayout {
-                                            spacing: 12px;
-                                            Glyph { source: @image-url("icons/display.svg"); width: 18px; }
-                                            Text { text: device.name; color: Theme.ink; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-                                            MutedText { text: device.detail; font-size: 11px; vertical-alignment: center; }
-                                            VerticalLayout { horizontal-stretch: 0; alignment: center; AppButton { label: "Connect"; quiet: true; clicked => { root.address = device.address; root.page = 0; root.connect(device.address); } } }
-                                        }
-                                        Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: Theme.line; }
-                                    }
-                                }
-                                if root.device-tab == 1: VerticalLayout {
-                                    spacing: 0px;
-                                    for device in root.filter-devices(root.trusted, root.search): Rectangle {
-                                        height: root.expanded-device == device.fingerprint ? 88px : 52px;
-                                        VerticalLayout {
-                                            spacing: 0px;
-                                            HorizontalLayout {
-                                                height: 52px; spacing: 12px;
-                                                Glyph { source: @image-url("icons/display.svg"); width: 18px; }
-                                                Text { text: device.name; color: Theme.ink; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-                                                Badge { label: device.detail; }
-                                                VerticalLayout { horizontal-stretch: 0; alignment: center; AppButton { icon: @image-url("icons/info.svg"); a11y-label: "Details for " + device.name; quiet: true; clicked => { root.expanded-device = root.expanded-device == device.fingerprint ? "" : device.fingerprint; } } }
-                                                VerticalLayout { horizontal-stretch: 0; alignment: center; AppButton { label: "Revoke"; a11y-label: "Revoke access for " + device.name; quiet: true; danger: true; clicked => { root.revoke-id = device.fingerprint; root.revoke-name = device.name; } } }
-                                            }
-                                            if root.expanded-device == device.fingerprint: TextInput { text: device.fingerprint; read-only: true; single-line: true; font-size: 11px; font-family: root.mac ? "Menlo" : "Consolas"; color: Theme.muted; accessible-label: "Certificate fingerprint for " + device.name; }
-                                        }
-                                        Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: Theme.line; }
-                                    }
-                                }
+                            if root.filter-devices(root.device-tab == 0 ? root.recent : root.trusted, root.search).length == 0: EmptyState {
+                                icon: root.search != "" ? @image-url("icons/search.svg") : root.device-tab == 0 ? @image-url("icons/clock.svg") : @image-url("icons/shield.svg");
+                                title: root.search != "" ? "No matching devices" : root.device-tab == 0 ? "No recent devices" : "No trusted devices";
+                                detail: root.search != "" ? "Try a different name." : root.device-tab == 0 ? "Your connected devices will appear here." : "Trust a device when accepting a connection or from Recent.";
+                            }
+                            DeviceGrid {
+                                devices: root.filter-devices(root.device-tab == 0 ? root.recent : root.trusted, root.search);
+                                connect(address, id) => { root.address = address; root.connect-device(address, id); }
+                                trust(id) => { root.trust(id); }
+                                revoke(id, name) => { root.revoke-id = id; root.revoke-name = name; }
                             }
                         }
                         if root.page == 2: VerticalLayout {
-                            spacing: 20px;
-                            VerticalLayout {
-                                spacing: 10px;
-                                SectionTitle { text: "Frames " + root.app-version; }
-                                Text { text: root.update-status; color: root.update-error ? #a84d55 : Theme.muted; font-size: 12px; wrap: word-wrap; }
-                                HorizontalLayout {
-                                    spacing: 8px;
-                                    AppButton { label: root.update-busy ? "Updating…" : "Check for updates"; enabled: !root.update-busy; clicked => { root.check-updates(); } }
-                                    if root.update-ready: AppButton { label: "Restart to update"; primary: true; enabled: root.sessions.length == 0 && !root.background-sharing-running; clicked => { root.restart-update(); } }
-                                    Rectangle { horizontal-stretch: 1; }
+                            spacing: 24px;
+                            if root.settings-status != "": Text { text: root.settings-status; color: root.settings-error ? #a84d55 : Theme.muted; font-size: 12px; wrap: word-wrap; }
+                            SettingsSection {
+                                title: "General";
+                                SettingRow { title: "Device name"; detail: "Shown to other devices. Leave blank to use the system name."; divider: !root.mac;
+                                    LineEdit { width: 250px; text <=> root.device-name-edit; placeholder-text: root.system-device-name; edited => { root.device-name-edited(); } accessible-label: "Device name"; }
                                 }
-                                if root.update-ready && root.sessions.length > 0: MutedText { text: "Stop running sessions before restarting to update."; font-size: 11px; wrap: word-wrap; }
-                                if root.update-ready && root.background-sharing-running: MutedText { text: "Background sharing is running. Stop it in sharing-at-login settings before restarting to update."; font-size: 11px; wrap: word-wrap; }
+                                if !root.mac: SettingRow { title: "When window closes"; detail: "Choose whether Frames keeps running or quits."; divider: false;
+                                    ComboBox { width: 180px; model: ["Ask every time", "Hide to tray", "Quit Frames"]; current-index <=> root.close-behavior; selected(value) => { root.close-behavior-edited(self.current-index); } accessible-label: "When window closes"; }
+                                }
                             }
-                            MutedText { text: "Choose defaults for new connections and sharing sessions."; }
-                            VerticalLayout {
-                                spacing: 0px;
-                                SectionTitle { text: "Connections"; height: 30px; }
+                            SettingsSection {
+                                title: "Connections";
                                 SettingRow { title: "Default view"; detail: "Open individual apps or the full remote desktop.";
                                     ComboBox { width: 180px; model: ["Application windows", "Full desktop"]; current-index: root.default-desktop ? 1 : 0; selected(value) => { root.default-desktop = self.current-index == 1; root.settings-edited(); } accessible-label: "Default connection view"; }
                                 }
@@ -308,34 +436,44 @@ export component Launcher inherits Window {
                                 SettingRow { title: "Video codec"; detail: "Automatic selects a working codec for both devices.";
                                     ComboBox { width: 180px; model: ["Automatic", "H.264", "HEVC", "AV1", "VP9"]; current-index <=> root.codec; selected(value) => { root.settings-edited(); } accessible-label: "Video codec"; }
                                 }
-                                SectionTitle { text: "Sharing"; height: 40px; }
-                                SettingRow { title: "Clipboard sync"; detail: "Share text and images in both directions.";
+                                SettingRow { title: "Clipboard sync"; detail: "Share text and images in both directions."; divider: false;
                                     AppSwitch { checked <=> root.clipboard; toggled => { root.settings-edited(); } accessible-label: "Clipboard sync"; }
                                 }
+                            }
+                            SettingsSection {
+                                title: "Sharing";
                                 SettingRow { title: "Unattended access"; detail: root.background-sharing-running ? "Enabled by sharing at login." : root.sharing ? "Stop sharing to change this setting." : "Allow approved devices to reconnect without a prompt.";
                                     if root.background-sharing-running: AppSwitch { checked: true; enabled: false; accessible-label: "Unattended access"; }
                                     if !root.background-sharing-running: AppSwitch { checked <=> root.unattended; toggled => { root.settings-edited(); } enabled: root.unattended-editable; accessible-label: "Unattended access"; }
                                 }
-                                SettingRow { title: "Shared window limit"; detail: "Maximum windows streamed at the same time, per connection.";
+                                SettingRow { title: "Shared window limit"; detail: "Maximum windows streamed at the same time, per connection."; divider: root.mac;
                                     SpinBox { width: 140px; minimum: 1; maximum: 32; value <=> root.max-streams; edited => { root.settings-edited(); } accessible-label: "Shared window limit"; }
                                 }
-                                if root.mac: SettingRow { title: "Sharing at login"; detail: root.background-sharing-registered ? "Enabled. Sharing starts when you sign in." : "Manage background sharing on this Mac.";
+                                if root.mac: SettingRow { title: "Sharing at login"; detail: root.background-sharing-registered ? "Enabled. Sharing starts when you sign in." : "Manage background sharing on this Mac."; divider: false;
                                     AppButton { label: "Manage"; a11y-label: "Manage sharing at login"; quiet: true; clicked => { root.login-settings(); } }
                                 }
                             }
+                            SettingsSection {
+                                title: "Updates";
+                                Rectangle {
+                                    min-height: 108px;
+                                    VerticalLayout {
+                                        padding-top: 16px; padding-bottom: 16px; spacing: 12px;
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            Text { text: "Frames " + root.app-version; color: Theme.ink; font-size: 13px; font-weight: 500; vertical-alignment: center; horizontal-stretch: 1; }
+                                            AppButton { label: root.update-busy ? "Updating..." : "Check for updates"; enabled: !root.update-busy; clicked => { root.check-updates(); } }
+                                            if root.update-ready: AppButton { label: "Restart to update"; primary: true; enabled: root.sessions.length == 0 && !root.background-sharing-running; clicked => { root.restart-update(); } }
+                                        }
+                                        Text { text: root.update-status; color: root.update-error ? #a84d55 : Theme.muted; font-size: 12px; wrap: word-wrap; }
+                                        if root.update-ready && root.sessions.length > 0: MutedText { text: "Stop running sessions before restarting to update."; font-size: 11px; wrap: word-wrap; }
+                                        if root.update-ready && root.background-sharing-running: MutedText { text: "Background sharing is running. Stop it in sharing-at-login settings before restarting to update."; font-size: 11px; wrap: word-wrap; }
+                                    }
+                                }
+                            }
+                            MutedText { text: "Changes save automatically. Connection defaults apply to new sessions."; font-size: 11px; }
                         }
                         Rectangle { vertical-stretch: 1; min-height: 1px; }
-                    }
-                }
-                if root.page == 2: Rectangle {
-                    height: 64px; vertical-stretch: 0; background: white;
-                    Rectangle { x: 0px; y: 0px; height: 1px; width: parent.width; background: Theme.line; }
-                    HorizontalLayout {
-                        padding-left: 24px; padding-right: 24px; spacing: 12px;
-                        Text { text: root.settings-status != "" ? root.settings-status : root.settings-dirty ? "Unsaved changes" : "Changes apply to new sessions."; color: root.settings-error && root.settings-status != "" ? #a84d55 : Theme.muted; font-size: 12px; wrap: word-wrap; vertical-alignment: center; horizontal-stretch: 1; }
-                        VerticalLayout { horizontal-stretch: 0; alignment: center;
-                            AppButton { label: root.settings-saving ? "Saving..." : "Save changes"; primary: true; enabled: root.settings-dirty && !root.settings-saving; clicked => { root.save-settings(); } }
-                        }
                     }
                 }
                 Rectangle {
@@ -370,8 +508,38 @@ export component Launcher inherits Window {
             }
         }
     }
-    if root.permissions-open: FocusScope {
-        init => { self.focus(); }
+    if root.window-picker-open: ModalFocus {
+        enabled: !root.close-prompt-open;
+        key-pressed(event) => { if event.text == Key.Escape { root.cancel-share-windows(); return accept; } return reject; }
+        Rectangle { background: #00000066; }
+        TouchArea { }
+        Card {
+            width: parent.width - 64px; height: parent.height - 48px; x: 32px; y: 24px;
+            VerticalLayout { padding: 24px; spacing: 14px;
+                HorizontalLayout {
+                    SectionTitle { text: root.share-mode == 2 ? "Choose a window" : "Choose windows"; font-size: 18px; horizontal-stretch: 1; }
+                    AppButton { icon: @image-url("icons/close.svg"); quiet: true; a11y-label: "Cancel window selection"; clicked => { root.cancel-share-windows(); } }
+                }
+                MutedText { text: root.share-mode == 2 ? "Share one window. On Windows, you can keep using your mouse and keyboard." : "Only the windows you select will be shared. Remote control uses your mouse and keyboard."; }
+                HorizontalLayout { spacing: 10px;
+                    LineEdit { text <=> root.share-search; placeholder-text: "Search windows"; accessible-label: "Search available windows"; horizontal-stretch: 1; }
+                    AppButton { label: root.window-picker-loading ? "Loading..." : "Refresh"; enabled: !root.window-picker-loading; icon: @image-url("icons/refresh.svg"); clicked => { root.load-share-windows(); } }
+                }
+                if root.window-picker-error != "": MutedText { text: root.window-picker-error; color: #a84d55; }
+                picker-scroll := ScrollView { vertical-stretch: 1; viewport-height: gallery.height; viewport-width: self.visible-width; viewport-y: 0px;
+                    gallery := ShareWindowGrid { x: 0px; y: 0px; width: picker-scroll.visible-width; windows: root.filter-share-windows(root.share-windows,root.share-search); toggle(id) => { root.toggle-share-window(id); } }
+                }
+                if !root.window-picker-loading && root.share-windows.length == 0: MutedText { text: "No application windows are available. Open a window and refresh."; }
+                HorizontalLayout { spacing: 8px;
+                    Text { text: root.share-selected-count == 1 ? "1 window selected" : root.share-selected-count + " windows selected"; color: Theme.muted; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; }
+                    AppButton { label: "Cancel"; clicked => { root.cancel-share-windows(); } }
+                    AppButton { label: "Share"; primary: true; enabled: root.share-selected-count > 0 && (root.share-mode != 2 || root.share-selected-count == 1); clicked => { root.confirm-share-windows(); } }
+                }
+            }
+        }
+    }
+    if root.permissions-open: ModalFocus {
+        enabled: !root.close-prompt-open;
         key-pressed(event) => { if event.text == Key.Escape { root.permissions-open = false; return accept; } return reject; }
         Rectangle { background: #00000066; }
         TouchArea { }
@@ -403,8 +571,8 @@ export component Launcher inherits Window {
             }
         }
     }
-    if root.revoke-id != "": FocusScope {
-        init => { self.focus(); }
+    if root.revoke-id != "": ModalFocus {
+        enabled: !root.close-prompt-open;
         key-pressed(event) => { if event.text == Key.Escape { root.revoke-id = ""; return accept; } return reject; }
         Rectangle { background: #00000066; }
         TouchArea { }
@@ -420,6 +588,33 @@ export component Launcher inherits Window {
                     alignment: end; spacing: 8px;
                     AppButton { label: "Cancel"; clicked => { root.revoke-id = ""; } }
                     AppButton { label: "Revoke"; danger: true; clicked => { root.revoke(root.revoke-id); root.revoke-id = ""; } }
+                }
+            }
+        }
+    }
+    if root.close-prompt-open: ModalFocus {
+        key-pressed(event) => { if event.text == Key.Escape && !root.close-busy { root.close-prompt-open = false; return accept; } return reject; }
+        Rectangle { background: #00000066; }
+        TouchArea { }
+        Card {
+            width: min(460px, parent.width - 48px); height: root.close-error == "" ? 254px : 294px;
+            // Keep the dialog origin on physical pixels, including at fractional DPI.
+            x: round((parent.width - self.width) / (2 * 1phx)) * 1phx;
+            y: round((parent.height - self.height) / (2 * 1phx)) * 1phx;
+            VerticalLayout {
+                padding: 24px; spacing: 12px;
+                SectionTitle { text: "Close Frames?"; font-size: 18px; }
+                MutedText { text: "Hide to the tray to keep sharing and sessions running, or quit Frames to stop them."; }
+                AppCheckBox { text: "Remember my choice"; checked <=> root.remember-close; enabled: !root.close-busy; }
+                MutedText { text: "You can change this in Settings."; font-size: 11px; }
+                if root.close-error != "": Text { text: root.close-error; color: #a84d55; font-size: 12px; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    AppButton { label: "Cancel"; enabled: !root.close-busy; clicked => { root.close-prompt-open = false; } }
+                    Rectangle { horizontal-stretch: 1; }
+                    AppButton { label: "Quit Frames"; enabled: !root.close-busy; clicked => { root.close-choice(2, root.remember-close); } }
+                    AppButton { label: root.close-busy ? "Saving..." : "Hide to tray"; primary: true; enabled: !root.close-busy; clicked => { root.close-choice(1, root.remember-close); } }
                 }
             }
         }

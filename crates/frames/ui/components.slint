@@ -39,7 +39,7 @@ export component AppButton inherits Rectangle {
     border-radius: 5px;
     background: !enabled ? #f1f2f4 : primary ? (touch.pressed ? Theme.accent-pressed : (touch.has-hover || focus.has-focus) ? Theme.accent-hover : Theme.accent) : (touch.has-hover || focus.has-focus) ? (danger ? #fff2f2 : #f5f6f9) : quiet ? transparent : white;
     border-width: quiet || primary ? 0px : 1px;
-    border-color: #d6d9e0;
+    border-color: enabled && danger ? #ac444c : #d6d9e0;
     animate background { duration: 100ms; }
     content := HorizontalLayout {
         alignment: center; spacing: 6px;
@@ -74,7 +74,7 @@ export component NavItem inherits Rectangle {
     forward-focus: focus;
     Glyph { source: root.icon; colorize: root.selected ? white : #bdbdbd; width: 20px; height: 20px; x: 10px; y: 10px; }
     if root.badge != "": Rectangle { x: 29px; y: 7px; width: 6px; height: 6px; border-radius: 3px; background: #f1bd65; }
-    if touch.has-hover || focus.has-focus: Rectangle {
+    if touch.has-hover: Rectangle {
         x: root.width + 12px; y: 6px; width: hint.preferred-width + 20px; height: 28px;
         background: #262626; border-radius: 4px;
         hint := Text { text: root.label; color: white; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
@@ -123,6 +123,15 @@ export component SectionTitle inherits Text {
 
 export component MutedText inherits Text {
     color: Theme.muted; font-size: 12px; wrap: word-wrap;
+}
+
+export component ModalFocus inherits FocusScope {
+    // Accessibility can instantiate a dialog while walking the item tree.
+    // Defer focus until that walk finishes to avoid re-entering AccessKit.
+    Timer {
+        interval: 0ms;
+        triggered => { self.stop(); root.focus(); }
+    }
 }
 
 // Keep selection controls on the same accent as primary actions.

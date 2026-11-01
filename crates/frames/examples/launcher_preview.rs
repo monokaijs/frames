@@ -7,12 +7,62 @@ use std::rc::Rc;
 mod window_style;
 
 slint::include_modules!();
+struct SnapshotPlatform(Rc<slint::platform::software_renderer::MinimalSoftwareWindow>);
+impl slint::platform::Platform for SnapshotPlatform {
+    fn create_window_adapter(
+        &self,
+    ) -> Result<Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError> {
+        Ok(self.0.clone())
+    }
+}
 fn rows<T: Clone + 'static>(data: Vec<T>) -> ModelRc<T> {
     Rc::new(VecModel::from(data)).into()
 }
+fn desktop_preview(blurred: bool) -> slint::Image {
+    let mut pixels = image::RgbaImage::from_fn(480, 270, |x, y| {
+        let color = if (40..340).contains(&x) && (30..235).contains(&y) {
+            if y < 52 {
+                [229, 232, 238, 255]
+            } else if x < 105 {
+                [240, 242, 247, 255]
+            } else if (70..78).contains(&y) || (98..104).contains(&y) || (126..132).contains(&y) {
+                [154, 172, 193, 255]
+            } else {
+                [255, 255, 255, 255]
+            }
+        } else {
+            [
+                65 + (x / 12) as u8,
+                91 + (y / 8) as u8,
+                134 + (x / 16) as u8,
+                255,
+            ]
+        };
+        image::Rgba(color)
+    });
+    if blurred {
+        pixels = image::DynamicImage::ImageRgba8(pixels)
+            .resize_exact(24, 14, image::imageops::FilterType::Triangle)
+            .resize_exact(480, 270, image::imageops::FilterType::Triangle)
+            .blur(8.0)
+            .to_rgba8();
+    }
+    slint::Image::from_rgba8(
+        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(pixels.as_raw(), 480, 270),
+    )
+}
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
-    window_style::initialize()?;
+    let snapshot_path = args.get(2).filter(|path| !path.starts_with("--"));
+    let software_window = if snapshot_path.is_some() {
+        let window =
+            slint::platform::software_renderer::MinimalSoftwareWindow::new(Default::default());
+        slint::platform::set_platform(Box::new(SnapshotPlatform(window.clone())))?;
+        Some(window)
+    } else {
+        window_style::initialize()?;
+        None
+    };
     let ui = Launcher::new()?;
     ui.set_app_version(env!("CARGO_PKG_VERSION").into());
     if args.iter().any(|arg| arg == "--update-ready") {
@@ -22,13 +72,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     ui.set_design_preview(true);
+    ui.on_filter_share_windows(|data, query| {
+        let query = query.to_lowercase();
+        rows(
+            data.iter()
+                .filter(|r| {
+                    format!("{} {}", r.title, r.app)
+                        .to_lowercase()
+                        .contains(&query)
+                })
+                .collect(),
+        )
+    });
+    if args.get(1).map(String::as_str) == Some("share") {
+        ui.set_share_mode(if args.iter().any(|s| s == "--multiple") {
+            1
+        } else {
+            2
+        });
+        ui.set_window_picker_open(true);
+        ui.set_share_selected_count(1);
+        ui.set_share_windows(rows(
+            [
+                ("Game window", "Game", true),
+                ("Project notes", "Notepad", false),
+                ("Browser window", "Browser", false),
+                ("Music", "Music player", false),
+                ("Terminal", "Terminal", false),
+                ("Image editor", "Editor", false),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (title, app, selected))| ShareWindowRow {
+                id: index.to_string().into(),
+                title: title.into(),
+                app: app.into(),
+                selected,
+                available: true,
+                preview: desktop_preview(false),
+                ..Default::default()
+            })
+            .collect(),
+        ));
+    }
     ui.window().set_size(slint::LogicalSize::new(
         if args.iter().any(|s| s == "--compact") {
             820.
         } else {
             960.
         },
-        if args.iter().any(|s| s == "--compact") {
+        if args.iter().any(|s| s == "--tall") {
+            1180.
+        } else if args.iter().any(|s| s == "--compact") {
             540.
         } else {
             620.
@@ -36,6 +131,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     ui.set_mac(true);
     ui.set_device_name("Studio Mac".into());
+    ui.set_system_device_name("Studio Mac".into());
+    ui.set_device_name_edit("Studio Mac".into());
     ui.set_local_address("192.168.1.24:47990".into());
     ui.set_screen_permission(1);
     ui.set_control_permission(0);
@@ -45,16 +142,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("settings") => 2,
         _ => 0,
     });
+    ui.set_connection_tab(if args.get(1).map(String::as_str) == Some("sessions") {
+        1
+    } else {
+        0
+    });
+    if args.iter().any(|arg| arg == "--no-matches") {
+        ui.set_search("Unmatched device".into());
+    }
     ui.set_permissions_open(args.get(1).map(String::as_str) == Some("permissions"));
-    ui.set_device_tab(1);
+    ui.set_close_prompt_open(args.get(1).map(String::as_str) == Some("close"));
+    ui.set_remember_close(args.iter().any(|arg| arg == "--remember"));
+    ui.set_device_tab(if args.iter().any(|s| s == "--recent") {
+        0
+    } else {
+        1
+    });
     if !args.iter().any(|s| s == "--empty") {
         ui.set_nearby(rows(vec![DeviceRow {
             name: "Design workstation".into(),
             address: "192.168.1.18:47990".into(),
+            online: true,
+            trusted: true,
+            preview_live: true,
+            preview: desktop_preview(false),
             ..Default::default()
         }]));
         ui.set_recent(rows(vec![DeviceRow {
-            name: "192.168.1.18:47990".into(),
+            name: "Design workstation".into(),
+            fingerprint: "b8e2c49f1650a320bfac96d07e8d321c45c2fb9dd6ca982cf48703f0cddae427".into(),
+            can_trust: true,
+            preview: desktop_preview(true),
+            online: false,
             address: "192.168.1.18:47990".into(),
             detail: "12 min ago".into(),
             ..Default::default()
@@ -62,6 +181,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.set_trusted(rows(vec![
             DeviceRow {
                 name: "Design workstation".into(),
+                address: "192.168.1.18:47990".into(),
+                online: true,
+                preview_live: true,
+                preview: desktop_preview(false),
                 detail: "Ask to connect".into(),
                 fingerprint: "b8e2c49f1650a320bfac96d07e8d321c45c2fb9dd6ca982cf48703f0cddae427"
                     .into(),
@@ -70,6 +193,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             DeviceRow {
                 name: "Travel MacBook".into(),
+                address: "192.168.1.25:47990".into(),
+                preview: desktop_preview(false),
                 detail: "Unattended".into(),
                 fingerprint: "31c6a2f09d7e48b5943fcb8d624c3813e1d45f8b7fa203963487e2f12b973a68"
                     .into(),
@@ -78,6 +203,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             DeviceRow {
                 name: "Office PC".into(),
+                address: "192.168.1.30:47990".into(),
+                online: true,
                 detail: "Host only".into(),
                 fingerprint: "5fe4b8c19207d3ae5406f182b937c8a635d72fe24c0b8d9a4ea36725c9b014ff"
                     .into(),
@@ -153,6 +280,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     ui.on_connect(move |_| preview_notice(&weak));
     let weak = ui.as_weak();
+    ui.on_connect_device(move |_, _| preview_notice(&weak));
+    let weak = ui.as_weak();
     ui.on_toggle_sharing(move || preview_notice(&weak));
     let weak = ui.as_weak();
     ui.on_discover(move || preview_notice(&weak));
@@ -167,24 +296,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     ui.on_login_settings(move || preview_notice(&weak));
     let weak = ui.as_weak();
-    ui.on_save_settings(move || preview_notice(&weak));
-    if let Some(path) = args.get(2).filter(|s| !s.starts_with("--")) {
-        let weak = ui.as_weak();
-        let path = path.clone();
-        slint::Timer::single_shot(std::time::Duration::from_millis(500), move || {
-            let ui = weak.upgrade().unwrap();
-            let pixels = ui.window().take_snapshot().expect("snapshot");
-            let file = std::fs::File::create(&path).unwrap();
-            let mut encoder = png::Encoder::new(file, pixels.width(), pixels.height());
-            encoder.set_color(png::ColorType::Rgba);
-            encoder.set_depth(png::BitDepth::Eight);
-            encoder
-                .write_header()
-                .unwrap()
-                .write_image_data(pixels.as_bytes())
-                .unwrap();
-            slint::quit_event_loop().unwrap();
+    ui.on_settings_edited(move || preview_notice(&weak));
+    let weak = ui.as_weak();
+    ui.on_close_behavior_edited(move |_| preview_notice(&weak));
+    let weak = ui.as_weak();
+    ui.on_close_choice(move |_, _| preview_notice(&weak));
+    let weak = ui.as_weak();
+    ui.on_device_name_edited(move || preview_notice(&weak));
+    let weak = ui.as_weak();
+    ui.on_trust(move |_| preview_notice(&weak));
+    if let (Some(path), Some(window)) = (snapshot_path, software_window) {
+        ui.show()?;
+        let size = ui.window().size();
+        let mut pixels =
+            vec![slint::Rgb8Pixel::default(); size.width as usize * size.height as usize];
+        window.draw_if_needed(|renderer| {
+            renderer.render(&mut pixels, size.width as usize);
         });
+        let bytes: Vec<u8> = pixels.iter().flat_map(|p| [p.r, p.g, p.b]).collect();
+        image::save_buffer(
+            path,
+            &bytes,
+            size.width,
+            size.height,
+            image::ColorType::Rgb8,
+        )?;
+        ui.hide()?;
+        return Ok(());
     }
     ui.run()?;
     Ok(())

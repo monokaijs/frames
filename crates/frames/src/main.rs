@@ -1,6 +1,12 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod connection_history;
+mod device_preview;
+mod device_session;
+mod device_setup;
+mod file_worker;
 mod launcher;
+mod media_sender;
 #[cfg(windows)]
 mod service;
 mod session;
@@ -21,9 +27,25 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    #[command(hide = true)]
+    GamepadWorker,
+    /// Install optional drivers used by device forwarding.
+    Devices {
+        #[command(subcommand)]
+        action: DeviceCommand,
+    },
+    #[command(hide = true)]
+    DeviceLease {
+        #[arg(long)]
+        bus_id: String,
+        #[arg(long)]
+        port: u16,
+        #[arg(long)]
+        token: String,
+    },
     /// Verify bundled codecs without capturing the desktop or playing audio.
     MediaCheck,
-    /// Print media library licenses and source/build references.
+    /// Print bundled library licenses and source/build references.
     Licenses,
     /// Check for a signed release, or download and install it after sessions close.
     Update {
@@ -49,6 +71,15 @@ enum Command {
     },
     /// Share this desktop. New devices require --pair and local confirmation.
     Host {
+        /// Share only the locally selected window identities.
+        #[arg(long = "share-window")]
+        share_windows: Vec<String>,
+        /// Share one window without taking over the host's input on Windows.
+        #[arg(long = "one-window", alias = "shared-game")]
+        shared_game: bool,
+        /// Local HWND for automation; choose windows in the launcher preview picker.
+        #[arg(long, requires = "shared_game")]
+        shared_window: Option<u64>,
         #[arg(long, default_value = "0.0.0.0:47990")]
         listen: SocketAddr,
         #[arg(long)]
@@ -85,6 +116,8 @@ enum Command {
     Doctor,
     /// Enumerate shareable application windows without capturing them.
     Windows,
+    /// Print reviewed game compatibility evidence bundled with this build.
+    Games,
     /// Transfer one file into the host's configured receive folder.
     Send { address: SocketAddr, path: PathBuf },
     /// Download a regular file, relative to the host user's home folder.
@@ -95,6 +128,11 @@ enum Command {
     Revoke { fingerprint: String },
     /// Display local identity fingerprint and configuration location.
     Identity,
+}
+#[derive(Subcommand)]
+enum DeviceCommand {
+    /// Install gamepad, usb-export (local devices), or usb-host (remote receiving) support.
+    Setup { target: String },
 }
 #[cfg(windows)]
 #[derive(Subcommand)]
@@ -139,7 +177,10 @@ fn main() {
         eprintln!("Frames: {error:#}");
         if std::env::var_os("FRAMES_GUI_CHILD").is_some()
             || std::env::args_os().len() == 1
-            || std::env::args().nth(1).as_deref() == Some("connect")
+            || matches!(
+                std::env::args().nth(1).as_deref(),
+                Some("connect" | "devices")
+            )
         {
             let _ = frames_native::show_error("Frames", &format!("{error:#}"));
         }
@@ -186,6 +227,19 @@ fn run() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
+    if matches!(args.command, Some(Command::GamepadWorker)) {
+        let _lease = update::runtime_lease()?;
+        return frames_native::gamepad::capture_worker();
+    }
+    if let Some(Command::DeviceLease {
+        bus_id,
+        port,
+        token,
+    }) = &args.command
+    {
+        let _lease = update::runtime_lease()?;
+        return frames_native::usb::lease_worker(bus_id, *port, token);
+    }
     if let Some(Command::ApplyUpdate { plan, relaunch }) = &args.command {
         return update::apply(plan, *relaunch);
     }
@@ -210,12 +264,15 @@ fn run() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     match command{
+        Command::GamepadWorker=>unreachable!(),
+        Command::DeviceLease{..}=>unreachable!(),
+        Command::Devices{action:DeviceCommand::Setup{target}}=>runtime.block_on(device_setup::install(&target)),
         Command::Update{check}=>update::manual(check),
         Command::ApplyUpdate{..}=>unreachable!(),
         #[cfg(target_os="macos")] Command::Permissions{request}=>{println!("{}",serde_json::to_string_pretty(&frames_native::permission_status(request)?)?);Ok(())},
         #[cfg(windows)] Command::Service{action:ServiceCommand::Agent}=>runtime.block_on(session::host("0.0.0.0:47990".parse()?,false,true,vec![],None,8,true)),
         #[cfg(windows)] Command::Service{..}=>unreachable!(),
-        Command::Host{listen,pair,unattended,exclude,receive_dir,max_streams,no_clipboard}=>runtime.block_on(session::host(listen,pair,unattended,exclude,receive_dir,max_streams,!no_clipboard)),
+        Command::Host{listen,pair,unattended,exclude,receive_dir,max_streams,no_clipboard,shared_game,shared_window,share_windows}=>{if !share_windows.is_empty(){runtime.block_on(session::selected_host(listen,pair,unattended,exclude,share_windows,shared_game,max_streams))}else if shared_game{runtime.block_on(session::shared_host(listen,pair,unattended,exclude,shared_window))}else{runtime.block_on(session::host(listen,pair,unattended,exclude,receive_dir,max_streams,!no_clipboard))}},
         Command::Connect{address,codec,no_clipboard,audio,view}=>{
             let (updates_tx,updates_rx)=frames_native::client_channel(16);let(events_tx,events_rx)=tokio::sync::mpsc::unbounded_channel();
             let shutdown=updates_tx.clone();let task=runtime.spawn(async move{let result=session::client(address,codec.codec(),updates_tx,events_rx,!no_clipboard,audio,match view{ViewChoice::Windows=>frames_core::model::ViewMode::Windows,ViewChoice::Desktop=>frames_core::model::ViewMode::Desktop}).await;if let Err(e)=&result{tracing::error!(error=%e,"connection ended");}let _=shutdown.send(frames_native::ClientUpdate::Shutdown);result});
@@ -244,6 +301,7 @@ fn run() -> anyhow::Result<()> {
         }),
         Command::Licenses=>{println!("{}",frames_core::codec::licenses());Ok(())},
         Command::Doctor=>runtime.block_on(async{let capabilities=frames_core::codec::probe().await;let native=frames_native::desktop(vec![]).and_then(|d|d.windows());println!("{}",serde_json::to_string_pretty(&serde_json::json!({"protocol":frames_core::PROTOCOL_VERSION,"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"media_runtime":frames_core::codec::runtime_status().map_err(|e|e.to_string()),"codecs":capabilities,"windows":native.as_ref().ok().map(|w|w.len()),"native_error":native.err().map(|e|e.to_string()),"capture":"native per-window; CPU readback","release_gates":["hardware latency measurements","macOS build and permissions","secure desktop and login service integration","drag application compatibility","macOS prelogin handoff","end-to-end zero-copy media"]}))?);anyhow::ensure!(!capabilities.is_empty(),"no bundled codec passed the encode/decode probe; run Frames doctor for details");Ok(())}),
+        Command::Games=>{println!("{}",serde_json::to_string_pretty(&frames_core::shared_game::Catalog::bundled()?)?);Ok(())},
         Command::Windows=>{println!("{}",serde_json::to_string_pretty(&frames_native::desktop(vec![])?.windows()?)?);Ok(())},
         Command::Send{address,path}=>runtime.block_on(session::send_file(address,path)),
         Command::Get{address,path}=>runtime.block_on(session::fetch_file(address,path)),

@@ -2,6 +2,24 @@
 //! Only controls generated windows whose title begins with "Frames QA source".
 //! Never persists captured pixels; reports metadata and measured restore time.
 #[allow(dead_code)]
+#[path = "../src/connection_history.rs"]
+mod connection_history;
+#[allow(dead_code)]
+#[path = "../src/device_preview.rs"]
+mod device_preview;
+#[allow(dead_code)]
+#[path = "../src/device_session.rs"]
+mod device_session;
+#[allow(dead_code)]
+#[path = "../src/device_setup.rs"]
+mod device_setup;
+#[allow(dead_code)]
+#[path = "../src/file_worker.rs"]
+mod file_worker;
+#[allow(dead_code)]
+#[path = "../src/media_sender.rs"]
+mod media_sender;
+#[allow(dead_code, unused_imports)]
 #[path = "../src/session.rs"]
 mod session;
 #[allow(dead_code)]
@@ -17,6 +35,10 @@ use frames_native::{ClientEvent, ClientUpdate};
 use std::time::{Duration, Instant};
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("gamepad-worker") {
+        let _lease = update::runtime_lease()?;
+        return frames_native::gamepad::capture_worker();
+    }
     tracing_subscriber::fmt()
         .with_env_filter("frames=info,control_probe=info,frames_core=info,frames_native=info")
         .with_writer(std::io::stderr)
@@ -256,6 +278,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 ClientUpdate::Frame(key, frame) if Some(key) == target.as_ref().map(|w| w.key) => {
                     ensure!(frame.validate(), "invalid decoded frame");
+                    let frame = frame.cpu_copy()?;
                     if stage == "latency_video" {
                         let index =
                             ((frame.height / 2 * frame.width + frame.width / 2) * 4) as usize;

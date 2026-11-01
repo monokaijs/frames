@@ -1,0 +1,26 @@
+[
+  {
+    "target": "gamepad",
+    "version": "1.22.0",
+    "file": "ViGEmBus_1.22.0_x64_x86_arm64.exe",
+    "url": "https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe",
+    "sha256": "89220a7865076b342892f98865f3499fb7c4cfd673159e89d352c360fd014c6a",
+    "source": "https://github.com/nefarius/ViGEmBus/tree/v1.22.0"
+  },
+  {
+    "target": "usb-export",
+    "version": "5.3.0",
+    "file": "usbipd-win_5.3.0_x64.msi",
+    "url": "https://github.com/dorssel/usbipd-win/releases/download/v5.3.0/usbipd-win_5.3.0_x64.msi",
+    "sha256": "1c984914aec944de19b64eff232421439629699f8138e3ddc29301175bc6d938",
+    "source": "https://github.com/dorssel/usbipd-win/tree/v5.3.0"
+  },
+  {
+    "target": "usb-host",
+    "version": "0.9.8.1",
+    "file": "USBip-0.9.8.1-x64.exe",
+    "url": "https://github.com/vadimgrn/usbip-win2/releases/download/v.0.9.8.1/USBip-0.9.8.1-x64.exe",
+    "sha256": "38cad6d4432b52d5bb9409d9ad03b72fdffc4ada4cd3a48fbeca1a2752a8518a",
+    "source": "https://github.com/vadimgrn/usbip-win2/tree/v.0.9.8.1"
+  }
+]

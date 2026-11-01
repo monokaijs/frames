@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "adapter_revision": "frames-protoinput-1",
+  "upstream_revision": "e18e06bb345b86540e7464f7355c649bfdd17f38",
+  "profiles": [{ "id": "generic", "revision": 1 }],
+  "records": []
+}

@@ -1,9 +1,11 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=FRAMES_RELEASE_BUILD");
     println!("cargo:rerun-if-changed=../../assets/icons");
+    println!("cargo:rerun-if-changed=../../native/windows/frames.manifest");
     #[cfg(windows)]
     {
         winresource::WindowsResource::new()
+            .set_manifest_file("../../native/windows/frames.manifest")
             .set_icon("../../assets/icons/Frames.ico")
             .set("ProductName", "Frames")
             .set("FileDescription", "Frames")
