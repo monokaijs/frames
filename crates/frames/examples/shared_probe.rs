@@ -45,8 +45,7 @@ fn stage(name: &str) {
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "frames=info,frames_core=info,frames_native=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_writer(std::io::stderr)
         .init();
@@ -63,10 +62,14 @@ fn main() -> anyhow::Result<()> {
     }
     let (ui, updates) = frames_native::client_channel(32);
     let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let requested = std::env::var("FRAMES_TEST_CODEC")
+        .ok()
+        .map(|name| serde_json::from_value(serde_json::Value::String(name)))
+        .transpose()?;
     // These preferences must be narrowed by the host's policy before actors start.
     let job = runtime.spawn(session::client(
         address,
-        None,
+        requested,
         ui,
         receiver,
         true,
