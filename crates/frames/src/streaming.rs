@@ -212,12 +212,18 @@ mod ready_tests {
             "a refresh already arriving must not cause a recovery storm"
         );
         for packet in &packets[1..] {
+            // Keep the synthetic network age at 60 ms. FEC table warmup and
+            // scheduling on a shared CI runner are not simulated transit time.
+            let local = media::monotonic_micros();
+            let remote = frame.encoded_us + 60_000;
+            client.clock.observe(local, remote, remote, local);
             client.packet(packet, &out).await.unwrap();
         }
         let stream = &client.streams[&window];
         assert_eq!(stream.next, 1);
         assert!(!stream.recovering);
         assert_eq!(stream.late, 0);
+        assert!(stream.encoded_receive.percentile(50) >= 60_000);
         assert!(messages.try_recv().is_err());
     }
     #[tokio::test]
