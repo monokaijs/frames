@@ -31,7 +31,24 @@ function Build-Fixture([string]$FixtureVersion, [string]$Name) {
 function Invoke-Installer([string]$Executable, [string]$Log, [switch]$Uninstall) {
     $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/LOG=`"$temporary\$Log.log`"")
     if (-not $Uninstall) { $arguments += "/DIR=`"$install`"" }
-    return (Start-Process -FilePath $Executable -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden).ExitCode
+    $process = Start-Process -FilePath $Executable -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
+    try { return $process.ExitCode } finally { $process.Dispose() }
+}
+function Wait-FixtureWritable([string]$Executable) {
+    # Windows may retain the just-exited codec probe's image briefly. Wait for
+    # this UUID-scoped fixture to retire; never stop a process or weaken the
+    # installer's running-session protection.
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        try {
+            $stream = [IO.File]::Open($Executable, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            $stream.Dispose()
+            return
+        } catch [IO.IOException] {
+            Start-Sleep -Milliseconds 100
+        }
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'The exited installer fixture still holds its executable after ten seconds'
 }
 try {
     $older = Build-Fixture '0.0.0' 'older-setup'
@@ -65,9 +82,12 @@ try {
     $metadata = (Get-Item -LiteralPath $executable).VersionInfo
     Assert-Installer ($metadata.ProductName -eq 'Frames') 'Installed executable has the wrong product name'
     $media = Start-Process -FilePath $executable -ArgumentList @('media-check') -WorkingDirectory $install -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $temporary 'media.json') -RedirectStandardError (Join-Path $temporary 'media.log')
-    Assert-Installer ($media.ExitCode -eq 0) 'Installed media codecs failed without an external FFmpeg executable'
+    try {
+        Assert-Installer ($media.ExitCode -eq 0) 'Installed media codecs failed without an external FFmpeg executable'
+    } finally { $media.Dispose() }
     $result = Get-Content -LiteralPath (Join-Path $temporary 'media.json') -Raw | ConvertFrom-Json
     Assert-Installer $result.opus_10ms_roundtrip 'Installed Opus roundtrip failed'
+    Wait-FixtureWritable $executable
     Assert-Installer ((Invoke-Installer $uninstaller 'uninstall' -Uninstall) -eq 0) 'Uninstallation failed'
     Assert-Installer (-not (Test-Path -LiteralPath $executable)) 'Uninstaller left the application executable'
     Assert-Installer (-not (Test-Path -LiteralPath $registration)) 'Uninstaller left the Installed Apps entry'
