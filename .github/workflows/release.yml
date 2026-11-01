@@ -64,7 +64,36 @@ jobs:
       - name: Prepare bundled media SDK
         run: python scripts/prepare_media.py
       - run: cargo fmt --all --check
+      - name: Game compatibility catalog documentation
+        run: python scripts/game_compatibility.py --check
+      - name: Shared input adapter regression checks
+        run: |
+          python scripts/build_shared_input.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test_shared_input.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test_shared_input.py --buffered
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test_shared_input.py --hidden-raw
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test_shared_input.py --buffered --hidden-raw
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test_shared_lifecycle.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & target/shared-input/native/Release/shared_ipc_fixture.exe
       - run: cargo test --workspace --locked
+      - name: Shared game production session and network lease
+        run: |
+          cargo build -p frames --bin frames --example shared_probe --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test_shared_session.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test_shared_session.py --network-loss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test_shared_session.py --picker
+      - name: Host-selected window identity and capture guards
+        run: |
+          cargo test -p frames-native window_selection::tests:: --locked -- --include-ignored --nocapture
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Codec and audio checks
         run: |
@@ -156,6 +185,15 @@ jobs:
           FRAMES_RELEASE_BUILD: '1'
           FRAMES_SIGN_IDENTITY: ${{ vars.MACOS_SIGN_IDENTITY }}
         run: bash native/macos/build.sh
+      - name: Shared game macOS viewer regression checks
+        run: |
+          set -euo pipefail
+          sources=()
+          for source in native/macos/Sources/*.swift; do
+            if [[ "$source" != */main.swift ]]; then sources+=("$source"); fi
+          done
+          swiftc -swift-version 5 -target arm64-apple-macos14.2 -import-objc-header native/include/frames.h "${sources[@]}" native/macos/Tests/SharedGameTests.swift target/aarch64-apple-darwin/release/libframes_core.a -framework AppKit -framework ScreenCaptureKit -framework Metal -framework QuartzCore -framework VideoToolbox -framework Security -framework CoreGraphics -framework ServiceManagement -framework UniformTypeIdentifiers -framework AudioToolbox -framework ImageIO -o "$RUNNER_TEMP/shared-game-tests"
+          "$RUNNER_TEMP/shared-game-tests"
       - name: Verify signed macOS updater replacement and rejection
         env:
           FRAMES_UPDATE_TEST_APP: ${{ github.workspace }}/dist/macos/Frames.app

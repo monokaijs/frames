@@ -2,13 +2,13 @@
 
 Native remote control for Windows 11 x64 and macOS 14.2+ on Apple silicon. Open individual remote applications in local windows, or switch to a full desktop view.
 
-[Download the latest release](https://github.com/monokaijs/frames/releases/latest). Media codecs are bundled and run inside Frames; no FFmpeg executable is required. Both computers need matching Frames builds; the current protocol is **5**.
+[Download the latest release](https://github.com/monokaijs/frames/releases/latest). Media codecs are bundled and run inside Frames; no FFmpeg executable is required. Both computers need matching Frames builds; the current protocol is **9**.
 
 On Windows, run **Frames-VERSION-windows-x86_64-setup.exe**. It installs Frames for your account, adds a Start menu shortcut and an Installed Apps entry, and includes an uninstaller. The default installation directory supports automatic updates without administrator access. The ZIP is also available for portable use.
 
 ## Connect
 
-Launch Frames, enable sharing on the host, and enter its address on the client. Nearby discovery works on the local network. Both computers must approve the same pairing code on first connection. Saving an address does not grant access; unattended reconnection requires the host's explicit approval.
+Launch Frames, enable sharing on the host, and enter its address on the client. Nearby discovery works on the local network. Rename this device in Settings. Device cards show names, online/offline status, and screenshots shared privately with trusted devices; recent devices without trust show a blurred image from their last session. Both computers must approve the same pairing code on first connection. Incoming requests offer Decline connection, Accept and trust, or Accept for this session only. You can also trust a previously accepted device from Recent. Unattended reconnection requires the host's explicit approval.
 
 Frames connects directly over LAN or VPN on UDP **47990**. Allow that port through the host firewall. There is no relay or NAT traversal service.
 
@@ -18,15 +18,21 @@ On macOS, open the Frames DMG, drag Frames.app to Applications, and open it in t
 
 The Frames menu controls desktop/window mode, sizing, keyboard mapping, cursor visibility, and file transfers. The host application's exposed menus appear alongside it. Custom application menus remain accessible in the video. **Ctrl+Alt+F12** releases remote input and minimizes the client window.
 
-Per-window capture excludes standard system chrome when its geometry can be verified. Custom headers remain intact. On Mac clients, **Show remote window header** changes the host capture while keeping the local title bar. On Windows clients, **Show window header** toggles the local title bar. Full desktop view includes every visible application, including applications excluded from per-window sharing.
+Per-window capture excludes standard system chrome when its geometry can be verified. Custom headers remain intact. **Show remote window header** changes the host capture while keeping the local title bar on both Mac and Windows clients. Full desktop view includes every visible application, including applications excluded from per-window sharing.
 
-Closing a remote application window requests closing the actual host window. Closing a desktop-view window disconnects. Closing the launcher stops the sessions it started; a separately configured sharing login item continues independently.
+Closing a remote application window requests closing the actual host window. Closing a desktop-view window disconnects. Quitting the launcher stops the sessions it started. On Windows, closing its window asks whether to hide to the tray or quit. Remember your choice, or change it in Settings. A separately configured sharing login item continues independently.
 
 Cross-platform sessions swap Control and Command by default. Shift and Alt/Option keep their meaning. Choose the physical-key profile for terminals or literal key positions. Focus loss, profile changes, and disconnect release held remote input.
 
 Text and PNG clipboard synchronization is enabled by default. Regular files can be dropped into remote windows or fetched from a path within the host user's home folder. Completed transfers are checksum verified and never overwrite existing files. Receive files default to `~/Downloads/Frames`; interrupted uploads can resume. Folder trees and dragging arbitrary files out of captured Finder/Explorer pixels are not supported.
 
-The optional Android ADB bridge forwards the client's existing ADB server over the paired connection. Start `adb start-server` on the client, enable the bridge in Frames, then use `adb -H 127.0.0.1 -P 15037 devices` on the host. It exposes all devices available to that ADB server. Generic USB, fastboot, DFU, and iOS forwarding are not implemented.
+The optional Android ADB bridge forwards the client's existing ADB server over the paired connection. Start `adb start-server` on the client, enable the bridge in Frames, then use `adb -H 127.0.0.1 -P 15037 devices` on the host. It exposes all devices available to that ADB server. Standard USB/Bluetooth gamepads can be forwarded to a Windows host through Devices > Gamepads. Wired USB passthrough is available between Windows computers with optional USB/IP drivers. USB audio/video and Mac receiving are excluded from this release; device compatibility needs physical validation. See [device forwarding and setup](docs/DEVICE_FORWARDING.md).
+
+## Sharing scopes
+
+Use **Start sharing** with **Everything** (default), **Selected windows**, or **One window**. The window modes open a searchable preview grid; select one or several windows and press **Share**. On Windows, One window uses experimental isolated input for eligible x64 applications and games, leaving your mouse and keyboard available. Its viewer scales locally and closing it disconnects. Selected windows retains normal remote control. Scoped sharing disables desktop access, clipboard/files, and device forwarding.
+
+Any technically eligible game can be tried as **Untested**. The initial catalog has no verified games; compatibility requires exact build and adapter/profile matching. See [sharing scopes and isolated input](docs/SHARED_GAME.md), [compatibility records](docs/GAME_COMPATIBILITY.md), and [validation limits](docs/SHARED_GAME_VALIDATION.md).
 
 ## Command line
 

@@ -40,6 +40,12 @@ In **Settings**, Check for updates shows progress and errors. After verification
 
 On macOS, the updater runs from a temporary copy of the complete signed app bundle. Its executable must stay with the signed Info.plist and resources so macOS can validate it before launch.
 
+The pinned `quinn-udp` source in `vendor/quinn-udp` preserves IPv4 reply addresses on Macs with multiple active interfaces. To check both LAN addresses without opening a remote session or approving pairing, run `cargo run -p frames-core --example quic_probe -- IP1:47990 IP2:47990`. Both TLS probes must succeed and report the same host identity. The Mac regression test is `FRAMES_TEST_SOURCE_IPV4=IP1 FRAMES_TEST_RECEIVER_IPV4=IP2 cargo test --manifest-path vendor/quinn-udp/Cargo.toml wildcard_socket_preserves_secondary_ipv4_source -- --ignored` (both addresses must belong to that Mac).
+
+Launcher-supervised sessions pass `FRAMES_LAUNCHER_PID` so Windows pairing and error dialogs remain owned by their launcher; current session windows take priority. On Windows, run the ignored `session_dialog_resolves_launcher_owner` native test with that variable set to a visible Frames launcher's process ID. macOS helper alerts use the modal panel level because they run outside the launcher's process.
+
 Older builds used `app.frames.desktop`. Install this DMG manually once to migrate to `dev.creaton.frames`: the old updater intentionally rejects a different bundle identifier. Disable the old sharing login item before replacing the app and grant the new Frames identity its macOS privacy permissions. Pairing data is retained in its existing location.
 
 For a local installer check on a Mac, run `bash native/macos/build.sh`, `python3 scripts/release.py dmg VERSION`, and `python3 scripts/release.py verify-dmg dist/release/Frames-VERSION-macos-aarch64.dmg VERSION` (use the workspace version). A local Developer ID signed build can exercise the complete updater with `FRAMES_UPDATE_TEST_APP="$PWD/dist/macos/Frames.app" cargo test -p frames signed_mac_update_replaces_entire_bundle -- --ignored --nocapture`; the test uses temporary installation/cache directories and an isolated test signing key.
+
+The F6 media format requires matching builds. Keep FEC/adaptation/GPU diagnostic switches available during acceptance. Run the media gates in [VALIDATION.md](VALIDATION.md) before claiming 1080p60 latency or uninterrupted frame delivery; smoke checks and codec timings do not certify those gates.

@@ -16,8 +16,38 @@ jobs:
       - name: Prepare bundled media SDK
         run: python scripts/prepare_media.py
       - run: cargo fmt --all --check
+      - name: Game compatibility catalog documentation
+        run: python scripts/game_compatibility.py --check
+      - name: Build and exercise shared input adapter
+        run: |
+          python scripts/build_shared_input.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test_shared_input.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test_shared_input.py --buffered
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test_shared_input.py --hidden-raw
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test_shared_input.py --buffered --hidden-raw
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test_shared_lifecycle.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & target/shared-input/native/Release/shared_ipc_fixture.exe
       - run: python scripts/test_release.py -k executable
+      - run: python scripts/test_media_network_fixture.py
       - run: cargo test --workspace --locked
+      - name: Shared game production session and network lease
+        run: |
+          cargo build -p frames --bin frames --example shared_probe --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test_shared_session.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test_shared_session.py --network-loss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/test_shared_session.py --picker
+      - name: Host-selected window identity and capture guards
+        run: |
+          cargo test -p frames-native window_selection::tests:: --locked -- --include-ignored --nocapture
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Real software codec roundtrip
         run: cargo test -p frames-core --test media_roundtrip --locked -- --nocapture
@@ -36,6 +66,7 @@ jobs:
           targets: aarch64-apple-darwin
       - name: Codec source download regression checks
         run: python scripts/test_prepare_media_macos_deps.py
+      - run: python3 scripts/test_media_network_fixture.py
       - name: Prepare bundled media SDK
         run: bash scripts/prepare_media_macos.sh
       - run: cargo test --workspace --locked
@@ -66,6 +97,14 @@ jobs:
           done
           swiftc -swift-version 5 -target arm64-apple-macos14.2 -import-objc-header native/include/frames.h "${sources[@]}" native/macos/Tests/RemoteHeaderTests.swift target/aarch64-apple-darwin/release/libframes_core.a -framework AppKit -framework ScreenCaptureKit -framework Metal -framework QuartzCore -framework VideoToolbox -framework Security -framework CoreGraphics -framework ServiceManagement -framework UniformTypeIdentifiers -framework AudioToolbox -o /tmp/frames-remote-header-tests
           /tmp/frames-remote-header-tests
+      - name: Mac shared game viewer policy and virtual cursor
+        run: |
+          sources=()
+          for source in native/macos/Sources/*.swift; do
+            if [[ "$source" != */main.swift ]]; then sources+=("$source"); fi
+          done
+          swiftc -swift-version 5 -target arm64-apple-macos14.2 -import-objc-header native/include/frames.h "${sources[@]}" native/macos/Tests/SharedGameTests.swift target/aarch64-apple-darwin/release/libframes_core.a -framework AppKit -framework ScreenCaptureKit -framework Metal -framework QuartzCore -framework VideoToolbox -framework Security -framework CoreGraphics -framework ServiceManagement -framework UniformTypeIdentifiers -framework AudioToolbox -framework ImageIO -o /tmp/frames-shared-game-tests
+          /tmp/frames-shared-game-tests
       - name: Mac control remains responsive when media is blocked
         run: |
           swiftc native/macos/Sources/Wire.swift native/macos/Tests/BridgeOutputTests.swift -framework AppKit -framework ScreenCaptureKit -framework ServiceManagement -o /tmp/frames-bridge-output-tests
@@ -74,6 +113,10 @@ jobs:
         run: |
           swiftc native/macos/Sources/ClientMedia.swift native/macos/Tests/ClientMediaTests.swift -o /tmp/frames-client-media-tests
           /tmp/frames-client-media-tests
+      - name: Mac native compressed video and hardware surfaces
+        run: |
+          swiftc -O -swift-version 5 native/macos/Sources/Wire.swift native/macos/Sources/ClientMedia.swift native/macos/Sources/NativeVideo.swift native/macos/Tests/NativeVideoTests.swift -o /tmp/frames-native-video-tests
+          /tmp/frames-native-video-tests
       - name: Mac locked session control checks
         run: |
           swiftc native/macos/Sources/SessionState.swift native/macos/Tests/SessionStateTests.swift -o /tmp/frames-session-state-tests

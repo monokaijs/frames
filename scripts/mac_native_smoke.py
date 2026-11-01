@@ -52,8 +52,10 @@ def main():
                       and e.get("width") == 640 and e.get("height") == 400 for e in events)
             menu = any(e.get("native_event") == "menu_installed" and e.get("remote_top_level_items") == 1
                        and e.get("activation_policy") == 0 for e in events)
-            if snapshot and gpu and menu:
-                print("PASS: Rust/Swift bridge, AppKit proxy, native application menu, Metal GPU completion")
+            idle = any(e.get("native_event") == "presentation_gap" and e.get("number") == 1
+                       and e.get("gap_us", 0) > 1_000_000 for e in events)
+            if snapshot and gpu and menu and idle:
+                print("PASS: Rust/Swift bridge, AppKit proxy, native application menu, Metal GPU completion and idle wakeup")
                 return
             time.sleep(0.25)
         raise RuntimeError("Native fixture did not reach all checkpoints:\n" + content)

@@ -11,6 +11,12 @@ Discovery, permission helpers, trust changes, and session supervision run outsid
 
 ## Preview
 
+The launcher uses GPU-accelerated FemtoVG with Slint 1.16.1's Swash glyph
+rasterization for small text. The close dialog's origin is rounded to physical
+pixels so centering does not add a half-pixel offset at odd window sizes or
+fractional display scaling. Remote video presentation uses its separate native
+renderer.
+
 The preview uses fixture data and the production Slint views without starting sessions or reading local trust/history:
 
 ```sh
@@ -22,3 +28,11 @@ SLINT_BACKEND=winit-software cargo run -p frames --example launcher_preview -- c
 ```
 
 Options include `--empty`, `--active`, `--stress`, `--error`, and `--windows`. The minimum window size is 820 by 540 logical pixels. Permission checks refresh on focus; repeated setup actions open Settings after the first prompt. Keep the signing identity stable to preserve macOS privacy grants.
+
+For text-rendering checks, run `launcher_preview close --windows --compact`
+without a PNG output argument. Set `SLINT_BACKEND=winit-femtovg` explicitly and
+repeat with `SLINT_SCALE_FACTOR=1`, `1.25`, `1.5`, and `2`, including resizing to
+odd window dimensions. A PNG output argument selects the headless software
+renderer and does not validate GPU text. `SLINT_DEBUG_PERFORMANCE=refresh_full_speed,console`
+forces continuous redraws and prints throughput for performance comparisons;
+unset it when checking normal idle CPU usage.

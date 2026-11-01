@@ -26,6 +26,8 @@ def main():
     parser.add_argument("--mac-app", help="Use an isolated Mac app build instead of ~/Applications/Frames.app")
     parser.add_argument("--mac-address", required=True)
     parser.add_argument("--windows-address", required=True)
+    parser.add_argument("--windows-client-address", help="Mac-side address of an optional UDP impairment proxy")
+    parser.add_argument("--windows-client-port", type=int, default=47992, help="Use a UDP impairment proxy in front of the Windows host")
     parser.add_argument("--control-probe", type=Path,
                         help="Optional production-session fixture client; requires Frames QA source on the Mac")
     parser.add_argument("--capture-only", action="store_true")
@@ -36,9 +38,11 @@ def main():
                         help="Windows window_fixture executable, required with --native-ui")
     parser.add_argument("--hold-ui", type=int, default=0,
                         help="Keep native clients open for this many seconds; write stop-ui in the report folder to end early")
+    parser.add_argument("--motion", action="store_true", help="Use a continuous 1080p60 generated Windows motion fixture")
     parser.add_argument("--desktop-bridge", action="store_true",
                         help="Also show the Mac desktop on Windows; avoid controlling the Windows fixture through this nested view")
     args = parser.parse_args()
+    windows_target = (args.windows_client_address or args.windows_address) + ":" + str(args.windows_client_port)
     binary = args.binary.resolve(strict=True)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     root = Path("dist/cross-platform").resolve() / run_id
@@ -64,7 +68,9 @@ def main():
     mac_root = home + "/Library/Caches/FramesCrossTest/" + run_id
     mac_app = args.mac_app or home + "/Applications/Frames.app"
     q = shlex.quote
+    mac_app = ssh(f"cd {q(mac_app)} && pwd -P").strip()
     ssh(f"mkdir -p {q(mac_root)}")
+    ssh(f"nohup /usr/bin/caffeinate -d -u -t {min(max(args.hold_ui + 180, 300), 7500)} </dev/null >/dev/null 2>&1 &")
 
     def environment(role):
         env = os.environ.copy()
@@ -77,9 +83,10 @@ def main():
         elif args.native_ui:
             env["RUST_LOG"] = "warn,frames=info,frames_native=info"
         if role == "fixture":
-            env["FRAMES_QA_SECONDS"] = str(min(max(args.hold_ui + 60, 300), 3660))
+            env["FRAMES_QA_SECONDS"] = str(min(max(args.hold_ui + 60, 300), 7260))
         if args.native_ui:
             env["FRAMES_INPUT_DIAGNOSTICS"] = "1"
+            env["FRAMES_MEDIA_DIAGNOSTICS"] = "1"
         return env
 
     def windows(role, arguments, executable=None):
@@ -118,6 +125,7 @@ def main():
                    "--env", "FRAMES_CONFIG_DIR=" + (mac_root + "/" + config_role if config_role else folder),
                    "--env", "FRAMES_PAIRING_CONSOLE=1", "--env", "FRAMES_NO_DISCOVERY=1",
                    "--env", "FRAMES_NATIVE_DIAGNOSTICS=1",
+                   "--env", "FRAMES_MEDIA_DIAGNOSTICS=1",
                    "--stdin", folder + "/input", "--stdout", folder + "/out.log",
                    "--stderr", folder + "/err.log", "--args", *arguments]
         if os.environ.get("FRAMES_CROSS_RUST_LOG"):
@@ -197,13 +205,13 @@ def main():
         excluded = []
         if args.native_ui:
             assert args.window_fixture, "Pass --window-fixture with --native-ui"
-            fixture, _ = windows("fixture", ["--no-cover"], args.window_fixture.resolve(strict=True))
-            time.sleep(0.5)
+            fixture, fixture_log = windows("fixture", ["--no-cover", *(["--1080p", "--motion"] if args.motion else [])], args.window_fixture.resolve(strict=True))
+            until(lambda: '"fixture_event":"ready"' in fixture_log["out"], 10)
             listing = subprocess.run([str(binary), "windows"], capture_output=True, text=True,
                                      encoding="utf-8", check=True, creationflags=creationflags)
             windows_list = json.loads(listing.stdout)
-            assert any(w["title"] == "Frames QA source" for w in windows_list), "Start window_fixture --no-cover first"
-            fixture_source = next(w for w in windows_list if w["title"] == "Frames QA source")
+            assert any(w["title"].startswith("Frames QA source") for w in windows_list), "Start window_fixture --no-cover first"
+            fixture_source = next(w for w in windows_list if w["title"].startswith("Frames QA source"))
             excluded = [arg for app_id in sorted({w["app_id"] for w in windows_list
                                                 if Path(w["app_id"]).stem != "window_fixture"})
                         for arg in ("--exclude", app_id)]
@@ -214,13 +222,13 @@ def main():
                                                         "--unattended", "--no-clipboard", "--receive-dir",
                                                         str(root / "received-windows"), *excluded])
         until(lambda: "Frames host listening" in win_host_log["err"])
-        mac_sender, sender_folder = mac("mac-client", ["send", args.windows_address + ":47992", mac_source])
+        mac_sender, sender_folder = mac("mac-client", ["send", windows_target, mac_source])
         pair(win_host, win_host_log, mac_sender, sender_folder)
         until(lambda: "Transferred " in read_remote(sender_folder + "/out.log"), 30)
         assert (root / "received-windows" / "Frames Mac Unicode.bin").read_bytes() == payload
         passed("Mac client -> Windows host: GUI Keychain identity, matching-code pairing, upload integrity")
         if args.native_ui:
-            _, native_folder = mac("mac-client-native", ["connect", args.windows_address + ":47992", "--no-clipboard"], "mac-client")
+            _, native_folder = mac("mac-client-native", ["connect", windows_target, "--no-clipboard"], "mac-client")
             until(lambda: '"native_event":"metal_present_completed"' in read_remote(native_folder + "/err.log"), 45)
             passed("Windows WGC -> QUIC -> Mac decoder -> native AppKit/Metal presentation")
             native_events = [json.loads(line) for line in read_remote(native_folder + "/err.log").splitlines()
@@ -236,13 +244,13 @@ def main():
                 if args.desktop_bridge:
                     windows("windows-client", ["connect", args.mac_address + ":47991", "--view", "desktop", "--no-clipboard"])
                 print("UI READY: " + str(root), flush=True)
-                end = time.monotonic() + min(args.hold_ui, 3600)
+                end = time.monotonic() + min(args.hold_ui, 7200)
                 next_health_check = 0
                 while time.monotonic() < end and not (root / "stop-ui").exists():
                     if time.monotonic() >= next_health_check:
                         assert fixture.poll() is None, "Windows QA fixture exited during interaction check"
                         assert win_host.poll() is None, "Windows host exited during interaction check"
-                        pattern = "^" + re.escape(mac_app + "/Contents/MacOS/Frames connect " + args.windows_address + ":47992")
+                        pattern = "^" + re.escape(mac_app + "/Contents/MacOS/Frames connect " + windows_target)
                         alive = ssh(f"pgrep -f {q(pattern)} | while read -r pid; do "
                                     f"if ps e -p \"$pid\" -o command= | grep -Fq {q(mac_root)}; then echo alive; fi; done")
                         assert "alive" in alive, "Mac native client exited during interaction check; inspect its err.log"
@@ -265,7 +273,7 @@ def main():
             ssh(f"pgrep -f {q(pattern)} | while read -r pid; do "
                 f"if ps -p \"$pid\" -o command= | grep -Fq {q(mac_root)}; then kill \"$pid\"; fi; done")
         if args.native_ui:
-            pattern = "^" + re.escape(mac_app + "/Contents/MacOS/Frames connect " + args.windows_address + ":47992")
+            pattern = "^" + re.escape(mac_app + "/Contents/MacOS/Frames connect " + windows_target)
             ssh(f"pgrep -f {q(pattern)} | while read -r pid; do "
                 f"if ps e -p \"$pid\" -o command= | grep -Fq {q(mac_root)}; then kill \"$pid\"; fi; done")
         (root / "results.json").write_text(json.dumps({"passed": results, "failure": failure,

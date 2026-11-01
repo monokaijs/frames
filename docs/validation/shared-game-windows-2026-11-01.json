@@ -1,0 +1,276 @@
+{
+  "schema": 1,
+  "kind": "generated_fixture_validation",
+  "date": "2026-11-01",
+  "frames_version": "0.1.4",
+  "adapter_revision": "frames-protoinput-1",
+  "profile": {
+    "id": "generic",
+    "revision": 1
+  },
+  "upstream_revision": "e18e06bb345b86540e7464f7355c649bfdd17f38",
+  "environment": {
+    "os": "Windows 11 Pro",
+    "version": "10.0.26200",
+    "architecture": "x64",
+    "compiler": "MSVC 14.29.30133",
+    "cpu": "AMD Ryzen 7 7800X3D",
+    "logical_processors": 16,
+    "gpu": "NVIDIA GeForce RTX 3080 Ti"
+  },
+  "artifacts": {
+    "FramesInput.dll": "7cb5767d2e5125b6604f888d8a71fd667d6d518c3d6f6e9b192c9d5bcb4dabc1",
+    "shared_input_fixture.exe": "c20ca5cd3dd0e2129ff823ac66e8699e31ceac1094493342278cbd774d640a8f"
+  },
+  "source_sha256": {
+    "native/windows/shared-input/adapter.cpp": "91edf42bbd17b6614730ed40fc119eaab6843ff19dbd71e847f81089cfe63827",
+    "native/windows/shared-input/audio_fixture.cpp": "f12626f2d0dccfa15e25145a10f88b61e20a29545c72487589da3c81b122b05a",
+    "native/windows/shared-input/broker.cpp": "a2615798fcf4bfcbaa2d6383223fc70d343817303446f58e37b4161db20037f4",
+    "native/windows/shared-input/CMakeLists.txt": "66d072fff1afc3a4b6202ef7e3bbe14790917ce1017a805d7da21b3a8ec2f56c",
+    "native/windows/shared-input/fixture.cpp": "14c58f9269299d9f0e1582d905cecc2527b8a4185380ec66febf2c37ed4f1d9c",
+    "native/windows/shared-input/ipc_fixture.cpp": "200438c2f95a95bec6ea12a8b0ac060a826b434fff48845460a31de9199a5f23",
+    "native/windows/shared-input/process_audio.cpp": "32a354cdb0da00baeb0bc3f579957b84cbad9bc5b724122981b369914e843a95",
+    "native/windows/shared-input/wire.h": "633d04863e2050e34079823119d88c04d62877ed1b0fbb8e1be7ed99b08b0384",
+    "vendor/frames-protoinput/SOURCE.json": "37f36d87ba2cb887f2b5094cdff09e96f2c37efa4eb4f29c05e1f11c3c932244",
+    "scripts/test_shared_input.py": "f2c07a0de4fa8b822f78f7d5d071c99e391085c2ca9b65b77132cee242453e63"
+  },
+  "workload": "Two simultaneous offscreen generated fixtures, each paced at 1000 relative mouse events per second for 1800 seconds, with independent 100 ms broker heartbeat threads. Individual and buffered-only reads use hidden raw-input sinks. Developer builds, UI rendering, and regression checks ran concurrently at multiple points.",
+  "measurement_boundaries": {
+    "broker_submit_us": "Benchmark broker submission including Python command marshalling and write-lock acquisition; not delivery latency.",
+    "delivery_latency_us": "Broker QPC timestamp to first raw-input read in the target process; histogram percentiles are logarithmic-bin upper bounds.",
+    "cpu": "Target fixture and injected DLL, percentage of one logical core.",
+    "frame_intervals": "GDI fixture paint intervals during the paced workload; not game frame time or network input-to-photon latency.",
+    "last_fixture": "Snapshot after overflow and the first normal detach, before resident reattachment. The final stalled-detach held-state and zero-live-record assertions run later in the harness. A notification hint can still be in flight in this earlier snapshot."
+  },
+  "not_game_verification": true,
+  "pending_acceptance": [
+    "macOS build and viewer execution",
+    "real-game Windows/macOS matrix",
+    "30-minute physical host use with remote gameplay",
+    "game frame-time and network input-latency percentiles on final target configurations",
+    "manual normal-sharing regression matrix"
+  ],
+  "automated_checks": {
+    "cargo_test_workspace": {
+      "passed": 120,
+      "ignored": 10
+    },
+    "clippy_all_targets_all_features": true,
+    "formatting": true,
+    "catalog_documentation_consistency": true,
+    "four_native_input_variants": true,
+    "fragmented_local_ipc": true,
+    "broker_failure_minimization_reconnect": true,
+    "covered_window_capture": true,
+    "layered_viewer_cursor": true,
+    "process_audio_isolation": true,
+    "quic_ui_stall_and_900ms_outage": true,
+    "picker_identity_quic_path": true,
+    "selected_window_capture_guards": true,
+    "picker_ui_stale_results_single_multi_cancel": true,
+    "optimized_picker_quic_ui_stall_and_900ms_outage": true
+  },
+  "audio_runs": [
+    {
+      "descendant": false,
+      "frames": 57120,
+      "target_880_amplitude": 0.019443186637876354,
+      "outside_440_amplitude": 6.460847692966477e-06
+    },
+    {
+      "descendant": true,
+      "frames": 57600,
+      "target_880_amplitude": 0.0194454483999104,
+      "outside_440_amplitude": 3.8527534821631955e-06
+    }
+  ],
+  "application_artifacts": {
+    "debug": "c152f0df1fc5b61c3994c9ada776e1f29d516023814a670e42eb661af432b9a1",
+    "release": "a48430e883fc4623bee5c4b50c35ec07fe5a535134eefd52c2253d20e4a698b6"
+  },
+  "earlier_attempts": [
+    {
+      "same_native_dll": true,
+      "modes": [
+        "individual",
+        "buffered"
+      ],
+      "heartbeat_source": "motion benchmark loop",
+      "last_progress_seconds": 420,
+      "outcome": "control paused, phase 2, error 0",
+      "heartbeat_gap_recorded": false,
+      "cause": "not established",
+      "counted_as_successful_soak": false
+    }
+  ],
+  "native_input_runs": [
+    {
+      "buffered": false,
+      "hidden_raw": true,
+      "seconds": 1800.0,
+      "events": 1800000,
+      "broker_submit_us": {
+        "50": 17.4,
+        "95": 24.3,
+        "99": 34.8
+      },
+      "delivery_latency_us_histogram_upper_bound": {
+        "50": 127,
+        "95": 255,
+        "99": 511
+      },
+      "fixture_initial_working_set_bytes": 13598720,
+      "fixture_working_set_growth_bytes": 176128,
+      "last_fixture": {
+        "pending": 65536,
+        "buffer_calls": 0,
+        "event": "report",
+        "w_raw": 0,
+        "w_legacy": 0,
+        "left_raw": 0,
+        "left_legacy": 0,
+        "w_async": 0,
+        "w_queue": 0,
+        "w_array": 0,
+        "raw_keys": 22,
+        "raw_mouse": 1800007,
+        "legacy_keys": 22,
+        "legacy_mouse": 1800007,
+        "errors": 0,
+        "registrations": 2,
+        "x": 1280,
+        "y": 720,
+        "frames": 71938,
+        "frame_mean_ms": 25.101,
+        "frame_max_ms": 5040.267
+      },
+      "delivered": 1800022,
+      "delivery_latency_max_us": 12506,
+      "delivery_histogram_log2_us": [
+        0,
+        0,
+        0,
+        0,
+        47606,
+        691570,
+        894564,
+        127617,
+        26469,
+        7862,
+        3974,
+        311,
+        40,
+        9,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "fixture_cpu_percent_one_core": 7.012150332095596,
+      "fixture_working_set_bytes": 13774848,
+      "fixture_peak_working_set_bytes": 13791232,
+      "baseline_frame_mean_ms": 25.538,
+      "load_frame_mean_ms": 25.031,
+      "load_frame_max_ms": 55.878,
+      "max_broker_heartbeat_gap_ms": 112.4573999986751
+    },
+    {
+      "buffered": true,
+      "hidden_raw": true,
+      "seconds": 1800.0,
+      "events": 1800000,
+      "broker_submit_us": {
+        "50": 17.4,
+        "95": 24.6,
+        "99": 35.1
+      },
+      "delivery_latency_us_histogram_upper_bound": {
+        "50": 127,
+        "95": 255,
+        "99": 1023
+      },
+      "fixture_initial_working_set_bytes": 13561856,
+      "fixture_working_set_growth_bytes": 159744,
+      "last_fixture": {
+        "pending": 0,
+        "buffer_calls": 2460826,
+        "event": "report",
+        "w_raw": 0,
+        "w_legacy": 0,
+        "left_raw": 0,
+        "left_legacy": 0,
+        "w_async": 0,
+        "w_queue": 0,
+        "w_array": 0,
+        "raw_keys": 22,
+        "raw_mouse": 1800007,
+        "legacy_keys": 22,
+        "legacy_mouse": 1800007,
+        "errors": 0,
+        "registrations": 2,
+        "x": 1280,
+        "y": 720,
+        "frames": 71903,
+        "frame_mean_ms": 25.125,
+        "frame_max_ms": 6120.391
+      },
+      "delivered": 1800022,
+      "delivery_latency_max_us": 23270,
+      "delivery_histogram_log2_us": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        293663,
+        933863,
+        500392,
+        50824,
+        13470,
+        7231,
+        483,
+        87,
+        6,
+        3,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "fixture_cpu_percent_one_core": 12.13280771158525,
+      "fixture_working_set_bytes": 13721600,
+      "fixture_peak_working_set_bytes": 13742080,
+      "baseline_frame_mean_ms": 31.074,
+      "load_frame_mean_ms": 25.039,
+      "load_frame_max_ms": 61.468,
+      "max_broker_heartbeat_gap_ms": 114.41049999848474
+    }
+  ]
+}
