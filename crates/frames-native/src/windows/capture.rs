@@ -625,8 +625,14 @@ mod tests {
                 SWP_NOACTIVATE,
             );
             let _ = UpdateWindow(cover);
-            let mut client = windows::Win32::Foundation::RECT::default();
-            GetClientRect(source, &mut client).unwrap();
+            let client = {
+                // The fixture is intentionally created at the caller's DPI
+                // awareness. Compare capture pixels with physical dimensions.
+                let _dpi = super::super::host::PhysicalDpi::enter();
+                let mut client = windows::Win32::Foundation::RECT::default();
+                GetClientRect(source, &mut client).unwrap();
+                client
+            };
             ready_tx
                 .send((source.0 as u64, client.right as u32, client.bottom as u32))
                 .unwrap();
