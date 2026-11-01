@@ -98,6 +98,36 @@ impl Drop for HostStream {
 #[cfg(test)]
 mod ready_tests {
     use super::*;
+    #[tokio::test]
+    async fn unavailable_audio_does_not_prevent_video_start_or_readiness() {
+        let (out, mut messages) = crate::session::test_outbound();
+        let (ui, updates) = frames_native::client_channel(8);
+        let mut client = ClientMedia::default();
+        client
+            .install_audio(7, &out, &ui, Err(anyhow::anyhow!("no playback device")))
+            .await
+            .unwrap();
+        assert!(client.audio.is_none());
+        assert!(matches!(
+            messages.recv().await,
+            Some(Message::AudioPreference { enabled: false })
+        ));
+        let window = WindowId {
+            id: 910,
+            generation: 1,
+        };
+        client
+            .start(fixture_config(window, 3), ui, &out)
+            .await
+            .unwrap();
+        assert!(client.streams.contains_key(&window));
+        assert!(
+            matches!(messages.recv().await, Some(Message::StreamReady { window: key, generation: 3 }) if key == window)
+        );
+        assert!(
+            matches!(updates.try_recv(), Ok(ClientUpdate::Status(key, message)) if key == window && message.contains("no playback device"))
+        );
+    }
     fn fixture_config(window: WindowId, generation: u32) -> StreamConfig {
         StreamConfig {
             window,
@@ -695,6 +725,7 @@ pub struct ClientMedia {
     reassembly: Reassembler,
     clock: media::ClockEstimator,
     audio: Option<ClientAudio>,
+    audio_error: Option<String>,
 }
 impl ClientMedia {
     pub fn clear_video(&mut self) {
@@ -731,10 +762,28 @@ impl ClientMedia {
         &mut self,
         generation: u32,
         out: &Outbound,
-        prepared: (frames_native::audio::Playback, frames_core::audio::Decoder),
+        ui: &frames_native::ClientSender,
+        prepared: anyhow::Result<(frames_native::audio::Playback, frames_core::audio::Decoder)>,
     ) -> anyhow::Result<()> {
         self.reassembly.forget_window(media::AUDIO_WINDOW);
-        let (player, mut decoder) = prepared;
+        self.audio = None;
+        let (player, mut decoder) = match prepared {
+            Ok(prepared) => {
+                self.audio_error = None;
+                prepared
+            }
+            Err(error) => {
+                let message = format!("Audio unavailable: {error}");
+                tracing::warn!(%error, "audio playback unavailable; retaining video and control");
+                for &window in self.streams.keys() {
+                    let _ = ui.try_send(ClientUpdate::Status(window, message.clone()));
+                }
+                self.audio_error = Some(message);
+                out.send(Message::AudioPreference { enabled: false })
+                    .await?;
+                return Ok(());
+            }
+        };
         let playback = player.stats.clone();
         let (_, empty) = tokio::sync::mpsc::channel(1);
         let mut pcm = std::mem::replace(&mut decoder.pcm, empty);
@@ -773,6 +822,9 @@ impl ClientMedia {
         out: &Outbound,
         prepared: Option<codec::Decoder>,
     ) -> anyhow::Result<()> {
+        if let Some(message) = &self.audio_error {
+            let _ = ui.try_send(ClientUpdate::Status(config.window, message.clone()));
+        }
         self.reassembly.forget_window(config.window);
         // H.264/HEVC IDRs reset reference pictures without restarting the
         // decoder worker. Keeping it warm avoids a cold-start recovery loop.
@@ -1316,7 +1368,7 @@ impl ClientMediaWorker {
                         },
                     },
                     initialized = audio_starting.join_next(), if !audio_starting.is_empty() => {
-                        if let Some(Ok((g, prepared))) = initialized && requested_audio == g { media.install_audio(g, &out, prepared?).await?; }
+                        if let Some(Ok((g, prepared))) = initialized && requested_audio == g { media.install_audio(g, &out, &ui, prepared).await?; }
                     },
                     initialized = starting.join_next(), if !starting.is_empty() => {
                         if let Some(Ok((tag, config, decoder))) = initialized && requested.get(&config.window) == Some(&tag) {
