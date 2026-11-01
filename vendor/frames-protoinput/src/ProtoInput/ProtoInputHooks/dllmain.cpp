@@ -1,0 +1,100 @@
+// dllmain.cpp : Defines the entry point for the DLL application.
+#include <windows.h>
+#include <iostream>
+#include <BlackBone/Process/Process.h>
+#include <BlackBone/Patterns/PatternSearch.h>
+#include <BlackBone/Process/RPC/RemoteFunction.hpp>
+#include <BlackBone/Syscalls/Syscall.h>
+#include <imgui.h>
+#include <easyhook.h>
+#include "Gui.h"
+#include "RawInput.h"
+#include "HookManager.h"
+#include "protoloader.h"
+#include "WindowMsgHook.h"
+#include "PipeCommunication.h"
+#include "HwndSelector.h"
+#include "FocusMessageLoop.h"
+#include "FakeCursor.h"
+#include "INISettings.h"
+#include "TranslateXtoMKB.h"
+#include "ScanThread.h"
+
+HMODULE Proto::hmodule;
+
+DWORD WINAPI StartThread(LPVOID lpParameter)
+{
+    
+    // Useful to add a pause if we need to attach a debugger //pause with MessageBoxA(NULL, "pause here", "oh, okay then, i will just wait here until messagebox close", MB_OK);
+    AllocConsole();
+    FILE* f = new FILE();
+    freopen_s(&f, "CONOUT$", "w", stdout);
+    freopen_s(&f, "CONOUT$", "w", stderr);
+    // Proto::ConsoleHwnd = (intptr_t)FindWindowW(L"ConsoleWindowClass", NULL);
+    Proto::ConsoleHwnd = (intptr_t)GetConsoleWindow();
+    Proto::SetConsoleVisible(false);
+
+    std::cout << "Hooks DLL loaded\n";
+
+    // LoadConfig is an alternative way of setting the configuration values instead of using the pipe communication.
+    Proto::LoadConfig();
+
+    Proto::HwndSelector::UpdateMainHwnd();
+
+    Proto::FocusMessageLoop::SetupThread(); //setfocus message spamming loop
+
+    Proto::FakeCursor::Initialise(Proto::hmodule); //create cursor drawing window. could be possible to create it later on first drawcursor enable
+
+    InitializeCriticalSection(&ScreenshotInput::ScanThread::critical);//must be placed before InitialiseRawInput
+
+    Proto::RawInput::InitialiseRawInput(); //create raw input listening window
+
+    Proto::AddThreadToACL(GetCurrentThreadId()); //dont hook this thread
+
+    Proto::StartPipeCommunication();  //hooks starting in here
+	
+    return 0;
+}
+ 
+// EasyHook entry point
+extern "C" __declspec(dllexport) void __stdcall NativeInjectionEntryPoint(REMOTE_ENTRY_INFO * inRemoteInfo)
+{
+    printf("EasyHook NativeInjectionEntryPoint called\n");
+}
+
+EASYHOOK_BOOL_EXPORT EasyHookDllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved);
+
+extern "C" BOOL WINAPI OpenXinputDllMain(HINSTANCE hInstDll, DWORD fdwReason, LPVOID lpvReserved);
+
+BOOL APIENTRY DllMain( HMODULE hModule,
+                       DWORD  ul_reason_for_call,
+                       LPVOID lpReserved
+                     )
+{
+	// Needed for EasyHook to initialise some stuff
+    EasyHookDllMain(hModule, ul_reason_for_call, lpReserved);
+
+    OpenXinputDllMain(hModule, ul_reason_for_call, lpReserved);
+	
+    switch (ul_reason_for_call)
+    {
+    case DLL_PROCESS_ATTACH:
+    {
+        Proto::hmodule = hModule;
+    		
+         HANDLE hThread = CreateThread(nullptr, 0,
+                                      (LPTHREAD_START_ROUTINE)StartThread, hModule, 0, 0);
+         if (hThread != nullptr)
+             CloseHandle(hThread);
+             		
+        break;
+    }
+    case DLL_THREAD_ATTACH:
+    case DLL_THREAD_DETACH:
+    case DLL_PROCESS_DETACH:
+        break;
+    }
+       
+	
+    return TRUE;
+}
