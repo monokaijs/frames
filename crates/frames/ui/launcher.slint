@@ -1,7 +1,8 @@
 import { LineEdit, ScrollView, ComboBox, SpinBox } from "std-widgets.slint";
+import { ConnectionButton } from "connection-button.slint";
 import { Theme, Glyph, AppButton, AppSwitch, AppCheckBox, NavItem, TabItem, Badge, Card, SectionTitle, MutedText, ModalFocus } from "components.slint";
 
-export struct DeviceRow { name: string, address: string, detail: string, fingerprint: string, trusted: bool, online: bool, can-trust: bool, preview: image, preview-live: bool }
+export struct DeviceRow { name: string, address: string, detail: string, fingerprint: string, trusted: bool, online: bool, can-trust: bool, preview: image, preview-live: bool, connection-audio: bool, connection-desktop: bool }
 export struct SessionRow { id: int, name: string, detail: string, hosting: bool }
 export struct ShareWindowRow { id: string, title: string, app: string, detail: string, preview: image, selected: bool, available: bool }
 
@@ -41,7 +42,8 @@ component ShareWindowGrid inherits Rectangle {
 
 component DeviceGrid inherits Rectangle {
     in property <[DeviceRow]> devices;
-    callback connect(string, string);
+    callback connect(string, string, bool, bool);
+    callback options-edited(string, string, bool, bool);
     callback trust(string);
     callback revoke(string, string);
     private property <int> columns: root.width > 720px ? 3 : root.width > 440px ? 2 : 1;
@@ -91,7 +93,12 @@ component DeviceGrid inherits Rectangle {
             HorizontalLayout {
                 x: 12px; y: 12px; width: parent.width - 24px; height: 32px;
                 spacing: 8px;
-                AppButton { label: "Connect"; enabled: device.address != ""; clicked => { root.connect(device.address, device.fingerprint); } }
+                ConnectionButton {
+                    enabled: device.address != "";
+                    audio: device.connection-audio; desktop: device.connection-desktop;
+                    connect => { root.connect(device.address, device.fingerprint, self.audio, self.desktop); }
+                    options-edited => { root.options-edited(device.address, device.fingerprint, self.audio, self.desktop); }
+                }
                 Rectangle { horizontal-stretch: 1; }
                 if device.can-trust: AppButton { label: "Trust device"; quiet: true; clicked => { root.trust(device.fingerprint); } }
                 if device.trusted: AppButton { label: "Revoke"; quiet: true; danger: true; clicked => { root.revoke(device.fingerprint, device.name); } }
@@ -248,6 +255,9 @@ export component Launcher inherits Window {
     in property <bool> update-busy: false;
     in property <bool> update-ready: false;
     in property <bool> update-error: false;
+    in-out property <bool> update-prompt-open: false;
+    in-out property <bool> update-restart-busy: false;
+    in-out property <string> update-restart-error;
     in property <[DeviceRow]> nearby;
     in property <[DeviceRow]> recent;
     in property <[DeviceRow]> trusted;
@@ -261,7 +271,9 @@ export component Launcher inherits Window {
     show-permissions => { root.settings-help = ""; root.permissions-open = true; root.refresh(); }
     pure callback filter-devices([DeviceRow], string) -> [DeviceRow];
     callback connect(string);
-    callback connect-device(string, string);
+    callback connect-device(string, string, bool, bool);
+    callback connection-options-edited(string, string, bool, bool);
+    callback connection-address-edited();
     callback toggle-sharing();
     callback discover();
     callback stop-session(int);
@@ -272,6 +284,7 @@ export component Launcher inherits Window {
     callback login-settings();
     callback check-updates();
     callback restart-update();
+    callback confirm-restart-update();
 
     FocusScope {
         enabled: root.revoke-id == "" && !root.permissions-open && !root.close-prompt-open && !root.window-picker-open;
@@ -341,14 +354,21 @@ export component Launcher inherits Window {
                                             VerticalLayout {
                                                 spacing: 7px;
                                                 MutedText { text: "IP address"; font-size: 11px; }
-                                                LineEdit { height: 32px; text <=> root.address; placeholder-text: "192.168.1.10:47990"; accessible-label: "Remote IP address and port"; accepted => { root.connect(root.address); } }
+                                                LineEdit { height: 32px; text <=> root.address; placeholder-text: "192.168.1.10:47990"; accessible-label: "Remote IP address and port"; edited => { root.connection-address-edited(); } accepted => { root.connect(root.address); } }
                                             }
                                             HorizontalLayout {
                                                 spacing: 16px;
-                                                AppCheckBox { text: "Audio"; checked <=> root.audio; }
-                                                AppCheckBox { text: "Desktop"; checked <=> root.desktop; }
                                                 Rectangle { horizontal-stretch: 1; }
-                                                AppButton { label: "Connect"; primary: true; enabled: root.address != ""; clicked => { root.connect(root.address); } }
+                                                ConnectionButton {
+                                                    primary: true; enabled: root.address != "";
+                                                    audio <=> root.audio; desktop <=> root.desktop;
+                                                    connect => { root.connect(root.address); }
+                                                    options-edited => {
+                                                        root.default-audio = root.audio; root.default-desktop = root.desktop;
+                                                        root.settings-edited();
+                                                        root.connection-options-edited(root.address, "", root.audio, root.desktop);
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -369,7 +389,8 @@ export component Launcher inherits Window {
                                     }
                                     DeviceGrid {
                                         devices: root.nearby;
-                                        connect(address, id) => { root.address = address; root.connect-device(address, id); }
+                                        connect(address, id, audio, desktop) => { root.address = address; root.connect-device(address, id, audio, desktop); }
+                                        options-edited(address, id, audio, desktop) => { root.connection-options-edited(address, id, audio, desktop); }
                                         trust(id) => { root.trust(id); }
                                         revoke(id, name) => { root.revoke-id = id; root.revoke-name = name; }
                                     }
@@ -411,7 +432,8 @@ export component Launcher inherits Window {
                             }
                             DeviceGrid {
                                 devices: root.filter-devices(root.device-tab == 0 ? root.recent : root.trusted, root.search);
-                                connect(address, id) => { root.address = address; root.connect-device(address, id); }
+                                connect(address, id, audio, desktop) => { root.address = address; root.connect-device(address, id, audio, desktop); }
+                                options-edited(address, id, audio, desktop) => { root.connection-options-edited(address, id, audio, desktop); }
                                 trust(id) => { root.trust(id); }
                                 revoke(id, name) => { root.revoke-id = id; root.revoke-name = name; }
                             }
@@ -455,7 +477,7 @@ export component Launcher inherits Window {
                             }
                             SettingsSection {
                                 title: "Sharing";
-                                SettingRow { title: "Unattended access"; detail: root.background-sharing-running ? "Enabled by sharing at login." : root.sharing ? "Stop sharing to change this setting." : "Allow approved devices to reconnect without a prompt.";
+                                SettingRow { title: "Unattended access"; detail: root.background-sharing-running ? "Enabled by sharing at login. Accept and trust devices to allow prompt-free access." : root.sharing ? "Stop sharing to change this setting." : "Enable, then accept and trust a device to allow reconnecting without a prompt.";
                                     if root.background-sharing-running: AppSwitch { checked: true; enabled: false; accessible-label: "Unattended access"; }
                                     if !root.background-sharing-running: AppSwitch { checked <=> root.unattended; toggled => { root.settings-edited(); } enabled: root.unattended-editable; accessible-label: "Unattended access"; }
                                 }
@@ -476,15 +498,14 @@ export component Launcher inherits Window {
                                             spacing: 8px;
                                             Text { text: "Frames " + root.app-version; color: Theme.ink; font-size: 13px; font-weight: 500; vertical-alignment: center; horizontal-stretch: 1; }
                                             AppButton { label: root.update-busy ? "Updating..." : "Check for updates"; enabled: !root.update-busy; clicked => { root.check-updates(); } }
-                                            if root.update-ready: AppButton { label: "Restart to update"; primary: true; enabled: root.sessions.length == 0 && !root.background-sharing-running; clicked => { root.restart-update(); } }
+                                            if root.update-ready: AppButton { label: "Restart to update"; primary: true; enabled: !root.update-restart-busy && !root.update-busy; clicked => { root.restart-update(); } }
                                         }
                                         Text { text: root.update-status; color: root.update-error ? #a84d55 : Theme.muted; font-size: 12px; wrap: word-wrap; }
-                                        if root.update-ready && root.sessions.length > 0: MutedText { text: "Stop running sessions before restarting to update."; font-size: 11px; wrap: word-wrap; }
-                                        if root.update-ready && root.background-sharing-running: MutedText { text: "Background sharing is running. Stop it in sharing-at-login settings before restarting to update."; font-size: 11px; wrap: word-wrap; }
+                                        if root.update-ready && (root.sessions.length > 0 || root.background-sharing-running): MutedText { text: "You can update now. Frames will ask before disconnecting active sessions."; font-size: 11px; wrap: word-wrap; }
                                     }
                                 }
                             }
-                            MutedText { text: "Changes save automatically. Connection defaults apply to new sessions."; font-size: 11px; }
+                            MutedText { text: "Changes save automatically. Devices remember their connection mode, audio and image quality."; font-size: 11px; }
                         }
                         Rectangle { vertical-stretch: 1; min-height: 1px; }
                     }
@@ -601,6 +622,29 @@ export component Launcher inherits Window {
                     alignment: end; spacing: 8px;
                     AppButton { label: "Cancel"; clicked => { root.revoke-id = ""; } }
                     AppButton { label: "Revoke"; danger: true; clicked => { root.revoke(root.revoke-id); root.revoke-id = ""; } }
+                }
+            }
+        }
+    }
+    if root.update-prompt-open: ModalFocus {
+        key-pressed(event) => { if event.text == Key.Escape && !root.update-restart-busy { root.update-prompt-open = false; return accept; } return reject; }
+        Rectangle { background: #00000066; }
+        TouchArea { }
+        Card {
+            width: min(460px, parent.width - 48px); height: root.update-restart-error == "" ? 246px : 296px;
+            x: round((parent.width - self.width) / (2 * 1phx)) * 1phx;
+            y: round((parent.height - self.height) / (2 * 1phx)) * 1phx;
+            VerticalLayout {
+                padding: 24px; spacing: 12px;
+                SectionTitle { text: "Disconnect and update?"; font-size: 18px; }
+                MutedText { text: "Updating will close Frames and disconnect all active sessions from this installation, including sharing and file transfers."; }
+                MutedText { text: "Frames will reopen after the update. You will need to reconnect."; font-size: 11px; }
+                if root.update-restart-error != "": Text { text: root.update-restart-error; color: #a84d55; font-size: 12px; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    alignment: end; spacing: 8px;
+                    AppButton { label: "Cancel"; enabled: !root.update-restart-busy; clicked => { root.update-prompt-open = false; } }
+                    AppButton { label: root.update-restart-busy ? "Preparing update..." : "Disconnect and update"; primary: true; enabled: !root.update-restart-busy; clicked => { root.confirm-restart-update(); } }
                 }
             }
         }

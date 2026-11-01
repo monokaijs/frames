@@ -1,0 +1,111 @@
+import { Theme, Glyph, AppCheckBox } from "components.slint";
+
+component ConnectionModeOption inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback clicked();
+    height: 32px; border-radius: 4px;
+    background: touch.has-hover || focus.has-focus ? #f5f6f9 : transparent;
+    forward-focus: focus;
+    if root.selected: Glyph { x: 8px; y: 9px; width: 15px; height: 15px; source: @image-url("icons/check.svg"); colorize: Theme.ink; }
+    Text { x: 30px; width: parent.width - 38px; height: parent.height; text: root.label; color: Theme.ink; font-size: 12px; vertical-alignment: center; }
+    focus := FocusScope {
+        key-pressed(event) => {
+            if event.text == " " || event.text == Key.Return { root.clicked(); return accept; }
+            return reject;
+        }
+    }
+    touch := TouchArea { mouse-cursor: pointer; clicked => { focus.focus(); root.clicked(); } }
+    accessible-role: button; accessible-label: root.label;
+    accessible-checkable: true; accessible-checked: root.selected;
+    accessible-action-default => { root.clicked(); }
+}
+
+// One shared surface: the label connects, the chevron opens connection choices.
+export component ConnectionButton inherits Rectangle {
+    in property <bool> enabled: true;
+    in property <bool> primary: false;
+    in-out property <bool> audio: false;
+    in-out property <bool> desktop: false;
+    callback connect();
+    callback options-edited();
+    width: 112px; height: 32px;
+    horizontal-stretch: 0;
+    border-radius: 5px;
+    border-width: root.primary ? 0px : 1px;
+    border-color: #d6d9e0;
+    background: !root.enabled ? #f1f2f4 : root.primary ? (action.pressed || dropdown.pressed ? Theme.accent-pressed : action.has-hover || dropdown.has-hover || connect-focus.has-focus || options-focus.has-focus ? Theme.accent-hover : Theme.accent) : action.has-hover || dropdown.has-hover || connect-focus.has-focus || options-focus.has-focus ? #f5f6f9 : white;
+    forward-focus: connect-focus;
+    Text {
+        width: parent.width - 30px; height: parent.height;
+        text: "Connect"; font-size: 12px; font-weight: 500;
+        color: !root.enabled ? #969ca7 : root.primary ? white : Theme.ink;
+        horizontal-alignment: center; vertical-alignment: center;
+    }
+    Glyph {
+        x: parent.width - 24px; y: 10px; width: 12px; height: 12px;
+        source: @image-url("icons/chevron-down.svg");
+        colorize: !root.enabled ? #969ca7 : root.primary ? white : Theme.muted;
+    }
+    connect-focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.DownArrow { root.show-options(); return accept; }
+            if event.text == " " || event.text == Key.Return { root.connect(); return accept; }
+            return reject;
+        }
+    }
+    action := TouchArea {
+        width: parent.width - 30px; enabled: root.enabled; mouse-cursor: pointer;
+        clicked => { connect-focus.focus(); root.connect(); }
+        accessible-role: button; accessible-label: "Connect"; accessible-enabled: root.enabled;
+        accessible-action-default => { if root.enabled { root.connect(); } }
+    }
+    options-focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == " " || event.text == Key.Return || event.text == Key.DownArrow { root.show-options(); return accept; }
+            return reject;
+        }
+    }
+    dropdown := TouchArea {
+        x: parent.width - 30px; width: 30px; enabled: root.enabled; mouse-cursor: pointer;
+        clicked => { options-focus.focus(); root.show-options(); }
+        accessible-role: button; accessible-label: "Connection options"; accessible-enabled: root.enabled;
+        accessible-action-default => { if root.enabled { root.show-options(); } }
+    }
+    function show-options() { options.show(); }
+    options := PopupWindow {
+        x: root.primary ? root.width - self.width : 0px; y: root.height + 6px;
+        width: 232px; height: 190px;
+        close-policy: close-on-click-outside;
+        forward-focus: menu-focus;
+        menu-focus := FocusScope {
+            key-pressed(event) => {
+                if event.text == Key.Escape { options.close(); options-focus.focus(); return accept; }
+                return reject;
+            }
+            Rectangle {
+                background: white; border-radius: 8px; border-width: 1px; border-color: #d6d9e0;
+                VerticalLayout {
+                    padding: 12px; spacing: 5px;
+                    Text { text: "Connection mode"; color: Theme.muted; font-size: 11px; height: 20px; }
+                    ConnectionModeOption {
+                        label: "Application windows"; selected: !root.desktop;
+                        clicked => { root.desktop = false; root.options-edited(); }
+                    }
+                    ConnectionModeOption {
+                        label: "Full desktop"; selected: root.desktop;
+                        clicked => { root.desktop = true; root.options-edited(); }
+                    }
+                    Rectangle { height: 1px; background: Theme.line; }
+                    Rectangle {
+                        height: 34px;
+                        AppCheckBox { y: 7px; text: "Play host audio"; checked <=> root.audio; toggled => { root.options-edited(); } }
+                    }
+                    Text { text: "Remembered for your next connection"; color: Theme.muted; font-size: 10px; height: 15px; }
+                }
+            }
+        }
+    }
+}

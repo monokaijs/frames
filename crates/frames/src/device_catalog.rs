@@ -19,7 +19,12 @@ fn decorate(
     mut device: Device,
     store: &TrustStore,
     history: &[crate::connection_history::Connection],
+    preferences: &Preferences,
+    saved: &crate::connection_preferences::Devices,
 ) -> Device {
+    let choices = saved.get(&device.fingerprint);
+    device.connection_audio = choices.map_or(preferences.options.audio, |p| p.audio);
+    device.connection_desktop = choices.map_or(preferences.options.desktop, |p| p.desktop);
     device.trusted = store.peers.contains_key(&device.fingerprint);
     device.can_trust = !device.trusted && history.iter().any(|c| c.device_id == device.fingerprint);
     device.preview = crate::connection_history::preview_path(&device.fingerprint, !device.trusted)
@@ -30,20 +35,22 @@ fn decorate(
     device
 }
 
-pub(super) fn nearby(devices: &[Device]) -> Result<Vec<Device>> {
+pub(super) fn nearby(devices: &[Device], prefs: &Preferences) -> Result<Vec<Device>> {
     let store = TrustStore::load()?;
     let history = crate::connection_history::load()?;
+    let saved = crate::connection_preferences::load()?;
     Ok(devices
         .iter()
         .filter(|d| d.online)
         .cloned()
-        .map(|d| decorate(d, &store, &history))
+        .map(|d| decorate(d, &store, &history, prefs, &saved))
         .collect())
 }
 
 pub(super) fn rows(prefs: &Preferences, devices: &[Device]) -> Result<(Vec<Device>, Vec<Device>)> {
     let store = TrustStore::load()?;
     let history = crate::connection_history::load()?;
+    let saved = crate::connection_preferences::load()?;
     let mut recent = Vec::new();
     for item in &history {
         let device = devices
@@ -56,7 +63,7 @@ pub(super) fn rows(prefs: &Preferences, devices: &[Device]) -> Result<(Vec<Devic
                 fingerprint: item.device_id.clone(),
                 ..Default::default()
             });
-        recent.push(decorate(device, &store, &history));
+        recent.push(decorate(device, &store, &history, prefs, &saved));
     }
     for old in recent_rows(prefs) {
         if !recent.iter().any(|d| d.address == old.address) {
@@ -65,7 +72,7 @@ pub(super) fn rows(prefs: &Preferences, devices: &[Device]) -> Result<(Vec<Devic
                 .find(|d| d.address == old.address)
                 .cloned()
                 .unwrap_or(old);
-            recent.push(decorate(device, &store, &history));
+            recent.push(decorate(device, &store, &history, prefs, &saved));
         }
     }
     recent.truncate(20);
@@ -79,7 +86,7 @@ pub(super) fn rows(prefs: &Preferences, devices: &[Device]) -> Result<(Vec<Devic
             device = found.clone();
             device.detail = detail;
         }
-        trusted.push(decorate(device, &store, &history));
+        trusted.push(decorate(device, &store, &history, prefs, &saved));
     }
     Ok((recent, trusted))
 }
@@ -175,7 +182,7 @@ pub(super) fn scan() -> Result<Vec<Device>> {
         let mut devices = Vec::new();
         while let Some(result) = tasks.join_next().await {
             if let Ok(device) = result {
-                devices.push(decorate(device, &store, &history));
+                devices.push(device);
             }
         }
         devices.sort_by(|a, b| a.name.cmp(&b.name).then(a.fingerprint.cmp(&b.fingerprint)));

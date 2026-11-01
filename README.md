@@ -8,7 +8,7 @@ On Windows, run **Frames-VERSION-windows-x86_64-setup.exe**. It installs Frames 
 
 ## Connect
 
-Launch Frames, enable sharing on the host, and enter its address on the client. Nearby discovery works on the local network. Rename this device in Settings. Device cards show names, online/offline status, and screenshots shared privately with trusted devices; recent devices without trust show a blurred image from their last session. Both computers must approve the same pairing code on first connection. Incoming requests offer Decline connection, Accept and trust, or Accept for this session only. You can also trust a previously accepted device from Recent. Unattended reconnection requires the host's explicit approval.
+Launch Frames, enable sharing on the host, and enter its address on the client. Nearby discovery works on the local network. Rename this device in Settings. Device cards show names, online/offline status, and screenshots shared privately with trusted devices; recent devices without trust show a blurred image from their last session. Both computers must approve the same pairing code on first connection. Incoming requests offer Decline connection, Accept and trust, or Accept for this session only. You can also trust a previously accepted device from Recent. Unattended reconnection requires the host's explicit approval. Open the chevron on Connect to choose connection mode and host audio; Frames remembers these per device, along with live view and image-quality choices.
 
 Frames connects directly over LAN or VPN on UDP **47990**. Allow that port through the host firewall. There is no relay or NAT traversal service.
 
@@ -53,7 +53,7 @@ frames update
 
 Use `--no-clipboard` on host or client to disable clipboard sharing. Automatic codec selection probes working implementations; `--codec` accepts h264, hevc, av1, or vp9. Run `frames --help` for all options.
 
-Official builds check for signed updates in the background every six hours. Use **Settings > Check for updates** to check manually and see download progress, then **Restart to update** when sessions are stopped. Background downloads defer while a remote session is active. Verified packages install after all Frames processes using that installation close. Active sessions are never interrupted. Updates require write access to the installation directory. See [release setup](docs/RELEASES.md), including migration from the previous bundle identifier.
+Official builds check for signed updates in the background every six hours. Use **Settings > Check for updates** to download manually, including during a session. **Restart to update** asks you to confirm disconnecting active sessions and file transfers before restarting Frames. Automatic downloads defer while a remote session is active and never interrupt sessions. Verified packages install after all Frames processes using that installation close. Updates require write access to the installation directory. See [release setup](docs/RELEASES.md), including migration from the previous bundle identifier.
 
 ## Build
 

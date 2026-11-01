@@ -11,6 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
+        Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -22,6 +23,11 @@ const MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
 const MAX_EXPANDED: u64 = 512 * 1024 * 1024;
 const PUBLIC_KEY: &str = include_str!("../../../scripts/update-public-key.hex");
 static RELAUNCH: AtomicBool = AtomicBool::new(false);
+static STOP_SESSIONS: AtomicBool = AtomicBool::new(false);
+static RESTART_HELPER: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+#[path = "update_shutdown.rs"]
+mod shutdown;
 
 #[cfg(windows)]
 #[path = "windows_install.rs"]
@@ -36,8 +42,23 @@ pub enum Status {
     Error(String),
 }
 
-pub fn request_restart() {
+pub fn request_restart() -> Result<()> {
+    let root = root()?;
+    let lock = lock_file(&root.join("download.lock"))?;
+    fs2::FileExt::try_lock_exclusive(&lock)
+        .context("Wait for the current update check to finish")?;
+    let plan = verified_plan(&root, &root.join("pending.json"), verify)?;
+    let (target, _) = installation()?;
+    ensure!(
+        plan.target == target,
+        "Update belongs to a different Frames installation"
+    );
+    // Prepare the helper before disconnecting anything, so copy/signature errors
+    // leave current sessions running and can be shown in the confirmation dialog.
+    *RESTART_HELPER.lock().unwrap() = Some(prepare_update_helper(&root, &target)?);
     RELAUNCH.store(true, Ordering::Relaxed);
+    STOP_SESSIONS.store(true, Ordering::Relaxed);
+    Ok(())
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -320,21 +341,23 @@ pub fn start(notify: impl Fn(Status) + Send + 'static) -> mpsc::Sender<()> {
         let mut automatic = option_env!("FRAMES_RELEASE_BUILD") == Some("1");
         let mut interval = Duration::from_secs(6 * 60 * 60);
         loop {
+            let mut background = automatic;
             if !automatic {
                 match receiver.recv_timeout(interval) {
-                    Ok(()) => {}
+                    Ok(()) => background = false,
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         if option_env!("FRAMES_RELEASE_BUILD") != Some("1") {
                             continue;
                         }
+                        background = true;
                     }
                 }
             }
             automatic = false;
             interval = Duration::from_secs(6 * 60 * 60);
             notify(Status::Checking);
-            match check(true, true, &notify) {
+            match check(true, background, &notify) {
                 Ok(Some(version)) => notify(Status::Ready(version)),
                 Ok(None) => notify(Status::Current),
                 Err(error) if error.is::<SessionActive>() => {
@@ -373,17 +396,22 @@ pub fn install_on_exit() -> Result<()> {
     }
     // Remove old helper copies on the next launch; Windows cannot unlink its
     // currently executing helper. No user files outside this cache are touched.
+    let prepared = RESTART_HELPER.lock().unwrap().take();
     for entry in fs::read_dir(&root)? {
         let path = entry?.path();
         if path
             .file_name()
             .is_some_and(|n| n.to_string_lossy().starts_with("apply-helper-"))
             && path.is_file()
+            && Some(&path) != prepared.as_ref()
         {
             let _ = fs::remove_file(path);
         }
     }
-    let helper = prepare_update_helper(&root, &target)?;
+    let helper = match prepared {
+        Some(helper) => helper,
+        None => prepare_update_helper(&root, &target)?,
+    };
     let mut command = Command::new(&helper);
     command
         .arg("apply-update")
@@ -399,6 +427,9 @@ pub fn install_on_exit() -> Result<()> {
         ));
     if RELAUNCH.load(Ordering::Relaxed) {
         command.arg("--relaunch");
+    }
+    if STOP_SESSIONS.load(Ordering::Relaxed) {
+        command.arg("--stop-sessions");
     }
     #[cfg(windows)]
     {
@@ -508,24 +539,34 @@ fn extract(archive: &Path, destination: &Path, bundle: bool) -> Result<PathBuf> 
     );
     Ok(replacement)
 }
-pub fn apply(path: &Path, relaunch: bool) -> Result<()> {
-    apply_in(&root()?, path, relaunch, verify)
+pub fn apply(path: &Path, relaunch: bool, stop_sessions: bool) -> Result<()> {
+    apply_in(&root()?, path, relaunch, stop_sessions, verify)
 }
 
 fn apply_in(
     root: &Path,
     path: &Path,
     relaunch: bool,
+    stop_sessions: bool,
     verify_manifest: impl Fn(&[u8], &[u8]) -> Result<Manifest>,
 ) -> Result<()> {
-    ensure!(
-        path.canonicalize()? == root.join("pending.json"),
-        "unexpected update plan"
-    );
     let download_lock = lock_file(&root.join("download.lock"))?;
     if fs2::FileExt::try_lock_exclusive(&download_lock).is_err() {
         return Ok(());
     }
+    let plan = verified_plan(root, path, verify_manifest)?;
+    apply_verified(root, path, relaunch, stop_sessions, download_lock, plan)
+}
+
+fn verified_plan(
+    root: &Path,
+    path: &Path,
+    verify_manifest: impl Fn(&[u8], &[u8]) -> Result<Manifest>,
+) -> Result<Pending> {
+    ensure!(
+        path.canonicalize()? == root.join("pending.json"),
+        "unexpected update plan"
+    );
     let plan: Pending = serde_json::from_slice(&fs::read(path)?)?;
     for file in [&plan.archive, &plan.manifest, &plan.signature] {
         ensure!(
@@ -552,18 +593,21 @@ fn apply_in(
         plan.target.is_absolute() && plan.target.canonicalize()? == plan.target,
         "invalid installation path"
     );
-    let lease = lock_file(&lease_path(root, &plan.target))?;
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while fs2::FileExt::try_lock_exclusive(&lease).is_err() {
-        if Instant::now() >= deadline {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
     ensure!(
         digest(&installed_binary(&plan.target, plan.bundle))? == plan.previous_sha256,
         "installation changed since download"
     );
+    Ok(plan)
+}
+
+fn apply_verified(
+    root: &Path,
+    path: &Path,
+    relaunch: bool,
+    stop_sessions: bool,
+    download_lock: File,
+    plan: Pending,
+) -> Result<()> {
     let parent = plan.target.parent().context("installation has no parent")?;
     let temporary = tempfile::Builder::new()
         .prefix(".frames-update-")
@@ -581,6 +625,32 @@ fn apply_in(
             "updated app signature is invalid"
         );
     }
+    // Validate and extract the replacement before interrupting any sessions.
+    // Keep the installation lease: confirmation permits closing processes,
+    // never replacing an executable that is still in use.
+    let _sharing = if stop_sessions {
+        let sharing = shutdown::BackgroundSharing::pause(&plan.target, plan.bundle)?;
+        shutdown::stop_processes(&plan.target, plan.bundle)?;
+        Some(sharing)
+    } else {
+        None
+    };
+    let lease = lock_file(&lease_path(root, &plan.target))?;
+    let deadline = Instant::now() + Duration::from_secs(if stop_sessions { 15 } else { 120 });
+    while fs2::FileExt::try_lock_exclusive(&lease).is_err() {
+        if Instant::now() >= deadline {
+            ensure!(
+                !stop_sessions,
+                "Some Frames processes could not be stopped for update. Close them and try again."
+            );
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    ensure!(
+        digest(&installed_binary(&plan.target, plan.bundle))? == plan.previous_sha256,
+        "installation changed while waiting for sessions to stop"
+    );
     let backup = parent.join(format!(".frames-backup-{}", uuid::Uuid::new_v4()));
     replace_installation(&plan.target, &replacement, &backup)?;
     #[cfg(windows)]
@@ -610,6 +680,7 @@ fn apply_in(
     // acquires its own shared lease before opening any windows.
     drop(lease);
     drop(download_lock);
+    drop(_sharing);
     if relaunch {
         #[cfg(target_os = "macos")]
         ensure!(
@@ -828,7 +899,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn signed_update_applies_and_tampered_archive_preserves_installation() {
-        for tamper in [false, true] {
+        for (tamper, stop_sessions) in [(false, false), (true, false), (false, true), (true, true)]
+        {
             let root = tempfile::tempdir().unwrap();
             let root = root.path().canonicalize().unwrap();
             let cache = root.join("cache");
@@ -846,7 +918,13 @@ mod tests {
             if tamper {
                 fs::write(&archive, b"tampered").unwrap();
             }
-            let result = apply_in(&cache, &cache.join("pending.json"), false, test_verifier);
+            let result = apply_in(
+                &cache,
+                &cache.join("pending.json"),
+                false,
+                stop_sessions,
+                test_verifier,
+            );
             assert_eq!(result.is_err(), tamper);
             assert_eq!(
                 fs::read(&target).unwrap(),
@@ -895,7 +973,14 @@ mod tests {
                 .success()
         );
         prepare_plan(&cache, target.clone(), archive, true);
-        apply_in(&cache, &cache.join("pending.json"), false, test_verifier).unwrap();
+        apply_in(
+            &cache,
+            &cache.join("pending.json"),
+            false,
+            false,
+            test_verifier,
+        )
+        .unwrap();
         assert!(
             !target
                 .join("Contents/Resources/obsolete-test-file")
@@ -954,10 +1039,16 @@ mod tests {
         );
         prepare_plan(&cache, target.clone(), archive, true);
         assert!(
-            apply_in(&cache, &cache.join("pending.json"), false, test_verifier)
-                .unwrap_err()
-                .to_string()
-                .contains("signature")
+            apply_in(
+                &cache,
+                &cache.join("pending.json"),
+                false,
+                false,
+                test_verifier
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("signature")
         );
         assert_eq!(
             fs::read(target.join("Contents/Resources/keep-existing-test-file")).unwrap(),

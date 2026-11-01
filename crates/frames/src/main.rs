@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod connection_history;
+mod connection_preferences;
 mod device_preview;
 mod device_session;
 mod device_setup;
@@ -57,6 +58,8 @@ enum Command {
         plan: PathBuf,
         #[arg(long)]
         relaunch: bool,
+        #[arg(long)]
+        stop_sessions: bool,
     },
     /// Inspect macOS permissions, optionally opening the system permission prompts.
     #[cfg(target_os = "macos")]
@@ -245,8 +248,13 @@ fn run() -> anyhow::Result<()> {
         let _lease = update::runtime_lease()?;
         return frames_native::usb::lease_worker(bus_id, *port, token);
     }
-    if let Some(Command::ApplyUpdate { plan, relaunch }) = &args.command {
-        return update::apply(plan, *relaunch);
+    if let Some(Command::ApplyUpdate {
+        plan,
+        relaunch,
+        stop_sessions,
+    }) = &args.command
+    {
+        return update::apply(plan, *relaunch, *stop_sessions);
     }
     let _lease = update::runtime_lease()?;
     let Some(command) = args.command else {

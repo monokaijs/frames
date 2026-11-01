@@ -17,6 +17,14 @@ if args.contains("--network-settings"){
         app.terminate(nil)
     }
     app.run()
+}else if args.contains("--pause-sharing-for-update"){
+    let service=SMAppService.agent(plistName:"dev.creaton.frames.agent.plist")
+    do{
+        if service.status == .enabled{try service.unregister();print("resume")}else{print("off")}
+    }catch{FileHandle.standardError.write(Data(error.localizedDescription.utf8));exit(1)}
+}else if args.contains("--resume-sharing-after-update"){
+    do{try SMAppService.agent(plistName:"dev.creaton.frames.agent.plist").register()}
+    catch{FileHandle.standardError.write(Data(error.localizedDescription.utf8));exit(1)}
 }else if args.contains("--login-item"){
     app.setActivationPolicy(.regular);app.activate(ignoringOtherApps:true)
     let service=SMAppService.agent(plistName:"dev.creaton.frames.agent.plist")

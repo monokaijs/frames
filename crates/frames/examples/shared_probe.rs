@@ -3,6 +3,9 @@
 #[path = "../src/connection_history.rs"]
 mod connection_history;
 #[allow(dead_code)]
+#[path = "../src/connection_preferences.rs"]
+mod connection_preferences;
+#[allow(dead_code)]
 #[path = "../src/device_preview.rs"]
 mod device_preview;
 #[allow(dead_code)]

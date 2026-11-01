@@ -93,6 +93,7 @@ impl SessionControl {
         id
     }
     pub fn sync_windows(&mut self, mut windows: Vec<SessionWindow>) {
+        let show_recovery = recovery_needed(self.connected, &windows);
         windows.sort_by(|a, b| {
             a.title
                 .to_lowercase()
@@ -187,7 +188,7 @@ impl SessionControl {
         items.push(Item::new(5, "Show remote cursor", G::Cursor).checked(self.cursor));
         items.push(Item::separator());
         items.push(Item::new(4, "Disconnect", G::Power));
-        self.tray.recovery(shown == 0);
+        self.tray.recovery(show_recovery);
         self.tray.update(
             items,
             self.connected,
@@ -307,5 +308,42 @@ impl SessionControl {
             let _ = DestroyMenu(menu);
             result
         }
+    }
+}
+
+fn recovery_needed(connected: bool, windows: &[SessionWindow]) -> bool {
+    connected && !windows.is_empty() && windows.iter().all(|window| !window.shown)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_waits_for_pairing_and_actual_hidden_windows() {
+        let mut windows = vec![SessionWindow {
+            key: WindowId {
+                id: 1,
+                generation: 1,
+            },
+            title: "Remote app".into(),
+            shown: false,
+            options: vec![],
+        }];
+        assert!(!recovery_needed(false, &[]), "Waiting for host approval");
+        assert!(!recovery_needed(false, &windows), "Unapproved connection");
+        assert!(
+            !recovery_needed(true, &[]),
+            "Waiting for the first window snapshot"
+        );
+        assert!(
+            recovery_needed(true, &windows),
+            "All connected windows were hidden"
+        );
+        windows[0].shown = true;
+        assert!(
+            !recovery_needed(true, &windows),
+            "A remote window was restored"
+        );
     }
 }

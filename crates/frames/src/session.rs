@@ -1099,6 +1099,12 @@ pub async fn client(
         delivery.send(ClientUpdate::SharedSession(Box::new(session.clone())))?;
     }
     let input_epoch = std::time::Instant::now();
+    if let Err(error) = crate::connection_preferences::update(&peer.device_id, |p| {
+        p.audio = audio;
+        p.quality = quality;
+    }) {
+        tracing::warn!(%error, "could not save connection preferences");
+    }
     let mut last_shared_ui = input_epoch;
     let devices = if shared.is_none() {
         Some(crate::device_session::Client::start(
@@ -1127,6 +1133,17 @@ pub async fn client(
     io.send
         .send(Message::AudioPreference { enabled: audio })
         .await?;
+    if shared.is_none() {
+        match crate::connection_preferences::load() {
+            Ok(saved) if saved.get(&peer.device_id).is_some_and(|p| !p.remote_cursor) => {
+                io.send
+                    .send(Message::SetRemoteCursor { visible: false })
+                    .await?;
+            }
+            Err(error) => tracing::warn!(%error, "could not restore remote cursor preference"),
+            _ => {}
+        }
+    }
     io.send
         .send(Message::SetViewMode {
             mode: if shared.is_some() {
@@ -1265,9 +1282,21 @@ pub async fn client(
                 },
                 Message::SharedState(state)=>{if shared.as_ref().is_some_and(|s|s.window==state.window&&s.generation==state.generation){delivery.send(ClientUpdate::SharedSession(Box::new(state)))?;}},
                 Message::SharedCursor{window,generation,cursor}=>{if cursor.valid() && shared.as_ref().is_some_and(|s|s.window==window&&s.generation==generation){delivery.send(ClientUpdate::SharedCursor(cursor))?;}},
-                Message::QualityChanged{preset}=>delivery.send(ClientUpdate::Quality(preset))?,
-                Message::RemoteCursorChanged{visible}=>delivery.send(ClientUpdate::RemoteCursor{visible})?,
-                Message::ViewModeChanged{mode,error}=>{if error.is_none(){media.send(crate::streaming::MediaCommand::Clear).await?;}delivery.send(ClientUpdate::ViewMode{mode,error})?;},
+                Message::QualityChanged{preset}=>{
+                    if let Err(error)=crate::connection_preferences::update(&peer.device_id,|p|p.quality=preset){tracing::warn!(%error,"could not save connection quality");}
+                    delivery.send(ClientUpdate::Quality(preset))?;
+                },
+                Message::RemoteCursorChanged{visible}=>{
+                    if shared.is_none() && let Err(error)=crate::connection_preferences::update(&peer.device_id,|p|p.remote_cursor=visible){tracing::warn!(%error,"could not save remote cursor preference");}
+                    delivery.send(ClientUpdate::RemoteCursor{visible})?;
+                },
+                Message::ViewModeChanged{mode,error}=>{
+                    if error.is_none(){
+                        if shared.is_none() && let Err(error)=crate::connection_preferences::update(&peer.device_id,|p|p.desktop=mode==ViewMode::Desktop){tracing::warn!(%error,"could not save connection mode");}
+                        media.send(crate::streaming::MediaCommand::Clear).await?;
+                    }
+                    delivery.send(ClientUpdate::ViewMode{mode,error})?;
+                },
                 Message::AdbBridgeStatus{enabled,address,error}=>{
                     adb_enabled=enabled&&adb_requested;adb_gate.send_replace(adb_enabled);
 

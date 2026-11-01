@@ -230,6 +230,18 @@ fn endpoint(value: &str) -> Result<SocketAddr> {
     anyhow::bail!("Enter a numeric IP address, such as 192.168.1.10:47990 or [::1]:47990.")
 }
 
+fn connection_device_id(address: SocketAddr, expected_id: &str) -> String {
+    if !expected_id.is_empty() {
+        return expected_id.into();
+    }
+    crate::connection_history::load()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|c| c.address == address.to_string())
+        .map(|c| c.device_id)
+        .unwrap_or_default()
+}
+
 #[derive(Clone, Default)]
 struct Device {
     name: String,
@@ -241,6 +253,8 @@ struct Device {
     can_trust: bool,
     preview_live: bool,
     preview: Vec<u8>,
+    connection_audio: bool,
+    connection_desktop: bool,
 }
 impl From<Device> for DeviceRow {
     fn from(value: Device) -> Self {
@@ -254,6 +268,8 @@ impl From<Device> for DeviceRow {
             can_trust: value.can_trust,
             preview_live: value.preview_live,
             preview: device_catalog::image(&value.preview),
+            connection_audio: value.connection_audio,
+            connection_desktop: value.connection_desktop,
         }
     }
 }
@@ -311,6 +327,8 @@ enum Action {
     CancelWindowPicker,
     ShareWindows(i32, Vec<String>),
     Connect(String, String, bool, bool),
+    SaveConnectionChoices(String, String, bool, bool),
+    RestartUpdate,
     ToggleSharing,
     SaveSettings(SessionOptions),
     SaveDeviceName(String),
@@ -333,6 +351,7 @@ enum Event {
     DeviceNameSaved(String, Result<(), String>),
     CloseBehaviorSaved(CloseBehavior, bool, Result<(), String>),
     Update(crate::update::Status),
+    UpdateRestart(Result<(), String>),
     #[cfg(target_os = "macos")]
     SharingBlocked(String),
     Recent(Vec<Device>),
@@ -356,6 +375,35 @@ fn bind_settings_autosave(ui: &Launcher, actions: mpsc::Sender<Action>) {
                 ui.set_settings_status(
                     "Couldn't save settings: settings worker unavailable.".into(),
                 );
+            }
+        }
+    });
+}
+
+fn bind_update_restart(ui: &Launcher, actions: mpsc::Sender<Action>) {
+    let weak = ui.as_weak();
+    ui.on_restart_update(move || {
+        if let Some(ui) = weak.upgrade()
+            && ui.get_update_ready()
+            && !ui.get_update_restart_busy()
+            && !ui.get_update_busy()
+        {
+            ui.set_update_restart_error("".into());
+            ui.set_update_prompt_open(true);
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_confirm_restart_update(move || {
+        if let Some(ui) = weak.upgrade()
+            && ui.get_update_ready()
+            && ui.get_update_prompt_open()
+            && !ui.get_update_restart_busy()
+            && !ui.get_update_busy()
+        {
+            ui.set_update_restart_busy(true);
+            if actions.send(Action::RestartUpdate).is_err() {
+                ui.set_update_restart_busy(false);
+                ui.set_update_restart_error("Couldn't restart: update worker unavailable.".into());
             }
         }
     });
@@ -423,7 +471,7 @@ impl Worker {
         ));
     }
     fn publish_devices(&self) {
-        if let Ok(nearby) = device_catalog::nearby(&self.devices) {
+        if let Ok(nearby) = device_catalog::nearby(&self.devices, &self.preferences) {
             let _ = self.events.send(Event::Nearby(Ok(nearby)));
         }
         match device_catalog::rows(&self.preferences, &self.devices) {
@@ -500,6 +548,14 @@ impl Worker {
     }
     fn handle(&mut self, action: Action) -> Result<()> {
         match action {
+            Action::RestartUpdate => {
+                let result = crate::update::request_restart().map_err(|error| format!("{error:#}"));
+                if result.is_ok() {
+                    self.sessions.clear();
+                    self.publish_sessions();
+                }
+                let _ = self.events.send(Event::UpdateRestart(result));
+            }
             Action::LoadShareWindows(request) => sharing_picker::load(self, request),
             Action::CancelWindowPicker => {
                 self.sharing_generation
@@ -560,6 +616,10 @@ impl Worker {
                 let mut options = self.preferences.options.clone();
                 options.audio = audio;
                 options.desktop = desktop;
+                let device_id = connection_device_id(address, &expected_id);
+                if let Some(saved) = crate::connection_preferences::load()?.get(&device_id) {
+                    options.quality = saved.quality;
+                }
                 let args = options.connection_args(address);
                 let name = self
                     .devices
@@ -590,14 +650,33 @@ impl Worker {
                     &expected_id,
                 )?;
                 self.preferences.remember(address);
+                self.preferences.options.audio = audio;
+                self.preferences.options.desktop = desktop;
                 self.publish_devices();
                 if let Err(error) = self.preferences.save() {
                     self.notice(
-                        format!("Session started, but history couldn't be saved: {error:#}"),
+                        format!("Session started, but preferences couldn't be saved: {error:#}"),
                         true,
                     );
                 } else {
                     self.notice("Connection started. If prompted, compare the pairing code on both devices.", false);
+                }
+            }
+            Action::SaveConnectionChoices(value, expected_id, audio, desktop) => {
+                let Ok(address) = endpoint(&value) else {
+                    return Ok(());
+                };
+                let id = connection_device_id(address, &expected_id);
+                if !id.is_empty() {
+                    let saved = crate::connection_preferences::load()?;
+                    crate::connection_preferences::update(&id, |p| {
+                        if !saved.contains_key(&id) {
+                            p.quality = self.preferences.options.quality;
+                        }
+                        p.audio = audio;
+                        p.desktop = desktop;
+                    })?;
+                    self.publish_devices();
                 }
             }
             Action::SaveSettings(options) => {
@@ -763,12 +842,6 @@ impl Worker {
             match result {
                 Ok(devices) => {
                     self.devices = devices;
-                    let _ = self.events.send(Event::Nearby(Ok(self
-                        .devices
-                        .iter()
-                        .filter(|d| d.online)
-                        .cloned()
-                        .collect())));
                     self.publish_devices();
                 }
                 Err(error) => {
@@ -953,6 +1026,9 @@ pub fn run() -> Result<()> {
     };
     ui.set_audio(preferences.options.audio);
     ui.set_desktop(preferences.options.desktop);
+    if let Some(recent) = preferences.recent.first() {
+        ui.set_address(recent.address.clone().into());
+    }
     ui.set_default_audio(preferences.options.audio);
     ui.set_default_desktop(preferences.options.desktop);
     ui.set_clipboard(preferences.options.clipboard);
@@ -991,17 +1067,7 @@ pub fn run() -> Result<()> {
         }
         let _ = update_requests.send(());
     });
-    let weak = ui.as_weak();
-    ui.on_restart_update(move || {
-        if let Some(ui) = weak.upgrade()
-            && ui.get_update_ready()
-            && ui.get_sessions().row_count() == 0
-            && !ui.get_background_sharing_running()
-        {
-            crate::update::request_restart();
-            let _ = slint::quit_event_loop();
-        }
-    });
+    bind_update_restart(&ui, actions.clone());
     let worker = std::thread::spawn(move || {
         let (discovery_tx, discovery_done) = mpsc::channel();
         let mut worker = Worker {
@@ -1045,6 +1111,8 @@ pub fn run() -> Result<()> {
     let tx = actions.clone();
     ui.on_connect(move |address| {
         if let Some(ui) = weak.upgrade() {
+            ui.set_default_audio(ui.get_audio());
+            ui.set_default_desktop(ui.get_desktop());
             let _ = tx.send(Action::Connect(
                 address.to_string(),
                 String::new(),
@@ -1055,16 +1123,41 @@ pub fn run() -> Result<()> {
     });
     let weak = ui.as_weak();
     let tx = actions.clone();
-    ui.on_connect_device(move |address, id| {
+    ui.on_connect_device(move |address, id, audio, desktop| {
         if let Some(ui) = weak.upgrade() {
+            ui.set_audio(audio);
+            ui.set_desktop(desktop);
+            ui.set_default_audio(audio);
+            ui.set_default_desktop(desktop);
             let _ = tx.send(Action::Connect(
                 address.to_string(),
                 id.to_string(),
-                ui.get_audio(),
-                ui.get_desktop(),
+                audio,
+                desktop,
             ));
         }
     });
+    let tx = actions.clone();
+    ui.on_connection_options_edited(move |address, id, audio, desktop| {
+        let _ = tx.send(Action::SaveConnectionChoices(
+            address.to_string(),
+            id.to_string(),
+            audio,
+            desktop,
+        ));
+    });
+    let weak = ui.as_weak();
+    ui.on_connection_address_edited(move || {
+        if let Some(ui) = weak.upgrade()
+            && let Ok(address) = endpoint(&ui.get_address())
+            && let Ok(saved) = crate::connection_preferences::load()
+            && let Some(p) = saved.get(&connection_device_id(address, ""))
+        {
+            ui.set_audio(p.audio);
+            ui.set_desktop(p.desktop);
+        }
+    });
+    ui.invoke_connection_address_edited();
     bind_settings_autosave(&ui, actions.clone());
     let tx = actions.clone();
     let weak = ui.as_weak();
@@ -1152,14 +1245,21 @@ pub fn run() -> Result<()> {
                         Status::Downloading(done, total) => format!("Downloading Frames update… {}%", done * 100 / total.max(1)),
                         Status::Ready(version) => {
                             ui.set_update_ready(true);
-                            format!("Frames {version} is ready. It will install after all Frames sessions close.")
+                            format!("Frames {version} is ready. Restart to install the update.")
                         }
                         Status::Current => "Frames is up to date.".into(),
-                        Status::Deferred => "Updates will resume when remote sessions have stopped.".into(),
+                        Status::Deferred => "Automatic download paused during a session. Choose Check for updates to download now.".into(),
                         Status::Error(message) => format!("Couldn't update Frames: {message}"),
                     };
                     ui.set_update_status(message.into());
                 }
+                Event::UpdateRestart(result) => match result {
+                    Ok(()) => { let _ = slint::quit_event_loop(); }
+                    Err(error) => {
+                        ui.set_update_restart_busy(false);
+                        ui.set_update_restart_error(format!("Couldn't prepare update: {error}").into());
+                    }
+                },
                 Event::Notice(message, error) => {
                     permission_notice = false;
                     ui.set_notice(message.into()); ui.set_notice_error(error);
@@ -1183,7 +1283,10 @@ pub fn run() -> Result<()> {
                     ui.set_notice(message.into());
                     ui.set_notice_error(true);
                 }
-                Event::Recent(rows) => ui.set_recent(model(rows.into_iter().map(Into::into).collect())),
+                Event::Recent(rows) => {
+                    ui.set_recent(model(rows.into_iter().map(Into::into).collect()));
+                    ui.invoke_connection_address_edited();
+                }
                 Event::Trusted(rows) => ui.set_trusted(model(rows.into_iter().map(Into::into).collect())),
                 Event::Nearby(result) => {
                     ui.set_discovering(false);
@@ -1243,6 +1346,59 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn updating_with_active_sessions_requires_explicit_confirmation() {
+        struct Headless;
+        impl slint::platform::Platform for Headless {
+            fn create_window_adapter(
+                &self,
+            ) -> Result<Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError> {
+                Ok(
+                    slint::platform::software_renderer::MinimalSoftwareWindow::new(
+                        Default::default(),
+                    ),
+                )
+            }
+        }
+        slint::platform::set_platform(Box::new(Headless)).unwrap();
+        let ui = Launcher::new().unwrap();
+        let (actions, received) = mpsc::channel();
+        bind_update_restart(&ui, actions);
+        ui.set_update_ready(true);
+        ui.set_background_sharing_running(true);
+        ui.set_sessions(model(vec![SessionRow {
+            id: 1,
+            name: "Remote host".into(),
+            detail: "Connected".into(),
+            hosting: false,
+        }]));
+        ui.invoke_restart_update();
+        assert!(ui.get_update_prompt_open());
+        assert!(
+            received.try_recv().is_err(),
+            "Opening confirmation must not disconnect sessions"
+        );
+        ui.set_update_prompt_open(false); // Cancel or Escape.
+        ui.invoke_confirm_restart_update();
+        assert!(
+            received.try_recv().is_err(),
+            "A dismissed prompt grants no permission"
+        );
+        assert_eq!(ui.get_sessions().row_count(), 1);
+        ui.invoke_restart_update();
+        ui.invoke_confirm_restart_update();
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Action::RestartUpdate
+        ));
+        assert!(ui.get_update_restart_busy());
+        ui.invoke_confirm_restart_update();
+        assert!(
+            received.try_recv().is_err(),
+            "Ignore duplicate confirmation clicks"
+        );
+    }
 
     #[test]
     fn settings_autosave_and_respect_running_sharing() {

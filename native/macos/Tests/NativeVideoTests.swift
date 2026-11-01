@@ -140,6 +140,20 @@ import ImageIO
             acknowledged.delivered(number:latest.number,refresh:true,token:42)
             let recovery=try packet(pipe.fileHandleForReading.fileDescriptor,kind:name=="hevc" ? 3:2,generation:10)
             precondition(recovery.number==latest.number+1 && recovery.bytes[0]==1)
+            // Live preset changes share the delivery backpressure used by
+            // Rust. Hold the current picture while configuring the next size,
+            // then release it just as a Windows decoder finishes readiness.
+            var current=recovery
+            for scale in [75,100,75,100,100] {
+                acknowledged.configure(bitrate:scale==75 ? 4_000_000:50_000_000,fps:scale==75 ? 30:60,scale:scale)
+                acknowledged.keyframe()
+                waiting.revents=0;precondition(poll(&waiting,1,60)==0,"preset change escaped delivery backpressure")
+                acknowledged.delivered(number:current.number,refresh:false,token:42)
+                let changed=try packet(pipe.fileHandleForReading.fileDescriptor,kind:name=="hevc" ? 3:2,generation:10)
+                precondition(changed.number==current.number+1 && changed.bytes[0]==1,"preset refresh must be independent and keep its delivery identity")
+                precondition(changed.width==640*scale/100 && changed.height==360*scale/100,"preset change retained the previous dimensions")
+                current=changed
+            }
             acknowledged.stop()
         }
         print("PASS: native H264/HEVC GPU surfaces, compressed IPC, changed pixels, idle keyframes, 75% scaling, odd dimensions, 1080p/1440p/4K")

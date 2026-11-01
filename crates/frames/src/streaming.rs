@@ -15,6 +15,10 @@ use std::{
 };
 use tokio::sync::watch;
 
+#[cfg(test)]
+#[path = "streaming/quality_tests.rs"]
+mod quality_tests;
+
 pub struct HostStream {
     pub task: tokio::task::JoinHandle<()>,
     ready: watch::Sender<u32>,
@@ -224,6 +228,16 @@ mod ready_tests {
         assert!(
             messages.try_recv().is_err(),
             "a refresh already arriving must not cause a recovery storm"
+        );
+        assert!(
+            client.next_deadline(Duration::from_millis(50)) > std::time::Instant::now(),
+            "an arriving keyframe must not leave the worker spinning on an expired status timer"
+        );
+        client.streams.get_mut(&window).unwrap().recovery_sent =
+            Some(std::time::Instant::now() - Duration::from_millis(60));
+        assert!(
+            client.next_deadline(Duration::from_millis(50)) > std::time::Instant::now(),
+            "an arriving keyframe must suspend expired retry timers too"
         );
         for packet in &packets[1..] {
             // Keep the synthetic network age at 60 ms. FEC table warmup and
@@ -710,7 +724,14 @@ pub fn start_host(
                     tokio::select! {
                         changed = reset_task.changed() => {
                             changed?;
-                            if *reset_task.borrow_and_update() == generation { encoder.request_keyframe(); awaiting_keyframe = true; }
+                            if *reset_task.borrow_and_update() == generation {
+                                if settings.scale.load(Ordering::Relaxed) != scale { break; }
+                                // Apply the new budget before waking an idle encoder for
+                                // its refresh, rather than one status tick afterwards.
+                                sender.set_budget(window, settings.bitrate.load(Ordering::Relaxed), settings.fec.load(Ordering::Relaxed) as u8, settings.focused.load(Ordering::Relaxed));
+                                encoder.bitrate.store(sender.encoder_target(window, settings.bitrate.load(Ordering::Relaxed)), Ordering::Relaxed);
+                                encoder.request_keyframe(); awaiting_keyframe = true;
+                            }
                         },
                         _ = status.tick() => {
                             status_ticks += 1;
@@ -942,6 +963,18 @@ impl ClientMedia {
     ) -> anyhow::Result<()> {
         self.start_prepared(config, ui, out, None).await
     }
+    fn can_reuse_decoder(&self, config: &StreamConfig) -> bool {
+        self.streams.get(&config.window).is_some_and(|stream| {
+            stream.generation < config.generation
+                && stream.codec == config.codec
+                && matches!(config.codec, codec::Codec::H264 | codec::Codec::Hevc)
+                && stream.dimensions == (config.width, config.height)
+                && !stream.decoder.is_external()
+                && !stream.decoder.input.is_closed()
+                && stream.decoder.output.has_changed().is_ok()
+                && (stream.paused_at.is_none() || stream.decoder.in_flight() == 0)
+        })
+    }
     async fn start_prepared(
         &mut self,
         config: StreamConfig,
@@ -955,16 +988,8 @@ impl ClientMedia {
         self.reassembly.forget_window(config.window);
         // H.264/HEVC IDRs reset reference pictures without restarting the
         // decoder worker. Keeping it warm avoids a cold-start recovery loop.
-        if let Some(stream) = self.streams.get_mut(&config.window)
-            && stream.generation < config.generation
-            && stream.codec == config.codec
-            && matches!(config.codec, codec::Codec::H264 | codec::Codec::Hevc)
-            && stream.dimensions == (config.width, config.height)
-            && !stream.decoder.is_external()
-            && !stream.decoder.input.is_closed()
-            && stream.decoder.output.has_changed().is_ok()
-            && (stream.paused_at.is_none() || stream.decoder.in_flight() == 0)
-        {
+        if self.can_reuse_decoder(&config) {
+            let stream = self.streams.get_mut(&config.window).unwrap();
             if stream.paused_at.take().is_some() {
                 stream.render = render_video(config.window, stream.decoder.output.clone(), ui);
             }
@@ -1283,10 +1308,13 @@ impl ClientMedia {
             next = next.min(at);
         }
         for s in self.streams.values().filter(|s| s.paused_at.is_none()) {
-            if s.recovering && s.recovery_sent.is_none() {
+            let receiving_keyframe = self.reassembly.has_keyframe(s.config.window, s.generation);
+            if s.recovering && s.recovery_sent.is_none() && !receiving_keyframe {
                 next = next.min(std::time::Instant::now());
             }
-            if let Some(at) = s.recovery_sent {
+            if let Some(at) = s.recovery_sent
+                && !receiving_keyframe
+            {
                 next = next.min(at + retry);
             }
             for (at, _) in s.pending.values() {
@@ -1294,6 +1322,7 @@ impl ClientMedia {
             }
             if let Some((number, at)) = s.latest_host
                 && number >= s.next
+                && !receiving_keyframe
             {
                 next = next.min(at + Duration::from_millis(50));
             }
@@ -1460,9 +1489,16 @@ impl ClientMediaWorker {
                         Some(MediaCommand::Start(config)) => {
                             anyhow::ensure!(config.width > 0 && config.height > 0 && config.width <= 8192 && config.height <= 8192 && config.fec.validate(), "invalid media configuration");
                             serial += 1; requested.insert(config.window, serial);
-                            if starting.len() >= 16 { anyhow::bail!("too many pending media configurations"); }
-                            let tag = serial; let software = software_only.contains(&config.window); let native_ui = ui.clone();
-                            starting.spawn(async move { let decoder = prepare_decoder(&config, native_ui, software).await; (tag, config, decoder) });
+                            // Reuse before probing another native session. A redundant
+                            // cold decoder can exhaust hardware capacity or fail an
+                            // otherwise healthy connection during a preset switch.
+                            if media.can_reuse_decoder(&config) {
+                                media.start_prepared(config, ui.clone(), &out, None).await?;
+                            } else {
+                                if starting.len() >= 16 { anyhow::bail!("too many pending media configurations"); }
+                                let tag = serial; let software = software_only.contains(&config.window); let native_ui = ui.clone();
+                                starting.spawn(async move { let decoder = prepare_decoder(&config, native_ui, software).await; (tag, config, decoder) });
+                            }
                         },
                         Some(MediaCommand::Stop(w, g)) => media.stop(w, g),
                         Some(MediaCommand::Pause(w)) => { requested.remove(&w); media.pause(w); },
@@ -1592,10 +1628,9 @@ async fn run_native_host(
         .media
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("missing media sender"))?;
-    let mut first = capture
-        .packets
-        .recv()
+    let mut first = tokio::time::timeout(Duration::from_secs(3), capture.packets.recv())
         .await
+        .map_err(|_| anyhow::anyhow!("native encoder produced no initial picture for 3 seconds"))?
         .ok_or_else(|| anyhow::anyhow!("native encoder stopped"))?;
 
     loop {
@@ -1640,14 +1675,20 @@ async fn run_native_host(
         let mut number = 0;
         let mut native_next = None;
         let mut awaiting_keyframe = true;
+        let mut refresh_started = Some(std::time::Instant::now());
         let mut latest = None;
         let mut status = tokio::time::interval(Duration::from_millis(50));
         status.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         first = loop {
             tokio::select! {
                 _ = connection.closed() => anyhow::bail!("media connection closed"),
-                changed = reset.changed() => { changed?; if *reset.borrow_and_update() == generation { awaiting_keyframe = true; let _ = capture.control.try_send(frames_native::NativeEncoderCommand::Keyframe); } },
+                changed = reset.changed() => { changed?; if *reset.borrow_and_update() == generation { awaiting_keyframe = true; refresh_started.get_or_insert_with(std::time::Instant::now); let _ = capture.control.try_send(frames_native::NativeEncoderCommand::Keyframe); } },
                 _ = status.tick() => {
+                    // Idle capture is valid; silence after requesting an independent
+                    // picture is not. Recover through the existing CPU fallback.
+                    if refresh_started.is_some_and(|at| at.elapsed() >= Duration::from_secs(3)) {
+                        anyhow::bail!("native encoder produced no refresh for 3 seconds");
+                    }
                     if let Some(number) = latest { out.send(Message::MediaStatus { window, generation, number }).await?; }
                     let budget = tuning.bitrate.load(Ordering::Relaxed); let fps = rate.load(Ordering::Relaxed); let scale = tuning.scale.load(Ordering::Relaxed);
                     sender.set_budget(window, budget, tuning.fec.load(Ordering::Relaxed) as u8, tuning.focused.load(Ordering::Relaxed));
@@ -1658,9 +1699,9 @@ async fn run_native_host(
                 frame = async { if let Some(frame) = pending.take() { Some(frame) } else { capture.packets.recv().await } } => {
                     let frame = frame.ok_or_else(|| anyhow::anyhow!("native encoder stopped"))?;
                     if (frame.width, frame.height) != size { break frame; }
-                    if native_next.is_some_and(|next| next != frame.packet.number) { awaiting_keyframe = true; let _ = capture.control.try_send(frames_native::NativeEncoderCommand::Keyframe); }
+                    if native_next.is_some_and(|next| next != frame.packet.number) { awaiting_keyframe = true; refresh_started.get_or_insert_with(std::time::Instant::now); let _ = capture.control.try_send(frames_native::NativeEncoderCommand::Keyframe); }
                     native_next = Some(frame.packet.number + 1);
-                    if awaiting_keyframe && !frame.packet.keyframe { capture.acknowledge(frame.packet.number,true)?;continue; } awaiting_keyframe = false;
+                    if awaiting_keyframe && !frame.packet.keyframe { capture.acknowledge(frame.packet.number,true)?;continue; } awaiting_keyframe = false; refresh_started = None;
                     let profile = media::FecProfile { parity_per_32: if std::env::var("FRAMES_FEC").as_deref() == Ok("0") { 0 } else if frame.packet.keyframe { 8 } else { tuning.fec.load(Ordering::Relaxed) as u8 } };
                     let captured_us = media::timestamp_micros(frame.packet.captured_at);
                     let deadline = tokio::time::Instant::now() + media::assembly_timeout(frame.packet.keyframe,frame.packet.bytes.len());
@@ -1671,6 +1712,7 @@ async fn run_native_host(
                     capture.acknowledge(native_number,!admitted)?;
                     if !admitted {
                         awaiting_keyframe = true;
+                        refresh_started.get_or_insert_with(std::time::Instant::now);
                         if sender.network_congested() {
                             let q = tuning.controller.lock().unwrap().congestion(std::time::Instant::now());
                             tuning.bitrate.store(q.bitrate, Ordering::Relaxed); tuning.scale.store(q.scale_percent, Ordering::Relaxed); rate.store(q.fps, Ordering::Relaxed);

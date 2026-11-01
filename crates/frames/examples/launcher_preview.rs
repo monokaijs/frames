@@ -67,11 +67,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_app_version(env!("CARGO_PKG_VERSION").into());
     if args.iter().any(|arg| arg == "--update-ready") {
         ui.set_update_ready(true);
-        ui.set_update_status(
-            "Frames 0.1.3 is ready. It will install after all Frames sessions close.".into(),
-        );
+        ui.set_update_status("Frames 0.2.4 is ready. Restart to install the update.".into());
     }
     ui.set_design_preview(true);
+    if args.iter().any(|arg| arg == "--update-confirm") {
+        ui.set_update_ready(true);
+        ui.set_update_prompt_open(true);
+    }
+    if args.iter().any(|arg| arg == "--update-confirm-error") {
+        ui.set_update_restart_error("Couldn't prepare update: installation is read-only.".into());
+    }
     ui.on_filter_share_windows(|data, query| {
         let query = query.to_lowercase();
         rows(
@@ -280,7 +285,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     ui.on_connect(move |_| preview_notice(&weak));
     let weak = ui.as_weak();
-    ui.on_connect_device(move |_, _| preview_notice(&weak));
+    ui.on_connect_device(move |_, _, _, _| preview_notice(&weak));
     let weak = ui.as_weak();
     ui.on_toggle_sharing(move || preview_notice(&weak));
     let weak = ui.as_weak();
@@ -313,6 +318,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         window.draw_if_needed(|renderer| {
             renderer.render(&mut pixels, size.width as usize);
         });
+        // Exercise production popups in a headless snapshot.
+        for arg in &args {
+            if let Some(point) = arg.strip_prefix("--click=") {
+                let (x, y) = point.split_once(',').ok_or("Use --click=x,y")?;
+                let position = slint::LogicalPosition::new(x.parse()?, y.parse()?);
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerPressed {
+                        position,
+                        button: slint::platform::PointerEventButton::Left,
+                    });
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                        position,
+                        button: slint::platform::PointerEventButton::Left,
+                    });
+            } else if let Some(key) = arg.strip_prefix("--key=") {
+                use slint::platform::{Key, WindowEvent};
+                let text: slint::SharedString = match key {
+                    "Escape" => Key::Escape.into(),
+                    "Tab" => Key::Tab.into(),
+                    "Down" => Key::DownArrow.into(),
+                    "Return" => Key::Return.into(),
+                    _ => return Err("Use --key=Escape, Tab, Down or Return".into()),
+                };
+                ui.window()
+                    .dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+                ui.window()
+                    .dispatch_event(WindowEvent::KeyReleased { text });
+            } else {
+                continue;
+            }
+            window.draw_if_needed(|renderer| {
+                renderer.render(&mut pixels, size.width as usize);
+            });
+        }
         let bytes: Vec<u8> = pixels.iter().flat_map(|p| [p.r, p.g, p.b]).collect();
         image::save_buffer(
             path,
