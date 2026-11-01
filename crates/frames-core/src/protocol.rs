@@ -117,9 +117,16 @@ pub enum Message {
         elapsed_ms: u64,
     },
     ReleaseInput,
+    SetQuality {
+        preset: crate::adaptive::QualityPreset,
+    },
+    QualityChanged {
+        preset: crate::adaptive::QualityPreset,
+    },
     SelectCodec {
         codec: Option<crate::codec::Codec>,
         bandwidth_mbps: u32,
+        quality: crate::adaptive::QualityPreset,
     },
     Menu {
         window: WindowId,

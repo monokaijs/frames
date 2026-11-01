@@ -61,13 +61,30 @@ fn main() -> anyhow::Result<()> {
         frames_core::model::ViewMode::Windows,
     ));
     let started = Instant::now();
+    let cycle = std::env::var_os("FRAMES_QA_QUALITY_CYCLE").is_some();
+    let presets = [
+        frames_core::adaptive::QualityPreset::High,
+        frames_core::adaptive::QualityPreset::Low,
+        frames_core::adaptive::QualityPreset::Medium,
+        frames_core::adaptive::QualityPreset::High,
+    ];
+    let mut stage = 0usize;
+    let mut stage_frames = [0u64; 4];
+    let mut quality_acks = 0u64;
     let mut target = None;
     let mut frames = 0;
     let mut samples = Vec::new();
     let mut last_picture = None;
     let mut last_sample = started - Duration::from_secs(1);
     let result = (|| -> anyhow::Result<()> {
-        while started.elapsed() < Duration::from_secs(30) {
+        while started.elapsed() < Duration::from_secs(if cycle { 40 } else { 30 }) {
+            if cycle {
+                let wanted = (started.elapsed().as_secs() as usize / 10).min(3);
+                if wanted != stage {
+                    stage = wanted;
+                    events.send(ClientEvent::Quality(presets[stage]))?;
+                }
+            }
             ensure!(
                 !job.is_finished(),
                 "production session ended before the quality check"
@@ -93,13 +110,30 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 ClientUpdate::Frame(key, frame) if Some(key) == target => {
+                    let expected = if cycle && stage == 1 {
+                        (source.width() * 75 / 100, source.height() * 75 / 100)
+                    } else {
+                        source.dimensions()
+                    };
+                    if (frame.width, frame.height) != expected
+                        && cycle
+                        && started.elapsed().as_secs() % 10 < 4
+                    {
+                        continue;
+                    }
                     ensure!(
-                        (frame.width, frame.height) == source.dimensions(),
-                        "production stream reduced text resolution: {}x{} instead of {:?}",
+                        (frame.width, frame.height) == expected,
+                        "preset {:?} delivered {}x{} instead of {:?}",
+                        presets[stage],
                         frame.width,
                         frame.height,
-                        source.dimensions()
+                        expected
                     );
+                    stage_frames[stage] += 1;
+                    if cycle && stage == 1 {
+                        frames += 1;
+                        continue;
+                    }
                     frames += 1;
                     if last_sample.elapsed() < Duration::from_secs(1) {
                         continue;
@@ -135,6 +169,10 @@ fn main() -> anyhow::Result<()> {
                         source.dimensions()
                     );
                 }
+                ClientUpdate::Quality(preset) => {
+                    quality_acks += 1;
+                    eprintln!("quality applied: {preset:?}");
+                }
                 ClientUpdate::Status(key, message) if Some(key) == target => {
                     ensure!(
                         !message.contains("failed") && !message.contains("stopped"),
@@ -149,6 +187,12 @@ fn main() -> anyhow::Result<()> {
             "not enough sustained text pictures: frames={frames}, samples={}",
             samples.len()
         );
+        if cycle {
+            ensure!(
+                stage_frames.iter().all(|count| *count > 0) && quality_acks >= 4,
+                "quality switching did not reach every preset: {stage_frames:?}, acknowledgements={quality_acks}"
+            );
+        }
         Ok(())
     })();
     let _ = events.send(ClientEvent::Disconnected);
@@ -172,7 +216,7 @@ fn main() -> anyhow::Result<()> {
     std::fs::write(
         report,
         serde_json::to_vec_pretty(
-            &serde_json::json!({"passed":result.is_ok(),"failure":result.as_ref().err().map(ToString::to_string),"width":source.width(),"height":source.height(),"frames":frames,"edge_error_samples":samples}),
+            &serde_json::json!({"passed":result.is_ok(),"failure":result.as_ref().err().map(ToString::to_string),"width":source.width(),"height":source.height(),"frames":frames,"edge_error_samples":samples,"preset_frames":stage_frames,"quality_acknowledgements":quality_acks}),
         )?,
     )?;
     result

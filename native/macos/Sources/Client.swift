@@ -18,6 +18,7 @@ import ImageIO
     var viewMode="windows"
     var showRemoteCursor=true
     var adbEnabled=false
+    var quality="high"
     var deviceData:[String:Any]=[:]
     var menuTracking=0
     var needsMenu=false
@@ -57,6 +58,21 @@ import ImageIO
         let local=NSMenu();local.autoenablesItems=false;local.delegate=self
         let appItem=NSMenuItem(title:"Frames",action:nil,keyEquivalent:"");appItem.submenu=local;bar.addItem(appItem)
         func add(_ title:String,_ action:Selector,_ state:Bool?=nil){let item=NSMenuItem(title:title,action:action,keyEquivalent:"");item.target=self;if let state{item.state=state ? .on:.off};local.addItem(item)}
+        let qualityMenu=NSMenu();qualityMenu.autoenablesItems=false
+        for (preset,title) in [("high","High (sharp text, native resolution)"),("medium","Medium (balanced)"),("low","Low (lower bandwidth)")] {
+            let item=NSMenuItem(title:title,action:#selector(selectQuality(_:)),keyEquivalent:"");item.target=self;item.representedObject=preset;item.state=quality==preset ? .on:.off;qualityMenu.addItem(item)
+        }
+        let qualityItem=NSMenuItem(title:"Image quality",action:nil,keyEquivalent:"");qualityItem.submenu=qualityMenu;local.addItem(qualityItem)
+        let windowMenu=NSMenu();windowMenu.autoenablesItems=false
+        for proxy in windows.values.sorted(by:{$0.window.title<$1.window.title}) {
+            let entry=NSMenuItem(title:proxy.remote["title"] as? String ?? "Remote window",action:#selector(toggleWindow(_:)),keyEquivalent:"");entry.target=self;entry.representedObject=Self.key(proxy.id);entry.state=proxy.hidden ? .off:.on;windowMenu.addItem(entry)
+        }
+        let windowItem=NSMenuItem(title:"Windows",action:nil,keyEquivalent:"");windowItem.submenu=windowMenu;local.addItem(windowItem)
+        add("Show all windows",#selector(showAllWindows));add("Hide all windows",#selector(hideAllWindows))
+        if let proxy=activeProxy {
+            let hide=NSMenuItem(title:"Ignore / hide this window",action:#selector(RemoteProxy.hideWindow),keyEquivalent:"");hide.target=proxy;local.addItem(hide)
+        }
+        local.addItem(.separator())
         if sharedSession != nil {
             add("Toggle relative mouse (Control+Option+F11)",#selector(toggleRelative))
             add("Show virtual cursor",#selector(toggleRemoteCursor),showRemoteCursor)
@@ -83,6 +99,15 @@ import ImageIO
         let deviceItem=NSMenuItem(title:"Devices",action:nil,keyEquivalent:"");deviceItem.submenu=devices;bar.addItem(deviceItem)
         NSApp.mainMenu=bar
         Wire.diagnostic("menu_installed", ["top_level_items":bar.items.count,"remote_top_level_items":activeProxy?.remoteMenuItems.count ?? 0,"activation_policy":NSApp.activationPolicy().rawValue])
+    }
+    @objc func selectQuality(_ item:NSMenuItem){if let preset=item.representedObject as? String{Wire.send(["event":"quality","preset":preset])}}
+    @objc func toggleWindow(_ item:NSMenuItem){if let key=item.representedObject as? String,let proxy=windows[key]{proxy.setShown(proxy.hidden)}}
+    @objc func showAllWindows(){for proxy in windows.values{proxy.setShown(true)}}
+    @objc func hideAllWindows(){for proxy in windows.values{proxy.setShown(false)}}
+    func connectionMenu(for proxy:RemoteProxy)->NSMenu {
+        activate(proxy);let menu=(NSApp.mainMenu?.items.first?.submenu?.copy() as? NSMenu) ?? NSMenu();menu.delegate=self
+        for item in NSApp.mainMenu?.items.dropFirst() ?? [] {menu.addItem(item.copy() as! NSMenuItem)}
+        return menu
     }
     @objc func toggleRelative(){activeProxy?.view.toggleRelative()}
     @objc func showCompatibility(){error("Window compatibility",compatibilityText)}
@@ -120,6 +145,7 @@ import ImageIO
             if !(cursor["png_base64"] is String){cursor["png_base64"]=virtualCursor["png_base64"]}
             virtualCursor=cursor;for proxy in windows.values{proxy.view.updateVirtualCursor(cursor)}
         case "devices":deviceData=message["data"] as? [String:Any] ?? [:];if let error=deviceData["error"] as? String{self.error("Device forwarding",error)};installMenu()
+        case "quality":quality=message["preset"] as? String ?? "high";installMenu()
         case "remote_cursor":showRemoteCursor=message["visible"] as? Bool ?? true;installMenu()
         case "view_mode":viewMode=message["mode"] as? String ?? "windows";if let error=message["error"] as? String{self.error("Frames view mode",error)}else{focusAfterSwitch=true};installMenu()
         case "adb_bridge":adbEnabled=message["enabled"] as? Bool ?? false;if let error=message["error"] as? String{self.error("Android ADB bridge",error)};installMenu()
@@ -155,7 +181,7 @@ import ImageIO
             let alive = Set(list.compactMap { $0["app_id"] as? String })
             for id in Array(docks.keys) where !alive.contains(id) { docks.removeValue(forKey: id)?.terminate() }
             presentVideo()
-            if focusAfterSwitch,let proxy=windows.values.first{focusAfterSwitch=false;NSApp.activate(ignoringOtherApps:true);proxy.window.makeKeyAndOrderFront(nil)}
+            if focusAfterSwitch,let proxy=windows.values.first(where:{!$0.hidden}){focusAfterSwitch=false;NSApp.activate(ignoringOtherApps:true);proxy.window.makeKeyAndOrderFront(nil)}
         case "status": if let id = message["window"] as? [String: Any], let proxy = windows[Self.key(id)] { if proxy.shared{proxy.sharedNotice=message["status"] as? String}else{proxy.status=message["status"] as? String ?? ""}; proxy.refreshTitle() }
         case "ack": if let id = message["window"] as? [String: Any], let proxy = windows[Self.key(id)] {
             if let actual = message["actual"] as? [String: Any] { proxy.remote = actual }
@@ -179,7 +205,7 @@ import ImageIO
                 for event in events {
                     let proxies = self.windows.values.filter { ($0.remote["app_id"] as? String) == id }
                     if event == "quit" { for proxy in proxies { if proxy.remote["role"] as? String == "desktop"{self.disconnect()}else{proxy.send("action",["action":["kind":"close"]])} } }
-                    else if event == "activate", let proxy = proxies.first { NSApp.activate(ignoringOtherApps: true); proxy.window.makeKeyAndOrderFront(nil) }
+                    else if event == "activate", let proxy = proxies.first { NSApp.activate(ignoringOtherApps: true); proxy.setShown(true) }
                 }
             }
         }
@@ -228,6 +254,8 @@ final class DockEventReader: @unchecked Sendable {
     var resizeWork: DispatchWorkItem?
     var lastSize = CGSize.zero
     var destroying = false
+    var hidden = false
+    var menuButton:NSButton?
     var showHeader:Bool{remote["show_header"] as? Bool ?? false}
     var id: [String: Any] { remote["key"] as? [String: Any] ?? [:] }
     var resizable: Bool { !shared && remote["resize"] as? String == "supported" }
@@ -250,10 +278,23 @@ final class DockEventReader: @unchecked Sendable {
         super.init(); window.acceptsFocus = !transient;view.proxy = self; window.contentView = view; window.delegate = self; window.isReleasedWhenClosed = false; window.acceptsMouseMovedEvents = true; window.title = remote["title"] as? String ?? "Remote window"
         window.collectionBehavior = [.managed, .fullScreenPrimary]
         if remote["role"] as? String == "desktop"{window.center()}
+        if !transient {
+            let accessory=NSTitlebarAccessoryViewController();accessory.layoutAttribute = .right
+            let button=NSButton(image:NSImage(systemSymbolName:"chevron.down",accessibilityDescription:"Connection menu")!,target:self,action:#selector(openConnectionMenu(_:)));button.bezelStyle = .inline;button.isBordered=false;button.toolTip="Connection menu";button.setAccessibilityLabel("Connection menu");button.frame=NSRect(x:0,y:0,width:34,height:24)
+            accessory.view=button;window.addTitlebarAccessoryViewController(accessory);menuButton=button
+        }
         refreshTitle()
     }
+    @objc func openConnectionMenu(_ button:NSButton){view.releaseInput();client?.connectionMenu(for:self).popUp(positioning:nil,at:NSPoint(x:0,y:button.bounds.minY),in:button)}
+    @objc func hideWindow(){setShown(false)}
+    func setShown(_ shown:Bool) {
+        hidden = !shown
+        if shown {NSApp.activate(ignoringOtherApps:true);window.makeKeyAndOrderFront(nil)}
+        else {view.releaseInput();resizeWork?.cancel();window.orderOut(nil);view.redraw()}
+        visibility();client?.installMenu()
+    }
     func send(_ event: String, _ fields: [String: Any] = [:]) { var value = fields;value["event"] = event;value["window"] = id;Wire.send(value) }
-    func visibility() { send("visibility",["visible":window.isVisible && !window.isMiniaturized && window.occlusionState.contains(.visible),"focused":window.isKeyWindow]) }
+    func visibility() { send("visibility",["visible":!hidden && window.isVisible && !window.isMiniaturized && window.occlusionState.contains(.visible),"focused":window.isKeyWindow]) }
     func refreshTitle() { let detail=commandError ?? (shared ? [sharedStatus,sharedNotice].compactMap{$0}.joined(separator:" / ") : status);let title = "\(remote["title"] ?? "Remote window") — \(mode == "resize_remote" && resizable ? "Resize remote" : "Stretch locally")\(physical ? " / Physical keys":"")\(detail.isEmpty ? "" : " — "+detail)";if window.title != title { window.title=title } }
     func save() { if shared{refreshTitle();view.redraw();return};UserDefaults.standard.set(mode,forKey:preference+":mode");UserDefaults.standard.set(fill,forKey:preference+":fill");UserDefaults.standard.set(swap,forKey:preference+":swap");UserDefaults.standard.set(physical,forKey:preference+":physical");refreshTitle();view.redraw() }
     @objc func setResize() { if resizable { mode="resize_remote";save() } }

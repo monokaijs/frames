@@ -197,6 +197,7 @@ export component Launcher inherits Window {
     in-out property <bool> unattended: false;
     in-out property <bool> clipboard: true;
     in-out property <int> codec: 0;
+    in-out property <int> quality: 0;
     in-out property <bool> bandwidth-auto: true;
     in-out property <int> bandwidth-mbps: 50;
     in-out property <int> max-streams: 8;
@@ -435,7 +436,10 @@ export component Launcher inherits Window {
                                 SettingRow { title: "Host audio"; detail: "Play sound from the remote computer.";
                                     AppSwitch { checked <=> root.default-audio; toggled => { root.settings-edited(); } accessible-label: "Host audio by default"; }
                                 }
-                                SettingRow { title: "Bandwidth limit"; detail: "Shared across streamed windows. Higher limits allow sharper images.";
+                                SettingRow { title: "Image quality"; detail: root.quality == 0 ? "Sharp text: native resolution, up to 60 fps and 50 Mbps at 1080p." : root.quality == 1 ? "Balanced: native resolution, up to 60 fps and 12 Mbps at 1080p." : "Save bandwidth: 75% resolution, up to 30 fps and 4 Mbps at 1080p.";
+                                    ComboBox { width: 180px; model: ["High", "Medium", "Low"]; current-index <=> root.quality; selected(value) => { root.settings-edited(); } accessible-label: "Image quality preset"; }
+                                }
+                                SettingRow { title: "Bandwidth limit"; detail: "Shared across windows. Caps the selected quality preset; applies to new connections.";
                                     HorizontalLayout { spacing: 10px; alignment: end;
                                         AppCheckBox { text: "Automatic"; checked <=> root.bandwidth-auto; toggled => { root.settings-edited(); } }
                                         SpinBox { width: 105px; minimum: 1; maximum: 200; value <=> root.bandwidth-mbps; enabled: !root.bandwidth-auto; edited => { root.settings-edited(); } accessible-label: "Bandwidth limit in Mbps"; }

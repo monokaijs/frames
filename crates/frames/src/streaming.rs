@@ -53,6 +53,20 @@ impl StreamTuning {
     }
 }
 impl HostStream {
+    pub fn set_quality(&self, preset: frames_core::adaptive::QualityPreset) {
+        let mut controller = self.tuning.controller.lock().unwrap();
+        controller.set_preset(preset, std::time::Instant::now());
+        let q = controller.quality();
+        self.tuning.bitrate.store(q.bitrate, Ordering::Relaxed);
+        self.tuning.scale.store(q.scale_percent, Ordering::Relaxed);
+        self.tuning
+            .fec
+            .store(q.fec.parity_per_32 as u32, Ordering::Relaxed);
+        self.rate.store(q.fps, Ordering::Relaxed);
+        self.reset
+            .send_replace(self.generation.load(Ordering::Acquire));
+    }
+
     pub fn set_fps(&self, fps: u32) {
         self.tuning.focused.store(fps >= 45, Ordering::Relaxed);
         let mut controller = self.tuning.controller.lock().unwrap();
@@ -602,6 +616,7 @@ pub fn start_audio(
     }
 }
 pub struct VideoOptions {
+    pub quality: frames_core::adaptive::QualityPreset,
     pub fps: u32,
     pub show_cursor: bool,
     pub bandwidth_mbps: u32,
@@ -617,6 +632,7 @@ pub fn start_host(
     generations: Arc<AtomicU32>,
 ) -> HostStream {
     let VideoOptions {
+        quality,
         fps,
         show_cursor,
         bandwidth_mbps,
@@ -634,6 +650,14 @@ pub fn start_host(
         .lock()
         .unwrap()
         .set_bandwidth_mbps(bandwidth_mbps);
+    {
+        let mut controller = tuning.controller.lock().unwrap();
+        controller.set_preset(quality, std::time::Instant::now());
+        let q = controller.quality();
+        tuning.bitrate.store(q.bitrate, Ordering::Relaxed);
+        tuning.scale.store(q.scale_percent, Ordering::Relaxed);
+        rate.store(q.fps, Ordering::Relaxed);
+    }
     let settings = tuning.clone();
     let (reset, mut reset_task) = watch::channel(0);
     let task = tokio::spawn(async move {

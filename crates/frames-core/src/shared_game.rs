@@ -329,6 +329,7 @@ impl SharedSession {
             Message::ReleaseInput
             | Message::InputClock { .. }
             | Message::SelectCodec { .. }
+            | Message::SetQuality { .. }
             | Message::AudioPreference { .. }
             | Message::ClockProbe { .. }
             | Message::Ping { .. }

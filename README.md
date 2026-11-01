@@ -76,4 +76,14 @@ An optional Windows service installs with `frames service install` from an Admin
 
 [Transport and latency](docs/LATENCY_REVIEW.md) ? [Launcher development](docs/LAUNCHER.md) ? [Validation](docs/VALIDATION.md)
 
-Set **Settings > Bandwidth limit** to Automatic, or choose **1-200 Mbps** for a connection. The limit is shared across streamed windows, including video protection and audio; focused windows receive more of the budget. Higher limits allow higher encoder quality while congestion adaptation remains enabled. Saved defaults apply to new connections. The CLI equivalent is `frames connect ADDRESS --bandwidth-mbps 50` (`0` means Automatic). Both peers need the protocol-10 build.
+Choose **Settings > Image quality** for saved connection defaults, or change **Image quality** live from the dropdown in a remote window's title bar.
+
+| Preset | Resolution / frame rate | 1080p encoder budget before protection |
+| --- | --- | --- |
+| High (default) | Native resolution, up to 60 fps; congestion keeps native resolution | 50 Mbps |
+| Medium | Native resolution, up to 60 fps; may reduce resolution under congestion | 12 Mbps |
+| Low | Starts at 75% resolution and up to 30 fps | 4 Mbps |
+
+Larger source displays scale the budget by pixel count, up to 200/64/24 Mbps respectively. A custom **Settings > Bandwidth limit** of **1-200 Mbps** caps the preset's total connection traffic, shared across video, protection, and audio. Automatic uses the preset budget. Saved defaults apply to new connections; title-bar preset changes apply immediately to that connection. CLI: `frames connect ADDRESS --quality high --bandwidth-mbps 50` (`0` means Automatic). Both peers need the protocol-11 build.
+
+The title-bar dropdown replaces each connection's Windows tray icon and the old eye-slash header button. It retains window options, view, devices, remote cursor, and disconnect controls. Choose **Ignore / hide this window** to hide a local proxy without closing the remote application. Restore individual windows under **Windows**, or choose **Show all windows**. When all windows are hidden on Windows, a small connection window provides restore and menu controls. On Mac, the same controls remain in the Frames menu and existing Dock entries can restore hidden windows. The launcher's single tray icon is unchanged.

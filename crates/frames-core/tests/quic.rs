@@ -38,7 +38,8 @@ async fn mutual_tls_binds_both_identities_and_pairing_code_to_the_connection() {
             protocol::recv_json(&mut rx).await.unwrap(),
             Message::SelectCodec {
                 codec: None,
-                bandwidth_mbps: 50
+                bandwidth_mbps: 50,
+                quality: frames_core::adaptive::QualityPreset::High
             }
         ));
         protocol::send_json(&mut tx, &Message::Pong { nonce: 42 })
@@ -63,6 +64,7 @@ async fn mutual_tls_binds_both_identities_and_pairing_code_to_the_connection() {
         &Message::SelectCodec {
             codec: None,
             bandwidth_mbps: 50,
+            quality: frames_core::adaptive::QualityPreset::High,
         },
     )
     .await

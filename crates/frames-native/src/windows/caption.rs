@@ -1,4 +1,4 @@
-//! An icon-only Hide control beside the untouched Windows caption controls.
+//! A connection-menu dropdown beside the untouched Windows caption controls.
 #![allow(unsafe_op_in_unsafe_fn)]
 use windows::{
     Win32::{
@@ -8,7 +8,7 @@ use windows::{
     },
     core::*,
 };
-pub const HIDE: usize = 0xA009;
+pub const MENU: usize = 0xA009;
 pub const LAYOUT: u32 = WM_APP + 77;
 
 pub unsafe fn create(parent: HWND) -> Result<HWND> {
@@ -17,7 +17,7 @@ pub unsafe fn create(parent: HWND) -> Result<HWND> {
     let button = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
         w!("BUTTON"),
-        w!("Hide to tray"),
+        w!("Connection menu"),
         WS_POPUP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
         0,
         0,
@@ -54,7 +54,7 @@ pub unsafe fn create(parent: HWND) -> Result<HWND> {
         uFlags: TTF_IDISHWND | TTF_SUBCLASS,
         hwnd: button,
         uId: button.0 as usize,
-        lpszText: PWSTR(w!("Hide to tray").as_ptr() as *mut _),
+        lpszText: PWSTR(w!("Connection menu").as_ptr() as *mut _),
         ..Default::default()
     };
     SendMessageW(
@@ -137,7 +137,13 @@ unsafe fn draw_icon(hwnd: HWND, owner: HWND) {
     let unit = |value: i32| (value * scale + 48) / 96;
     let x = (width - unit(18)) / 2;
     let y = (height - unit(18)) / 2;
-    draw_eye_slash(dc, x, y, scale * 18 / 16);
+    let pen = CreatePen(PS_SOLID, unit(2), COLORREF(0xffffff));
+    let old_pen = SelectObject(dc, pen.into());
+    let _ = MoveToEx(dc, x + unit(4), y + unit(6), None);
+    let _ = LineTo(dc, x + unit(9), y + unit(11));
+    let _ = LineTo(dc, x + unit(14), y + unit(6));
+    SelectObject(dc, old_pen);
+    let _ = DeleteObject(pen.into());
     let mut dark = BOOL(0);
     let _ = DwmGetWindowAttribute(
         owner,
@@ -329,7 +335,7 @@ unsafe extern "system" fn button_procedure(
             let _ = PostMessageW(
                 Some(HWND(owner as *mut _)),
                 WM_COMMAND,
-                WPARAM(HIDE),
+                WPARAM(MENU),
                 LPARAM(0),
             );
         }

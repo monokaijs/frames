@@ -41,6 +41,18 @@ import AppKit
             precondition(action["kind"] as? String == "set_header" && action["visible"] as? Bool == visible)
             precondition((events[index]["window"] as! [String:Int])["id"]==42)
         }
+        precondition(proxy.menuButton?.toolTip=="Connection menu")
+        client.update(["type":"quality","preset":"low"])
+        let connectionMenu=client.connectionMenu(for:proxy)
+        let quality=connectionMenu.items.first{$0.title=="Image quality"}?.submenu
+        precondition(quality?.items.count==3)
+        precondition(quality?.items.first{($0.representedObject as? String)=="low"}?.state == .on)
+        precondition(connectionMenu.items.contains{$0.title=="Ignore / hide this window"})
+        precondition(connectionMenu.items.contains{$0.title=="Windows"})
+        proxy.setShown(false)
+        precondition(proxy.hidden && !proxy.window.isVisible)
+        client.showAllWindows()
+        precondition(!proxy.hidden && proxy.window.isVisible)
         proxy.destroy()
         print("PASS: header toggles request remote capture changes, follow host state, preserve local chrome, and reject desktop toggles")
     }

@@ -445,7 +445,18 @@ unsafe extern "system" fn procedure(
                 return LRESULT(0);
             }
             match command {
-                super::caption::HIDE => state.set_shown(hwnd, false),
+                super::caption::MENU => {
+                    state.release_mouse();
+                    state.event(ClientEvent::ReleaseInput);
+                    state.forwarded.clear();
+                    state.surrogate = None;
+                    let _ = PostThreadMessageW(
+                        GetWindowThreadProcessId(hwnd, None),
+                        super::session_control::OPEN,
+                        WPARAM(hwnd.0 as usize),
+                        LPARAM(0),
+                    );
+                }
                 RELATIVE_MOUSE => {
                     state.event(ClientEvent::ReleaseInput);
                     state.forwarded.clear();
@@ -1076,6 +1087,7 @@ pub fn run_client(
             }
             for update in updates.try_iter() {
                 match update {
+                    ClientUpdate::Quality(preset) => session_control.set_quality(preset),
                     ClientUpdate::SharedSession(info) => {
                         let info = *info;
                         shared = Some(info.clone());
@@ -1541,6 +1553,16 @@ pub fn run_client(
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 if msg.message == WM_QUIT {
                     running = false;
+                }
+                if msg.message == super::session_control::OPEN {
+                    let hwnd = HWND(msg.wParam.0 as *mut _);
+                    if let Some((&key, _)) = windows.iter().find(|(_, value)| **value == hwnd) {
+                        let mut anchor = RECT::default();
+                        let proxy = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Proxy);
+                        let _ = GetWindowRect(proxy.header, &mut anchor);
+                        session_control.open(key, tray_windows.clone(), anchor.left, anchor.bottom);
+                    }
+                    continue;
                 }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);

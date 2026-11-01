@@ -712,6 +712,9 @@ pub fn run_client(
             };
             let window = serde_json::from_value::<WindowId>(value["window"].clone()).ok();
             let event = match value["event"].as_str() {
+                Some("quality") => serde_json::from_value(value["preset"].clone())
+                    .ok()
+                    .map(ClientEvent::Quality),
                 Some("view_mode") => serde_json::from_value(value["mode"].clone())
                     .ok()
                     .map(ClientEvent::ViewMode),
@@ -828,6 +831,7 @@ pub fn run_client(
                 }
                 continue;
             }
+            ClientUpdate::Quality(preset) => json!({"type":"quality","preset":preset}),
             ClientUpdate::RemoteCursor { visible } => {
                 json!({"type":"remote_cursor","visible":visible})
             }

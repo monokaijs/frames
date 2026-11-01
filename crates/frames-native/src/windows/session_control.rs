@@ -1,4 +1,5 @@
-//! Persistent per-connection tray controls. Hidden proxies remain in this list.
+//! Connection menus on an independent worker. Hidden proxies remain restorable.
+pub const OPEN: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 80;
 use super::{
     devices::DeviceMenu,
     tray::{Tray, TrayGlyph as G, TrayItem as Item},
@@ -11,6 +12,7 @@ use frames_core::{
 use std::collections::HashMap;
 use windows::{Win32::UI::WindowsAndMessaging::*, core::PWSTR};
 
+#[derive(Clone)]
 pub struct SessionWindow {
     pub key: WindowId,
     pub title: String,
@@ -36,11 +38,13 @@ pub struct SessionControl {
     actions: HashMap<u32, SessionAction>,
     ids: HashMap<String, u32>,
     next: u32,
+    current: Option<WindowId>,
+    quality: frames_core::adaptive::QualityPreset,
 }
 impl SessionControl {
     pub fn new(events: tokio::sync::mpsc::UnboundedSender<ClientEvent>) -> anyhow::Result<Self> {
         Ok(Self {
-            tray: Tray::new("Frames connection")?,
+            tray: Tray::menu_only("Frames connection")?,
             events,
             mode: ViewMode::Windows,
             adb: false,
@@ -52,7 +56,18 @@ impl SessionControl {
             actions: HashMap::new(),
             ids: HashMap::new(),
             next: 0x10000,
+            current: None,
+            quality: Default::default(),
         })
+    }
+    pub fn set_quality(&mut self, preset: frames_core::adaptive::QualityPreset) {
+        self.quality = preset;
+    }
+    pub fn open(&mut self, window: WindowId, windows: Vec<SessionWindow>, x: i32, y: i32) {
+        self.current = Some(window);
+        self.sync_windows(windows);
+        let _ = self.events.send(ClientEvent::ReleaseInput);
+        self.tray.popup(x, y);
     }
     pub fn update(&mut self, mode: ViewMode, adb: bool, cursor: bool) {
         self.mode = mode;
@@ -84,6 +99,10 @@ impl SessionControl {
                 .cmp(&b.title.to_lowercase())
                 .then(a.key.cmp(&b.key))
         });
+        let active = windows
+            .iter()
+            .find(|window| Some(window.key) == self.current)
+            .cloned();
         let shown = windows.iter().filter(|w| w.shown).count();
         let mut list = Vec::new();
         let mut options = Vec::new();
@@ -124,6 +143,33 @@ impl SessionControl {
             Item::new(7, "Hide all windows", G::Hide).enabled(shown > 0),
             Item::separator(),
         ];
+        if let Some(window) = active {
+            let hide = self.register(
+                format!("hide:{:?}", window.key),
+                SessionAction::Visibility(window.key, false),
+            );
+            items.insert(2, Item::new(hide, "Ignore / hide this window", G::Hide));
+            let children = self.window_items(window.key, window.options);
+            items.insert(
+                3,
+                Item::new(0, "This window", G::Settings).children(children),
+            );
+        }
+        items.push(
+            Item::new(0, "Image quality", G::Display).children(
+                [
+                    (8, "High (sharp text, native resolution)"),
+                    (9, "Medium (balanced)"),
+                    (10, "Low (lower bandwidth)"),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (id, title))| {
+                    Item::new(id, title, G::Display).checked(self.quality.index() == index as i32)
+                })
+                .collect(),
+            ),
+        );
         if !options.is_empty() {
             items.push(Item::new(0, "Window options", G::Settings).children(options));
         }
@@ -141,6 +187,7 @@ impl SessionControl {
         items.push(Item::new(5, "Show remote cursor", G::Cursor).checked(self.cursor));
         items.push(Item::separator());
         items.push(Item::new(4, "Disconnect", G::Power));
+        self.tray.recovery(shown == 0);
         self.tray.update(
             items,
             self.connected,
@@ -171,6 +218,12 @@ impl SessionControl {
                     let _ = self.events.send(ClientEvent::RemoteCursor {
                         visible: !self.cursor,
                     });
+                }
+                8..=10 => {
+                    let _ = self.events.send(ClientEvent::Quality(
+                        frames_core::adaptive::QualityPreset::from_index(command as i32 - 8)
+                            .unwrap(),
+                    ));
                 }
                 6 | 7 => result.extend(
                     windows

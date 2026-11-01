@@ -241,6 +241,7 @@ fn interactive(message: &Message) -> bool {
             | Message::Visibility { .. }
             | Message::SetViewMode { .. }
             | Message::SetRemoteCursor { .. }
+            | Message::SetQuality { .. }
     )
 }
 fn realtime(message: &Message) -> bool {
@@ -795,6 +796,7 @@ async fn host_session(
     );
     let mut preference = None;
     let mut bandwidth_mbps = 0;
+    let mut quality = frames_core::adaptive::QualityPreset::default();
     let mut failures = HashMap::<WindowId, u32>::new();
     let mut media_losses = HashMap::<WindowId, u64>::new();
     let mut audio = None::<crate::streaming::HostStream>;
@@ -891,7 +893,7 @@ async fn host_session(
                         if failures.get(&key).copied().unwrap_or(0)>1&&!scan.is_multiple_of(50){continue;}
                         let selected=if preference.is_none()&&failures.get(&key).copied().unwrap_or(0)>0{Some(Codec::Vp9)}else{preference};
                         let cap=codec::negotiate(&codecs,&peer.codecs,selected)?;
-                        entry.insert(crate::streaming::start_host(desktop.clone(),key,cap,crate::streaming::VideoOptions{fps:sub.fps(),show_cursor,bandwidth_mbps},connection.clone(),io.send.clone(),generations.clone()));
+                        entry.insert(crate::streaming::start_host(desktop.clone(),key,cap,crate::streaming::VideoOptions{quality,fps:sub.fps(),show_cursor,bandwidth_mbps},connection.clone(),io.send.clone(),generations.clone()));
                     }
                 }
 
@@ -947,7 +949,8 @@ async fn host_session(
                 Message::Visibility{window,visible,focused}=>{if known.contains_key(&window){let subscription=subscriptions.entry(window).or_default();
                     if shared.is_some() && (!visible||!focused){input.release()?;}
                     subscription.update(visible,focused);if !visible{streams.remove(&window);}else if let Some(stream)=streams.get(&window){stream.set_fps(subscription.fps());}}},
-                Message::SelectCodec{codec,bandwidth_mbps:limit}=>{anyhow::ensure!(limit<=200,"bandwidth limit must be between 1 and 200 Mbps, or 0 for automatic");codec::negotiate(&codecs,&peer.codecs,codec)?;preference=codec;bandwidth_mbps=limit;if let Some(sender)=&io.send.media{sender.set_limit_mbps(limit);}streams.clear();failures.clear();},
+                Message::SetQuality{preset}=>{quality=preset;for stream in streams.values(){stream.set_quality(preset);}io.send.send(Message::QualityChanged{preset}).await?;},
+                Message::SelectCodec{codec,bandwidth_mbps:limit,quality:preset}=>{quality=preset;io.send.send(Message::QualityChanged{preset}).await?;anyhow::ensure!(limit<=200,"bandwidth limit must be between 1 and 200 Mbps, or 0 for automatic");codec::negotiate(&codecs,&peer.codecs,codec)?;preference=codec;bandwidth_mbps=limit;if let Some(sender)=&io.send.media{sender.set_limit_mbps(limit);}streams.clear();failures.clear();},
                 Message::StreamReady{window,generation}=>if window==frames_core::media::AUDIO_WINDOW{if let Some(audio)=&audio{audio.acknowledge(generation);}}else if let Some(stream)=streams.get(&window){stream.acknowledge(generation);},
                 Message::ClockProbe{client_us}=>{let received_us=frames_core::media::monotonic_micros();io.send.send(Message::ClockReply{client_us,received_us,sent_us:frames_core::media::monotonic_micros()}).await?;},
                 Message::Feedback{window,generation,mut stats}=>{let previous=media_losses.insert(window,stats.delivery.missing_shards).unwrap_or(0);if stats.delivery.missing_shards>previous && let Some(sender)=&io.send.media{sender.note_loss();}
@@ -1035,6 +1038,7 @@ fn connection_timeout_hint() -> &'static str {
 
 #[derive(Default)]
 pub struct MediaOptions {
+    pub quality: frames_core::adaptive::QualityPreset,
     pub audio: bool,
     pub bandwidth_mbps: u32,
 }
@@ -1048,6 +1052,7 @@ pub async fn client(
     initial_view: ViewMode,
 ) -> anyhow::Result<()> {
     let MediaOptions {
+        quality,
         audio,
         bandwidth_mbps,
     } = media;
@@ -1116,6 +1121,7 @@ pub async fn client(
         .send(Message::SelectCodec {
             codec: requested,
             bandwidth_mbps,
+            quality,
         })
         .await?;
     io.send
@@ -1209,6 +1215,7 @@ pub async fn client(
                 Some(ClientEvent::MediaRecovery{window,generation})=>media.send(crate::streaming::MediaCommand::Recover(window,generation)).await?,
                 Some(ClientEvent::DecoderFailed{window,generation,reason})=>media.send(crate::streaming::MediaCommand::Failed(window,generation,reason)).await?,
                 Some(ClientEvent::Presented{window,generation,number,at})=>media.send(crate::streaming::MediaCommand::Presented(window,generation,number,at)).await?,
+                Some(ClientEvent::Quality(preset))=>io.send.send(Message::SetQuality{preset}).await?,
                 Some(ClientEvent::RemoteCursor{visible})=>io.send.send(Message::SetRemoteCursor{visible}).await?,
                 Some(ClientEvent::ViewMode(mode))=>{if shared.is_some(){continue;}io.send.send(Message::ReleaseInput).await?;io.send.send(Message::SetViewMode{mode}).await?;},
                 Some(ClientEvent::AdbBridge{enabled})=>{if shared.is_some(){continue;}
@@ -1258,6 +1265,7 @@ pub async fn client(
                 },
                 Message::SharedState(state)=>{if shared.as_ref().is_some_and(|s|s.window==state.window&&s.generation==state.generation){delivery.send(ClientUpdate::SharedSession(Box::new(state)))?;}},
                 Message::SharedCursor{window,generation,cursor}=>{if cursor.valid() && shared.as_ref().is_some_and(|s|s.window==window&&s.generation==generation){delivery.send(ClientUpdate::SharedCursor(cursor))?;}},
+                Message::QualityChanged{preset}=>delivery.send(ClientUpdate::Quality(preset))?,
                 Message::RemoteCursorChanged{visible}=>delivery.send(ClientUpdate::RemoteCursor{visible})?,
                 Message::ViewModeChanged{mode,error}=>{if error.is_none(){media.send(crate::streaming::MediaCommand::Clear).await?;}delivery.send(ClientUpdate::ViewMode{mode,error})?;},
                 Message::AdbBridgeStatus{enabled,address,error}=>{

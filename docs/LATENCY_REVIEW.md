@@ -65,16 +65,17 @@ and essential control acknowledgements cannot be silently evicted.
 Feedback runs every 100 ms and includes bytes/shards, pre-FEC loss, repairs,
 failures, late frames, decoder backlog, presentation gaps, and audio underruns.
 The sender combines it with Quinn RTT, minimum RTT, congestion events, window,
-and loss statistics. A focused 1080p stream begins with a 12 Mbps encoder target.
+and loss statistics. The default High preset begins with a 50 Mbps encoder target
+at 1080p; Medium uses 12 Mbps and Low uses 4 Mbps.
 Settings supports an automatic budget or a custom 1-200 Mbps media limit per
-connection (`--bandwidth-mbps` in the CLI). A custom limit raises the encoder
-ceiling; weighted sharing gives the focused window four shares and each
+connection (`--bandwidth-mbps` in the CLI). A custom limit caps the selected
+preset; weighted sharing gives the focused window four shares and each
 background window one, reclaiming unused requested allocations. Pacing reserves
 5% for transport/control plus a 256 kbps audio allowance before video allocation.
 FEC and measured padding/header costs reduce the encoder allocation within that
 limit; congestion adaptation remains active. Changes apply to new connections.
-In automatic mode, larger physical captures scale the clean-link budget by source pixel count, up
-to 64 Mbps (4K starts at 48 Mbps). Source resizing preserves existing congestion
+In automatic mode, larger physical captures scale the clean-link budget by source
+pixel count, up to 200/64/24 Mbps for High/Medium/Low. Source resizing preserves existing congestion
 reductions. Isolated late pictures and short encoder spikes do not reduce quality;
 pressure must persist for 300 ms before bitrate drops. RTT variation alone and
 application budget waits do not imply network congestion. Recoverable packet
@@ -84,10 +85,13 @@ after three seconds. Protection moves from 12.5% toward 6.25% after five clean
 seconds, or toward 25% for loss above 2% or failed reconstruction without
 congestion. Extra parity consumes the encoder's existing allowance.
 
-After a sustained overloaded second, dimensions step through 100%, 75%, and 50%.
-Frame rate then steps through 60, 45, and 30. Restoration requires ten stable
+High preserves native resolution and reduces frame rate under sustained overload.
+Medium may step dimensions through 100%, 75%, and 50%, followed by 60/45/30 fps.
+Low begins at 75% and 30 fps, with a 50% resolution floor. Restoration requires ten stable
 seconds per quality step. Stream dimensions do not resize the remote application
-or alter normalized input coordinates.
+or alter normalized input coordinates. Preset changes apply live and request a
+fresh independent picture; dimension changes use the existing configuration
+generation handshake. Saved launcher defaults also select the CLI preset.
 
 ## Native video and audio
 
@@ -163,7 +167,9 @@ The `text_quality_probe` example connects through the production session and
 checks full source resolution and text edges for 30 seconds; point
 `FRAMES_SCREEN_TEXT_SOURCE` at the generated source PNG and display it with
 `FRAMES_QA_TEXT_SOURCE` in `QAWindowFixture.app`. It saves only synthetic fixture
-pixels and performs no remote input.
+pixels and performs no remote input. `FRAMES_QA_QUALITY_CYCLE=1` exercises
+High/Low/Medium/High over 40 seconds, checks acknowledgements and dimensions at
+each stage, and verifies text edges at native resolution.
 `cross_transfer_smoke.py --native-ui --motion --hold-ui 600` runs a
 real 1080p motion fixture; `--hold-ui 7200` supports a two-hour run.
 `media_network_fixture.py` supplies a bounded seeded UDP proxy with loss, bursts,
@@ -203,3 +209,9 @@ The results above do **not** establish the clean-LAN <=65 ms input-to-presentati
 gate, the Wi-Fi <=85 ms gate, the complete hardware matrix, or a two-hour soak.
 No display-level latency claim is made. Physical validation and remaining release
 gates are tracked in [VALIDATION.md](VALIDATION.md).
+
+The live preset-cycle check passed with 215 decoded pictures and four applied
+preset acknowledgements: 9 High, 28 Low, 56 Medium, then 122 High pictures. Low
+delivered 1440x810 from a 1920x1080 source; native stages retained full resolution.
+These sparse text updates establish live controls and readability, not motion
+frame-rate or latency acceptance gates.

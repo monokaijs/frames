@@ -14,6 +14,8 @@ use windows::{
 
 const CALLBACK: u32 = WM_APP + 74;
 const UPDATE: u32 = WM_APP + 75;
+const OPEN: u32 = WM_APP + 78;
+const RECOVERY: u32 = WM_APP + 79;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TrayGlyph {
@@ -105,6 +107,32 @@ pub struct Tray {
 }
 impl Tray {
     pub fn new(title: &str) -> anyhow::Result<Self> {
+        Self::create(title, true)
+    }
+    pub fn menu_only(title: &str) -> anyhow::Result<Self> {
+        Self::create(title, false)
+    }
+    pub fn popup(&self, x: i32, y: i32) {
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(self.hwnd as *mut _)),
+                OPEN,
+                WPARAM(x as usize),
+                LPARAM(y as isize),
+            );
+        }
+    }
+    pub fn recovery(&self, visible: bool) {
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(self.hwnd as *mut _)),
+                RECOVERY,
+                WPARAM(usize::from(visible)),
+                LPARAM(0),
+            );
+        }
+    }
+    fn create(title: &str, notification: bool) -> anyhow::Result<Self> {
         let (updates, receiver) = mpsc::channel();
         let (commands_tx, commands) = mpsc::channel();
         let (ready_tx, ready) = mpsc::sync_channel(1);
@@ -116,6 +144,7 @@ impl Tray {
                     lpfnWndProc: Some(procedure),
                     hInstance: instance.into(),
                     lpszClassName: w!("FramesTray"),
+                    hbrBackground: GetSysColorBrush(COLOR_WINDOW),
                     ..Default::default()
                 });
                 let mut context = Box::new(Context {
@@ -130,24 +159,81 @@ impl Tray {
                     bitmaps: HashMap::new(),
                     taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
                     added: false,
+                    notification,
                 });
                 // A hidden top-level window receives Explorer's TaskbarCreated broadcast.
                 let hwnd = CreateWindowExW(
-                    WS_EX_TOOLWINDOW,
+                    if notification {
+                        WS_EX_TOOLWINDOW
+                    } else {
+                        WINDOW_EX_STYLE(0)
+                    },
                     w!("FramesTray"),
                     PCWSTR(wide(&title).as_ptr()),
-                    WINDOW_STYLE(0),
-                    0,
-                    0,
-                    0,
-                    0,
+                    if notification {
+                        WINDOW_STYLE(0)
+                    } else {
+                        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+                    },
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    470,
+                    155,
                     None,
                     None,
                     Some(instance.into()),
                     Some((&mut *context as *mut Context).cast()),
                 )?;
                 context.notify(hwnd, NIM_ADD);
-                SetTimer(Some(hwnd), 1, 2000, None);
+                if notification {
+                    SetTimer(Some(hwnd), 1, 2000, None);
+                } else {
+                    let label = CreateWindowExW(
+                        WINDOW_EX_STYLE(0),
+                        w!("STATIC"),
+                        w!("Remote windows are hidden. Restore them or open the connection menu."),
+                        WS_CHILD | WS_VISIBLE,
+                        20,
+                        16,
+                        425,
+                        36,
+                        Some(hwnd),
+                        None,
+                        Some(instance.into()),
+                        None,
+                    )?;
+                    SendMessageW(
+                        label,
+                        WM_SETFONT,
+                        Some(WPARAM(GetStockObject(DEFAULT_GUI_FONT).0 as usize)),
+                        Some(LPARAM(1)),
+                    );
+                    for (id, title, x, width) in [
+                        (6, "Show all windows", 20, 190),
+                        (9, "Connection menu", 230, 190),
+                    ] {
+                        let button = CreateWindowExW(
+                            WINDOW_EX_STYLE(0),
+                            w!("BUTTON"),
+                            PCWSTR(wide(title).as_ptr()),
+                            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                            x,
+                            62,
+                            width,
+                            28,
+                            Some(hwnd),
+                            Some(HMENU(id as *mut _)),
+                            Some(instance.into()),
+                            None,
+                        )?;
+                        SendMessageW(
+                            button,
+                            WM_SETFONT,
+                            Some(WPARAM(GetStockObject(DEFAULT_GUI_FONT).0 as usize)),
+                            Some(LPARAM(1)),
+                        );
+                    }
+                }
                 Ok((hwnd, context))
             })();
             match result {
@@ -221,9 +307,13 @@ struct Context {
     bitmaps: HashMap<TrayGlyph, HBITMAP>,
     taskbar_created: u32,
     added: bool,
+    notification: bool,
 }
 impl Context {
     unsafe fn notify(&mut self, hwnd: HWND, action: NOTIFY_ICON_MESSAGE) {
+        if !self.notification {
+            return;
+        }
         let mut icon = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: hwnd,
@@ -310,6 +400,9 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             if let Some(state) = context.receiver.try_iter().last() {
                 context.state = state;
                 context.notify(hwnd, if context.added { NIM_MODIFY } else { NIM_ADD });
+                if !context.notification {
+                    let _ = SetWindowTextW(hwnd, PCWSTR(wide(&context.state.tip).as_ptr()));
+                }
             }
             return LRESULT(0);
         }
@@ -317,16 +410,49 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             (*pointer).notify(hwnd, NIM_ADD);
             return LRESULT(0);
         }
-        if message == CALLBACK
-            && matches!(
-                l.0 as u32,
-                WM_LBUTTONUP | WM_RBUTTONUP | WM_CONTEXTMENU | NIN_SELECT
-            )
+        if message == RECOVERY && !(*pointer).notification {
+            let visible = w.0 != 0;
+            if IsWindowVisible(hwnd).as_bool() != visible {
+                let _ = ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+            }
+            return LRESULT(0);
+        }
+        if message == WM_COMMAND && !(*pointer).notification {
+            match w.0 & 0xffff {
+                6 => {
+                    let _ = (*pointer).commands.send(6);
+                }
+                9 => {
+                    let mut rect = RECT::default();
+                    let _ = GetWindowRect(hwnd, &mut rect);
+                    let _ = PostMessageW(
+                        Some(hwnd),
+                        OPEN,
+                        WPARAM((rect.left + 20) as usize),
+                        LPARAM((rect.top + 100) as isize),
+                    );
+                }
+                _ => {}
+            }
+            return LRESULT(0);
+        }
+        if message == OPEN
+            || message == CALLBACK
+                && matches!(
+                    l.0 as u32,
+                    WM_LBUTTONUP | WM_RBUTTONUP | WM_CONTEXTMENU | NIN_SELECT
+                )
         {
             let items = (*pointer).state.items.clone();
             if let Ok(menu) = (*pointer).menu(&items) {
                 let mut point = POINT::default();
-                let _ = GetCursorPos(&mut point);
+                if message == OPEN {
+                    point.x = w.0 as i32;
+                    point.y = l.0 as i32;
+                } else {
+                    let _ = GetCursorPos(&mut point);
+                }
+                let foreground = GetForegroundWindow();
                 let _ = SetForegroundWindow(hwnd);
                 let selected = TrackPopupMenu(
                     menu,
@@ -341,12 +467,18 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 if selected != 0 {
                     let _ = (*pointer).commands.send(selected as u32);
                 }
+                if !(*pointer).notification && !foreground.is_invalid() {
+                    let _ = SetForegroundWindow(foreground);
+                }
                 let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
                 let _ = DestroyMenu(menu);
             }
             return LRESULT(0);
         }
         if message == WM_CLOSE {
+            if !(*pointer).notification {
+                let _ = (*pointer).commands.send(4);
+            }
             let data = NOTIFYICONDATAW {
                 cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
                 hWnd: hwnd,

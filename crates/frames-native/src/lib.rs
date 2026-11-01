@@ -241,6 +241,7 @@ pub enum ClientEvent {
         created: std::time::Instant,
     },
     ViewMode(ViewMode),
+    Quality(frames_core::adaptive::QualityPreset),
     RemoteCursor {
         visible: bool,
     },
@@ -274,6 +275,7 @@ pub enum ClientEvent {
     },
 }
 pub enum ClientUpdate {
+    Quality(frames_core::adaptive::QualityPreset),
     SharedSession(Box<frames_core::shared_game::SharedSession>),
     SharedCursor(frames_core::shared_game::Cursor),
     Devices(frames_core::devices::DeviceList),

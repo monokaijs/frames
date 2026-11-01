@@ -77,6 +77,7 @@ fn main() -> anyhow::Result<()> {
         session::MediaOptions {
             audio: true,
             bandwidth_mbps: 0,
+            quality: Default::default(),
         },
         ViewMode::Desktop,
     ));

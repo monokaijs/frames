@@ -76,6 +76,7 @@ struct SessionOptions {
     unattended: bool,
     codec: String,
     bandwidth_mbps: u32,
+    quality: frames_core::adaptive::QualityPreset,
     max_streams: usize,
 }
 const CODECS: [&str; 5] = ["auto", "h264", "hevc", "av1", "vp9"];
@@ -88,6 +89,7 @@ impl Default for SessionOptions {
             unattended: false,
             codec: "auto".into(),
             bandwidth_mbps: 0,
+            quality: Default::default(),
             max_streams: 8,
         }
     }
@@ -115,6 +117,7 @@ impl SessionOptions {
             "--codec".into(),
             self.codec.clone(),
         ];
+        args.extend(["--quality".into(), self.quality.name().into()]);
         if self.bandwidth_mbps != 0 {
             args.extend(["--bandwidth-mbps".into(), self.bandwidth_mbps.to_string()]);
         }
@@ -146,6 +149,8 @@ impl SessionOptions {
     }
     fn from_ui(ui: &Launcher) -> Self {
         Self {
+            quality: frames_core::adaptive::QualityPreset::from_index(ui.get_quality())
+                .unwrap_or_default(),
             audio: ui.get_default_audio(),
             desktop: ui.get_default_desktop(),
             clipboard: ui.get_clipboard(),
@@ -959,6 +964,7 @@ pub fn run() -> Result<()> {
             .unwrap_or(0) as i32,
     );
     ui.set_max_streams(preferences.options.max_streams as i32);
+    ui.set_quality(preferences.options.quality.index());
     ui.set_bandwidth_auto(preferences.options.bandwidth_mbps == 0);
     ui.set_bandwidth_mbps(if preferences.options.bandwidth_mbps == 0 {
         50
@@ -1265,15 +1271,18 @@ mod tests {
         ui.set_default_desktop(true);
         ui.set_bandwidth_auto(false);
         ui.set_bandwidth_mbps(50);
+        ui.set_quality(2);
         ui.invoke_settings_edited();
         let Action::SaveSettings(latest) = saves.try_recv().unwrap() else {
             panic!("Further edits must remain available while saving");
         };
         assert!(latest.audio && latest.desktop);
         assert_eq!(latest.bandwidth_mbps, 50);
+        assert_eq!(latest.quality, frames_core::adaptive::QualityPreset::Low);
         let persisted: SessionOptions =
             serde_json::from_slice(&serde_json::to_vec(&latest).unwrap()).unwrap();
         assert_eq!(persisted.bandwidth_mbps, 50);
+        assert_eq!(persisted.quality, frames_core::adaptive::QualityPreset::Low);
         apply_settings_result(&ui, &first, Err("outdated failure".into()));
         assert!(ui.get_settings_status().is_empty());
         apply_settings_result(&ui, &latest, Err("disk full".into()));
@@ -1326,6 +1335,10 @@ mod tests {
         assert!(!preferences.options.unattended);
         assert_eq!(preferences.options.codec, "auto");
         assert_eq!(preferences.options.bandwidth_mbps, 0);
+        assert_eq!(
+            preferences.options.quality,
+            frames_core::adaptive::QualityPreset::High
+        );
         assert_eq!(preferences.options.max_streams, 8);
         assert_eq!(preferences.recent.len(), 1);
         assert_eq!(preferences.close_behavior, CloseBehavior::Ask);
@@ -1363,6 +1376,7 @@ mod tests {
             unattended: true,
             codec: "hevc".into(),
             bandwidth_mbps: 50,
+            quality: frames_core::adaptive::QualityPreset::High,
             max_streams: 12,
         };
         let connect = crate::Args::try_parse_from(

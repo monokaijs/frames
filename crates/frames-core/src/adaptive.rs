@@ -3,6 +3,67 @@ use crate::media::{DeliveryStats, FecProfile};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
+/// User-selected balance between text clarity, motion, and bandwidth.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityPreset {
+    #[default]
+    High,
+    Medium,
+    Low,
+}
+impl QualityPreset {
+    pub fn index(self) -> i32 {
+        match self {
+            Self::High => 0,
+            Self::Medium => 1,
+            Self::Low => 2,
+        }
+    }
+    pub fn from_index(index: i32) -> Option<Self> {
+        match index {
+            0 => Some(Self::High),
+            1 => Some(Self::Medium),
+            2 => Some(Self::Low),
+            _ => None,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+    fn bitrate(self, width: u32, height: u32) -> u32 {
+        let (base, ceiling) = match self {
+            Self::High => (50_000_000u64, 200_000_000),
+            Self::Medium => (12_000_000, 64_000_000),
+            Self::Low => (4_000_000, 24_000_000),
+        };
+        (base * width as u64 * height as u64 / (1920 * 1080)).clamp(base, ceiling) as u32
+    }
+    fn scale(self) -> u32 {
+        if self == Self::Low { 75 } else { 100 }
+    }
+    fn fps(self) -> u32 {
+        if self == Self::Low { 30 } else { 60 }
+    }
+    fn scale_floor(self) -> u32 {
+        if self == Self::High { 100 } else { 50 }
+    }
+}
+impl std::str::FromStr for QualityPreset {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "high" => Ok(Self::High),
+            "medium" => Ok(Self::Medium),
+            "low" => Ok(Self::Low),
+            _ => Err("quality must be high, medium, or low"),
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct Feedback {
     pub delivery: DeliveryStats,
@@ -40,6 +101,8 @@ pub struct Controller {
     local_pressure_until: Option<Instant>,
     base_bitrate: u32,
     manual_bitrate: Option<u32>,
+    preset: QualityPreset,
+    source: (u32, u32),
 }
 impl Controller {
     pub fn new(fps: u32, now: Instant) -> Self {
@@ -62,6 +125,8 @@ impl Controller {
             local_pressure_until: None,
             base_bitrate: 12_000_000,
             manual_bitrate: None,
+            preset: QualityPreset::Medium,
+            source: (1920, 1080),
         }
     }
     pub fn quality(&self) -> Quality {
@@ -74,10 +139,11 @@ impl Controller {
     /// Retina/4K captures need a larger clean-link budget than 1080p. Keep
     /// congestion reductions proportional when the source itself is resized.
     pub fn set_source_size(&mut self, width: u32, height: u32) {
-        let budget = self.manual_bitrate.unwrap_or_else(|| {
-            (12_000_000u64 * width as u64 * height as u64 / (1920 * 1080))
-                .clamp(12_000_000, 64_000_000) as u32
-        });
+        self.source = (width, height);
+        let requested = self.preset.bitrate(width, height);
+        let budget = self
+            .manual_bitrate
+            .map_or(requested, |limit| requested.min(limit));
         self.quality.bitrate = (self.quality.bitrate as u64 * budget as u64
             / self.base_bitrate as u64)
             .min(budget as u64) as u32;
@@ -85,10 +151,27 @@ impl Controller {
     }
     pub fn set_bandwidth_mbps(&mut self, mbps: u32) {
         self.manual_bitrate = (mbps != 0).then_some(mbps.clamp(1, 200) * 1_000_000);
-        if let Some(budget) = self.manual_bitrate {
-            self.base_bitrate = budget;
-            self.quality.bitrate = budget;
+        self.set_source_size(self.source.0, self.source.1);
+    }
+    pub fn set_preset(&mut self, preset: QualityPreset, now: Instant) {
+        self.preset = preset;
+        self.base_bitrate = preset.bitrate(self.source.0, self.source.1);
+        if let Some(limit) = self.manual_bitrate {
+            self.base_bitrate = self.base_bitrate.min(limit);
         }
+        self.fps_cap = preset.fps();
+        self.quality = Quality {
+            bitrate: self.base_bitrate,
+            scale_percent: preset.scale(),
+            fps: self.base_fps.min(self.fps_cap),
+            fec: FecProfile::default(),
+        };
+        self.stable_since = now;
+        self.clean_since = now;
+        self.overloaded_since = None;
+        self.local_pressure_until = None;
+        self.last_step = now;
+        self.last_increase = now;
     }
     pub fn congestion(&mut self, now: Instant) -> Quality {
         self.local_pressure_until = Some(now + Duration::from_millis(250));
@@ -138,7 +221,7 @@ impl Controller {
                 self.last_step = now;
             }
             if now.saturating_duration_since(since) >= Duration::from_secs(1) {
-                if self.quality.scale_percent > 50 {
+                if self.quality.scale_percent > self.preset.scale_floor() {
                     self.quality.scale_percent -= 25;
                 } else {
                     self.fps_cap = if self.fps_cap > 45 { 45 } else { 30 };
@@ -176,11 +259,12 @@ impl Controller {
                 self.last_increase = now;
             }
             if now.saturating_duration_since(self.stable_since) >= Duration::from_secs(10) {
-                if self.fps_cap < 60 {
+                if self.fps_cap < self.preset.fps() {
                     self.fps_cap = if self.fps_cap < 45 { 45 } else { 60 };
                     self.quality.fps = self.base_fps.min(self.fps_cap);
                 } else {
-                    self.quality.scale_percent = (self.quality.scale_percent + 25).min(100);
+                    self.quality.scale_percent =
+                        (self.quality.scale_percent + 25).min(self.preset.scale());
                 }
                 self.stable_since = now;
             }
@@ -191,6 +275,34 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn presets_control_clarity_and_respect_a_custom_bandwidth_cap() {
+        let now = Instant::now();
+        let mut c = Controller::new(60, now);
+        c.set_preset(QualityPreset::High, now);
+        assert_eq!(c.quality().bitrate, 50_000_000);
+        for n in 1..=60 {
+            c.congestion(now + Duration::from_millis(n * 100));
+        }
+        assert_eq!(c.quality().scale_percent, 100);
+        assert_eq!(c.quality().fps, 30);
+        c.set_preset(QualityPreset::Medium, now + Duration::from_secs(7));
+        assert_eq!(c.quality().bitrate, 12_000_000);
+        assert_eq!(c.quality().scale_percent, 100);
+        assert_eq!(c.quality().fps, 60);
+        c.set_preset(QualityPreset::Low, now + Duration::from_secs(8));
+        assert_eq!(c.quality().bitrate, 4_000_000);
+        assert_eq!(c.quality().scale_percent, 75);
+        assert_eq!(c.quality().fps, 30);
+        c.set_bandwidth_mbps(2);
+        assert_eq!(c.quality().bitrate, 2_000_000);
+        c.set_preset(QualityPreset::High, now + Duration::from_secs(9));
+        assert_eq!(c.quality().bitrate, 2_000_000);
+        c.set_bandwidth_mbps(0);
+        assert_eq!(c.quality().bitrate, 50_000_000);
+        c.set_source_size(3840, 2160);
+        assert_eq!(c.quality().bitrate, 200_000_000);
+    }
     #[test]
     fn recoverable_loss_does_not_lock_the_desktop_at_reduced_quality() {
         let now = Instant::now();
@@ -265,6 +377,7 @@ mod tests {
     fn manual_bandwidth_raises_the_ceiling_and_still_adapts_to_congestion() {
         let now = Instant::now();
         let mut c = Controller::new(60, now);
+        c.set_preset(QualityPreset::High, now);
         c.set_bandwidth_mbps(50);
         c.set_source_size(1920, 1080);
         assert_eq!(c.quality().bitrate, 50_000_000);

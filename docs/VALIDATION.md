@@ -54,6 +54,13 @@ device failure, and software fallback. Mac native fixtures cover functional
 1440p/4K scaling; sustained-rate scalability and the two-hour mixed workload soak
 remain pending. Measure input-to-photon separately before display-level claims.
 
+The preset-cycle production fixture also passed all four applied preset stages
+(High/Low/Medium/High), including Low at 1440x810 and restoration to 1920x1080.
+The synthetic Windows connection-menu fixture verified the title-bar dropdown,
+hiding all windows, and restoring them from the connection window. Mac native
+header tests cover the dropdown, preset check state, and hide/restore without
+closing the remote application.
+
 ## Remaining coverage
 
 - Controlled RustDesk/Moonlight comparison and input-to-photon measurements.
