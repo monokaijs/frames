@@ -357,8 +357,28 @@ mod tests {
                 .is_err()
         );
         assert!(selected.action(outside, &WindowAction::Close).is_err());
-        let key = selected.windows()?[0].key;
-        let capture = selected.capture(key, false)?;
+        second.destroy()?;
+        assert_eq!(selected.windows()?.len(), 1);
+        assert!(selected.check_health().is_ok());
+        assert!(selected_desktop(vec![], vec![second_ticket.argument()]).is_err());
+        first.destroy()?;
+        assert!(selected.windows()?.is_empty());
+        assert!(selected.check_health().is_err());
+        assert!(!valid_marker(first_id, &first_marker));
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires interactive Windows Graphics Capture; captures an owned fixture"]
+    fn selected_preview_captures_its_owned_window() -> Result<()> {
+        let fixture = Fixture::start()?;
+        let source = crate::desktop(vec![])?;
+        let ticket = sharing_windows(source.as_ref())?
+            .into_iter()
+            .find(|choice| source.local_window_handle(choice.window.key).ok() == Some(fixture.1))
+            .and_then(|choice| choice.selection)
+            .context("fixture was not selectable")?;
+        let selected = selected_desktop(vec![], vec![ticket.argument()])?;
+        let capture = selected.capture(selected.windows()?[0].key, false)?;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(frame) = capture.frames.borrow().clone() {
@@ -371,15 +391,6 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        drop(capture);
-        second.destroy()?;
-        assert_eq!(selected.windows()?.len(), 1);
-        assert!(selected.check_health().is_ok());
-        assert!(selected_desktop(vec![], vec![second_ticket.argument()]).is_err());
-        first.destroy()?;
-        assert!(selected.windows()?.is_empty());
-        assert!(selected.check_health().is_err());
-        assert!(!valid_marker(first_id, &first_marker));
         Ok(())
     }
     #[test]

@@ -33,8 +33,8 @@ class LossProxy:
     def close(self):
         self.stopped=True;self.socket.close();self.thread.join(timeout=1)
 
-def main(network_loss=False,picker=False):
-    root=Path(tempfile.mkdtemp(prefix='frames-shared-session-'));env=dict(os.environ,FRAMES_CONFIG_DIR=str(root/'identity'),FRAMES_NO_DISCOVERY='1')
+def main(network_loss=False,picker=False,input_only=False):
+    root=Path(tempfile.mkdtemp(prefix='frames-shared-session-'));env=dict(os.environ,FRAMES_CONFIG_DIR=str(root/'identity'),FRAMES_NO_DISCOVERY='1',FRAMES_TEST_INPUT_ONLY='1' if input_only else '0')
     directory=Path(os.environ.get('FRAMES_TEST_BIN_DIR',str(ROOT/'target/debug')))
     frames=directory/'frames.exe';probe=directory/'examples/shared_probe.exe'
     identity=subprocess.check_output([str(frames),'identity'],env=env,text=True).splitlines()[0].strip()
@@ -93,7 +93,7 @@ def main(network_loss=False,picker=False):
         time.sleep(.2);fixture.stdin.write('report\n');fixture.stdin.flush();report=reports.get(timeout=5)
         assert report['registrations']==2 and report['w_async']==0,report
         assert C.windll.user32.IsWindow(C.c_void_p(hwnd)),'viewer close terminated the fixture'
-        print(json.dumps({'policy_tests':policy_tests,'picker_identity':picker,'network_outage_ms':900 if network_loss else 0,'stages':passed,'last_fixture':report,'logs':str(root)}))
+        print(json.dumps({'policy_tests':policy_tests,'picker_identity':picker,'capture_required':not input_only,'capture_observed':'capture_received' in passed,'network_outage_ms':900 if network_loss else 0,'stages':passed,'last_fixture':report,'logs':str(root)}))
     except BaseException:
         for name in ['host.log','client.log']:
             path=root/name
@@ -106,4 +106,4 @@ def main(network_loss=False,picker=False):
         if proxy:proxy.close()
         print('Logs:',root)
 if __name__=='__main__':
-    parser=argparse.ArgumentParser();parser.add_argument('--network-loss',action='store_true');parser.add_argument('--picker',action='store_true');args=parser.parse_args();main(args.network_loss,args.picker)
+    parser=argparse.ArgumentParser();parser.add_argument('--network-loss',action='store_true');parser.add_argument('--picker',action='store_true');parser.add_argument('--input-only',action='store_true',help='Exercise policy/input/lease without asserting video capture (headless CI only)');args=parser.parse_args();main(args.network_loss,args.picker,args.input_only)

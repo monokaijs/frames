@@ -2,6 +2,10 @@
 
 Test environment: 2026-11-01, Windows 11 Pro build 26200, AMD Ryzen 7 7800X3D, x64 MSVC 14.29. Adapter revision `frames-protoinput-1`, generic profile revision 1. The catalog contains no game verification records.
 
+Hosted Windows CI exercises production session policy, private input, identity, disconnection, and network leases using `scripts/test_shared_session.py --input-only`. Its result explicitly reports `capture_required: false`; it is not capture validation. The hosted runner rejects the fixture's Windows Graphics Capture item with `0x80070057` and has no playback device. Full capture remains the script's default and must pass on an interactive Windows desktop, together with `selected_preview_captures_its_owned_window` and `captures_the_window_while_another_window_covers_it`. The interactive Windows evidence below covers real capture; hosted CI does not replace that release acceptance work.
+
+The 2026-11-01 release follow-up reran all four `window_selection::tests::` cases, the covered-window capture case, and both `test_shared_session.py --picker` and `--picker --network-loss` on the interactive Windows environment above. They passed; both production-session results reported `capture_required: true` and `capture_observed: true`. The separate `--input-only --network-loss` run passed with both capture fields false, checking the narrower hosted-CI coverage. The covered-window fixture now measures its expected dimensions in physical pixels so the assertion remains valid at 150% display scaling.
+
 ## Functional checks
 
 - Fragmented byte-pipe records, idle timeouts, and partial-record rejection. Deliberately blocked status readers preserve the attachment and do not block lease expiry.

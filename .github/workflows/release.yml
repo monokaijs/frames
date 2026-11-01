@@ -83,18 +83,20 @@ jobs:
           & target/shared-input/native/Release/shared_ipc_fixture.exe
       - run: cargo test --workspace --locked -- --nocapture
         timeout-minutes: 20
-      - name: Shared game production session and network lease
+      - name: Shared game production input session and network lease
         run: |
           cargo build -p frames --bin frames --example shared_probe --locked
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          python scripts/test_shared_session.py
+          python scripts/test_shared_session.py --input-only
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          python scripts/test_shared_session.py --network-loss
+          python scripts/test_shared_session.py --network-loss --input-only
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          python scripts/test_shared_session.py --picker
-      - name: Host-selected window identity and capture guards
+          python scripts/test_shared_session.py --picker --input-only
+      - name: Host-selected window identity and privacy guards
         run: |
-          cargo test -p frames-native window_selection::tests:: --locked -- --include-ignored --nocapture
+          cargo test -p frames-native window_selection::tests::selected_windows_reject --locked -- --include-ignored --nocapture
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test -p frames-native window_selection::tests::one_window_picker --locked -- --include-ignored --nocapture
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Codec and audio checks
         run: |

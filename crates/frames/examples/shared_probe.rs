@@ -55,6 +55,7 @@ fn main() -> anyhow::Result<()> {
         .parse()?;
     let runtime = tokio::runtime::Runtime::new()?;
     let network_loss = std::env::args().nth(2).as_deref() == Some("--network-loss");
+    let require_capture = std::env::var("FRAMES_TEST_INPUT_ONLY").as_deref() != Ok("1");
     if let Some(mode) = std::env::args().nth(2).filter(|_| !network_loss) {
         return runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(12), policy_probe(address, &mode)).await?
@@ -123,7 +124,7 @@ fn main() -> anyhow::Result<()> {
             }
             if released_at.is_some_and(|t: Instant| t.elapsed() > Duration::from_millis(300)) {
                 ensure!(
-                    video && cursor && policy.is_some(),
+                    (video || !require_capture) && cursor && policy.is_some(),
                     "missing shared capture or policy"
                 );
                 stage("passed");
@@ -178,6 +179,7 @@ fn main() -> anyhow::Result<()> {
                 ClientUpdate::Frame(window, frame) => {
                     if !video {
                         eprintln!("shared first frame: {}x{}", frame.width, frame.height);
+                        stage("capture_received");
                     }
                     ensure!(
                         Some(window) == target && frame.width > 0 && frame.height > 0,
@@ -201,8 +203,11 @@ fn main() -> anyhow::Result<()> {
                 ClientUpdate::Status(_, message) => eprintln!("shared status: {message}"),
                 _ => {}
             }
-            if video && cursor && held_at.is_none() {
-                let window = target.unwrap();
+            if (video || !require_capture)
+                && cursor
+                && held_at.is_none()
+                && let Some(window) = target
+            {
                 events.send(ClientEvent::ResumeInput {
                     created: std::time::Instant::now(),
                 })?;
