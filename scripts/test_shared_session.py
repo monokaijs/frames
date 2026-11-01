@@ -94,6 +94,11 @@ def main(network_loss=False,picker=False):
         assert report['registrations']==2 and report['w_async']==0,report
         assert C.windll.user32.IsWindow(C.c_void_p(hwnd)),'viewer close terminated the fixture'
         print(json.dumps({'policy_tests':policy_tests,'picker_identity':picker,'network_outage_ms':900 if network_loss else 0,'stages':passed,'last_fixture':report,'logs':str(root)}))
+    except BaseException:
+        for name in ['host.log','client.log']:
+            path=root/name
+            if path.exists():print(f'--- {name} ---\n{path.read_text(errors="replace")}',flush=True)
+        raise
     finally:
         for child in reversed(children):
             if child.poll() is None:child.terminate();child.wait(timeout=5)
