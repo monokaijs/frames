@@ -36,8 +36,9 @@ impl Drop for Owner {
 struct Shared {
     queue: Mutex<Vec<Work>>,
     wake: Notify,
-    budgets: Mutex<HashMap<WindowId, u32>>,
-    overhead: Mutex<HashMap<WindowId, f64>>,
+    budgets: Mutex<HashMap<WindowId, StreamBudget>>,
+    limit_bps: AtomicU32,
+    overhead: Mutex<HashMap<WindowId, WireOverhead>>,
     wire_bps: AtomicU32,
     queue_micros: AtomicU32,
     late: AtomicU64,
@@ -51,6 +52,97 @@ struct SendTimings {
     fec: media::LatencyHistogram,
     admission: media::LatencyHistogram,
     queue_age: media::LatencyHistogram,
+}
+#[derive(Clone, Copy)]
+struct StreamBudget {
+    bitrate: u32,
+    parity: u8,
+    focused: bool,
+}
+impl StreamBudget {
+    fn wire(self) -> u64 {
+        self.bitrate as u64 * (32 + self.parity as u64) / 32
+    }
+    fn weight(self) -> u64 {
+        if self.focused { 4 } else { 1 }
+    }
+}
+fn allocated_wire(
+    budgets: &HashMap<WindowId, StreamBudget>,
+    window: WindowId,
+    available: u64,
+) -> u64 {
+    let mut active: Vec<_> = budgets
+        .iter()
+        .filter(|(id, _)| **id != media::AUDIO_WINDOW)
+        .map(|(&id, &b)| (id, b.wire(), b.weight()))
+        .collect();
+    let mut remaining = available;
+    loop {
+        let weights = active.iter().map(|v| v.2).sum::<u64>();
+        if weights == 0 {
+            return 0;
+        }
+        if let Some(index) = active.iter().position(|v| v.1 <= remaining * v.2 / weights) {
+            let (id, need, _) = active.swap_remove(index);
+            if id == window {
+                return need;
+            }
+            remaining = remaining.saturating_sub(need);
+        } else {
+            return active
+                .iter()
+                .find(|v| v.0 == window)
+                .map_or(0, |v| remaining * v.2 / weights);
+        }
+    }
+}
+fn pacing_rate(budgets: &HashMap<WindowId, StreamBudget>, limit: u32) -> u32 {
+    // Leave room for reliable input/control and transport framing. Audio and
+    // parity use this same media pace; bulk traffic has its own shared slice.
+    if limit != 0 {
+        return (limit as u64 * 95 / 100) as u32;
+    }
+    if budgets.keys().all(|w| *w == media::AUDIO_WINDOW) {
+        17_000_000
+    } else {
+        (budgets.values().map(|b| b.wire() * 5 / 4).sum::<u64>()).clamp(2_000_000, 200_000_000)
+            as u32
+    }
+}
+// Charge the measured extra bytes per second, rather than multiplying the
+// entire encoder budget by a tiny idle picture's header/padding ratio.
+struct WireOverhead {
+    started: std::time::Instant,
+    bytes: f64,
+    bps: f64,
+}
+impl WireOverhead {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            started: now,
+            bytes: 0.0,
+            bps: 0.0,
+        }
+    }
+    fn record(&mut self, extra_bytes: f64, now: std::time::Instant) {
+        self.bytes += extra_bytes;
+        let elapsed = now.saturating_duration_since(self.started);
+        if elapsed >= Duration::from_millis(250) {
+            let sample = self.bytes * 8.0 / elapsed.as_secs_f64();
+            self.bps = self.bps * 0.5 + sample * 0.5;
+            self.bytes = 0.0;
+            self.started = now;
+        }
+    }
+    fn target(&self, bitrate: u32, now: std::time::Instant) -> u32 {
+        let overhead = if now.saturating_duration_since(self.started) > Duration::from_secs(2) {
+            0
+        } else {
+            self.bps.ceil() as u32
+        };
+        bitrate.saturating_sub(overhead).max(128_000)
+    }
 }
 struct Work {
     window: WindowId,
@@ -93,6 +185,7 @@ impl MediaSender {
             queue: Mutex::new(Vec::new()),
             wake: Notify::new(),
             budgets: Mutex::new(HashMap::new()),
+            limit_bps: AtomicU32::new(0),
             overhead: Mutex::new(HashMap::new()),
             wire_bps: AtomicU32::new(17_000_000),
             queue_micros: AtomicU32::new(0),
@@ -106,35 +199,62 @@ impl MediaSender {
         Self(Arc::new(Owner { shared, task }))
     }
     pub fn register(&self, window: WindowId) -> MediaRegistration {
+        self.set_budget(
+            window,
+            if window == media::AUDIO_WINDOW {
+                128_000
+            } else {
+                12_000_000
+            },
+            if window == media::AUDIO_WINDOW { 0 } else { 4 },
+            false,
+        );
         MediaRegistration {
             sender: self.clone(),
             window,
         }
     }
     pub fn encoder_target(&self, window: WindowId, bitrate: u32) -> u32 {
-        let extra = self
-            .0
-            .shared
-            .overhead
-            .lock()
-            .unwrap()
+        let limit = self.0.shared.limit_bps.load(Ordering::Relaxed);
+        let bitrate = if limit == 0 {
+            bitrate
+        } else {
+            let budgets = self.0.shared.budgets.lock().unwrap();
+            let parity = budgets.get(&window).map_or(4, |b| b.parity) as u64;
+            let available = (limit as u64 * 95 / 100).saturating_sub(256_000);
+            let allocated = allocated_wire(&budgets, window, available) * 32 / (32 + parity);
+            bitrate.min(allocated.min(u32::MAX as u64) as u32)
+        };
+        let overhead = self.0.shared.overhead.lock().unwrap();
+        overhead
             .get(&window)
-            .copied()
-            .unwrap_or(1.06);
-        (bitrate as f64 / extra).round().max(128_000.0) as u32
+            .map_or(bitrate, |sample| {
+                sample.target(bitrate, std::time::Instant::now())
+            })
+            .clamp(128_000, 100_000_000)
     }
-    pub fn set_budget(&self, window: WindowId, bitrate: u32, parity: u8) {
+    pub fn set_limit_mbps(&self, mbps: u32) {
+        let limit = mbps.min(200) * 1_000_000;
+        self.0.shared.limit_bps.store(limit, Ordering::Relaxed);
+        let budgets = self.0.shared.budgets.lock().unwrap();
+        self.0
+            .shared
+            .wire_bps
+            .store(pacing_rate(&budgets, limit), Ordering::Relaxed);
+        self.0.shared.wake.notify_one();
+    }
+    pub fn set_budget(&self, window: WindowId, bitrate: u32, parity: u8, focused: bool) {
         let mut budgets = self.0.shared.budgets.lock().unwrap();
         budgets.insert(
             window,
-            ((bitrate as u64 * (32 + parity as u64) / 32) * 5 / 4).min(200_000_000) as u32,
+            StreamBudget {
+                bitrate,
+                parity,
+                focused,
+            },
         );
         self.0.shared.wire_bps.store(
-            budgets
-                .values()
-                .copied()
-                .sum::<u32>()
-                .clamp(2_000_000, 200_000_000),
+            pacing_rate(&budgets, self.0.shared.limit_bps.load(Ordering::Relaxed)),
             Ordering::Relaxed,
         );
     }
@@ -154,15 +274,7 @@ impl MediaSender {
         self.0.shared.overhead.lock().unwrap().remove(&window);
         let mut budgets = self.0.shared.budgets.lock().unwrap();
         budgets.remove(&window);
-        let bps = if budgets.keys().all(|w| *w == media::AUDIO_WINDOW) {
-            17_000_000
-        } else {
-            budgets
-                .values()
-                .copied()
-                .sum::<u32>()
-                .clamp(2_000_000, 200_000_000)
-        };
+        let bps = pacing_rate(&budgets, self.0.shared.limit_bps.load(Ordering::Relaxed));
         self.0.shared.wire_bps.store(bps, Ordering::Relaxed);
     }
     pub fn report_timings(&self) {
@@ -237,12 +349,15 @@ impl MediaSender {
         let wire = packets.iter().map(Vec::len).sum::<usize>();
         // Controller budgets already include nominal parity. Charge the extra
         // padding, small-block rounding, and every media header to the encoder.
-        let extra = (wire as f64 / payload as f64 / (1.0 + fec.parity_per_32 as f64 / 32.0))
-            .clamp(1.0, 8.0);
+        let extra =
+            (wire as f64 - payload as f64 * (1.0 + fec.parity_per_32 as f64 / 32.0)).max(0.0);
         {
             let mut overhead = self.0.shared.overhead.lock().unwrap();
-            let previous = overhead.entry(window).or_insert(extra);
-            *previous = *previous * 0.75 + extra * 0.25;
+            let now = std::time::Instant::now();
+            overhead
+                .entry(window)
+                .or_insert_with(|| WireOverhead::new(now))
+                .record(extra, now);
         }
         let (done, result) = oneshot::channel();
         {
@@ -428,6 +543,106 @@ impl Drop for TimerResolution {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn custom_limit_is_shared_with_focus_weight_and_reclaims_small_demands() {
+        let focused = WindowId {
+            id: 1,
+            generation: 1,
+        };
+        let background = WindowId {
+            id: 2,
+            generation: 1,
+        };
+        let mut budgets = HashMap::from([
+            (
+                focused,
+                StreamBudget {
+                    bitrate: 50_000_000,
+                    parity: 4,
+                    focused: true,
+                },
+            ),
+            (
+                background,
+                StreamBudget {
+                    bitrate: 50_000_000,
+                    parity: 4,
+                    focused: false,
+                },
+            ),
+        ]);
+        let limit = 50_000_000;
+        let available = (pacing_rate(&budgets, limit) as u64).saturating_sub(256_000);
+        let foreground = allocated_wire(&budgets, focused, available);
+        let other = allocated_wire(&budgets, background, available);
+        assert_eq!(foreground, other * 4);
+        assert!(foreground + other <= available);
+        budgets.get_mut(&background).unwrap().bitrate = 1_000_000;
+        assert_eq!(allocated_wire(&budgets, background, available), 1_125_000);
+        assert_eq!(
+            allocated_wire(&budgets, focused, available),
+            available - 1_125_000
+        );
+        budgets.remove(&background);
+        assert_eq!(allocated_wire(&budgets, focused, available), available);
+    }
+    #[test]
+    fn every_custom_limit_bounds_combined_video_parity_and_audio() {
+        for mbps in [1, 5, 10, 25, 50, 100, 200] {
+            for streams in 1..=32 {
+                let budgets: HashMap<_, _> = (0..streams)
+                    .map(|id| {
+                        (
+                            WindowId {
+                                id: id + 1,
+                                generation: 1,
+                            },
+                            StreamBudget {
+                                bitrate: ((id % 4) + 1) as u32 * 12_000_000,
+                                parity: if id % 2 == 0 { 8 } else { 4 },
+                                focused: id == 0,
+                            },
+                        )
+                    })
+                    .collect();
+                let pace = pacing_rate(&budgets, mbps * 1_000_000) as u64;
+                let available = pace - 256_000;
+                let total = budgets
+                    .keys()
+                    .map(|&window| allocated_wire(&budgets, window, available))
+                    .sum::<u64>();
+                assert!(total + 256_000 <= pace && pace < mbps as u64 * 1_000_000);
+            }
+        }
+    }
+    #[test]
+    fn tiny_idle_updates_charge_bytes_per_second_without_collapsing_quality() {
+        let now = std::time::Instant::now();
+        let mut overhead = WireOverhead::new(now);
+        // A tiny picture can have a huge header/parity ratio, while using only
+        // 16 kbps of overhead. It must not divide the entire 12 Mbps budget.
+        for second in 1..=10 {
+            overhead.record(2000.0, now + Duration::from_secs(second));
+        }
+        assert!(overhead.target(12_000_000, now + Duration::from_secs(10)) > 11_980_000);
+        assert_eq!(
+            overhead.target(12_000_000, now + Duration::from_secs(13)),
+            12_000_000
+        );
+    }
+    #[test]
+    fn sustained_header_and_padding_bytes_are_charged_to_the_encoder_budget() {
+        let now = std::time::Instant::now();
+        let mut overhead = WireOverhead::new(now);
+        for n in 1..=120 {
+            overhead.record(1000.0, now + Duration::from_micros(n * 16_667));
+        }
+        let target = overhead.target(12_000_000, now + Duration::from_secs(2));
+        assert!(
+            (11_510_000..11_550_000).contains(&target),
+            "target={target}"
+        );
+    }
     fn work(id: u64, focused: bool, ms: u64, now: tokio::time::Instant) -> Work {
         Work {
             window: WindowId { id, generation: 1 },

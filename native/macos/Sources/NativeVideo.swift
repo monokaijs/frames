@@ -31,6 +31,8 @@ final class NativeVideoEncoder: @unchecked Sendable {
     private var delayed = false
     private var consecutiveDrops = 0
     private var restartRequired = false
+    private var presentationNanoseconds:UInt64 = 0
+    private var dropStarted:UInt64?
     init(handle: UInt64, codec: String, fps: Int) throws {
         guard let device = MTLCreateSystemDefaultDevice() else { throw Wire.failure("Metal unavailable") }
         self.handle = handle; self.codec = codec == "hevc" ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264
@@ -49,13 +51,16 @@ final class NativeVideoEncoder: @unchecked Sendable {
             guard let self else { return }
             let changed = self.scale != scale
             let rateChanged=self.bitrate != bitrate || self.fps != fps
+            let improvePicture = bitrate > self.bitrate + max(64_000,self.bitrate/25)
             self.bitrate = max(128_000,min(100_000_000,bitrate));self.fps = Int32(max(1,min(60,fps)));self.scale = max(50,min(100,scale))
             if let session,rateChanged {
                 let status=VTSessionSetProperty(session,key:kVTCompressionPropertyKey_AverageBitRate,value:self.bitrate as CFNumber)
                 if status != noErr{self.restartRequired=true;Wire.diagnostic("encoder_restart_required",["reason":"VideoToolbox rejected live bitrate update","status":status])}
                 VTSessionSetProperty(session,key:kVTCompressionPropertyKey_ExpectedFrameRate,value:self.fps as CFNumber)
             }
-            if changed || self.restartRequired { self.force = true; self.drain() }
+            // An idle desktop needs a fresh independent picture when its
+            // quality budget recovers; otherwise the old blurry image remains.
+            if changed || improvePicture || self.restartRequired { self.force = true; self.drain() }
         }
     }
     func stop() { queue.async { [self] in stopped = true; if let session { VTCompressionSessionCompleteFrames(session,untilPresentationTimeStamp:.invalid);VTCompressionSessionInvalidate(session) };session = nil;pool = nil;lock.lock();latest = nil;lock.unlock() } }
@@ -74,6 +79,7 @@ final class NativeVideoEncoder: @unchecked Sendable {
         guard VTSessionSetProperty(session,key:kVTCompressionPropertyKey_AverageBitRate,value:bitrate as CFNumber) == noErr else{throw Wire.failure("VideoToolbox cannot apply the bitrate budget")}
         VTSessionSetProperty(session,key:kVTCompressionPropertyKey_ExpectedFrameRate,value:fps as CFNumber)
         VTSessionSetProperty(session,key:kVTCompressionPropertyKey_MaxKeyFrameInterval,value:60 as CFNumber)
+        if codec == kCMVideoCodecType_H264 { VTSessionSetProperty(session,key:kVTCompressionPropertyKey_ProfileLevel,value:kVTProfileLevel_H264_ConstrainedHigh_AutoLevel) }
         VTSessionSetProperty(session,key:kVTCompressionPropertyKey_MaxFrameDelayCount,value:0 as CFNumber)
         VTSessionSetProperty(session,key:kVTCompressionPropertyKey_ColorPrimaries,value:kCVImageBufferColorPrimaries_ITU_R_709_2)
         VTSessionSetProperty(session,key:kVTCompressionPropertyKey_TransferFunction,value:kCVImageBufferTransferFunction_ITU_R_709_2)
@@ -102,10 +108,13 @@ final class NativeVideoEncoder: @unchecked Sendable {
             let image = CIImage(cvPixelBuffer:buffer).cropped(to:crop).transformed(by:CGAffineTransform(translationX:-crop.minX,y:-crop.minY)).transformed(by:CGAffineTransform(scaleX:CGFloat(width)/region.width,y:CGFloat(height)/region.height)).clampedToExtent()
             context.render(image,to:target,bounds:CGRect(x:0,y:0,width:CVPixelBufferGetWidth(target),height:CVPixelBufferGetHeight(target)),colorSpace:CGColorSpaceCreateDeviceRGB())
             let ticket = NativeEncodeTicket(owner:self,width:width,height:height,sourceWidth:Int(region.width),sourceHeight:Int(region.height),captured:captured,number:number,started:now,source:buffer,target:target)
-            number &+= 1;lastVersion = version;busy = true
+            lastVersion = version;busy = true
             let properties: CFDictionary? = force ? [kVTEncodeFrameOptionKey_ForceKeyFrame:true] as CFDictionary : nil;force = false
             let retained = Unmanaged.passRetained(ticket).toOpaque()
-            let status = VTCompressionSessionEncodeFrame(session,imageBuffer:target,presentationTimeStamp:CMTime(value:Int64(ticket.number),timescale:fps),duration:CMTime(value:1,timescale:fps),frameProperties:properties,sourceFrameRefcon:retained,infoFlagsOut:nil)
+            // Frame identity is not a media clock. Changing 24 -> 60 fps must
+            // never reinterpret old frame counts and move timestamps backwards.
+            presentationNanoseconds=max(now,presentationNanoseconds+1)
+            let status = VTCompressionSessionEncodeFrame(session,imageBuffer:target,presentationTimeStamp:CMTime(value:Int64(presentationNanoseconds),timescale:1_000_000_000),duration:CMTime(value:1,timescale:fps),frameProperties:properties,sourceFrameRefcon:retained,infoFlagsOut:nil)
             if status != noErr { Unmanaged<NativeEncodeTicket>.fromOpaque(retained).release();busy = false;throw Wire.failure("Hardware encode failed (\(status))") }
         } catch { stopped = true;Wire.send(["event":"capture_error","handle":handle,"error":error.localizedDescription]) }
     }
@@ -116,7 +125,9 @@ final class NativeVideoEncoder: @unchecked Sendable {
         if status == noErr && sample == nil {
             queue.async { [self] in
                 busy = false;consecutiveDrops += 1
-                if consecutiveDrops > 2 { stopped = true;Wire.send(["event":"capture_error","handle":handle,"error":"VideoToolbox repeatedly dropped a picture"]) }
+                let now=DispatchTime.now().uptimeNanoseconds
+                if dropStarted == nil {dropStarted=now}
+                if now-dropStarted! >= 500_000_000 { stopped = true;Wire.send(["event":"capture_error","handle":handle,"error":"VideoToolbox produced no picture for 500 ms"]) }
                 else { force = true;queue.asyncAfter(deadline:.now()+1.0/Double(fps)){[weak self] in self?.drain()} }
             };return
         }
@@ -146,7 +157,7 @@ final class NativeVideoEncoder: @unchecked Sendable {
             }
             guard offset == packet.count else { throw Wire.failure("Truncated encoded NAL") }
             Wire.sendEncoded(handle:handle,width:UInt32(ticket.width),height:UInt32(ticket.height),sourceWidth:UInt32(ticket.sourceWidth),sourceHeight:UInt32(ticket.sourceHeight),number:ticket.number,captured:ticket.captured,keyframe:keyframe,bytes:bytes,encodeMicros:UInt32(min(UInt64(UInt32.max),(DispatchTime.now().uptimeNanoseconds-ticket.started)/1000)))
-            queue.async { [self] in busy = false;consecutiveDrops = 0;drain() }
+            queue.async { [self] in number &+= 1;busy = false;consecutiveDrops = 0;dropStarted=nil;drain() }
         } catch { queue.async { [self] in busy = false;stopped = true;Wire.send(["event":"capture_error","handle":handle,"error":error.localizedDescription]) } }
     }
 }

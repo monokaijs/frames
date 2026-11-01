@@ -74,7 +74,10 @@ fn main() -> anyhow::Result<()> {
         ui,
         receiver,
         true,
-        true,
+        session::MediaOptions {
+            audio: true,
+            bandwidth_mbps: 0,
+        },
         ViewMode::Desktop,
     ));
     let started = Instant::now();

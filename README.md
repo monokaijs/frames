@@ -2,7 +2,7 @@
 
 Native remote control for Windows 11 x64 and macOS 14.2+ on Apple silicon. Open individual remote applications in local windows, or switch to a full desktop view.
 
-[Download the latest release](https://github.com/monokaijs/frames/releases/latest). Media codecs are bundled and run inside Frames; no FFmpeg executable is required. Both computers need matching Frames builds; the current protocol is **9**.
+[Download the latest release](https://github.com/monokaijs/frames/releases/latest). Media codecs are bundled and run inside Frames; no FFmpeg executable is required. Both computers need matching Frames builds; the current protocol is **10**.
 
 On Windows, run **Frames-VERSION-windows-x86_64-setup.exe**. It installs Frames for your account, adds a Start menu shortcut and an Installed Apps entry, and includes an uninstaller. The default installation directory supports automatic updates without administrator access. The ZIP is also available for portable use.
 
@@ -75,3 +75,5 @@ Mac builds reuse the previous signing identity or select a unique Developer ID/A
 An optional Windows service installs with `frames service install` from an Administrator terminal after unattended pairing. It uses machine-scoped protected credentials and an interactive-console agent. Uninstall with `frames service uninstall`. Secure-desktop support and Mac prelogin/FileVault access need further validation; see [validation](docs/VALIDATION.md).
 
 [Transport and latency](docs/LATENCY_REVIEW.md) ? [Launcher development](docs/LAUNCHER.md) ? [Validation](docs/VALIDATION.md)
+
+Set **Settings > Bandwidth limit** to Automatic, or choose **1-200 Mbps** for a connection. The limit is shared across streamed windows, including video protection and audio; focused windows receive more of the budget. Higher limits allow higher encoder quality while congestion adaptation remains enabled. Saved defaults apply to new connections. The CLI equivalent is `frames connect ADDRESS --bandwidth-mbps 50` (`0` means Automatic). Both peers need the protocol-10 build.

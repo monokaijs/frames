@@ -144,6 +144,7 @@ typedef struct Media {
     dispatch_semaphore_t ready;
     uint8_t *vt_bytes;
     int vt_size, vt_key, vt_error, vt_received, fps;
+    CMTime vt_pts;
 #endif
 } Media;
 
@@ -226,11 +227,13 @@ static void vt_output(void *opaque,void *frame,OSStatus status,VTEncodeInfoFlags
             else vt_append(m,nal,count);
             free(nal);offset+=count;
         }
-    } else if (!status) m->vt_error=-1;
+    }
+    /* A successful callback without a sample is a rate-control picture drop,
+       not a failed hardware backend. The next capture/recovery request retries. */
     dispatch_semaphore_signal(m->ready);
 }
 static int vt_open(Media *m,const char *name,int fps) {
-    int hevc=strstr(name,"hevc")!=NULL;m->fps=fps;
+    int hevc=strstr(name,"hevc")!=NULL;m->fps=fps;m->vt_pts=kCMTimeZero;
     const void *keys[]={kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,kVTVideoEncoderSpecification_EnableLowLatencyRateControl};
     const void *values[]={kCFBooleanTrue,kCFBooleanTrue};
     CFDictionaryRef spec=CFDictionaryCreate(NULL,keys,values,2,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks);
@@ -247,6 +250,7 @@ static int vt_open(Media *m,const char *name,int fps) {
     VTSessionSetProperty(m->vt,kVTCompressionPropertyKey_ExpectedFrameRate,number);CFRelease(number);
     number=CFNumberCreate(NULL,kCFNumberIntType,&gop);
     VTSessionSetProperty(m->vt,kVTCompressionPropertyKey_MaxKeyFrameInterval,number);CFRelease(number);
+    if(!hevc)VTSessionSetProperty(m->vt,kVTCompressionPropertyKey_ProfileLevel,kVTProfileLevel_H264_ConstrainedHigh_AutoLevel);
     int pixel_format=kCVPixelFormatType_32BGRA;
     CFNumberRef w=CFNumberCreate(NULL,kCFNumberIntType,&m->padded_width),h=CFNumberCreate(NULL,kCFNumberIntType,&m->padded_height),pixel=CFNumberCreate(NULL,kCFNumberIntType,&pixel_format);
     const void *pool_keys[]={kCVPixelBufferWidthKey,kCVPixelBufferHeightKey,kCVPixelBufferPixelFormatTypeKey};
@@ -274,7 +278,9 @@ static int vt_send(Media *m,const uint8_t *bgra) {
         properties=CFDictionaryCreate(NULL,&key,&value,1,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks);
     }
     m->force_keyframe=0;
-    result=VTCompressionSessionEncodeFrame(m->vt,buffer,CMTimeMake(m->pts++,m->fps),CMTimeMake(1,m->fps),properties,NULL,NULL);
+    CMTime duration=CMTimeMake(1,m->fps),presentation=m->vt_pts;
+    m->vt_pts=CMTimeAdd(m->vt_pts,duration);
+    result=VTCompressionSessionEncodeFrame(m->vt,buffer,presentation,duration,properties,NULL,NULL);
     if(properties)CFRelease(properties);
     CVPixelBufferRelease(buffer);
     if(result)return result;

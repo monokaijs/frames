@@ -794,6 +794,7 @@ async fn host_session(
         completed_files.clone(),
     );
     let mut preference = None;
+    let mut bandwidth_mbps = 0;
     let mut failures = HashMap::<WindowId, u32>::new();
     let mut media_losses = HashMap::<WindowId, u64>::new();
     let mut audio = None::<crate::streaming::HostStream>;
@@ -890,7 +891,7 @@ async fn host_session(
                         if failures.get(&key).copied().unwrap_or(0)>1&&!scan.is_multiple_of(50){continue;}
                         let selected=if preference.is_none()&&failures.get(&key).copied().unwrap_or(0)>0{Some(Codec::Vp9)}else{preference};
                         let cap=codec::negotiate(&codecs,&peer.codecs,selected)?;
-                        entry.insert(crate::streaming::start_host(desktop.clone(),key,cap,crate::streaming::VideoOptions{fps:sub.fps(),show_cursor},connection.clone(),io.send.clone(),generations.clone()));
+                        entry.insert(crate::streaming::start_host(desktop.clone(),key,cap,crate::streaming::VideoOptions{fps:sub.fps(),show_cursor,bandwidth_mbps},connection.clone(),io.send.clone(),generations.clone()));
                     }
                 }
 
@@ -946,7 +947,7 @@ async fn host_session(
                 Message::Visibility{window,visible,focused}=>{if known.contains_key(&window){let subscription=subscriptions.entry(window).or_default();
                     if shared.is_some() && (!visible||!focused){input.release()?;}
                     subscription.update(visible,focused);if !visible{streams.remove(&window);}else if let Some(stream)=streams.get(&window){stream.set_fps(subscription.fps());}}},
-                Message::SelectCodec{codec}=>{codec::negotiate(&codecs,&peer.codecs,codec)?;preference=codec;streams.clear();failures.clear();},
+                Message::SelectCodec{codec,bandwidth_mbps:limit}=>{anyhow::ensure!(limit<=200,"bandwidth limit must be between 1 and 200 Mbps, or 0 for automatic");codec::negotiate(&codecs,&peer.codecs,codec)?;preference=codec;bandwidth_mbps=limit;if let Some(sender)=&io.send.media{sender.set_limit_mbps(limit);}streams.clear();failures.clear();},
                 Message::StreamReady{window,generation}=>if window==frames_core::media::AUDIO_WINDOW{if let Some(audio)=&audio{audio.acknowledge(generation);}}else if let Some(stream)=streams.get(&window){stream.acknowledge(generation);},
                 Message::ClockProbe{client_us}=>{let received_us=frames_core::media::monotonic_micros();io.send.send(Message::ClockReply{client_us,received_us,sent_us:frames_core::media::monotonic_micros()}).await?;},
                 Message::Feedback{window,generation,mut stats}=>{let previous=media_losses.insert(window,stats.delivery.missing_shards).unwrap_or(0);if stats.delivery.missing_shards>previous && let Some(sender)=&io.send.media{sender.note_loss();}
@@ -1032,15 +1033,28 @@ fn connection_timeout_hint() -> &'static str {
     }
 }
 
+#[derive(Default)]
+pub struct MediaOptions {
+    pub audio: bool,
+    pub bandwidth_mbps: u32,
+}
 pub async fn client(
     address: SocketAddr,
     requested: Option<Codec>,
     ui: frames_native::ClientSender,
     mut events: mpsc::UnboundedReceiver<ClientEvent>,
     clipboard: bool,
-    audio: bool,
+    media: MediaOptions,
     initial_view: ViewMode,
 ) -> anyhow::Result<()> {
+    let MediaOptions {
+        audio,
+        bandwidth_mbps,
+    } = media;
+    anyhow::ensure!(
+        bandwidth_mbps <= 200,
+        "bandwidth limit must be between 1 and 200 Mbps, or 0 for automatic"
+    );
     let _update_lease = crate::update::session_lease()?;
     let codecs = codec::probe_decoders().await;
     anyhow::ensure!(
@@ -1099,7 +1113,10 @@ pub async fn client(
     let selected = codec::negotiate(&peer.codecs, &codecs, requested)?;
     tracing::info!(codec=?selected.codec,encoder=?selected.encoder,"media negotiation");
     io.send
-        .send(Message::SelectCodec { codec: requested })
+        .send(Message::SelectCodec {
+            codec: requested,
+            bandwidth_mbps,
+        })
         .await?;
     io.send
         .send(Message::AudioPreference { enabled: audio })

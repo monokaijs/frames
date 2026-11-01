@@ -119,6 +119,7 @@ pub enum Message {
     ReleaseInput,
     SelectCodec {
         codec: Option<crate::codec::Codec>,
+        bandwidth_mbps: u32,
     },
     Menu {
         window: WindowId,

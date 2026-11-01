@@ -64,7 +64,7 @@ fn main() -> anyhow::Result<()> {
         ui,
         receiver,
         false,
-        false,
+        Default::default(),
         ViewMode::Windows,
     ));
     let mut passed = Vec::<String>::new();

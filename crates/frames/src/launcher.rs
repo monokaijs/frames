@@ -75,6 +75,7 @@ struct SessionOptions {
     clipboard: bool,
     unattended: bool,
     codec: String,
+    bandwidth_mbps: u32,
     max_streams: usize,
 }
 const CODECS: [&str; 5] = ["auto", "h264", "hevc", "av1", "vp9"];
@@ -86,12 +87,17 @@ impl Default for SessionOptions {
             clipboard: true,
             unattended: false,
             codec: "auto".into(),
+            bandwidth_mbps: 0,
             max_streams: 8,
         }
     }
 }
 impl SessionOptions {
     fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.bandwidth_mbps <= 200,
+            "Choose automatic bandwidth or a limit between 1 and 200 Mbps."
+        );
         anyhow::ensure!(
             CODECS.contains(&self.codec.as_str()),
             "Choose a supported video codec."
@@ -109,6 +115,9 @@ impl SessionOptions {
             "--codec".into(),
             self.codec.clone(),
         ];
+        if self.bandwidth_mbps != 0 {
+            args.extend(["--bandwidth-mbps".into(), self.bandwidth_mbps.to_string()]);
+        }
         if self.audio {
             args.push("--audio".into());
         }
@@ -141,6 +150,11 @@ impl SessionOptions {
             desktop: ui.get_default_desktop(),
             clipboard: ui.get_clipboard(),
             unattended: ui.get_unattended(),
+            bandwidth_mbps: if ui.get_bandwidth_auto() {
+                0
+            } else {
+                ui.get_bandwidth_mbps().max(1) as u32
+            },
             codec: CODECS
                 .get(ui.get_codec() as usize)
                 .unwrap_or(&"auto")
@@ -945,6 +959,12 @@ pub fn run() -> Result<()> {
             .unwrap_or(0) as i32,
     );
     ui.set_max_streams(preferences.options.max_streams as i32);
+    ui.set_bandwidth_auto(preferences.options.bandwidth_mbps == 0);
+    ui.set_bandwidth_mbps(if preferences.options.bandwidth_mbps == 0 {
+        50
+    } else {
+        preferences.options.bandwidth_mbps as i32
+    });
     ui.set_recent(model(
         recent_rows(&preferences)
             .into_iter()
@@ -1243,11 +1263,17 @@ mod tests {
         };
         assert!(first.audio);
         ui.set_default_desktop(true);
+        ui.set_bandwidth_auto(false);
+        ui.set_bandwidth_mbps(50);
         ui.invoke_settings_edited();
         let Action::SaveSettings(latest) = saves.try_recv().unwrap() else {
             panic!("Further edits must remain available while saving");
         };
         assert!(latest.audio && latest.desktop);
+        assert_eq!(latest.bandwidth_mbps, 50);
+        let persisted: SessionOptions =
+            serde_json::from_slice(&serde_json::to_vec(&latest).unwrap()).unwrap();
+        assert_eq!(persisted.bandwidth_mbps, 50);
         apply_settings_result(&ui, &first, Err("outdated failure".into()));
         assert!(ui.get_settings_status().is_empty());
         apply_settings_result(&ui, &latest, Err("disk full".into()));
@@ -1299,6 +1325,7 @@ mod tests {
         assert!(preferences.options.clipboard);
         assert!(!preferences.options.unattended);
         assert_eq!(preferences.options.codec, "auto");
+        assert_eq!(preferences.options.bandwidth_mbps, 0);
         assert_eq!(preferences.options.max_streams, 8);
         assert_eq!(preferences.recent.len(), 1);
         assert_eq!(preferences.close_behavior, CloseBehavior::Ask);
@@ -1335,6 +1362,7 @@ mod tests {
             clipboard: false,
             unattended: true,
             codec: "hevc".into(),
+            bandwidth_mbps: 50,
             max_streams: 12,
         };
         let connect = crate::Args::try_parse_from(
@@ -1349,6 +1377,7 @@ mod tests {
                 no_clipboard: true,
                 view: crate::ViewChoice::Desktop,
                 codec: crate::CodecChoice::Hevc,
+                bandwidth_mbps: 50,
                 ..
             })
         ));
@@ -1383,6 +1412,25 @@ mod tests {
 
     #[test]
     fn invalid_saved_options_are_rejected() {
+        use clap::Parser;
+        assert!(
+            SessionOptions {
+                bandwidth_mbps: 201,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            crate::Args::try_parse_from([
+                "frames",
+                "connect",
+                "127.0.0.1:47990",
+                "--bandwidth-mbps",
+                "201"
+            ])
+            .is_err()
+        );
         for max_streams in [0, 33] {
             assert!(
                 SessionOptions {

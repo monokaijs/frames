@@ -197,6 +197,8 @@ export component Launcher inherits Window {
     in-out property <bool> unattended: false;
     in-out property <bool> clipboard: true;
     in-out property <int> codec: 0;
+    in-out property <bool> bandwidth-auto: true;
+    in-out property <int> bandwidth-mbps: 50;
     in-out property <int> max-streams: 8;
     in-out property <string> settings-status;
     in-out property <bool> settings-error: false;
@@ -432,6 +434,13 @@ export component Launcher inherits Window {
                                 }
                                 SettingRow { title: "Host audio"; detail: "Play sound from the remote computer.";
                                     AppSwitch { checked <=> root.default-audio; toggled => { root.settings-edited(); } accessible-label: "Host audio by default"; }
+                                }
+                                SettingRow { title: "Bandwidth limit"; detail: "Shared across streamed windows. Higher limits allow sharper images.";
+                                    HorizontalLayout { spacing: 10px; alignment: end;
+                                        AppCheckBox { text: "Automatic"; checked <=> root.bandwidth-auto; toggled => { root.settings-edited(); } }
+                                        SpinBox { width: 105px; minimum: 1; maximum: 200; value <=> root.bandwidth-mbps; enabled: !root.bandwidth-auto; edited => { root.settings-edited(); } accessible-label: "Bandwidth limit in Mbps"; }
+                                        Text { text: "Mbps"; color: Theme.muted; vertical-alignment: center; }
+                                    }
                                 }
                                 SettingRow { title: "Video codec"; detail: "Automatic selects a working codec for both devices.";
                                     ComboBox { width: 180px; model: ["Automatic", "H.264", "HEVC", "AV1", "VP9"]; current-index <=> root.codec; selected(value) => { root.settings-edited(); } accessible-label: "Video codec"; }

@@ -34,6 +34,13 @@ async fn mutual_tls_binds_both_identities_and_pairing_code_to_the_connection() {
             protocol::recv_json(&mut rx).await.unwrap(),
             Message::Ping { nonce: 42 }
         ));
+        assert!(matches!(
+            protocol::recv_json(&mut rx).await.unwrap(),
+            Message::SelectCodec {
+                codec: None,
+                bandwidth_mbps: 50
+            }
+        ));
         protocol::send_json(&mut tx, &Message::Pong { nonce: 42 })
             .await
             .unwrap();
@@ -51,6 +58,15 @@ async fn mutual_tls_binds_both_identities_and_pairing_code_to_the_connection() {
     protocol::send_json(&mut tx, &Message::Ping { nonce: 42 })
         .await
         .unwrap();
+    protocol::send_json(
+        &mut tx,
+        &Message::SelectCodec {
+            codec: None,
+            bandwidth_mbps: 50,
+        },
+    )
+    .await
+    .unwrap();
     assert!(matches!(
         protocol::recv_json(&mut rx).await.unwrap(),
         Message::Pong { nonce: 42 }

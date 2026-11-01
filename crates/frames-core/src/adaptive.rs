@@ -36,6 +36,9 @@ pub struct Controller {
     base_fps: u32,
     fps_cap: u32,
     enabled: bool,
+    local_pressure_until: Option<Instant>,
+    base_bitrate: u32,
+    manual_bitrate: Option<u32>,
 }
 impl Controller {
     pub fn new(fps: u32, now: Instant) -> Self {
@@ -54,6 +57,9 @@ impl Controller {
             base_fps: fps,
             fps_cap: 60,
             enabled: std::env::var("FRAMES_ADAPTATION").as_deref() != Ok("0"),
+            local_pressure_until: None,
+            base_bitrate: 12_000_000,
+            manual_bitrate: None,
         }
     }
     pub fn quality(&self) -> Quality {
@@ -63,7 +69,27 @@ impl Controller {
         self.base_fps = fps;
         self.quality.fps = fps.min(self.fps_cap);
     }
+    /// Retina/4K captures need a larger clean-link budget than 1080p. Keep
+    /// congestion reductions proportional when the source itself is resized.
+    pub fn set_source_size(&mut self, width: u32, height: u32) {
+        let budget = self.manual_bitrate.unwrap_or_else(|| {
+            (12_000_000u64 * width as u64 * height as u64 / (1920 * 1080))
+                .clamp(12_000_000, 64_000_000) as u32
+        });
+        self.quality.bitrate = (self.quality.bitrate as u64 * budget as u64
+            / self.base_bitrate as u64)
+            .min(budget as u64) as u32;
+        self.base_bitrate = budget;
+    }
+    pub fn set_bandwidth_mbps(&mut self, mbps: u32) {
+        self.manual_bitrate = (mbps != 0).then_some(mbps.clamp(1, 200) * 1_000_000);
+        if let Some(budget) = self.manual_bitrate {
+            self.base_bitrate = budget;
+            self.quality.bitrate = budget;
+        }
+    }
     pub fn congestion(&mut self, now: Instant) -> Quality {
+        self.local_pressure_until = Some(now + Duration::from_millis(250));
         self.update(self.previous, Duration::ZERO, Duration::ZERO, true, now)
     }
     pub fn update(
@@ -87,13 +113,13 @@ impl Controller {
             feedback.delivery.unrecoverable_frames > self.previous.delivery.unrecoverable_frames;
         let loss = missing as f64 / (received + missing).max(1) as f64;
         let overloaded = congested
+            || self.local_pressure_until.is_some_and(|until| now < until)
             || (feedback.congestion_events > self.previous.congestion_events
                 && (feedback.queue_micros > 4_000
                     || rtt.saturating_sub(min_rtt) > Duration::from_millis(5)))
             || feedback.queue_micros > 8_000
             || (feedback.decoder_backlog >= 2 && feedback.decode_p95_micros > 16_667)
-            || rtt.saturating_sub(min_rtt) > Duration::from_millis(10)
-            || (feedback.late_frames > self.previous.late_frames && missing == 0 && !failed);
+            || rtt.saturating_sub(min_rtt) > Duration::from_millis(10);
         self.previous = feedback;
         if !self.enabled {
             return self.quality;
@@ -101,8 +127,11 @@ impl Controller {
         if overloaded {
             self.stable_since = now;
             let since = *self.overloaded_since.get_or_insert(now);
-            if now.saturating_duration_since(self.last_step) >= Duration::from_millis(300) {
-                self.quality.bitrate = (self.quality.bitrate * 4 / 5).max(1_000_000);
+            if now.saturating_duration_since(since) >= Duration::from_millis(300)
+                && now.saturating_duration_since(self.last_step) >= Duration::from_millis(300)
+            {
+                self.quality.bitrate = (self.quality.bitrate * 4 / 5)
+                    .max((self.base_bitrate / 12).clamp(128_000, 1_000_000));
                 self.last_step = now;
             }
             if now.saturating_duration_since(since) >= Duration::from_secs(1) {
@@ -129,7 +158,7 @@ impl Controller {
                 && now.saturating_duration_since(self.last_increase) >= Duration::from_secs(1)
             {
                 self.quality.bitrate =
-                    (self.quality.bitrate as u64 * 105 / 100).min(12_000_000) as u32;
+                    (self.quality.bitrate as u64 * 105 / 100).min(self.base_bitrate as u64) as u32;
                 self.last_increase = now;
             }
             if now.saturating_duration_since(self.stable_since) >= Duration::from_secs(10) {
@@ -145,7 +174,7 @@ impl Controller {
         if self.quality.fec.parity_per_32 != previous_parity {
             self.quality.bitrate = (self.quality.bitrate as u64 * (32 + previous_parity as u64)
                 / (32 + self.quality.fec.parity_per_32 as u64))
-                .min(12_000_000) as u32;
+                .min(self.base_bitrate as u64) as u32;
         }
         self.quality
     }
@@ -153,6 +182,72 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn manual_bandwidth_raises_the_ceiling_and_still_adapts_to_congestion() {
+        let now = Instant::now();
+        let mut c = Controller::new(60, now);
+        c.set_bandwidth_mbps(50);
+        c.set_source_size(1920, 1080);
+        assert_eq!(c.quality().bitrate, 50_000_000);
+        c.congestion(now);
+        c.congestion(now + Duration::from_millis(400));
+        assert_eq!(c.quality().bitrate, 40_000_000);
+        c.set_source_size(3840, 2160);
+        assert_eq!(c.quality().bitrate, 40_000_000);
+        let q = c.update(
+            Feedback::default(),
+            Duration::ZERO,
+            Duration::ZERO,
+            false,
+            now + Duration::from_secs(4),
+        );
+        assert!(q.bitrate > 40_000_000 && q.bitrate <= 50_000_000);
+        c.set_bandwidth_mbps(1);
+        c.congestion(now + Duration::from_secs(5));
+        c.congestion(now + Duration::from_millis(5400));
+        assert!(c.quality().bitrate < 1_000_000);
+    }
+    #[test]
+    fn clean_network_late_pictures_and_isolated_encoder_spikes_preserve_resolution() {
+        let now = Instant::now();
+        let mut c = Controller::new(60, now);
+        for n in 1..=300 {
+            let at = now + Duration::from_millis(n * 100);
+            if n % 10 == 0 {
+                c.congestion(at);
+            }
+            let q = c.update(
+                Feedback {
+                    late_frames: n,
+                    ..Default::default()
+                },
+                Duration::from_millis(2),
+                Duration::from_millis(2),
+                false,
+                at,
+            );
+            assert_eq!(q.scale_percent, 100);
+            assert_eq!(q.fps, 60);
+            assert_eq!(
+                q.bitrate, 12_000_000,
+                "a brief local spike must not collapse a clean-link bitrate"
+            );
+        }
+    }
+    #[test]
+    fn retina_budget_scales_with_source_pixels_and_preserves_congestion_reductions() {
+        let now = Instant::now();
+        let mut c = Controller::new(60, now);
+        c.set_source_size(3840, 2160);
+        assert_eq!(c.quality().bitrate, 48_000_000);
+        c.congestion(now);
+        c.congestion(now + Duration::from_millis(400));
+        assert_eq!(c.quality().bitrate, 38_400_000);
+        c.set_source_size(1920, 1080);
+        assert_eq!(c.quality().bitrate, 9_600_000);
+        c.set_source_size(1920, 1080);
+        assert_eq!(c.quality().bitrate, 9_600_000);
+    }
     #[test]
     fn persistent_congestion_reduces_rate_then_resolution_then_fps_and_recovers_slowly() {
         let now = Instant::now();

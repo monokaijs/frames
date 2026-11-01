@@ -56,6 +56,24 @@ import Darwin
                 }
                 encoder.stop()
             }
+            // Focus changes rate without changing dimensions or reopening the
+            // session. Timestamps must remain increasing across 24 -> 60.
+            let focusEncoder=try NativeVideoEncoder(handle:42,codec:name,fps:24)
+            let buffer=try makeBuffer(640,360,false)
+            focusEncoder.submit(buffer,region:CGRect(x:0,y:0,width:640,height:360))
+            _ = try packet(pipe.fileHandleForReading.fileDescriptor,kind:name=="hevc" ? 3:2,generation:9)
+            for fps in [24,24,60,24,60,45,60] {
+                focusEncoder.configure(bitrate:12_000_000,fps:fps,scale:100)
+                focusEncoder.keyframe()
+                let frame=try packet(pipe.fileHandleForReading.fileDescriptor,kind:name=="hevc" ? 3:2,generation:9)
+                precondition(frame.width==640 && frame.height==360 && frame.bytes[0]==1,"focus change must preserve native resolution and an independently decodable picture")
+            }
+            // A stationary desktop must be refined when bandwidth recovers,
+            // without requiring another ScreenCaptureKit notification.
+            focusEncoder.configure(bitrate:16_000_000,fps:60,scale:100)
+            let refined=try packet(pipe.fileHandleForReading.fileDescriptor,kind:name=="hevc" ? 3:2,generation:9)
+            precondition(refined.bytes[0]==1 && refined.width==640 && refined.height==360,"idle quality recovery needs a fresh independent picture")
+            focusEncoder.stop()
         }
         print("PASS: native H264/HEVC GPU surfaces, compressed IPC, changed pixels, idle keyframes, 75% scaling, odd dimensions, 1080p/1440p/4K")
     }

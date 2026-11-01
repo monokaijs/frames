@@ -9,7 +9,7 @@ use frames_native::{ClientUpdate, Desktop};
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Duration,
 };
@@ -27,6 +27,7 @@ struct StreamTuning {
     bitrate: AtomicU32,
     scale: AtomicU32,
     fec: AtomicU32,
+    focused: AtomicBool,
     controller: std::sync::Mutex<frames_core::adaptive::Controller>,
 }
 impl Default for StreamTuning {
@@ -35,6 +36,7 @@ impl Default for StreamTuning {
             bitrate: AtomicU32::new(12_000_000),
             scale: AtomicU32::new(100),
             fec: AtomicU32::new(4),
+            focused: AtomicBool::new(true),
             controller: std::sync::Mutex::new(frames_core::adaptive::Controller::new(
                 60,
                 std::time::Instant::now(),
@@ -42,8 +44,17 @@ impl Default for StreamTuning {
         }
     }
 }
+impl StreamTuning {
+    fn source_size(&self, width: u32, height: u32) {
+        let mut controller = self.controller.lock().unwrap();
+        controller.set_source_size(width, height);
+        self.bitrate
+            .store(controller.quality().bitrate, Ordering::Relaxed);
+    }
+}
 impl HostStream {
     pub fn set_fps(&self, fps: u32) {
+        self.tuning.focused.store(fps >= 45, Ordering::Relaxed);
         let mut controller = self.tuning.controller.lock().unwrap();
         controller.set_fps(fps.clamp(1, 240));
         self.rate.store(controller.quality().fps, Ordering::Relaxed);
@@ -58,13 +69,21 @@ impl HostStream {
         if self.generation.load(Ordering::Acquire) != generation {
             return;
         }
-        let q = self.tuning.controller.lock().unwrap().update(
-            stats,
-            rtt,
-            min_rtt,
-            false,
-            std::time::Instant::now(),
-        );
+        let mut controller = self.tuning.controller.lock().unwrap();
+        let previous = controller.quality();
+        let q = controller.update(stats, rtt, min_rtt, false, std::time::Instant::now());
+        if q != previous {
+            tracing::info!(
+                generation,
+                bitrate = q.bitrate,
+                scale = q.scale_percent,
+                fps = q.fps,
+                parity = q.fec.parity_per_32,
+                queue_us = stats.queue_micros,
+                rtt_us = rtt.as_micros() as u64,
+                "stream quality changed"
+            );
+        }
         self.tuning
             .fec
             .store(q.fec.parity_per_32 as u32, Ordering::Relaxed);
@@ -523,6 +542,7 @@ pub fn start_audio(
 pub struct VideoOptions {
     pub fps: u32,
     pub show_cursor: bool,
+    pub bandwidth_mbps: u32,
 }
 
 pub fn start_host(
@@ -534,7 +554,11 @@ pub fn start_host(
     out: Outbound,
     generations: Arc<AtomicU32>,
 ) -> HostStream {
-    let VideoOptions { fps, show_cursor } = options;
+    let VideoOptions {
+        fps,
+        show_cursor,
+        bandwidth_mbps,
+    } = options;
     let (ready, mut ready_rx) = watch::channel(0);
     let active_generation = Arc::new(AtomicU32::new(0));
     let task_generation = active_generation.clone();
@@ -542,6 +566,12 @@ pub fn start_host(
     let task_rate = rate.clone();
     let tuning = Arc::new(StreamTuning::default());
     tuning.controller.lock().unwrap().set_fps(fps);
+    tuning.focused.store(fps >= 45, Ordering::Relaxed);
+    tuning
+        .controller
+        .lock()
+        .unwrap()
+        .set_bandwidth_mbps(bandwidth_mbps);
     let settings = tuning.clone();
     let (reset, mut reset_task) = watch::channel(0);
     let task = tokio::spawn(async move {
@@ -562,12 +592,15 @@ pub fn start_host(
 
             loop {
                 let (source_width, source_height) = loop { if let Some(frame) = capture.frames.borrow().as_ref() { break (frame.width, frame.height); } capture.frames.changed().await?; };
+                settings.source_size(source_width, source_height);
                 let scale = settings.scale.load(Ordering::Relaxed);
                 let (width, height) = ((source_width * scale / 100).max(1), (source_height * scale / 100).max(1));
                 let generation = generations.fetch_add(1, Ordering::Relaxed);
+                sender.set_budget(window, settings.bitrate.load(Ordering::Relaxed), settings.fec.load(Ordering::Relaxed) as u8, settings.focused.load(Ordering::Relaxed));
                 let mut encoder = codec::encode_paced(width, height, 60, &capability, capture.frames.clone(), task_rate.clone()).await?;
                 task_generation.store(generation, Ordering::Release);
-                encoder.bitrate.store(sender.encoder_target(window, settings.bitrate.load(Ordering::Relaxed)), Ordering::Relaxed);
+                let target = sender.encoder_target(window, settings.bitrate.load(Ordering::Relaxed));
+                if target > encoder.bitrate.swap(target, Ordering::Relaxed) { encoder.request_keyframe(); }
                 let first_packet = tokio::time::timeout(Duration::from_secs(3), encoder.frames.recv()).await?.ok_or_else(|| anyhow::anyhow!("encoder stopped during its surface probe"))?;
                 let cpu_readback = !first_packet.surface_encoded;
                 let fec = media::FecProfile { parity_per_32: settings.fec.load(Ordering::Relaxed) as u8 };
@@ -593,8 +626,10 @@ pub fn start_host(
                             status_ticks += 1;
                             if status_ticks % 20 == 0 && std::env::var("FRAMES_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") { tracing::info!(?window,generation,capture_encode_p50_us=capture_encode.percentile(50),capture_encode_p95_us=capture_encode.percentile(95),encode_p50_us=encode_times.percentile(50),encode_p95_us=encode_times.percentile(95),encode_p99_us=encode_times.percentile(99),"video encoder timing"); sender.report_timings(); }
                             if let Some(number) = latest { out.send(Message::MediaStatus { window, generation, number }).await?; }
-                            encoder.bitrate.store(sender.encoder_target(window, settings.bitrate.load(Ordering::Relaxed)), Ordering::Relaxed);
-                            sender.set_budget(window, settings.bitrate.load(Ordering::Relaxed), settings.fec.load(Ordering::Relaxed) as u8);
+                            sender.set_budget(window, settings.bitrate.load(Ordering::Relaxed), settings.fec.load(Ordering::Relaxed) as u8, settings.focused.load(Ordering::Relaxed));
+                            let target = sender.encoder_target(window, settings.bitrate.load(Ordering::Relaxed));
+                            let previous = encoder.bitrate.swap(target, Ordering::Relaxed);
+                            if target > previous.saturating_add((previous/25).max(64_000)) { encoder.request_keyframe(); }
                             if settings.scale.load(Ordering::Relaxed) != scale { break; }
                         },
                         changed = capture.frames.changed() => {
@@ -619,7 +654,7 @@ pub fn start_host(
                             let fec = if std::env::var("FRAMES_FEC").as_deref() == Ok("0") { media::FecProfile { parity_per_32: 0 } }
                                 else { media::FecProfile { parity_per_32: if frame.keyframe { 8 } else { settings.fec.load(Ordering::Relaxed) as u8 } } };
                             let mtu = connection.max_datagram_size().ok_or_else(|| anyhow::anyhow!("peer disabled datagrams"))?;
-                            if !sender.send(frame, mtu, fec, captured_us, deadline, task_rate.load(Ordering::Relaxed) >= 45).await? {
+                            if !sender.send(frame, mtu, fec, captured_us, deadline, settings.focused.load(Ordering::Relaxed)).await? {
                                 awaiting_keyframe = true; encoder.request_keyframe();
                                 let q = settings.controller.lock().unwrap().congestion(std::time::Instant::now());
                                 settings.bitrate.store(q.bitrate, Ordering::Relaxed); settings.scale.store(q.scale_percent, Ordering::Relaxed); task_rate.store(q.fps, Ordering::Relaxed);
@@ -1467,9 +1502,16 @@ async fn run_native_host(
         .ok_or_else(|| anyhow::anyhow!("native encoder stopped"))?;
 
     loop {
+        tuning.source_size(first.source_width, first.source_height);
         let size = (first.width, first.height);
         let generation = generations.fetch_add(1, Ordering::Relaxed);
         active_generation.store(generation, Ordering::Release);
+        sender.set_budget(
+            window,
+            tuning.bitrate.load(Ordering::Relaxed),
+            tuning.fec.load(Ordering::Relaxed) as u8,
+            tuning.focused.load(Ordering::Relaxed),
+        );
         out.send(Message::StreamStarted(StreamConfig {
             window,
             generation,
@@ -1504,9 +1546,10 @@ async fn run_native_host(
                 changed = reset.changed() => { changed?; if *reset.borrow_and_update() == generation { awaiting_keyframe = true; let _ = capture.control.try_send(frames_native::NativeEncoderCommand::Keyframe); } },
                 _ = status.tick() => {
                     if let Some(number) = latest { out.send(Message::MediaStatus { window, generation, number }).await?; }
-                    let budget = tuning.bitrate.load(Ordering::Relaxed); let bitrate = sender.encoder_target(window, budget); let fps = rate.load(Ordering::Relaxed); let scale = tuning.scale.load(Ordering::Relaxed);
+                    let budget = tuning.bitrate.load(Ordering::Relaxed); let fps = rate.load(Ordering::Relaxed); let scale = tuning.scale.load(Ordering::Relaxed);
+                    sender.set_budget(window, budget, tuning.fec.load(Ordering::Relaxed) as u8, tuning.focused.load(Ordering::Relaxed));
+                    let bitrate = sender.encoder_target(window, budget);
                     let _ = capture.control.try_send(frames_native::NativeEncoderCommand::Configure { bitrate, fps, scale });
-                    sender.set_budget(window, budget, tuning.fec.load(Ordering::Relaxed) as u8);
                     if awaiting_keyframe { let _ = capture.control.try_send(frames_native::NativeEncoderCommand::Keyframe); }
                 },
                 frame = async { if let Some(frame) = pending.take() { Some(frame) } else { capture.packets.recv().await } } => {
@@ -1520,7 +1563,7 @@ async fn run_native_host(
                     let deadline = tokio::time::Instant::now() + Duration::from_millis(if frame.packet.keyframe { 50 } else { 25 });
                     let encoded = EncodedFrame { encoded_us: media::timestamp_micros(frame.packet.encoded_at), captured_us: 0, window, generation, number, keyframe: frame.packet.keyframe, bytes: frame.packet.bytes };
                     latest = Some(number); number += 1;
-                    if !sender.send(encoded, connection.max_datagram_size().unwrap_or(1200), profile, captured_us, deadline, rate.load(Ordering::Relaxed) >= 45).await? {
+                    if !sender.send(encoded, connection.max_datagram_size().unwrap_or(1200), profile, captured_us, deadline, tuning.focused.load(Ordering::Relaxed)).await? {
                         awaiting_keyframe = true; let _ = capture.control.try_send(frames_native::NativeEncoderCommand::Keyframe);
                         let q = tuning.controller.lock().unwrap().congestion(std::time::Instant::now());
                         tuning.bitrate.store(q.bitrate, Ordering::Relaxed); tuning.scale.store(q.scale_percent, Ordering::Relaxed); rate.store(q.fps, Ordering::Relaxed);

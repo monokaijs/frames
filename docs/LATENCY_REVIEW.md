@@ -14,8 +14,9 @@ Profiles use 2, 4, or 8 parity shards per 32 source shards, rounded upward for a
 partial block. Keyframes use eight. Even shard payloads fit the smaller of the
 peer's datagram limit and 1200 bytes, after the 60-byte header. Small pictures
 use small shards; padding, headers, and parity are charged as actual wire bytes.
-The sender adjusts the encoder allowance for measured overhead, including
-partial-block rounding.
+The sender subtracts measured overhead bytes per second from the encoder
+allowance, including partial-block rounding. Tiny idle pictures do not multiply
+the entire bitrate budget by their header-to-payload ratio.
 
 Headers carry window identity, stream generation, frame number, keyframe status,
 capture/encode timestamps, original length, FEC scheme/profile, block counts,
@@ -57,7 +58,18 @@ and essential control acknowledgements cannot be silently evicted.
 Feedback runs every 100 ms and includes bytes/shards, pre-FEC loss, repairs,
 failures, late frames, decoder backlog, presentation gaps, and audio underruns.
 The sender combines it with Quinn RTT, minimum RTT, congestion events, window,
-and loss statistics. A focused stream begins with a 12 Mbps encoder target.
+and loss statistics. A focused 1080p stream begins with a 12 Mbps encoder target.
+Settings supports an automatic budget or a custom 1-200 Mbps media limit per
+connection (`--bandwidth-mbps` in the CLI). A custom limit raises the encoder
+ceiling; weighted sharing gives the focused window four shares and each
+background window one, reclaiming unused requested allocations. Pacing reserves
+5% for transport/control plus a 256 kbps audio allowance before video allocation.
+FEC and measured padding/header costs reduce the encoder allocation within that
+limit; congestion adaptation remains active. Changes apply to new connections.
+In automatic mode, larger physical captures scale the clean-link budget by source pixel count, up
+to 64 Mbps (4K starts at 48 Mbps). Source resizing preserves existing congestion
+reductions. Isolated late pictures and short encoder spikes do not reduce quality;
+pressure must persist for 300 ms before bitrate drops.
 Persistent overload reduces bitrate by 20%; stable links recover 5% per second
 after three seconds. Protection moves from 12.5% toward 6.25% after five clean
 seconds, or toward 25% for loss above 2% or failed reconstruction without
@@ -82,6 +94,11 @@ macOS keeps ScreenCaptureKit, Core Image/Metal scaling, hardware VideoToolbox,
 CVPixelBuffer lifetimes, and Metal presentation in the native helper. Compressed
 access units cross IPC for hardware codecs; the CPU path remains for software
 codecs. Encoded video and audio have separate bounded sockets from control.
+Encoder timestamps use a stable media clock across focus/frame-rate changes.
+A successful VideoToolbox callback without a sample is a picture drop, not a
+backend failure; native retries are paced and bounded by 500 ms. Only actual
+encoded pictures advance frame identity. A meaningful bitrate increase forces
+a fresh independent picture even on a stationary desktop.
 Each native decoder has an ordered bounded worker, and decode/presentation
 acknowledgements carry generation and frame number. CAMetalDisplayLink selects
 the newest decoded surface at display opportunities, with one outstanding GPU

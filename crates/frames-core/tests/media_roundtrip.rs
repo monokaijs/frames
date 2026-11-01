@@ -5,6 +5,44 @@ use std::time::Duration;
 // exclusively so a limited hardware codec service is not oversubscribed.
 static CODEC_SESSIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn videotoolbox_focus_rate_changes_preserve_the_encoder_clock() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    };
+    let _sessions = CODEC_SESSIONS.lock().await;
+    let capability = codec::probe()
+        .await
+        .into_iter()
+        .find(|c| c.encoder.as_deref() == Some("h264_videotoolbox"))
+        .unwrap();
+    let (_capture, frames) = tokio::sync::watch::channel(Some(RawFrame {
+        media_generation: 0,
+        captured_at: std::time::Instant::now(),
+        frame_number: 0,
+        width: 256,
+        height: 256,
+        bgra: [20, 30, 220, 255].repeat(256 * 256).into(),
+    }));
+    let rate = Arc::new(AtomicU32::new(24));
+    let mut encoder = codec::encode_paced(256, 256, 60, &capability, frames, rate.clone())
+        .await
+        .unwrap();
+    encoder.frames.recv().await.unwrap();
+    for fps in [24, 24, 60, 24, 60, 45, 60] {
+        rate.store(fps, Ordering::Relaxed);
+        encoder.request_keyframe();
+        let packet = tokio::time::timeout(Duration::from_secs(3), encoder.frames.recv())
+            .await
+            .unwrap()
+            .expect("focus change stopped VideoToolbox");
+        assert!(packet.keyframe);
+    }
+    encoder.shutdown().await;
+}
+
 #[tokio::test]
 async fn recovery_keyframes_reuse_the_encoder_and_need_no_new_capture() {
     let _sessions = CODEC_SESSIONS.lock().await;
