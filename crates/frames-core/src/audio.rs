@@ -41,6 +41,10 @@ pub async fn encode(
     let (stop, mut stopping) = watch::channel(false);
     let (ready, started) = oneshot::channel();
     let handle = tokio::runtime::Handle::current();
+    // Native callbacks can contain many 10 ms frames. Deliver them at their
+    // playback rate so a single callback cannot flood the receiver's decoder.
+    let mut clock = tokio::time::interval(std::time::Duration::from_millis(PACKET_MILLIS as u64));
+    clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let task = tokio::task::spawn_blocking(move || {
         let setup = (|| -> anyhow::Result<_> {
             let mut encoder =
@@ -96,7 +100,18 @@ pub async fn encode(
                         return;
                     }
                 }
-                if !handle.block_on(async{tokio::select!{biased;_=stopping.changed()=>false,r=sender.send(packet)=>r.is_ok()}}){return;}
+                if !handle.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = stopping.changed() => false,
+                        result = async {
+                            clock.tick().await;
+                            sender.send(packet).await
+                        } => result.is_ok(),
+                    }
+                }) {
+                    return;
+                }
             }
             pending.drain(..complete);
         }

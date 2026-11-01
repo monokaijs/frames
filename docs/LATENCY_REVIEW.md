@@ -8,7 +8,7 @@ Windows selects a successfully probed NVENC, Quick Sync, AMF, or Media Foundatio
 
 Encoding reads the newest capture at the requested rate; its output queue holds one packet. Decoding accepts two queued packets, uses slice threading instead of frame threading, and publishes only the newest completed picture. Actual encoder keyframe flags cover H.264, HEVC, AV1, and VP9. Mac decoding uses VideoToolbox with CPU copyback when its reference probe succeeds. Windows currently uses software decoding; D3D11VA remains a future GPU presentation path.
 
-Opus is linked into Frames and emits raw 10 ms packets. Device rate/channel conversion uses in-process libswresample. Audio capture and decoder queues are bounded; playback retains at most 20 ms. Late audio packets are discarded and small gaps use Opus loss concealment instead of restarting a container stream.
+Opus is linked into Frames and emits raw 10 ms packets paced at the playback rate, including when a native capture callback contains several packets. Device rate/channel conversion uses in-process libswresample. Audio capture and decoder queues are bounded; playback retains at most one device callback plus 20 ms. Late audio packets are discarded and small gaps use Opus loss concealment instead of restarting a container stream.
 
 ## Matched synthetic measurements
 

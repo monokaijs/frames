@@ -2,6 +2,41 @@ use frames_core::audio::{self, PcmFormat};
 use std::time::Duration;
 
 #[tokio::test]
+async fn a_large_capture_callback_is_paced_instead_of_flooding_the_client() {
+    let format = PcmFormat {
+        rate: 48000,
+        channels: 2,
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let mut encoder = audio::encode(format, rx).await.unwrap();
+    // One native callback contains 100 ms, or ten Opus packets. The client
+    // only has room for two packets while its decoder is busy.
+    tx.send(vec![0; audio::packet_bytes(format) * 10])
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), encoder.packets.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!first.is_empty());
+    let start = tokio::time::Instant::now();
+    for _ in 1..10 {
+        tokio::time::timeout(Duration::from_secs(2), encoder.packets.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(
+        start.elapsed() >= Duration::from_millis(60),
+        "capture block was sent as a burst"
+    );
+    tokio::time::timeout(Duration::from_secs(2), encoder.shutdown())
+        .await
+        .unwrap();
+    drop(tx);
+}
+
+#[tokio::test]
 async fn one_ten_millisecond_packet_decodes_without_more_input_or_eof() {
     let format = PcmFormat {
         rate: 48000,

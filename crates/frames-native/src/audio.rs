@@ -106,12 +106,44 @@ where
 
 pub struct Playback {
     pub format: PcmFormat,
-    queue: Arc<parking_lot::Mutex<VecDeque<f32>>>,
+    queue: Arc<parking_lot::Mutex<PlaybackQueue>>,
     _guard: Guard,
 }
+
+#[derive(Default)]
+struct PlaybackQueue {
+    samples: VecDeque<f32>,
+    callback_samples: usize,
+}
+impl PlaybackQueue {
+    fn push(&mut self, pcm: &[u8], format: PcmFormat) {
+        let channels = format.channels as usize;
+        // Preserve whole interleaved frames, including when trimming a backlog.
+        let frames = pcm.len() / (channels * 4);
+        self.samples.extend(
+            pcm[..frames * channels * 4]
+                .chunks_exact(4)
+                .map(|unit| f32::from_le_bytes(unit.try_into().unwrap())),
+        );
+        let jitter = format.rate as usize * channels * 20 / 1000;
+        let max = self.callback_samples + jitter;
+        let excess = self.samples.len().saturating_sub(max).div_ceil(channels) * channels;
+        self.samples.drain(..excess);
+    }
+
+    fn fill<T: cpal::Sample + cpal::FromSample<f32>>(&mut self, output: &mut [T]) {
+        // Device callbacks may be longer than 20 ms. Retain enough audio for
+        // their next request as well as the bounded network jitter allowance.
+        self.callback_samples = self.callback_samples.max(output.len());
+        for sample in output {
+            *sample = cpal::Sample::from_sample(self.samples.pop_front().unwrap_or(0.0));
+        }
+    }
+}
+
 impl Playback {
     pub fn new() -> anyhow::Result<Self> {
-        let queue = Arc::new(parking_lot::Mutex::new(VecDeque::<f32>::new()));
+        let queue = Arc::new(parking_lot::Mutex::new(PlaybackQueue::default()));
         let samples = queue.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));
@@ -159,20 +191,13 @@ impl Playback {
         })
     }
     pub fn push(&self, pcm: &[u8]) {
-        let mut queue = self.queue.lock();
-        let max = self.format.rate as usize * self.format.channels as usize * 20 / 1000;
-        for unit in pcm.as_chunks::<4>().0 {
-            queue.push_back(f32::from_le_bytes(*unit));
-        }
-        while queue.len() > max {
-            queue.pop_front();
-        }
+        self.queue.lock().push(pcm, self.format);
     }
 }
 fn output<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
-    queue: Arc<parking_lot::Mutex<VecDeque<f32>>>,
+    queue: Arc<parking_lot::Mutex<PlaybackQueue>>,
 ) -> anyhow::Result<cpal::Stream>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
@@ -180,12 +205,55 @@ where
     Ok(device.build_output_stream(
         config,
         move |samples: &mut [T], _| {
-            let mut queue = queue.lock();
-            for sample in samples {
-                *sample = cpal::Sample::from_sample(queue.pop_front().unwrap_or(0.0));
-            }
+            queue.lock().fill(samples);
         },
         |error| tracing::warn!(%error,"audio output"),
         None,
     )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_retains_audio_for_callbacks_longer_than_twenty_milliseconds() {
+        let format = PcmFormat {
+            rate: 48000,
+            channels: 2,
+        };
+        let mut queue = PlaybackQueue::default();
+        let mut output = vec![0f32; 4800 * 2]; // A 100 ms device callback.
+        queue.fill(&mut output);
+        let packet: Vec<_> = std::iter::repeat_n(0.25f32, 480 * 2)
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        for _ in 0..10 {
+            queue.push(&packet, format);
+        }
+        queue.fill(&mut output);
+        assert!(output.iter().all(|&sample| sample == 0.25));
+        // Keep the most recent callback plus 20 ms when a backlog builds.
+        for _ in 0..20 {
+            queue.push(&packet, format);
+        }
+        assert_eq!(queue.samples.len(), 5760 * 2);
+    }
+
+    #[test]
+    fn trimming_playback_preserves_channel_alignment() {
+        let format = PcmFormat {
+            rate: 11025,
+            channels: 2,
+        };
+        let pcm: Vec<_> = (0..400)
+            .flat_map(|_| [0.25f32, -0.25])
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let mut queue = PlaybackQueue::default();
+        queue.push(&pcm, format);
+        let mut output = [0f32; 2];
+        queue.fill(&mut output);
+        assert_eq!(output, [0.25, -0.25]);
+    }
 }
