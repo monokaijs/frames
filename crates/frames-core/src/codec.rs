@@ -701,11 +701,35 @@ async fn decode_inner(
                 awaiting_keyframe = false;
             }
             let started = Instant::now();
-            let decoded = if surfaces {
+            let mut decoded = if surfaces {
                 context.decode_presentable(&packet)
             } else {
                 context.decode(&packet)
             };
+            // A reference probe cannot establish support for every live bitstream.
+            // Retry an independent picture immediately, including hardware paths
+            // that silently buffer it. An idle desktop may never send another.
+            if hardware_active
+                && (decoded.is_err() || (packet.keyframe && matches!(decoded, Ok(None))))
+            {
+                hardware_active = false;
+                tracing::warn!(
+                    ?codec,
+                    "hardware decoder did not produce a picture; using software"
+                );
+                match runtime::Context::decoder(codec.decoder(), width, height, false) {
+                    Ok(replacement) => {
+                        context = replacement;
+                        if packet.keyframe {
+                            decoded = context.decode(&packet);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "software decoder fallback failed");
+                        break;
+                    }
+                }
+            }
             worker_metrics
                 .histogram
                 .lock()
@@ -739,17 +763,6 @@ async fn decode_inner(
                     tracing::warn!(error=%e,"Video decoder failed; awaiting an independent picture");
                     worker_metrics.failed.store(true, Ordering::Release);
                     awaiting_keyframe = true;
-                    if hardware_active {
-                        hardware_active = false;
-                        tracing::warn!("performing one software decoder fallback");
-                        match runtime::Context::decoder(codec.decoder(), width, height, false) {
-                            Ok(replacement) => context = replacement,
-                            Err(error) => {
-                                tracing::warn!(%error, "software decoder fallback failed");
-                                break;
-                            }
-                        }
-                    }
                 }
             }
         }

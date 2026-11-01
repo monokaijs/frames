@@ -144,6 +144,7 @@ async fn every_advertised_codec_roundtrips_a_live_window_frame() {
 async fn one_capture_encodes_and_decodes_without_a_later_capture_or_eof() {
     for capability in codec::probe().await {
         let codec = capability.codec;
+        eprintln!("Single capture: {codec:?} with {:?}", capability.encoder);
         let (tx, rx) = tokio::sync::watch::channel(Some(RawFrame {
             media_generation: 0,
             #[cfg(windows)]
