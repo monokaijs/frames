@@ -1,5 +1,31 @@
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(frames_shared_input)");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        // Static SDL Objective-C code uses Clang's @available runtime. Rust's
+        // -nodefaultlibs link omits it, which surfaces when LTO retains Cocoa.
+        println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
+        let output = std::process::Command::new("xcrun")
+            .args(["clang", "-print-resource-dir"])
+            .output()
+            .expect("locate the selected Apple Clang runtime");
+        assert!(
+            output.status.success(),
+            "query Apple Clang resource directory"
+        );
+        let directory = std::path::PathBuf::from(
+            String::from_utf8(output.stdout)
+                .expect("Clang resource path is UTF-8")
+                .trim(),
+        )
+        .join("lib/darwin");
+        assert!(
+            directory.join("libclang_rt.osx.a").is_file(),
+            "missing macOS Clang runtime"
+        );
+        println!("cargo:rustc-link-search=native={}", directory.display());
+        println!("cargo:rustc-link-lib=static=clang_rt.osx");
+        return;
+    }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
         || std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc")
         || std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64")
