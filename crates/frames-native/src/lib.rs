@@ -65,7 +65,19 @@ pub enum NativeEncoderCommand {
 pub struct NativeEncodedCapture {
     pub packets: mpsc::Receiver<NativeEncodedFrame>,
     pub control: std::sync::mpsc::SyncSender<NativeEncoderCommand>,
+    pub delivery: std::sync::mpsc::SyncSender<NativeFrameDelivery>,
     pub guard: Box<dyn Capture>,
+}
+pub struct NativeFrameDelivery {
+    pub number: u64,
+    pub refresh: bool,
+}
+impl NativeEncodedCapture {
+    pub fn acknowledge(&self, number: u64, refresh: bool) -> anyhow::Result<()> {
+        self.delivery
+            .try_send(NativeFrameDelivery { number, refresh })
+            .map_err(|error| anyhow::anyhow!("native delivery acknowledgement failed: {error}"))
+    }
 }
 pub trait Desktop: Send + Sync {
     /// Local picker identity; never transmitted in the remote window graph.

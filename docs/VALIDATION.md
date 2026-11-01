@@ -11,13 +11,22 @@ cargo test -p frames-core --test audio_roundtrip --locked -- --nocapture
 python native/macos/Tests/SigningTests.py
 ```
 
-Codec/audio integration tests use the bundled shared libraries and run with the normal test suite. Prepare the media SDK before invoking Cargo directly. The release workflow also compiles Swift fixtures for geometry, modifier routing, binary media, blocked-media control delivery, session state, and remote header behavior. Update tests reject forged manifests, modified signatures, unsafe archives, and incompatible packages.
+Codec/audio integration tests use the bundled shared libraries and run with the normal test suite. Prepare the media SDK before invoking Cargo directly. The release workflow also compiles Swift fixtures for geometry, modifier routing, binary media, blocked-media control delivery, session state, remote header behavior, native compressed text quality, and source admission backpressure. Update tests reject forged manifests, modified signatures, unsafe archives, and incompatible packages.
 
 ## Physical-machine checks
 
 Windows and Apple-silicon Mac development builds have passed bidirectional LAN file transfers, pairing, native window capture/control, AppKit/Metal presentation, menu projection, content geometry, desktop/window switching, clipboard text/images, and interrupted transfer resumption. Mac privacy permissions persisted across rebuilds using the same Developer ID identity.
 
 The latency fixture and its limitations are recorded in [media and latency](LATENCY_REVIEW.md). Generated codec roundtrips and real QUIC tests cover software codecs and ordered input delivery independently of a large blocked clipboard message. These checks do not establish performance on other GPUs or networks.
+
+The quality regression check uses a generated dense-text source rather than flat
+colors. A 30-second Mac-to-Windows production session kept all 129 decoded frames
+at 1920×1080, with 24 passing edge-sharpness samples and a visually inspected
+decoded PNG. Bidirectional transfer checks also passed. This fixture has sparse
+capture updates and does not establish continuous 60 fps, display latency, or the
+full network envelope. Windows and Mac workspace tests and Clippy passed; local
+Windows tests used MinGW. One earlier sharpness sample failed during competing
+builds, so that workload is not covered by the passing isolated run.
 
 ## FEC/media release gates
 

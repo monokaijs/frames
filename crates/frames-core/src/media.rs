@@ -18,6 +18,17 @@ pub const AUDIO_WINDOW: WindowId = WindowId {
     generation: 1,
 };
 
+/// Ordinary references remain short-lived. A detailed text refresh can exceed
+/// 500 KiB; give its protected bytes time to cross the 30 Mbps reference link,
+/// with bounded jitter allowance. This is an expiry ceiling, never a playout wait.
+pub fn assembly_timeout(keyframe: bool, bytes: usize) -> Duration {
+    if !keyframe {
+        return Duration::from_millis(25);
+    }
+    let wire_us = (bytes.min(MAX_FRAME_BYTES) as u64 * 10 * 1_000_000).div_ceil(30_000_000);
+    Duration::from_micros((wire_us + 20_000).clamp(50_000, 200_000))
+}
+
 /// A small ownership-aware pool. A picture returns its storage only after the
 /// last capture/decoder/UI/render reference has gone away.
 #[derive(Clone, Default)]
@@ -421,6 +432,13 @@ impl Reassembler {
     pub fn next_deadline(&self) -> Option<Instant> {
         self.deadline
     }
+    pub fn has_keyframe(&self, window: WindowId, generation: u32) -> bool {
+        self.frames.values().any(|frame| {
+            frame.header.window == window
+                && frame.header.generation == generation
+                && frame.header.keyframe
+        })
+    }
     fn refresh_deadline(&mut self) {
         self.deadline = self
             .frames
@@ -526,13 +544,11 @@ impl Reassembler {
                 Partial {
                     header: h,
                     deadline: now
-                        + Duration::from_millis(if h.window == AUDIO_WINDOW {
-                            20
-                        } else if h.keyframe {
-                            50
+                        + if h.window == AUDIO_WINDOW {
+                            Duration::from_millis(20)
                         } else {
-                            25
-                        }),
+                            assembly_timeout(h.keyframe, h.length)
+                        },
                     blocks: (0..h.blocks).map(|_| None).collect(),
                     output: vec![0; h.length],
                     remaining: h.blocks,
@@ -790,6 +806,37 @@ mod tests {
         for p in packets {
             assert!(r.push(&p, at + Duration::from_millis(26)).is_none());
         }
+    }
+    #[test]
+    fn detailed_refresh_has_a_bounded_size_aware_expiry_and_completes_immediately() {
+        let mut f = frame(512 * 1024);
+        f.keyframe = true;
+        let packets = fragment_fec(&f, 1200, FecProfile { parity_per_32: 8 }, 0).unwrap();
+        let at = Instant::now();
+        let mut r = Reassembler::default();
+        assert!(r.push(&packets[0], at).is_none());
+        assert_eq!(
+            r.next_deadline(),
+            Some(at + assembly_timeout(true, f.bytes.len()))
+        );
+        assert!(r.has_keyframe(f.window, f.generation));
+        let later = at + Duration::from_millis(100);
+        assert_eq!(r.expire(later), 0);
+        let result = packets
+            .iter()
+            .skip(1)
+            .find_map(|p| r.push(p, later))
+            .unwrap();
+        assert_eq!(result.bytes, f.bytes);
+        assert!(!r.has_keyframe(f.window, f.generation));
+        assert_eq!(
+            assembly_timeout(false, MAX_FRAME_BYTES),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            assembly_timeout(true, MAX_FRAME_BYTES),
+            Duration::from_millis(200)
+        );
     }
     #[test]
     fn malformed_headers_and_metadata_conflicts_are_bounded() {

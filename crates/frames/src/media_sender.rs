@@ -45,6 +45,7 @@ struct Shared {
     bytes: AtomicU64,
     bulk_next: tokio::sync::Mutex<tokio::time::Instant>,
     loss_until: Mutex<Option<std::time::Instant>>,
+    pressure_until: Mutex<Option<std::time::Instant>>,
     timings: Mutex<SendTimings>,
 }
 #[derive(Default)]
@@ -52,6 +53,52 @@ struct SendTimings {
     fec: media::LatencyHistogram,
     admission: media::LatencyHistogram,
     queue_age: media::LatencyHistogram,
+}
+// The encoder controls the average picture rate. A refresh may be much larger
+// than one frame's allowance: retain bounded wire credit for those bursts,
+// while Quinn congestion control and the small transport queue pace the path.
+const WIRE_BURST_BYTES: usize = 1024 * 1024;
+struct WirePacer {
+    credit: f64,
+    updated: tokio::time::Instant,
+}
+impl WirePacer {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            credit: WIRE_BURST_BYTES as f64,
+            updated: now,
+        }
+    }
+    fn ready_at(
+        &mut self,
+        bytes: usize,
+        now: tokio::time::Instant,
+        bps: u32,
+    ) -> tokio::time::Instant {
+        self.credit = (self.credit
+            + now.saturating_duration_since(self.updated).as_secs_f64() * bps as f64 / 8.0)
+            .min(WIRE_BURST_BYTES as f64);
+        self.updated = now;
+        now + Duration::from_secs_f64(
+            ((bytes as f64 - self.credit).max(0.0) * 8.0 / bps.max(1) as f64).min(1.0),
+        )
+    }
+    fn spend(&mut self, bytes: usize) {
+        self.credit = (self.credit - bytes as f64).max(0.0);
+    }
+    fn refund(&mut self, bytes: usize) {
+        self.credit = (self.credit + bytes as f64).min(WIRE_BURST_BYTES as f64);
+    }
+}
+fn record_network_wait(shared: &Shared, duration: Duration) {
+    shared.queue_micros.store(
+        duration.as_micros().min(u32::MAX as u128) as u32,
+        Ordering::Relaxed,
+    );
+    if duration >= Duration::from_millis(10) {
+        *shared.pressure_until.lock().unwrap() =
+            Some(std::time::Instant::now() + Duration::from_millis(500));
+    }
 }
 #[derive(Clone, Copy)]
 struct StreamBudget {
@@ -192,6 +239,7 @@ impl MediaSender {
             late: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             loss_until: Mutex::new(None),
+            pressure_until: Mutex::new(None),
             timings: Mutex::default(),
             bulk_next: tokio::sync::Mutex::new(tokio::time::Instant::now()),
         });
@@ -295,6 +343,14 @@ impl MediaSender {
     pub fn queue_micros(&self) -> u32 {
         self.0.shared.queue_micros.load(Ordering::Relaxed)
     }
+    pub fn network_congested(&self) -> bool {
+        self.0
+            .shared
+            .pressure_until
+            .lock()
+            .unwrap()
+            .is_some_and(|until| until > std::time::Instant::now())
+    }
     pub fn late(&self) -> u64 {
         self.0.shared.late.load(Ordering::Relaxed)
     }
@@ -396,10 +452,11 @@ async fn run(connection: quinn::Connection, shared: Arc<Shared>) {
     let _liveness = SenderLiveness(connection.clone());
     #[cfg(windows)]
     let _timer = TimerResolution::new();
-    let mut next_send = tokio::time::Instant::now();
+    let mut pacer = WirePacer::new(tokio::time::Instant::now());
+    let mut blocked_since = None;
     let mut last_window = None;
     let mut consecutive = 0;
-    loop {
+    'dispatch: loop {
         let now = tokio::time::Instant::now();
         {
             let mut queue = shared.queue.lock().unwrap();
@@ -415,27 +472,44 @@ async fn run(connection: quinn::Connection, shared: Arc<Shared>) {
             }
         }
         if shared.queue.lock().unwrap().is_empty() {
+            blocked_since = None;
             shared.queue_micros.store(0, Ordering::Relaxed);
             tokio::select! { _ = connection.closed() => break, _ = shared.wake.notified() => {} }
             continue;
         }
-        if next_send > now {
-            tokio::select! { _ = connection.closed() => break, _ = tokio::time::sleep_until(next_send) => {}, _ = shared.wake.notified() => continue }
-        }
-        let bps = shared.wire_bps.load(Ordering::Relaxed) as usize;
-        let cap = (bps / 8 / 200).clamp(1200, media::DATAGRAM_SEND_BUFFER_BYTES);
-        let queued = media::DATAGRAM_SEND_BUFFER_BYTES
-            .saturating_sub(connection.datagram_send_buffer_space());
-        if queued + 1200 > cap {
-            shared.queue_micros.store(
-                (queued * 8_000_000 / bps.max(1)).min(u32::MAX as usize) as u32,
-                Ordering::Relaxed,
-            );
-            tokio::select! { _ = connection.closed() => break, _ = tokio::time::sleep(Duration::from_millis(1)) => {} }
-            continue;
-        }
+        let bps = shared.wire_bps.load(Ordering::Relaxed);
+        let path = connection.stats().path;
+        let cap = ((path.cwnd as f64 / path.rtt.as_secs_f64().max(0.001)) * 0.005) as usize;
+        let cap = cap.clamp(1200, media::DATAGRAM_SEND_BUFFER_BYTES);
         // At most four packets per wake; reselect after each packet so audio can preempt.
         for _ in 0..4 {
+            let len = {
+                let queue = shared.queue.lock().unwrap();
+                select_work(&queue, last_window, consecutive)
+                    .and_then(|i| queue[i].packets.front().map(|p| p.len()))
+            };
+            let Some(required) = len else {
+                break;
+            };
+            let now = tokio::time::Instant::now();
+            let admitted_at = pacer.ready_at(required, now, bps);
+            if admitted_at > now {
+                // Waiting for the user's average budget is not network
+                // congestion and must not trigger a quality-collapse loop.
+                blocked_since = None;
+                shared.queue_micros.store(0, Ordering::Relaxed);
+                tokio::select! {_=connection.closed()=>return,_=tokio::time::sleep_until(admitted_at)=>{},_=shared.wake.notified()=>{}}
+                continue 'dispatch;
+            }
+            let queued = media::DATAGRAM_SEND_BUFFER_BYTES
+                .saturating_sub(connection.datagram_send_buffer_space());
+            if queued + required > cap {
+                let since = *blocked_since.get_or_insert(now);
+                record_network_wait(&shared, now.saturating_duration_since(since));
+                tokio::select! {_=connection.closed()=>return,_=tokio::time::sleep(Duration::from_millis(1))=>{}}
+                continue 'dispatch;
+            }
+            blocked_since = None;
             let selected = {
                 let mut queue = shared.queue.lock().unwrap();
                 let index = select_work(&queue, last_window, consecutive);
@@ -450,9 +524,15 @@ async fn run(connection: quinn::Connection, shared: Arc<Shared>) {
                 break;
             };
             let len = packet.len();
+            pacer.spend(len);
+            let sending = tokio::time::Instant::now();
             let result =
                 tokio::time::timeout_at(deadline, connection.send_datagram_wait(packet)).await;
             let success = matches!(result, Ok(Ok(())));
+            record_network_wait(&shared, sending.elapsed());
+            if !success {
+                pacer.refund(len);
+            }
             if let Ok(Err(error)) = result {
                 if matches!(
                     error,
@@ -492,26 +572,15 @@ async fn run(connection: quinn::Connection, shared: Arc<Shared>) {
             if success {
                 shared.bytes.fetch_add(len as u64, Ordering::Relaxed);
             }
-            let retained = media::DATAGRAM_SEND_BUFFER_BYTES
-                .saturating_sub(connection.datagram_send_buffer_space());
-            let queue_age = (retained * 8_000_000 / bps.max(1)).min(u32::MAX as usize) as u32;
-            shared.queue_micros.store(queue_age, Ordering::Relaxed);
+            let queue_age = shared.queue_micros.load(Ordering::Relaxed);
             shared
                 .timings
                 .lock()
                 .unwrap()
                 .queue_age
                 .record(queue_age as u64);
-            next_send = next_send.max(tokio::time::Instant::now() - Duration::from_millis(5))
-                + Duration::from_secs_f64(len as f64 * 8.0 / bps.max(1) as f64);
-            if media::DATAGRAM_SEND_BUFFER_BYTES
-                .saturating_sub(connection.datagram_send_buffer_space())
-                + 1200
-                > cap
-            {
-                break;
-            }
         }
+        tokio::task::yield_now().await;
     }
 }
 #[cfg(windows)]
@@ -543,6 +612,166 @@ impl Drop for TimerResolution {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wire_credit_allows_refresh_bursts_but_bounds_the_average_budget() {
+        let now = tokio::time::Instant::now();
+        let mut pacer = WirePacer::new(now);
+        assert_eq!(pacer.ready_at(WIRE_BURST_BYTES, now, 8_000_000), now);
+        pacer.spend(WIRE_BURST_BYTES);
+        assert_eq!(
+            pacer.ready_at(100_000, now, 8_000_000),
+            now + Duration::from_millis(100)
+        );
+        let later = now + Duration::from_millis(250);
+        assert_eq!(pacer.ready_at(250_000, later, 8_000_000), later);
+        pacer.spend(250_000);
+        assert_eq!(
+            pacer.ready_at(1_000, later, 8_000_000),
+            later + Duration::from_millis(1)
+        );
+    }
+    #[tokio::test]
+    async fn fast_quic_link_delivers_a_large_refresh_without_self_congestion() {
+        use frames_core::{
+            transport,
+            trust::{Identity, fingerprint},
+        };
+        fn identity() -> Identity {
+            let rcgen::CertifiedKey { cert, signing_key } =
+                rcgen::generate_simple_self_signed(vec!["frames.local".into()]).unwrap();
+            let certificate = cert.der().clone();
+            let device_id = fingerprint(&certificate);
+            Identity {
+                certificate,
+                key: rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der())
+                    .into(),
+                device_id,
+            }
+        }
+        let server = transport::server(&identity(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = transport::client(&identity()).unwrap();
+        let connecting = client
+            .connect(server.local_addr().unwrap(), "frames.local")
+            .unwrap();
+        let (viewer, host) =
+            tokio::join!(connecting, async { server.accept().await.unwrap().await });
+        let viewer = viewer.unwrap();
+        let viewer_alive = viewer.clone();
+        let host = host.unwrap();
+        let window = WindowId {
+            id: 1,
+            generation: 1,
+        };
+        let sender = MediaSender::new(host.clone());
+        let _stream = sender.register(window);
+        sender.set_budget(window, 12_000_000, 4, true);
+        // A detailed desktop refresh is far larger than a solid-color codec
+        // fixture. On a fast link it must burst within the admission deadline,
+        // rather than being serialized at the average encoder bitrate.
+        let real_text = std::env::var_os("FRAMES_SCREEN_TEXT_PACKET");
+        let payload = real_text.as_ref().map_or_else(
+            || vec![0x6d; 512 * 1024],
+            |path| std::fs::read(path).unwrap(),
+        );
+        let expected = payload.clone();
+        let receive = tokio::spawn(async move {
+            let mut reassembly = media::Reassembler::default();
+            loop {
+                let datagram = viewer.read_datagram().await.unwrap();
+                if let Some(frame) = reassembly.push(&datagram, std::time::Instant::now()) {
+                    assert_eq!(frame.bytes, expected);
+                    return frame;
+                }
+            }
+        });
+        let frame = EncodedFrame {
+            window,
+            generation: 1,
+            number: 0,
+            keyframe: true,
+            bytes: payload,
+            captured_us: 0,
+            encoded_us: 0,
+        };
+        let started = std::time::Instant::now();
+        let admitted = sender
+            .send(
+                frame,
+                host.max_datagram_size().unwrap(),
+                FecProfile { parity_per_32: 8 },
+                0,
+                tokio::time::Instant::now() + Duration::from_millis(250),
+                true,
+            )
+            .await
+            .unwrap();
+        eprintln!(
+            "refresh admitted={admitted} elapsed={:?} bytes={} queue_us={} buffer_space={} path={:?}",
+            started.elapsed(),
+            sender.bytes(),
+            sender.queue_micros(),
+            host.datagram_send_buffer_space(),
+            host.stats().path
+        );
+        assert!(
+            admitted,
+            "a local encoder-rate pacer expired a refresh despite a fast QUIC path"
+        );
+        let received = tokio::time::timeout(Duration::from_secs(2), receive)
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some(path) = real_text {
+            let mut decoder =
+                frames_core::codec::decode_software(frames_core::codec::Codec::H264, 1920, 1080)
+                    .await
+                    .unwrap();
+            let now = std::time::Instant::now();
+            decoder
+                .input
+                .send(frames_core::codec::EncodedPacket {
+                    bytes: received.bytes,
+                    generation: 0,
+                    number: 0,
+                    keyframe: true,
+                    captured_at: now,
+                    encoded_at: now,
+                    surface_encoded: false,
+                    encode_micros: 0,
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), decoder.output.changed())
+                .await
+                .unwrap()
+                .unwrap();
+            let picture = decoder.output.borrow().clone().unwrap();
+            assert_eq!((picture.width, picture.height), (1920, 1080));
+            let source = std::path::Path::new(&path).with_file_name("screen-text-h264-source.png");
+            let source = image::open(source).unwrap().to_rgba8();
+            let mut total = 0u64;
+            let mut edges = 0u64;
+            for y in 1..1079 {
+                for x in 1..1919 {
+                    let c = source.get_pixel(x, y)[0] as i32;
+                    if (c - source.get_pixel(x - 1, y)[0] as i32).abs() > 40
+                        || (c - source.get_pixel(x, y - 1)[0] as i32).abs() > 40
+                    {
+                        total += (c - picture.bgra[(y as usize * 1920 + x as usize) * 4] as i32)
+                            .unsigned_abs() as u64;
+                        edges += 1;
+                    }
+                }
+            }
+            let error = total as f64 / edges as f64;
+            assert!(error < 35.0, "text edge error after transport: {error}");
+            eprintln!(
+                "PASS: Mac text -> FEC -> QUIC -> Windows decode: 1920x1080 edge_error={error}"
+            );
+            decoder.shutdown().await;
+        }
+        viewer_alive.close(0u32.into(), b"fixture complete");
+    }
     #[test]
     fn custom_limit_is_shared_with_focus_weight_and_reclaims_small_demands() {
         let focused = WindowId {

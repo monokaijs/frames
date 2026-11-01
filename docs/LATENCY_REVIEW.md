@@ -27,11 +27,14 @@ are included in admission accounting. The frame limit is 8 MiB. Retired frame
 identities reject duplicates and late resurrection. Reordered originals arriving
 after a successful repair still update pre-FEC loss counters until the deadline.
 
-Ordinary pictures expire 25 ms after first arrival; keyframes get 50 ms. Completion
-runs immediately, and a deadline timer replaces coarse polling. Encoded references
+Ordinary pictures expire 25 ms after first arrival. Keyframes get a size-aware
+50–200 ms ceiling, allowing a detailed desktop refresh to arrive on the 30 Mbps
+reference path. Completion runs immediately; this ceiling adds no playout delay.
+A deadline timer replaces coarse polling. Encoded references
 are submitted in order. A missing reference discards its dependent chain and
 requests a fresh independently decodable picture within the current generation.
-Requests coalesce and retry after `clamp(2 * RTT, 50 ms, 250 ms)`. The encoder wakes
+Requests coalesce and retry after `clamp(2 * RTT, 50 ms, 250 ms)`, while suppressing
+redundant requests during active keyframe assembly. The encoder wakes
 on recovery even without a changed desktop. Sender status every 50 ms reveals a
 completely lost final picture. Configuration/backend changes create generations;
 ordinary packet loss does not repeat the readiness handshake.
@@ -41,8 +44,12 @@ ordinary packet loss does not repeat the readiness handshake.
 One sender serves video, audio, and parity for each connection. Audio preempts
 video; video uses deadlines with a small focused-window preference. Admission is
 bounded and non-evicting. The Quinn send buffer is 16 KiB, with an application
-ceiling targeting 5 ms of queued media. A bounded pacing credit lets a new picture
-start promptly without accumulating an unbounded burst. Successful admission is
+ceiling targeting 5 ms of queued media, estimated from the congestion window and
+RTT. A token bucket retains at most 1 MiB of wire credit for refresh bursts while
+bounding the average connection budget. Quinn congestion control paces the path;
+dispatch yields after four datagrams so audio and control can run. Queue pressure
+measures actual transport admission waits, not time spent enforcing the user's
+average bandwidth setting. Successful admission is
 not a delivery acknowledgement. MTU changes retire the affected picture and
 request a fresh keyframe at the new size.
 
@@ -69,7 +76,9 @@ limit; congestion adaptation remains active. Changes apply to new connections.
 In automatic mode, larger physical captures scale the clean-link budget by source pixel count, up
 to 64 Mbps (4K starts at 48 Mbps). Source resizing preserves existing congestion
 reductions. Isolated late pictures and short encoder spikes do not reduce quality;
-pressure must persist for 300 ms before bitrate drops.
+pressure must persist for 300 ms before bitrate drops. RTT variation alone and
+application budget waits do not imply network congestion. Recoverable packet
+loss may increase FEC without permanently preventing quality restoration.
 Persistent overload reduces bitrate by 20%; stable links recover 5% per second
 after three seconds. Protection moves from 12.5% toward 6.25% after five clean
 seconds, or toward 25% for loss above 2% or failed reconstruction without
@@ -97,7 +106,11 @@ codecs. Encoded video and audio have separate bounded sockets from control.
 Encoder timestamps use a stable media clock across focus/frame-rate changes.
 A successful VideoToolbox callback without a sample is a picture drop, not a
 backend failure; native retries are paced and bounded by 500 ms. Only actual
-encoded pictures advance frame identity. A meaningful bitrate increase forces
+encoded pictures advance frame identity. A separate bounded source acknowledgement
+lane holds the next encode until Rust admits or retires the current access unit.
+Raw captures coalesce while a large refresh sends; encoded references stay in
+order. Obsolete pictures captured before decoder readiness are retired with a
+fresh keyframe request. A meaningful bitrate increase forces
 a fresh independent picture even on a stationary desktop.
 Each native decoder has an ordered bounded worker, and decode/presentation
 acknowledgements carry generation and frame number. CAMetalDisplayLink selects
@@ -141,7 +154,17 @@ eight-erasure reconstruction.
 
 `NativeVideoTests.swift` exercises actual H.264/HEVC hardware encode/decode,
 changed-pixel verification, idle keyframes, scaling, odd dimensions, 1080p,
-1440p, and 4K. `cross_transfer_smoke.py --native-ui --motion --hold-ui 600` runs a
+1440p, and 4K. Dense 1920×1080 text fixtures check decoded text edges and source
+acknowledgement backpressure. Set `FRAMES_SCREEN_TEXT_OUTPUT` to an existing
+directory when running the native test to export synthetic PNGs and access units.
+`FRAMES_SCREEN_TEXT_PACKET` enables the real Mac access-unit branch of
+`media_sender::tests::fast_quic_link_delivers_a_large_refresh_without_self_congestion`.
+The `text_quality_probe` example connects through the production session and
+checks full source resolution and text edges for 30 seconds; point
+`FRAMES_SCREEN_TEXT_SOURCE` at the generated source PNG and display it with
+`FRAMES_QA_TEXT_SOURCE` in `QAWindowFixture.app`. It saves only synthetic fixture
+pixels and performs no remote input.
+`cross_transfer_smoke.py --native-ui --motion --hold-ui 600` runs a
 real 1080p motion fixture; `--hold-ui 7200` supports a two-hour run.
 `media_network_fixture.py` supplies a bounded seeded UDP proxy with loss, bursts,
 jitter, capacity, and outage controls. Use a Mac loopback proxy with
@@ -162,12 +185,20 @@ Earlier software/CPU measurements remain in [codec-latency.json](codec-latency.j
 | RTX 3080 Ti, generated 1080p | 41/41 GPU-encoded and GPU-decoded surfaces; warm roundtrip p95 13.151 ms | Includes verification readback; excludes capture/network/presentation |
 | RTX 3080 Ti, generated 1440p / 4K | 41/41 GPU-encoded and GPU-decoded surfaces each; warm roundtrip p95 18.365 / 41.125 ms | Same synthetic scope; functional scalability, no sustained-rate claim |
 | Mac hardware H.264/HEVC | Changed pixels, idle keyframes, 75% scale, odd sizes, 1080p/1440p/4K passed | Functional; 1440p/4K fixture uses 30 fps |
+| Mac hardware dense 1080p text | H.264 / HEVC refresh 547,940 / 550,380 bytes; text-edge mean error 4.55 / 4.02 on a 0–255 scale | Synthetic source, native decode; functional readability |
+| Mac dense-text access unit through FEC, loopback QUIC, Windows software decode | Exact compressed bytes; 1920×1080; text-edge mean error 4.51; debug send admission about 80.5 ms | Real hardware-generated access unit; no capture or display |
+| Mac to Windows production text session, 30 seconds | 129 decoded frames, all 1920×1080; 24 sharpness samples passed (edge error 9.54–28.21) | Sparse synthetic capture updates, Auto bandwidth, development builds, no competing builds; not a 60 fps or latency gate |
 | Mac to Windows generated 1080p60 fixture | 20 click-to-decoded-pixel samples: p50 54 ms, p95 81 ms; hide/restore 273 ms | Single client clock; excludes native presentation and panel |
 | Windows to Mac ten-minute live motion run | Connected/rendering throughout; first long stream capture-to-presentation p50 71 ms, p95 86 ms; 105 intervals over 50 ms among 23,129 intervals | Development builds, startup included, other window activity; source pacing subsequently corrected |
 
 The live run exposed and fixed a CAMetalDisplayLink presentation exception. The
 4K fixture exposed transient VideoToolbox picture drops; retries are now bounded
 and paced. These fixes are covered by the native fixtures and live smoke checks.
+The text session exposed refresh admission at the average encoder bitrate and
+RTT-only congestion decisions collapsing the stream to 50% resolution near
+1 Mbps. Refresh wire credit, size-aware expiry, source admission acknowledgements,
+and corrected congestion signals address that loop. An earlier text run during
+concurrent builds failed one sharpness sample; the isolated 30-second run passed.
 The results above do **not** establish the clean-LAN <=65 ms input-to-presentation
 gate, the Wi-Fi <=85 ms gate, the complete hardware matrix, or a two-hour soak.
 No display-level latency claim is made. Physical validation and remaining release

@@ -164,6 +164,11 @@ jobs:
           "$RUNNER_TEMP/session-tests"
           swiftc native/macos/Sources/Wire.swift native/macos/Tests/BridgeOutputTests.swift -framework AppKit -framework ScreenCaptureKit -framework ServiceManagement -o "$RUNNER_TEMP/bridge-tests"
           "$RUNNER_TEMP/bridge-tests"
+      - name: Native compressed video, text quality, and source backpressure
+        run: |
+          set -euo pipefail
+          swiftc -O -swift-version 5 native/macos/Sources/Wire.swift native/macos/Sources/ClientMedia.swift native/macos/Sources/NativeVideo.swift native/macos/Tests/NativeVideoTests.swift -o "$RUNNER_TEMP/native-video-tests"
+          "$RUNNER_TEMP/native-video-tests"
       - name: Import Developer ID certificate
         env:
           CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}

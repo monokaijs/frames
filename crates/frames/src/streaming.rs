@@ -165,6 +165,62 @@ mod ready_tests {
         }
     }
     #[tokio::test]
+    async fn a_large_recovery_picture_is_not_re_requested_or_discarded_at_fifty_ms() {
+        let (out, mut messages) = crate::session::test_outbound();
+        let (ui, _) = frames_native::client_channel(4);
+        let window = WindowId {
+            id: 912,
+            generation: 1,
+        };
+        let mut client = ClientMedia::default();
+        client
+            .start_prepared(
+                fixture_config(window, 7),
+                ui,
+                &out,
+                Some(codec::Decoder::external(|_| Ok(()))),
+            )
+            .await
+            .unwrap();
+        while messages.try_recv().is_ok() {}
+        client.clock.observe(0, 60_000, 60_000, 0);
+        let frame = EncodedFrame {
+            window,
+            generation: 7,
+            number: 0,
+            keyframe: true,
+            bytes: vec![1; 512 * 1024],
+            captured_us: 0,
+            encoded_us: media::monotonic_micros(),
+        };
+        let packets =
+            media::fragment_fec(&frame, 1200, media::FecProfile { parity_per_32: 8 }, 0).unwrap();
+        client.streams.get_mut(&window).unwrap().recovering = true;
+        client.packet(&packets[0], &out).await.unwrap();
+        client.status(window, 7, 0);
+        client
+            .streams
+            .get_mut(&window)
+            .unwrap()
+            .latest_host
+            .as_mut()
+            .unwrap()
+            .1 -= Duration::from_millis(61);
+        client.expire(&out).await.unwrap();
+        assert!(
+            messages.try_recv().is_err(),
+            "a refresh already arriving must not cause a recovery storm"
+        );
+        for packet in &packets[1..] {
+            client.packet(packet, &out).await.unwrap();
+        }
+        let stream = &client.streams[&window];
+        assert_eq!(stream.next, 1);
+        assert!(!stream.recovering);
+        assert_eq!(stream.late, 0);
+        assert!(messages.try_recv().is_err());
+    }
+    #[tokio::test]
     async fn completely_lost_idle_frame_is_recovered_and_requests_are_coalesced() {
         let (out, mut messages) = crate::session::test_outbound();
         let (ui, _) = frames_native::client_channel(4);
@@ -612,7 +668,11 @@ pub fn start_host(
                 let mut capture_encode = media::LatencyHistogram::default();
                 let mut last_capture = None;
                 let mut status_ticks = 0;
-                let mut first_packet = Some(first_packet);
+                let mut first_packet = if first_packet.encoded_at.elapsed()>Duration::from_millis(50) {
+                    // Codec initialization/readiness can outlive the picture.
+                    // Do not spend the refresh burst on a stale reference.
+                    encoder.request_keyframe();None
+                } else {Some(first_packet)};
                 let mut first_output = true;
                 let mut number = 0; let mut latest = None; let mut awaiting_keyframe = true;
                 let mut status = tokio::time::interval(Duration::from_millis(50)); status.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -648,7 +708,7 @@ pub fn start_host(
                             if awaiting_keyframe && !packet.keyframe { continue; }
                             awaiting_keyframe = false;
                             let captured_us = media::timestamp_micros(packet.captured_at);
-                            let deadline = (if first_output { tokio::time::Instant::now() } else { tokio::time::Instant::from_std(packet.encoded_at) }) + Duration::from_millis(if packet.keyframe { 50 } else { 25 }); first_output = false;
+                            let deadline = (if first_output { tokio::time::Instant::now() } else { tokio::time::Instant::from_std(packet.encoded_at) }) + media::assembly_timeout(packet.keyframe,packet.bytes.len()); first_output = false;
                             let frame = EncodedFrame { encoded_us: media::timestamp_micros(packet.encoded_at), captured_us: 0, window, generation, number, keyframe: packet.keyframe, bytes: packet.bytes };
                             latest = Some(number); number += 1;
                             let fec = if std::env::var("FRAMES_FEC").as_deref() == Ok("0") { media::FecProfile { parity_per_32: 0 } }
@@ -656,8 +716,10 @@ pub fn start_host(
                             let mtu = connection.max_datagram_size().ok_or_else(|| anyhow::anyhow!("peer disabled datagrams"))?;
                             if !sender.send(frame, mtu, fec, captured_us, deadline, settings.focused.load(Ordering::Relaxed)).await? {
                                 awaiting_keyframe = true; encoder.request_keyframe();
-                                let q = settings.controller.lock().unwrap().congestion(std::time::Instant::now());
-                                settings.bitrate.store(q.bitrate, Ordering::Relaxed); settings.scale.store(q.scale_percent, Ordering::Relaxed); task_rate.store(q.fps, Ordering::Relaxed);
+                                if sender.network_congested() {
+                                    let q = settings.controller.lock().unwrap().congestion(std::time::Instant::now());
+                                    settings.bitrate.store(q.bitrate, Ordering::Relaxed); settings.scale.store(q.scale_percent, Ordering::Relaxed); task_rate.store(q.fps, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
@@ -894,7 +956,7 @@ impl ClientMedia {
             .await?;
             return Ok(());
         }
-        tracing::info!(window=?config.window,generation=config.generation,encoder=%config.encoder,"starting video decoder");
+        tracing::info!(window=?config.window,generation=config.generation,encoder=%config.encoder,width=config.width,height=config.height,source_width=config.source_width,source_height=config.source_height,target_bitrate=config.target_bitrate,"starting video decoder");
         let decoder = if let Some(decoder) = prepared {
             decoder
         } else {
@@ -998,16 +1060,19 @@ impl ClientMedia {
             + self.audio.as_ref().map_or(0, |a| a.jitter.retained_bytes());
         self.reassembly.set_external_bytes(pending_bytes);
         let frame = self.reassembly.push(packet, std::time::Instant::now());
-        self.expire(out).await?;
         let Some(frame) = frame else {
+            self.expire(out).await?;
             return Ok(());
         };
         let encoded_age = self.clock.age(frame.encoded_us, media::monotonic_micros());
-        let age_limit = Duration::from_millis(if frame.window == media::AUDIO_WINDOW {
-            20
+        let age_limit = if frame.window == media::AUDIO_WINDOW {
+            Duration::from_millis(20)
+        } else if frame.keyframe {
+            media::assembly_timeout(true, frame.bytes.len()) + Duration::from_millis(20)
         } else {
-            50
-        }) + Duration::from_micros(self.clock.uncertainty_us as u64);
+            Duration::from_millis(50)
+        };
+        let age_limit = age_limit + Duration::from_micros(self.clock.uncertainty_us as u64);
         if encoded_age.is_some_and(|age| age > age_limit) {
             if frame.window == media::AUDIO_WINDOW {
                 if let Some(audio) = &mut self.audio {
@@ -1136,7 +1201,7 @@ impl ClientMedia {
             stream.queued_at.push_back(std::time::Instant::now());
             next = stream.pending.remove(&stream.next).map(|(_, frame)| frame);
         }
-        Ok(())
+        self.expire(out).await
     }
     pub fn status(&mut self, window: WindowId, generation: u32, number: u64) {
         if let Some(s) = self.streams.get_mut(&window)
@@ -1284,12 +1349,14 @@ impl ClientMedia {
                 || s.latest_host.is_some_and(|(number, at)| {
                     number >= s.next
                         && now.saturating_duration_since(at) >= Duration::from_millis(50)
+                        && !self.reassembly.has_keyframe(window, s.generation)
                 })
             {
                 s.recovering = true;
                 s.pending.clear();
             }
             if s.recovering
+                && !self.reassembly.has_keyframe(window, s.generation)
                 && s.recovery_sent
                     .is_none_or(|at| now.saturating_duration_since(at) >= retry)
             {
@@ -1533,7 +1600,13 @@ async fn run_native_host(
             ready.wait_for(|g| *g == generation),
         )
         .await??;
-        let mut pending = Some(first);
+        let mut pending = if first.packet.encoded_at.elapsed() > Duration::from_millis(50) {
+            while capture.packets.try_recv().is_ok() {}
+            capture.acknowledge(first.packet.number, true)?;
+            None
+        } else {
+            Some(first)
+        };
         let mut number = 0;
         let mut native_next = None;
         let mut awaiting_keyframe = true;
@@ -1557,16 +1630,21 @@ async fn run_native_host(
                     if (frame.width, frame.height) != size { break frame; }
                     if native_next.is_some_and(|next| next != frame.packet.number) { awaiting_keyframe = true; let _ = capture.control.try_send(frames_native::NativeEncoderCommand::Keyframe); }
                     native_next = Some(frame.packet.number + 1);
-                    if awaiting_keyframe && !frame.packet.keyframe { continue; } awaiting_keyframe = false;
+                    if awaiting_keyframe && !frame.packet.keyframe { capture.acknowledge(frame.packet.number,true)?;continue; } awaiting_keyframe = false;
                     let profile = media::FecProfile { parity_per_32: if std::env::var("FRAMES_FEC").as_deref() == Ok("0") { 0 } else if frame.packet.keyframe { 8 } else { tuning.fec.load(Ordering::Relaxed) as u8 } };
                     let captured_us = media::timestamp_micros(frame.packet.captured_at);
-                    let deadline = tokio::time::Instant::now() + Duration::from_millis(if frame.packet.keyframe { 50 } else { 25 });
+                    let deadline = tokio::time::Instant::now() + media::assembly_timeout(frame.packet.keyframe,frame.packet.bytes.len());
+                    let native_number=frame.packet.number;
                     let encoded = EncodedFrame { encoded_us: media::timestamp_micros(frame.packet.encoded_at), captured_us: 0, window, generation, number, keyframe: frame.packet.keyframe, bytes: frame.packet.bytes };
                     latest = Some(number); number += 1;
-                    if !sender.send(encoded, connection.max_datagram_size().unwrap_or(1200), profile, captured_us, deadline, tuning.focused.load(Ordering::Relaxed)).await? {
-                        awaiting_keyframe = true; let _ = capture.control.try_send(frames_native::NativeEncoderCommand::Keyframe);
-                        let q = tuning.controller.lock().unwrap().congestion(std::time::Instant::now());
-                        tuning.bitrate.store(q.bitrate, Ordering::Relaxed); tuning.scale.store(q.scale_percent, Ordering::Relaxed); rate.store(q.fps, Ordering::Relaxed);
+                    let admitted=sender.send(encoded, connection.max_datagram_size().unwrap_or(1200), profile, captured_us, deadline, tuning.focused.load(Ordering::Relaxed)).await?;
+                    capture.acknowledge(native_number,!admitted)?;
+                    if !admitted {
+                        awaiting_keyframe = true;
+                        if sender.network_congested() {
+                            let q = tuning.controller.lock().unwrap().congestion(std::time::Instant::now());
+                            tuning.bitrate.store(q.bitrate, Ordering::Relaxed); tuning.scale.store(q.scale_percent, Ordering::Relaxed); rate.store(q.fps, Ordering::Relaxed);
+                        }
                     }
                 }
             }

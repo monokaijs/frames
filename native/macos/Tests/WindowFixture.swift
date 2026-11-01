@@ -21,6 +21,16 @@ import AppKit
         source.title="Frames QA source";source.backgroundColor=NSColor(srgbRed:0.85,green:0.05,blue:0.05,alpha:1);source.delegate=self;source.isReleasedWhenClosed=false
         input.delegate=self;source.contentView?.addSubview(input)
         let click=NSButton(frame:NSRect(x:20,y:large ? 200:80,width:160,height:32));click.title="Test remote click";click.target=self;click.action=#selector(clicked);source.contentView?.addSubview(click)
+        if let path=ProcessInfo.processInfo.environment["FRAMES_QA_TEXT_SOURCE"],let image=NSImage(contentsOfFile:path),let representation=image.representations.first {
+            let scale=NSScreen.main?.backingScaleFactor ?? 1
+            let size=NSSize(width:CGFloat(representation.pixelsWide)/scale,height:CGFloat(representation.pixelsHigh)/scale)
+            source.setContentSize(size)
+            let view=NSImageView(frame:NSRect(origin:.zero,size:size));view.image=image;view.imageScaling = .scaleAxesIndependently
+            source.contentView=view
+            let marker=NSView(frame:NSRect(x:2,y:2,width:8,height:8));marker.wantsLayer=true;view.addSubview(marker)
+            var bright=false
+            Timer.scheduledTimer(withTimeInterval:0.1,repeats:true){_ in MainActor.assumeIsolated {bright.toggle();marker.layer?.backgroundColor=(bright ? NSColor.white:NSColor.black).cgColor}}
+        }
         let bar=NSMenu();bar.autoenablesItems=false
         let appItem=NSMenuItem(title:"QA",action:nil,keyEquivalent:"");let appMenu=NSMenu();appMenu.addItem(withTitle:"Quit fixture",action:#selector(quit),keyEquivalent:"");appItem.submenu=appMenu;bar.addItem(appItem)
         let file=NSMenuItem(title:"File",action:nil,keyEquivalent:"");let menu=NSMenu();menu.autoenablesItems=false

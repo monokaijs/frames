@@ -1,6 +1,9 @@
 ﻿import Foundation
 import CoreVideo
 import Darwin
+import CoreGraphics
+import CoreText
+import ImageIO
 
 @main struct NativeVideoTests {
     static func exact(_ fd:Int32,_ length:Int)throws->Data{
@@ -32,6 +35,51 @@ import Darwin
             CVPixelBufferUnlockBaseAddress(buffer,[]);return buffer
         }
         for (index,name) in ["h264","hevc"].enumerated(){
+            // Real desktop text has a much larger refresh than flat-color
+            // frames. Exercise its pixels and expose its actual transport size.
+            let text=try makeBuffer(1920,1080,false)
+            CVPixelBufferLockBaseAddress(text,[])
+            let textContext=CGContext(data:CVPixelBufferGetBaseAddress(text),width:1920,height:1080,bitsPerComponent:8,bytesPerRow:CVPixelBufferGetBytesPerRow(text),space:CGColorSpaceCreateDeviceRGB(),bitmapInfo:CGImageAlphaInfo.premultipliedFirst.rawValue|CGBitmapInfo.byteOrder32Little.rawValue)!
+            textContext.setFillColor(CGColor(gray:0.08,alpha:1));textContext.fill(CGRect(x:0,y:0,width:1920,height:1080))
+            let font=CTFontCreateWithName("Menlo" as CFString,13,nil)
+            for row in 0..<64 {
+                let line=NSAttributedString(string:"\(row): let frame = capture.latest(); // Frames screen-content quality 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz " + String(repeating:"[window 1920x1080] ",count:5),attributes:[NSAttributedString.Key(kCTFontAttributeName as String):font,NSAttributedString.Key(kCTForegroundColorAttributeName as String):CGColor(gray:0.92,alpha:1)])
+                textContext.textPosition=CGPoint(x:12,y:1060-row*16);CTLineDraw(CTLineCreateWithAttributedString(line),textContext)
+            }
+            CVPixelBufferUnlockBaseAddress(text,[])
+            let textEncoder=try NativeVideoEncoder(handle:42,codec:name,fps:60)
+            textEncoder.submit(text,region:CGRect(x:0,y:0,width:1920,height:1080))
+            let textFrame=try packet(pipe.fileHandleForReading.fileDescriptor,kind:name=="hevc" ? 3:2,generation:99)
+            let textInbox=ClientVideoInbox{_ in},textDecoder=NativeVideoDecoders()
+            textDecoder.decode(textFrame,into:textInbox)
+            var textDecoded=textInbox.take();let textDeadline=Date().addingTimeInterval(5)
+            while textDecoded.isEmpty && Date()<textDeadline {Thread.sleep(forTimeInterval:0.001);textDecoded=textInbox.take()}
+            precondition(textDecoded.count==1 && textDecoded[0].pixelBuffer != nil)
+            let decodedText=textDecoded[0].pixelBuffer!
+            CVPixelBufferLockBaseAddress(text,.readOnly);CVPixelBufferLockBaseAddress(decodedText,.readOnly)
+            let original=CVPixelBufferGetBaseAddress(text)!.assumingMemoryBound(to:UInt8.self),output=CVPixelBufferGetBaseAddress(decodedText)!.assumingMemoryBound(to:UInt8.self)
+            let sourceStride=CVPixelBufferGetBytesPerRow(text),decodedStride=CVPixelBufferGetBytesPerRow(decodedText)
+            var error=0.0,edges=0
+            for y in 1..<1079 {for x in 1..<1919 {
+                let i=y*sourceStride+x*4
+                if abs(Int(original[i])-Int(original[i-4]))>40 || abs(Int(original[i])-Int(original[i-sourceStride]))>40 {
+                    error+=Double(abs(Int(original[i])-Int(output[y*decodedStride+x*4])));edges+=1
+                }
+            }}
+            let edgeError=error/Double(max(1,edges))
+            precondition(textFrame.width==1920 && textFrame.height==1080 && edgeError<35,"native-resolution text was blurred: edge error \(edgeError)")
+            if let path=ProcessInfo.processInfo.environment["FRAMES_SCREEN_TEXT_OUTPUT"] {
+                try FileManager.default.createDirectory(atPath:path,withIntermediateDirectories:true)
+                try textFrame.bytes.write(to:URL(fileURLWithPath:path+"/screen-text-\(name).bin"))
+                for (label,pixel) in [("source",text),("decoded",decodedText)] {
+                    let context=CGContext(data:CVPixelBufferGetBaseAddress(pixel),width:1920,height:1080,bitsPerComponent:8,bytesPerRow:CVPixelBufferGetBytesPerRow(pixel),space:CGColorSpaceCreateDeviceRGB(),bitmapInfo:CGImageAlphaInfo.premultipliedFirst.rawValue|CGBitmapInfo.byteOrder32Little.rawValue)!
+                    let destination=CGImageDestinationCreateWithURL(URL(fileURLWithPath:path+"/screen-text-\(name)-\(label).png") as CFURL,"public.png" as CFString,1,nil)!
+                    CGImageDestinationAddImage(destination,context.makeImage()!,nil);precondition(CGImageDestinationFinalize(destination))
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(decodedText,.readOnly);CVPixelBufferUnlockBaseAddress(text,.readOnly)
+            print("SCREEN TEXT: \(name) 1920x1080 keyframe=\(textFrame.bytes.count) bytes edge_error=\(edgeError)")
+            textEncoder.stop()
             for (width,height) in [(640,360),(1920,1080),(2560,1440),(3840,2160),(129,97)] {
                 let encoder=try NativeVideoEncoder(handle:42,codec:name,fps:width>=2560 ? 30:60)
                 encoder.submit(try makeBuffer(width,height,false),region:CGRect(x:0,y:0,width:width,height:height))
@@ -74,6 +122,25 @@ import Darwin
             let refined=try packet(pipe.fileHandleForReading.fileDescriptor,kind:name=="hevc" ? 3:2,generation:9)
             precondition(refined.bytes[0]==1 && refined.width==640 && refined.height==360,"idle quality recovery needs a fresh independent picture")
             focusEncoder.stop()
+            // A slow media admission must coalesce raw captures, not discard
+            // encoded reference pictures in the helper's bounded IPC queue.
+            let acknowledged=try NativeVideoEncoder(handle:42,codec:name,fps:60,deliveryToken:42)
+            acknowledged.submit(try makeBuffer(640,360,false),region:CGRect(x:0,y:0,width:640,height:360))
+            let initial=try packet(pipe.fileHandleForReading.fileDescriptor,kind:name=="hevc" ? 3:2,generation:10)
+            let green=try makeBuffer(640,360,true)
+            for _ in 0..<100 {acknowledged.submit(green,region:CGRect(x:0,y:0,width:640,height:360))}
+            acknowledged.delivered(number:initial.number,refresh:false,token:99)
+            var waiting=pollfd(fd:pipe.fileHandleForReading.fileDescriptor,events:Int16(POLLIN),revents:0)
+            precondition(poll(&waiting,1,20)==0,"raw captures escaped delivery backpressure")
+            acknowledged.delivered(number:initial.number,refresh:false,token:42)
+            let latest=try packet(pipe.fileHandleForReading.fileDescriptor,kind:name=="hevc" ? 3:2,generation:10)
+            precondition(latest.number==initial.number+1,"encoded references were discarded instead of coalescing raw captures")
+            acknowledged.delivered(number:initial.number,refresh:true,token:42)
+            waiting.revents=0;precondition(poll(&waiting,1,20)==0,"stale delivery acknowledgement restarted capture")
+            acknowledged.delivered(number:latest.number,refresh:true,token:42)
+            let recovery=try packet(pipe.fileHandleForReading.fileDescriptor,kind:name=="hevc" ? 3:2,generation:10)
+            precondition(recovery.number==latest.number+1 && recovery.bytes[0]==1)
+            acknowledged.stop()
         }
         print("PASS: native H264/HEVC GPU surfaces, compressed IPC, changed pixels, idle keyframes, 75% scaling, odd dimensions, 1080p/1440p/4K")
     }

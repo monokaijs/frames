@@ -33,10 +33,13 @@ final class NativeVideoEncoder: @unchecked Sendable {
     private var restartRequired = false
     private var presentationNanoseconds:UInt64 = 0
     private var dropStarted:UInt64?
-    init(handle: UInt64, codec: String, fps: Int) throws {
+    private let deliveryToken:UInt64
+    private var pendingDelivery:UInt64?
+    init(handle: UInt64, codec: String, fps: Int, deliveryToken:UInt64 = 0) throws {
         guard let device = MTLCreateSystemDefaultDevice() else { throw Wire.failure("Metal unavailable") }
         self.handle = handle; self.codec = codec == "hevc" ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264
         self.fps = Int32(max(1,min(60,fps)))
+        self.deliveryToken=deliveryToken
         context = CIContext(mtlDevice: device, options: [.cacheIntermediates:false])
     }
     func submit(_ buffer: CVPixelBuffer, region: CGRect, captured:UInt64 = DispatchTime.now().uptimeNanoseconds) {
@@ -46,6 +49,12 @@ final class NativeVideoEncoder: @unchecked Sendable {
         if wake { queue.async { [weak self] in self?.drain() } }
     }
     func keyframe() { queue.async { [weak self] in self?.force = true; self?.drain() } }
+    func delivered(number:UInt64,refresh:Bool,token:UInt64) {
+        queue.async { [weak self] in
+            guard let self,!self.stopped,token==self.deliveryToken,self.pendingDelivery==number else{return}
+            self.pendingDelivery=nil;self.busy=false;self.force = self.force || refresh;self.drain()
+        }
+    }
     func configure(bitrate: Int, fps: Int, scale: Int) {
         queue.async { [weak self] in
             guard let self else { return }
@@ -156,8 +165,14 @@ final class NativeVideoEncoder: @unchecked Sendable {
                 bytes.append(contentsOf:[0,0,0,1]);bytes.append(packet[offset..<offset+length]);offset += length
             }
             guard offset == packet.count else { throw Wire.failure("Truncated encoded NAL") }
+            if deliveryToken != 0 {
+                // Publish the acknowledgement state before the packet can be
+                // observed on IPC. Keep busy until Rust admits or retires it;
+                // raw captures coalesce instead of losing encoded references.
+                queue.async { [self] in number &+= 1;pendingDelivery=ticket.number;consecutiveDrops=0;dropStarted=nil }
+            }
             Wire.sendEncoded(handle:handle,width:UInt32(ticket.width),height:UInt32(ticket.height),sourceWidth:UInt32(ticket.sourceWidth),sourceHeight:UInt32(ticket.sourceHeight),number:ticket.number,captured:ticket.captured,keyframe:keyframe,bytes:bytes,encodeMicros:UInt32(min(UInt64(UInt32.max),(DispatchTime.now().uptimeNanoseconds-ticket.started)/1000)))
-            queue.async { [self] in number &+= 1;busy = false;consecutiveDrops = 0;dropStarted=nil;drain() }
+            if deliveryToken == 0 {queue.async { [self] in number &+= 1;busy = false;consecutiveDrops = 0;dropStarted=nil;drain() }}
         } catch { queue.async { [self] in busy = false;stopped = true;Wire.send(["event":"capture_error","handle":handle,"error":error.localizedDescription]) } }
     }
 }

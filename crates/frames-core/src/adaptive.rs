@@ -30,6 +30,7 @@ pub struct Controller {
     quality: Quality,
     previous: Feedback,
     stable_since: Instant,
+    clean_since: Instant,
     overloaded_since: Option<Instant>,
     last_step: Instant,
     last_increase: Instant,
@@ -51,6 +52,7 @@ impl Controller {
             },
             previous: Feedback::default(),
             stable_since: now,
+            clean_since: now,
             overloaded_since: None,
             last_step: now,
             last_increase: now,
@@ -115,17 +117,18 @@ impl Controller {
         let overloaded = congested
             || self.local_pressure_until.is_some_and(|until| now < until)
             || (feedback.congestion_events > self.previous.congestion_events
-                && (feedback.queue_micros > 4_000
-                    || rtt.saturating_sub(min_rtt) > Duration::from_millis(5)))
+                && feedback.transport_lost_packets > self.previous.transport_lost_packets
+                && feedback.queue_micros > 4_000
+                && rtt.saturating_sub(min_rtt) > Duration::from_millis(15))
             || feedback.queue_micros > 8_000
-            || (feedback.decoder_backlog >= 2 && feedback.decode_p95_micros > 16_667)
-            || rtt.saturating_sub(min_rtt) > Duration::from_millis(10);
+            || (feedback.decoder_backlog >= 2 && feedback.decode_p95_micros > 16_667);
         self.previous = feedback;
         if !self.enabled {
             return self.quality;
         }
         if overloaded {
             self.stable_since = now;
+            self.clean_since = now;
             let since = *self.overloaded_since.get_or_insert(now);
             if now.saturating_duration_since(since) >= Duration::from_millis(300)
                 && now.saturating_duration_since(self.last_step) >= Duration::from_millis(300)
@@ -147,18 +150,29 @@ impl Controller {
             self.overloaded_since = None;
             if loss > 0.02 || failed {
                 self.quality.fec.parity_per_32 = 8;
-                self.stable_since = now;
+                self.clean_since = now;
             } else if loss > 0.001 {
                 self.quality.fec.parity_per_32 = 4;
-                self.stable_since = now;
-            } else if now.saturating_duration_since(self.stable_since) >= Duration::from_secs(5) {
+                self.clean_since = now;
+            } else if now.saturating_duration_since(self.clean_since) >= Duration::from_secs(5) {
                 self.quality.fec.parity_per_32 = 2;
             }
+            if failed {
+                self.stable_since = now;
+            }
+            if self.quality.fec.parity_per_32 != previous_parity {
+                self.quality.bitrate = (self.quality.bitrate as u64 * (32 + previous_parity as u64)
+                    / (32 + self.quality.fec.parity_per_32 as u64))
+                    .min(self.base_bitrate as u64) as u32;
+            }
+            let protected_ceiling = (self.base_bitrate as u64 * 36
+                / (32 + self.quality.fec.parity_per_32 as u64))
+                .min(self.base_bitrate as u64);
             if now.saturating_duration_since(self.stable_since) >= Duration::from_secs(3)
                 && now.saturating_duration_since(self.last_increase) >= Duration::from_secs(1)
             {
                 self.quality.bitrate =
-                    (self.quality.bitrate as u64 * 105 / 100).min(self.base_bitrate as u64) as u32;
+                    (self.quality.bitrate as u64 * 105 / 100).min(protected_ceiling) as u32;
                 self.last_increase = now;
             }
             if now.saturating_duration_since(self.stable_since) >= Duration::from_secs(10) {
@@ -171,17 +185,82 @@ impl Controller {
                 self.stable_since = now;
             }
         }
-        if self.quality.fec.parity_per_32 != previous_parity {
-            self.quality.bitrate = (self.quality.bitrate as u64 * (32 + previous_parity as u64)
-                / (32 + self.quality.fec.parity_per_32 as u64))
-                .min(self.base_bitrate as u64) as u32;
-        }
         self.quality
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recoverable_loss_does_not_lock_the_desktop_at_reduced_quality() {
+        let now = Instant::now();
+        let mut c = Controller::new(60, now);
+        for n in 0..=15 {
+            c.congestion(now + Duration::from_millis(n * 100));
+        }
+        assert_eq!(c.quality.scale_percent, 75);
+        let mut feedback = Feedback::default();
+        for n in 1..=400 {
+            feedback.delivery.received_shards += 199;
+            feedback.delivery.missing_shards += 1;
+            c.update(
+                feedback,
+                Duration::from_millis(10),
+                Duration::from_millis(2),
+                false,
+                now + Duration::from_millis(2000 + n * 100),
+            );
+        }
+        assert_eq!(c.quality.scale_percent, 100);
+        assert_eq!(c.quality.fps, 60);
+        assert_eq!(c.quality.bitrate, 12_000_000);
+        assert_eq!(
+            c.update(
+                feedback,
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+                now + Duration::from_millis(42100)
+            )
+            .fec
+            .parity_per_32,
+            4
+        );
+        assert_eq!(
+            c.update(
+                feedback,
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+                now + Duration::from_secs(48)
+            )
+            .fec
+            .parity_per_32,
+            2
+        );
+    }
+    #[test]
+    fn rtt_jitter_without_real_queue_pressure_does_not_destroy_desktop_quality() {
+        let now = Instant::now();
+        let mut c = Controller::new(60, now);
+        for n in 1..=300 {
+            let q = c.update(
+                Feedback {
+                    queue_micros: 5056,
+                    congestion_events: n / 20,
+                    transport_lost_packets: n / 20,
+                    ..Default::default()
+                },
+                Duration::from_micros([26_262, 9_652, 17_189][n as usize % 3]),
+                Duration::from_millis(2),
+                false,
+                now + Duration::from_millis(n * 100),
+            );
+            assert_eq!(q.scale_percent, 100);
+            assert_eq!(q.fps, 60);
+            assert!(q.bitrate > 10_000_000);
+        }
+    }
     #[test]
     fn manual_bandwidth_raises_the_ceiling_and_still_adapts_to_congestion() {
         let now = Instant::now();

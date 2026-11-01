@@ -55,6 +55,7 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
             return ["windows":[["key":["id":desktopCaptureID,"generation":1],"app_id":"app.frames.desktop-view","app_name":"Remote desktop","title":"Remote desktop — primary display","icon_png":NSNull(),"parent":NSNull(),"role":"desktop","bounds":["x":rect.minX,"y":rect.minY,"width":rect.width,"height":rect.height],"scale":Double(display.width)/max(1,Double(rect.width)),"resize":"fixed","minimized":false,"visible":true,"modal":false]]]
         case "windows": return try await enumerate(exclusions: data["exclude"] as? [String] ?? [])
         case "encoder_keyframe": captures[id]?.hardwareEncoder?.keyframe();return [:]
+        case "encoder_delivered": captures[id]?.hardwareEncoder?.delivered(number:data["number"] as? UInt64 ?? 0,refresh:data["refresh"] as? Bool ?? false,token:data["delivery_token"] as? UInt64 ?? 0);return [:]
         case "encoder_configure": captures[id]?.hardwareEncoder?.configure(bitrate:data["bitrate"] as? Int ?? 12_000_000,fps:data["fps"] as? Int ?? 60,scale:data["scale"] as? Int ?? 100);return [:]
         case "capture", "capture_encoded":
             let showCursor=data["show_cursor"] as? Bool ?? true
@@ -63,7 +64,7 @@ let desktopCaptureID:CGWindowID=CGWindowID.max-1
                 if id==desktopCaptureID,let display=desktopDisplay{capture=WindowCapture(display:display,cursor:showCursor)}
                 else if let window=windows[id]{capture=WindowCapture(window:window,content:contentFrames[id] ?? window.frame,cursor:showCursor)}
                 else{throw Wire.failure("Window or display no longer exists")}
-                if command == "capture_encoded" { capture.hardwareEncoder = try NativeVideoEncoder(handle:UInt64(id),codec:data["codec"] as? String ?? "h264",fps:data["fps"] as? Int ?? 60) }
+                if command == "capture_encoded" { capture.hardwareEncoder = try NativeVideoEncoder(handle:UInt64(id),codec:data["codec"] as? String ?? "h264",fps:data["fps"] as? Int ?? 60,deliveryToken:data["delivery_token"] as? UInt64 ?? 0) }
                 captures[id] = capture
                 do { try await capture.start() }
                 catch {

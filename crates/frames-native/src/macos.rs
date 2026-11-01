@@ -297,10 +297,10 @@ impl Bridge {
         std::thread::spawn(move || {
             let mut reader = BufReader::new(audio_read);
             while let Ok(packet) = crate::native_media::read_packet(&mut reader) {
-                if packet.kind == 2 {
-                    if let Some(sender) = captured_audio.lock().as_ref() {
-                        let _ = sender.try_send(packet.bytes);
-                    }
+                if packet.kind == 2
+                    && let Some(sender) = captured_audio.lock().as_ref()
+                {
+                    let _ = sender.try_send(packet.bytes);
                 }
             }
         });
@@ -531,10 +531,20 @@ impl Desktop for Host {
             bridge: self.bridge.clone(),
             handle,
         };
+        let delivery_token = self.bridge.next.fetch_add(1, Ordering::Relaxed);
         self.bridge.request(
             "capture_encoded",
-            json!({"handle":handle,"show_cursor":cursor,"codec":capability.codec,"fps":fps}),
+            json!({"handle":handle,"show_cursor":cursor,"codec":capability.codec,"fps":fps,"delivery_token":delivery_token}),
         )?;
+        let (delivery, delivered) = std::sync::mpsc::sync_channel::<crate::NativeFrameDelivery>(1);
+        let bridge = self.bridge.clone();
+        std::thread::spawn(move || {
+            while let Ok(frame) = delivered.recv() {
+                if let Err(error)=bridge.request("encoder_delivered",json!({"handle":handle,"number":frame.number,"refresh":frame.refresh,"delivery_token":delivery_token})) {
+                    tracing::warn!(%error,"native delivery acknowledgement worker stopped");break;
+                }
+            }
+        });
         let (control, commands) = std::sync::mpsc::sync_channel(4);
         let bridge = self.bridge.clone();
         std::thread::spawn(move || {
@@ -561,6 +571,7 @@ impl Desktop for Host {
         Ok(Some(crate::NativeEncodedCapture {
             packets,
             control,
+            delivery,
             guard: Box::new(guard),
         }))
     }

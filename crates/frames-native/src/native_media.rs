@@ -100,6 +100,40 @@ pub fn read_packet(reader: &mut impl Read) -> io::Result<Packet> {
     })
 }
 
+#[cfg(target_os = "macos")]
+pub fn write_encoded(
+    writer: &mut impl Write,
+    window: frames_core::model::WindowId,
+    generation: u32,
+    codec: frames_core::codec::Codec,
+    width: u32,
+    height: u32,
+    packet: &frames_core::codec::EncodedPacket,
+) -> io::Result<()> {
+    let kind = match codec {
+        frames_core::codec::Codec::H264 => 2u32,
+        frames_core::codec::Codec::Hevc => 3,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported native codec",
+            ));
+        }
+    };
+    let mut header = [0u8; 48];
+    header[..4].copy_from_slice(b"FRV2");
+    header[4..8].copy_from_slice(&kind.to_le_bytes());
+    header[8..16].copy_from_slice(&window.id.to_le_bytes());
+    header[16..20].copy_from_slice(&window.generation.to_le_bytes());
+    header[20..24].copy_from_slice(&width.to_le_bytes());
+    header[24..28].copy_from_slice(&height.to_le_bytes());
+    header[28..32].copy_from_slice(&generation.to_le_bytes());
+    header[32..40].copy_from_slice(&(packet.bytes.len() as u64).to_le_bytes());
+    header[40..48].copy_from_slice(&packet.number.to_le_bytes());
+    writer.write_all(&header)?;
+    writer.write_all(&packet.bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,38 +226,4 @@ mod tests {
             io::ErrorKind::UnexpectedEof
         );
     }
-}
-
-#[cfg(target_os = "macos")]
-pub fn write_encoded(
-    writer: &mut impl Write,
-    window: frames_core::model::WindowId,
-    generation: u32,
-    codec: frames_core::codec::Codec,
-    width: u32,
-    height: u32,
-    packet: &frames_core::codec::EncodedPacket,
-) -> io::Result<()> {
-    let kind = match codec {
-        frames_core::codec::Codec::H264 => 2u32,
-        frames_core::codec::Codec::Hevc => 3,
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "unsupported native codec",
-            ));
-        }
-    };
-    let mut header = [0u8; 48];
-    header[..4].copy_from_slice(b"FRV2");
-    header[4..8].copy_from_slice(&kind.to_le_bytes());
-    header[8..16].copy_from_slice(&window.id.to_le_bytes());
-    header[16..20].copy_from_slice(&window.generation.to_le_bytes());
-    header[20..24].copy_from_slice(&width.to_le_bytes());
-    header[24..28].copy_from_slice(&height.to_le_bytes());
-    header[28..32].copy_from_slice(&generation.to_le_bytes());
-    header[32..40].copy_from_slice(&(packet.bytes.len() as u64).to_le_bytes());
-    header[40..48].copy_from_slice(&packet.number.to_le_bytes());
-    writer.write_all(&header)?;
-    writer.write_all(&packet.bytes)
 }
