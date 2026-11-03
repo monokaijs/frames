@@ -1,0 +1,11 @@
+[package]
+name = "swift-static-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+build = "build.rs"
+
+# Standalone: not a member of the Frames workspace (Phase 0 spike 0-B).
+[workspace]
+
+[dependencies]

@@ -1,0 +1,21 @@
+[package]
+name = "iroh-transport-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone: not a member of the Frames workspace (Phase 0 spike 0-A).
+[workspace]
+
+[dependencies]
+iroh = "=1.4.1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+# Same noq-proto as iroh 1.4.1 uses, for the congestion::Controller trait.
+noq-proto = "=1.4.0"
+bytes = "1"
+hex = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[patch.crates-io]
+noq-udp = { path = "vendor/noq-udp" }
