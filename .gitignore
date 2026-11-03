@@ -14,3 +14,5 @@ __pycache__/
 /.media-runtime/
 # SwiftPM build output (native/macos and spikes)
 .build/
+# Claude Code agent worktrees
+/.claude/worktrees/
