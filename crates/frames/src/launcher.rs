@@ -433,6 +433,10 @@ struct Session {
     name: String,
     address: String,
     detail: String,
+    /// Connection choices shown after the phase, e.g. "per-window view".
+    mode: String,
+    /// Last phase the session process reported in its log.
+    phase: crate::launcher_status::Phase,
     host: bool,
     child: Child,
     log: PathBuf,
@@ -530,6 +534,17 @@ impl Worker {
             command.creation_flags(0x08000000); // CREATE_NO_WINDOW, native pairing still works.
         }
         let child = command.spawn().context("couldn't start session")?;
+        let phase = crate::launcher_status::Phase::Starting;
+        // Hosts show their sharing scope; clients show live connection phase
+        // followed by their view and audio choices.
+        let (detail, mode) = if host {
+            (detail, String::new())
+        } else {
+            (
+                crate::launcher_status::session_detail(phase, &detail),
+                detail,
+            )
+        };
         self.sessions.push(Session {
             id,
             name,
@@ -539,6 +554,8 @@ impl Worker {
                 args.get(1).cloned().unwrap_or_default()
             },
             detail,
+            mode,
+            phase,
             host,
             child,
             log,
@@ -595,9 +612,9 @@ impl Worker {
                     "This device".into(),
                     true,
                     if mode == 2 {
-                        "One window"
+                        "Sharing one window · new devices need a pairing code"
                     } else {
-                        "Selected windows"
+                        "Sharing selected windows · new devices need a pairing code"
                     }
                     .into(),
                     "",
@@ -639,7 +656,7 @@ impl Worker {
                     name,
                     false,
                     format!(
-                        "Starting · {}{}",
+                        "{}{}",
                         if desktop {
                             "full desktop"
                         } else {
@@ -740,9 +757,9 @@ impl Worker {
                         "This device".into(),
                         true,
                         if self.preferences.options.unattended {
-                            "Unattended"
+                            "Sharing everything · trusted devices connect without a prompt"
                         } else {
-                            "Ask to connect"
+                            "Sharing everything · new devices need a pairing code"
                         }
                         .into(),
                         "",
@@ -877,20 +894,30 @@ impl Worker {
                     if status.success() {
                         self.notice(format!("{} ended.", session.name), false);
                     } else {
-                        let log = fs::read_to_string(&session.log).unwrap_or_default();
-                        let last_error = log.lines().rev().find(|line| line.starts_with("Frames:"))
-                            .unwrap_or("Session exited. Check the address, network access, and permission settings.");
+                        let log = crate::launcher_status::read_tail(&session.log);
+                        let phase =
+                            crate::launcher_status::latest_phase(&log).unwrap_or(session.phase);
                         self.notice(
-                            format!(
-                                "{}: {}",
-                                session.name,
-                                last_error.chars().take(500).collect::<String>()
-                            ),
+                            crate::launcher_status::explain_failure(&session.name, &log, phase),
                             true,
                         );
                     }
                 }
-                Ok(None) => index += 1,
+                Ok(None) => {
+                    let session = &mut self.sessions[index];
+                    if !session.host
+                        && let Some(phase) = crate::launcher_status::latest_phase(
+                            &crate::launcher_status::read_tail(&session.log),
+                        )
+                        && phase != session.phase
+                    {
+                        session.phase = phase;
+                        session.detail =
+                            crate::launcher_status::session_detail(phase, &session.mode);
+                        changed = true;
+                    }
+                    index += 1;
+                }
                 Err(error) => {
                     self.notice(format!("Couldn't inspect session: {error}"), true);
                     index += 1;

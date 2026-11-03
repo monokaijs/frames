@@ -126,6 +126,9 @@ async fn handshake(
     };
     let mut decision = frames_native::ConnectionDecision::Accept;
     if needs_approval {
+        if !server {
+            report_phase("pairing");
+        }
         anyhow::ensure!(
             !server || allow_pair || known.is_some_and(|p| p.allow_control),
             "new device pairing disabled; start host with --pair"
@@ -146,6 +149,9 @@ async fn handshake(
         );
     }
     protocol::send_json(&mut send, &Message::PairApproved).await?;
+    if !server {
+        report_phase("waiting");
+    }
     anyhow::ensure!(
         matches!(
             tokio::time::timeout(
@@ -1020,6 +1026,7 @@ async fn connect(
 ) -> anyhow::Result<(quinn::Endpoint, quinn::Connection, Control, Hello)> {
     let identity = Identity::load()?;
     let endpoint = transport::client(&identity)?;
+    report_phase("connecting");
     let connection = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         endpoint.connect(address, "frames.local")?,
@@ -1034,6 +1041,15 @@ async fn connect(
         control(connection, send, receive),
         peer,
     ))
+}
+
+/// One machine-readable line per client connection phase on stderr, which the
+/// launcher reads from the session log to show live status. Only printed when
+/// the launcher started this process, so CLI output is unchanged.
+fn report_phase(phase: &str) {
+    if std::env::var_os("FRAMES_LAUNCHER_PID").is_some() {
+        eprintln!("Frames status: {phase}");
+    }
 }
 
 fn connection_timeout_hint() -> &'static str {
@@ -1077,6 +1093,7 @@ pub async fn client(
     let delivery = ui_delivery::Delivery::new(ui.clone());
     let (_endpoint, connection, mut io, peer) =
         connect(address, codecs.clone(), SessionPurpose::Control).await?;
+    report_phase("connected");
     if let Err(error) =
         crate::connection_history::remember(address, &peer.device_id, &peer.name, false)
     {

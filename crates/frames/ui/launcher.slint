@@ -46,7 +46,9 @@ component DeviceGrid inherits Rectangle {
     callback options-edited(string, string, bool, bool);
     callback trust(string);
     callback revoke(string, string);
-    private property <int> columns: root.width > 720px ? 3 : root.width > 440px ? 2 : 1;
+    // Three columns from the launcher's minimum width, so a card's actions
+    // stay visible without scrolling.
+    private property <int> columns: root.width > 640px ? 3 : root.width > 440px ? 2 : 1;
     private property <length> card-width: (root.width - (root.columns - 1) * 14px) / root.columns;
     private property <length> preview-height: (root.card-width - 2px) * 9 / 16;
     private property <length> card-height: root.preview-height + 58px;
@@ -83,9 +85,23 @@ component DeviceGrid inherits Rectangle {
                     height: 18px;
                     Rectangle { x: 0px; y: (parent.height - 6px) / 2; width: 6px; height: 6px; border-radius: 3px; background: device.online ? #69dda6 : #c2c9d2; }
                     Text { x: 12px; y: 0px; height: parent.height; width: self.preferred-width; text: device.online ? "Online" : "Offline"; color: #ffffffde; font-size: 11px; vertical-alignment: center; }
-                    Text { x: parent.width - self.width; y: 0px; height: parent.height; width: self.preferred-width; text: device.trusted ? "Trusted" : device.can-trust ? "Session only" : "New device"; color: #ffffffb8; font-size: 10px; vertical-alignment: center; }
+                    Text { x: parent.width - self.width; y: 0px; height: parent.height; width: self.preferred-width; text: device.trusted ? "Trusted" : device.can-trust ? "Not trusted" : "New device"; color: #ffffffb8; font-size: 10px; vertical-alignment: center; }
                 }
             }
+            // The preview is the largest target on the card: clicking it
+            // connects with the device's saved view and audio choices.
+            if device.address != "" && preview-touch.has-hover: Rectangle {
+                x: 0px; y: 0px; width: parent.width; height: parent.height;
+                background: #ffffff14;
+            }
+            preview-touch := TouchArea {
+                enabled: device.address != "";
+                mouse-cursor: pointer;
+                clicked => { root.connect(device.address, device.fingerprint, device.connection-audio, device.connection-desktop); }
+            }
+            accessible-role: button;
+            accessible-label: "Connect to " + device.name + (device.online ? "" : " (offline)");
+            accessible-action-default => { if device.address != "" { root.connect(device.address, device.fingerprint, device.connection-audio, device.connection-desktop); } }
         }
         Rectangle {
             x: 1px; y: root.preview-height + 1px; width: parent.width - 2px; height: 56px;
@@ -101,7 +117,7 @@ component DeviceGrid inherits Rectangle {
                 }
                 Rectangle { horizontal-stretch: 1; }
                 if device.can-trust: AppButton { label: "Trust device"; quiet: true; clicked => { root.trust(device.fingerprint); } }
-                if device.trusted: AppButton { label: "Revoke"; quiet: true; danger: true; clicked => { root.revoke(device.fingerprint, device.name); } }
+                if device.trusted: AppButton { label: "Remove"; a11y-label: "Remove " + device.name + " from trusted devices"; quiet: true; danger: true; clicked => { root.revoke(device.fingerprint, device.name); } }
             }
         }
         // The software renderer does not round child clips. Keep the same
@@ -326,19 +342,16 @@ export component Launcher inherits Window {
                             if root.connection-tab == 0: VerticalLayout {
                                 spacing: 24px;
                                 Card {
-                                    height: 208px;
+                                    height: 156px;
                                     HorizontalLayout {
-                                        padding: 22px; spacing: 24px;
+                                        padding: 20px; spacing: 24px;
                                         VerticalLayout {
-                                            min-width: 250px; horizontal-stretch: 1; spacing: 16px;
-                                            SectionTitle { text: "Allow access"; }
-                                            Rectangle {
-                                                height: 70px; background: #f6f7f9; border-radius: 6px;
-                                                VerticalLayout {
-                                                    padding: 14px; spacing: 6px;
-                                                    Text { text: root.device-name; font-size: 16px; font-weight: 500; color: Theme.ink; overflow: elide; }
-                                                    TextInput { text: root.local-address; read-only: true; single-line: true; font-size: 11px; color: Theme.muted; accessible-label: "This device's address"; }
-                                                }
+                                            min-width: 250px; horizontal-stretch: 1; spacing: 10px;
+                                            SectionTitle { text: "Share this device"; }
+                                            VerticalLayout {
+                                                spacing: 3px;
+                                                Text { text: root.device-name; font-size: 15px; font-weight: 500; color: Theme.ink; overflow: elide; }
+                                                TextInput { text: root.local-address; read-only: true; single-line: true; font-size: 11px; color: Theme.muted; accessible-label: "This device's address. Other devices connect to it."; }
                                             }
                                             HorizontalLayout {
                                                 spacing: 8px;
@@ -349,16 +362,12 @@ export component Launcher inherits Window {
                                         }
                                         Rectangle { width: 1px; background: Theme.line; }
                                         VerticalLayout {
-                                            min-width: 290px; horizontal-stretch: 1.1; spacing: 16px;
+                                            min-width: 290px; horizontal-stretch: 1.1; spacing: 10px;
                                             SectionTitle { text: "Connect to a device"; }
-                                            VerticalLayout {
-                                                spacing: 7px;
-                                                MutedText { text: "IP address"; font-size: 11px; }
-                                                LineEdit { height: 32px; text <=> root.address; placeholder-text: "192.168.1.10:47990"; accessible-label: "Remote IP address and port"; edited => { root.connection-address-edited(); } accepted => { root.connect(root.address); } }
-                                            }
+                                            MutedText { text: "Enter the address shown on the other device."; font-size: 11px; }
                                             HorizontalLayout {
-                                                spacing: 16px;
-                                                Rectangle { horizontal-stretch: 1; }
+                                                spacing: 8px;
+                                                LineEdit { height: 32px; horizontal-stretch: 1; text <=> root.address; placeholder-text: "192.168.1.10 or 192.168.1.10:47990"; accessible-label: "Address of the other device"; edited => { root.connection-address-edited(); } accepted => { if root.address != "" { root.connect(root.address); } } }
                                                 ConnectionButton {
                                                     primary: true; enabled: root.address != "";
                                                     audio <=> root.audio; desktop <=> root.desktop;
@@ -370,6 +379,7 @@ export component Launcher inherits Window {
                                                     }
                                                 }
                                             }
+                                            Rectangle { vertical-stretch: 1; }
                                         }
                                     }
                                 }
@@ -385,7 +395,7 @@ export component Launcher inherits Window {
                                     if root.nearby.length == 0: EmptyState {
                                         icon: @image-url("icons/devices.svg");
                                         title: root.discovering ? "Looking for devices" : "No nearby devices";
-                                        detail: root.discovering ? "" : "Start sharing on another device, or enter its address.";
+                                        detail: root.discovering ? "" : "Start sharing on the other device. It appears here when both are on the same network.";
                                     }
                                     DeviceGrid {
                                         devices: root.nearby;
@@ -400,7 +410,7 @@ export component Launcher inherits Window {
                                 spacing: 0px;
                                 if root.sessions.length == 0: EmptyState {
                                     icon: @image-url("icons/connections.svg"); title: "No active sessions";
-                                    detail: "Connect to a device or start sharing.";
+                                    detail: "Sessions appear here while you are connected to a device or sharing this one.";
                                 }
                                 for session in root.sessions: Rectangle {
                                     height: 56px;
@@ -408,7 +418,7 @@ export component Launcher inherits Window {
                                         spacing: 12px;
                                         Glyph { source: @image-url("icons/display.svg"); width: 18px; }
                                         VerticalLayout { horizontal-stretch: 1; spacing: 3px; alignment: center; Text { text: session.name; color: Theme.ink; font-size: 12px; overflow: elide; } MutedText { text: session.detail; font-size: 11px; } }
-                                        VerticalLayout { horizontal-stretch: 0; alignment: center; AppButton { label: session.hosting ? "Stop" : "Disconnect"; quiet: true; danger: true; clicked => { root.stop-session(session.id); } } }
+                                        VerticalLayout { horizontal-stretch: 0; alignment: center; AppButton { label: session.hosting ? "Stop sharing" : "Disconnect"; a11y-label: (session.hosting ? "Stop sharing" : "Disconnect from ") + (session.hosting ? "" : session.name); quiet: true; danger: true; clicked => { root.stop-session(session.id); } } }
                                     }
                                     Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: Theme.line; }
                                 }
@@ -614,14 +624,14 @@ export component Launcher inherits Window {
             width: 400px; height: 210px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
             VerticalLayout {
                 padding: 22px; spacing: 12px;
-                SectionTitle { text: "Revoke access?"; font-size: 17px; }
+                SectionTitle { text: "Remove trusted device?"; font-size: 17px; }
                 Text { text: root.revoke-name; color: Theme.ink; font-size: 12px; overflow: elide; }
-                MutedText { text: "Pair again to reconnect. Active sessions stay connected."; font-size: 12px; }
+                MutedText { text: "It will need a pairing code the next time it connects. Active sessions stay connected."; font-size: 12px; wrap: word-wrap; }
                 Rectangle { vertical-stretch: 1; }
                 HorizontalLayout {
                     alignment: end; spacing: 8px;
                     AppButton { label: "Cancel"; clicked => { root.revoke-id = ""; } }
-                    AppButton { label: "Revoke"; danger: true; clicked => { root.revoke(root.revoke-id); root.revoke-id = ""; } }
+                    AppButton { label: "Remove"; danger: true; clicked => { root.revoke(root.revoke-id); root.revoke-id = ""; } }
                 }
             }
         }

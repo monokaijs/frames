@@ -7,6 +7,7 @@ mod device_session;
 mod device_setup;
 mod file_worker;
 mod launcher;
+mod launcher_status;
 mod media_debug;
 mod media_sender;
 #[cfg(windows)]

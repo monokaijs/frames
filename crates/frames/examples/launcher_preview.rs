@@ -224,13 +224,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             SessionRow {
                 id: 1,
                 name: "Design workstation".into(),
-                detail: "Starting · per-window view".into(),
+                detail: "Connected · per-window view".into(),
                 hosting: false,
             },
             SessionRow {
                 id: 2,
                 name: "This device".into(),
-                detail: "Ask to connect".into(),
+                detail: "Sharing everything · new devices need a pairing code".into(),
                 hosting: true,
             },
         ]));
