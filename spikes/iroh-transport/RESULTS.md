@@ -71,3 +71,11 @@ The Mac has two LAN addresses: en0 192.168.0.169 (default route) and en1 192.168
 3. The target-rate controller ignores loss by design. The media rate controller must therefore own loss and delay reaction completely, including on relay paths, or a misbehaving controller floods the path, as at 20 Mbps above.
 4. Vendoring moves from `quinn-udp` to `noq-udp` (source-address fix, plus DSCP).
 5. The multipath and dual-stack path validation issue above must be fixed or worked around before Phase 4 can pass its NAT matrix gate. Add a dual-interface Mac to that matrix.
+
+### Follow-up, same day (patched noq-udp, quiet Windows PC)
+
+- **Normal dialing** (by endpoint id, with relay and discovery): **5/5 trials** upgraded to direct (always via the Mac's default interface, .169) and delivered 8 Mbps with 0% loss and p95 queueing of 0.6 ms for the whole run. The two earlier failures happened while another job was saturating the Windows PC; they are unexplained, not resolved.
+- **`--direct` to the secondary address .131**: failed in 2/3 trials. The connection starts on .131; multipath then opens a path via .169 (the default interface), selects it, and host→client delivery stops (≥99.7% loss). The trial that stayed on .131 worked. The host log shows both paths `added validated=false`.
+- iroh's IPv6 socket is already IPv6-only (netwatch `set_only_v6(true)`), so the earlier IPv4-mapped hypothesis is wrong.
+
+**Decision for frames-net:** always dial by endpoint id with relay and discovery, and never force a single direct address. Report the multipath path-switch failure upstream with this repro: a dual-interface, same-subnet Mac host on the patched noq-udp, dialed by its secondary address.
