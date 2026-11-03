@@ -146,6 +146,10 @@ pub async fn probe() -> Vec<CodecCapability> {
                                 runtime::Context::decoder(codec.decoder(), 128, 128, false)?;
                             for _ in 0..4 {
                                 let packets = encoder.encode(&frame)?;
+                                anyhow::ensure!(
+                                    packets.len() == 1,
+                                    "Encoder buffered a picture instead of returning one complete packet"
+                                );
                                 let output = decoder
                                     .decode(&packets[0])?
                                     .ok_or_else(|| anyhow::anyhow!("Decoder buffers pictures"))?;

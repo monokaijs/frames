@@ -613,10 +613,17 @@ impl Context {
             packet.extend_from_slice(unsafe { std::slice::from_raw_parts(data, size as usize) });
             packets.push(packet);
         }
-        anyhow::ensure!(
-            packets.len() == 1,
-            "Encoder buffered a picture instead of returning one complete packet"
-        );
+        // Rate control may drop a picture (VideoToolbox does under rapid IDR
+        // requests and bitrate changes on lossy links): it returns no packet,
+        // and later pictures still reference the last encoded one. Treating
+        // that as fatal stopped the stream. The probe still requires strict
+        // one-in, one-out behavior from every advertised encoder.
+        if packets.len() != 1 {
+            tracing::debug!(
+                packets = packets.len(),
+                "encoder returned no packet or several for one picture"
+            );
+        }
         Ok(packets)
     }
     pub fn decode(&mut self, packet: &[u8]) -> anyhow::Result<Option<crate::media::RawFrame>> {
