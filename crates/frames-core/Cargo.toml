@@ -25,6 +25,7 @@ directories = "6"
 fs2 = "0.4"
 mdns-sd = "0.17"
 opus = "0.4"
+socket2 = "0.6"
 reed-solomon-simd = "=3.1.0"
 
 [build-dependencies]

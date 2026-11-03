@@ -503,7 +503,13 @@ async fn run(connection: quinn::Connection, shared: Arc<Shared>) {
             }
             let queued = media::DATAGRAM_SEND_BUFFER_BYTES
                 .saturating_sub(connection.datagram_send_buffer_space());
-            if queued + required > cap {
+            // On a fast path 5 ms of wire time exceeds the whole transport
+            // buffer, so "over the cap" only means "no space yet", and the send
+            // below waits for exactly that. Polling with a 1 ms sleep instead
+            // cost ~1-2 ms per 16 KB: 6 ms median, 11 ms p95 to emit one
+            // 50 Mbit/s NVENC picture on a Windows LAN host.
+            let fast_path = cap >= media::DATAGRAM_SEND_BUFFER_BYTES;
+            if queued + required > cap && !fast_path {
                 let since = *blocked_since.get_or_insert(now);
                 record_network_wait(&shared, now.saturating_duration_since(since));
                 tokio::select! {_=connection.closed()=>return,_=tokio::time::sleep(Duration::from_millis(1))=>{}}

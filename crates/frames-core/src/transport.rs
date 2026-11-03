@@ -120,6 +120,43 @@ fn transport() -> Arc<quinn::TransportConfig> {
     Arc::new(config)
 }
 
+/// Kernel buffer for media sockets. A single high-bitrate picture arrives as a
+/// burst of 100+ datagrams at LAN speed; the OS default (64 KB on Windows)
+/// overflows before the receive task runs, and those drops look like network
+/// loss to QUIC: reduced congestion window, repaired or lost pictures.
+const UDP_BUFFER_BYTES: [usize; 4] = [8 << 20, 4 << 20, 2 << 20, 1 << 20];
+fn udp_socket(address: SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(address),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    // Best effort: platforms cap the size (macOS at kern.ipc.maxsockbuf).
+    for bytes in UDP_BUFFER_BYTES {
+        if socket.set_recv_buffer_size(bytes).is_ok() {
+            break;
+        }
+    }
+    for bytes in UDP_BUFFER_BYTES {
+        if socket.set_send_buffer_size(bytes).is_ok() {
+            break;
+        }
+    }
+    socket.bind(&address.into())?;
+    Ok(socket.into())
+}
+fn endpoint(
+    address: SocketAddr,
+    server: Option<quinn::ServerConfig>,
+) -> anyhow::Result<quinn::Endpoint> {
+    Ok(quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        server,
+        udp_socket(address)?,
+        Arc::new(quinn::TokioRuntime),
+    )?)
+}
+
 pub fn server(identity: &Identity, address: SocketAddr) -> anyhow::Result<quinn::Endpoint> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut tls = rustls::ServerConfig::builder_with_provider(provider.clone())
@@ -131,7 +168,7 @@ pub fn server(identity: &Identity, address: SocketAddr) -> anyhow::Result<quinn:
         quinn::crypto::rustls::QuicServerConfig::try_from(tls)?,
     ));
     config.transport_config(transport());
-    Ok(quinn::Endpoint::server(config, address)?)
+    endpoint(address, Some(config))
 }
 
 pub fn client(identity: &Identity) -> anyhow::Result<quinn::Endpoint> {
@@ -146,7 +183,7 @@ pub fn client(identity: &Identity) -> anyhow::Result<quinn::Endpoint> {
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
     ));
     config.transport_config(transport());
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    let mut endpoint = endpoint("0.0.0.0:0".parse()?, None)?;
     endpoint.set_default_client_config(config);
     Ok(endpoint)
 }

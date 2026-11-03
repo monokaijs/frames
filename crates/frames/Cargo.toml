@@ -44,3 +44,4 @@ windows = { workspace = true, features = ["Win32_System_RemoteDesktop", "Win32_S
 png = "0.17"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+socket2 = "0.6"

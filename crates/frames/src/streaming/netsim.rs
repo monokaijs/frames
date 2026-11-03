@@ -158,10 +158,23 @@ fn delay_line(
     });
     tx
 }
+/// A proxy socket that never drops by itself: default UDP buffers (64 KB on
+/// Windows) overflow during one picture's burst and would add loss that the
+/// modelled link does not have.
+fn proxy_socket() -> UdpSocket {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
+    let _ = socket.set_recv_buffer_size(16 << 20);
+    let _ = socket.set_send_buffer_size(16 << 20);
+    socket
+        .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+        .unwrap();
+    socket.set_nonblocking(true).unwrap();
+    UdpSocket::from_std(socket.into()).unwrap()
+}
 /// UDP relay: client ⇄ front socket ⇄ back socket ⇄ server.
 async fn proxy(server: SocketAddr, link: Impairment) -> (SocketAddr, Arc<LinkStats>) {
-    let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let back = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let front = Arc::new(proxy_socket());
+    let back = Arc::new(proxy_socket());
     back.connect(server).await.unwrap();
     let address = front.local_addr().unwrap();
     let down_stats = Arc::new(LinkStats::default());
@@ -308,10 +321,16 @@ fn read_counter(frame: &media::RawFrame) -> Option<u32> {
     if (frame.width, frame.height) != (WIDTH, HEIGHT) || frame.bgra.is_empty() {
         return None;
     }
+    read_counter_pixels(&frame.bgra)
+}
+fn read_counter_pixels(bgra: &[u8]) -> Option<u32> {
+    if bgra.len() != (WIDTH * HEIGHT * 4) as usize {
+        return None;
+    }
     let mut code = 0u32;
     for bit in 0..BITS {
         let (x, y) = (bit * BLOCK + BLOCK / 2, BLOCK / 2);
-        let green = frame.bgra[((y * WIDTH + x) * 4 + 1) as usize];
+        let green = bgra[((y * WIDTH + x) * 4 + 1) as usize];
         code = (code << 1) | u32::from(green > 128);
     }
     let counter = code >> 8;
@@ -421,11 +440,34 @@ async fn run(name: &str, link: Impairment, seconds: u64) -> serde_json::Value {
     let reader = {
         let (shown, stamps) = (shown.clone(), stamps.clone());
         std::thread::spawn(move || {
+            // Windows decoders hand back GPU textures. Read them back off the
+            // measured path: the arrival time is taken first.
+            #[cfg(windows)]
+            let mut converter: Option<codec::GpuConverter> = None;
             for update in updates {
-                if let ClientUpdate::Frame(_, frame) = update
-                    && let Some(counter) = read_counter(&frame)
-                {
-                    let now = Instant::now();
+                let ClientUpdate::Frame(_, frame) = update else {
+                    continue;
+                };
+                let arrived = Instant::now();
+                #[cfg(windows)]
+                let counter = match &frame.gpu {
+                    Some(gpu) => {
+                        let converter = converter.get_or_insert_with(|| {
+                            codec::GpuConverter::new(&gpu.texture, frame.width, frame.height)
+                                .unwrap()
+                        });
+                        let mut pixels = vec![0; (WIDTH * HEIGHT * 4) as usize];
+                        converter
+                            .readback(gpu, frame.width, frame.height, &mut pixels)
+                            .ok()
+                            .and_then(|_| read_counter_pixels(&pixels))
+                    }
+                    None => read_counter(&frame),
+                };
+                #[cfg(not(windows))]
+                let counter = read_counter(&frame);
+                if let Some(counter) = counter {
+                    let now = arrived;
                     if let Some(at) = stamps.lock().unwrap().get(&counter) {
                         shown.lock().unwrap().push((
                             now,
