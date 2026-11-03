@@ -51,6 +51,15 @@ import AppKit
             var bright=false
             Timer.scheduledTimer(withTimeInterval:0.1,repeats:true){_ in MainActor.assumeIsolated {bright.toggle();marker.layer?.backgroundColor=(bright ? NSColor.white:NSColor.black).cgColor}}
         }
+        // Continuous 60 Hz motion for sustained frame-rate checks (scripts/e2e_matrix.py).
+        // The bar sits below the controls so it never intercepts test clicks.
+        if ProcessInfo.processInfo.environment["FRAMES_QA_MOTION"] == "1", let content=source.contentView {
+            let moving=NSView(frame:NSRect(x:0,y:0,width:24,height:content.bounds.height));moving.wantsLayer=true
+            moving.layer?.backgroundColor=NSColor.white.cgColor;moving.autoresizingMask=[.height]
+            content.addSubview(moving,positioned:.below,relativeTo:nil)
+            var offset:CGFloat=0
+            Timer.scheduledTimer(withTimeInterval:1.0/60,repeats:true){_ in MainActor.assumeIsolated {offset=(offset+7).truncatingRemainder(dividingBy:max(1,content.bounds.width-24));moving.frame.origin.x=offset}}
+        }
         let bar=NSMenu();bar.autoenablesItems=false
         let appItem=NSMenuItem(title:"QA",action:nil,keyEquivalent:"");let appMenu=NSMenu();appMenu.addItem(withTitle:"Quit fixture",action:#selector(quit),keyEquivalent:"");appItem.submenu=appMenu;bar.addItem(appItem)
         let file=NSMenuItem(title:"File",action:nil,keyEquivalent:"");let menu=NSMenu();menu.autoenablesItems=false

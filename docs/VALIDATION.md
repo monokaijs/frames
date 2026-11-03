@@ -28,6 +28,71 @@ full network envelope. Windows and Mac workspace tests and Clippy passed; local
 Windows tests used MinGW. One earlier sharpness sample failed during competing
 builds, so that workload is not covered by the passing isolated run.
 
+## Cross-platform end-to-end matrix
+
+`scripts/e2e_matrix.py` runs on the Mac and drives the Windows test PC over
+SSH. It covers four pairings: Mac client to Windows host, Windows client to
+Mac host, and a loopback pairing on each machine.
+
+For each pairing it starts a generated `Frames QA source` fixture and an
+isolated host, with a fresh identity, configuration, receive folder and port.
+It then checks the following:
+
+- mDNS discovery.
+- Matching-code pairing with a Unicode upload, verified by SHA-256.
+- A trusted reconnect without approval, with a download verified the same
+  way.
+- `e2e_probe`, a production session client without native UI, covering:
+  - the window list;
+  - 10 s of sustained video, with capture-to-decoded p50 and p95;
+  - the debug overlay;
+  - audio;
+  - a live High, Low, High quality change;
+  - clipboard in both directions, on cross-machine pairings only;
+  - a clean disconnect.
+- `control_probe`, covering input, Unicode text, menus, resize and close.
+- The real native client, measuring presented frames per second and
+  capture-to-present latency.
+- Host shutdown, checking that the UDP port is released and no stray
+  processes remain.
+
+What the runs leave alone:
+
+- Hosts share only the fixture: every other app with a window is excluded.
+- The full-desktop view is never requested.
+- Pixels are never stored.
+- Both clipboards are restored afterwards.
+
+How processes start on each machine:
+
+- **Windows:** every process runs in the logged-on console session through
+  one-shot `/IT` scheduled tasks (`scripts/e2e/win_launch.ps1`). This is
+  where capture, the user's clipboard, DPAPI and GUI windows work.
+- **Mac:** processes are unbundled builds started from the invoking session.
+  - `--features test-identity-file` keeps each throwaway identity key in its
+    config folder. It is for automation contexts that cannot use the login
+    Keychain and is never enabled in releases.
+  - Capture needs a Screen Recording grant. If the invoking session has none,
+    pass `--mac-host-app` to run the Mac host from a signed bundle that has
+    the grant, launched through LaunchServices. That bundle must speak the
+    same protocol version.
+
+```sh
+# Windows (PC): build into the target folder the driver reads.
+powershell -File scripts\e2e\win_build.ps1 -Source F:\frames-e2e -Target F:\frames-ab\target
+# Mac: helper, fixture, and test-identity binaries.
+bash native/macos/build.sh            # the helper is used unbundled; signing may fail in automation
+bash native/macos/build_fixture.sh
+cargo build --release --locked --target aarch64-apple-darwin -p frames \
+  --features test-identity-file --bin frames --example e2e_probe --example control_probe
+python3 scripts/e2e_matrix.py --win-address 192.168.0.100 --artifacts /tmp/frames-e2e \
+  [--pairings mac-win,win-mac,mac-mac,win-win] [--mac-host-app /Applications/Frames.app]
+```
+
+Each run writes `results.json` and the logs to the artifacts folder. A
+signed Mac host keeps its test identities in the login Keychain; the driver
+prints a `security delete-generic-password` command for each one.
+
 ## FEC/media release gates
 
 The F6 media pipeline has deterministic tests for loss/reordering/duplicates,
