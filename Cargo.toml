@@ -1,11 +1,13 @@
 [workspace]
-members = ["crates/frames-core", "crates/frames-native", "crates/frames", "crates/frames-proto", "crates/frames-media", "crates/frames-testkit"]
+members = ["crates/frames-core", "crates/frames-native", "crates/frames", "crates/frames-proto", "crates/frames-media", "crates/frames-testkit", "crates/frames-net"]
 resolver = "2"
-exclude = ["vendor/quinn-udp"]
+exclude = ["vendor/quinn-udp", "vendor/noq-udp"]
 
 [patch.crates-io]
-# macOS must use IP_PKTINFO to preserve IPv4 reply source addresses.
+# macOS must use IP_PKTINFO to preserve IPv4 reply source addresses: v1
+# (quinn) and v2 (iroh's noq fork). See each FRAMES-PATCH.md.
 quinn-udp = { path = "vendor/quinn-udp" }
+noq-udp = { path = "vendor/noq-udp" }
 
 [workspace.package]
 version = "0.2.5"

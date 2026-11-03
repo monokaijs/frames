@@ -30,6 +30,8 @@ const QUEUE_LIMIT_MS: f64 = 30.0;
 /// The empty-queue one-way delay is the minimum over two windows this long,
 /// so clock drift between the machines cannot accumulate.
 const BASE_WINDOW_US: i64 = 5_000_000;
+/// How long a congestion point is remembered without another one.
+const CAPACITY_MEMORY_US: u64 = 10_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RateConfig {
@@ -109,6 +111,12 @@ impl RateController {
         self.target as u32
     }
 
+    /// Changes the ceiling, e.g. for a relayed path; the target follows.
+    pub fn set_max_bps(&mut self, max_bps: u32) {
+        self.config.max_bps = max_bps.max(self.config.min_bps);
+        self.target = self.target.min(f64::from(self.config.max_bps));
+    }
+
     pub fn signal(&self) -> Signal {
         self.signal
     }
@@ -160,6 +168,26 @@ impl RateController {
         }
         let bytes: usize = self.acked.iter().map(|(_, b)| b).sum();
         Some(bytes as f64 * 8.0 * 1e6 / span as f64)
+    }
+
+    /// The transport switched paths (relay ↔ direct, or a new route): the
+    /// delay baseline, trend, and congestion estimate describe the old path
+    /// and must not judge the new one. The current target is kept.
+    pub fn path_changed(&mut self) {
+        self.group = None;
+        self.previous = None;
+        self.first_arrival_us = None;
+        self.accumulated_ms = 0.0;
+        self.smoothed_ms = 0.0;
+        self.history.clear();
+        self.deltas = 0;
+        self.overuse_since = None;
+        self.previous_trend = 0.0;
+        self.signal = Signal::Normal;
+        self.acked.clear();
+        self.congestion_bps = None;
+        self.base = None;
+        self.queue_ms = 0.0;
     }
 
     /// One received packet, in send order. `arrival_us` is on the
@@ -288,6 +316,17 @@ impl RateController {
             }
             Signal::Normal => {
                 let before = self.target;
+                // A capacity estimate is stale once the rate clearly exceeds
+                // it without congestion, or after a quiet while.
+                let stale = self.congestion_bps.is_some_and(|congestion| {
+                    self.target > 1.1 * congestion
+                        || self
+                            .last_decrease_us
+                            .is_some_and(|at| now_us.saturating_sub(at) > CAPACITY_MEMORY_US)
+                });
+                if stale {
+                    self.congestion_bps = None;
+                }
                 let near = self
                     .congestion_bps
                     .is_some_and(|congestion| self.target > 0.85 * congestion);
@@ -409,6 +448,34 @@ mod tests {
             rc.update(1_000_000, 10_000) <= rc.target_bps(),
             "rate-limited"
         );
+    }
+
+    #[test]
+    fn a_stale_congestion_point_stops_slowing_growth() {
+        let mut rc = controller();
+        // One congestion event at 5 Mbps, then a free link.
+        drive(&mut rc, 0, 1.0, 5e6, 1200);
+        drive(&mut rc, 1_000_000, 4.0, 1e9, 1200);
+        assert!(rc.target_bps() > 40_000_000, "{}", rc.target_bps());
+    }
+
+    #[test]
+    fn a_path_change_resets_the_delay_baseline() {
+        let mut rc = controller();
+        // Direct path: 1 ms one way.
+        for i in 0..200u64 {
+            rc.on_packet(i * 1_000, (i * 1_000 + 1_000) as i64, 1200);
+        }
+        rc.path_changed();
+        // Relay path: 40 ms one way, no queue. Without the reset this would
+        // read as a 39 ms standing queue and cut the rate.
+        for i in 200..400u64 {
+            rc.on_packet(i * 1_000, (i * 1_000 + 40_000) as i64, 1200);
+        }
+        assert!(rc.queue_ms() < 1.0, "{}", rc.queue_ms());
+        let before = rc.target_bps();
+        rc.update(400_000, 80_000);
+        assert!(rc.target_bps() >= before);
     }
 
     #[test]

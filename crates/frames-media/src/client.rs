@@ -39,7 +39,10 @@ pub struct ClientConfig {
     /// The host's encoder can invalidate references (else ask for keyframes).
     pub invalidate: bool,
     /// Added to host capture times to express them on the local clock.
-    pub clock_offset_us: i64,
+    /// `None` estimates it from packet send and arrival times: the minimum
+    /// of `arrival - send` is offset plus one-way delay, and half the RTT is
+    /// taken as the one-way delay (error at most RTT/2).
+    pub clock_offset_us: Option<i64>,
 }
 
 impl ClientConfig {
@@ -52,7 +55,7 @@ impl ClientConfig {
             min_frame_timeout_us: 30_000,
             nack: true,
             invalidate: true,
-            clock_offset_us: 0,
+            clock_offset_us: None,
         }
     }
 }
@@ -145,6 +148,9 @@ pub struct ClientSession {
     missing: BTreeMap<u64, Missing>,
     frame_unwrap: Option<Unwrapper>,
     capture_unwrap: Unwrapper,
+    send_unwrap: Unwrapper,
+    /// `(window start, minimum, previous window's minimum)` of arrival - send.
+    min_transit: Option<(u64, i64, i64)>,
     frames: BTreeMap<u64, FrameAssembly>,
     next_frame: Option<u64>,
     highest_frame: u64,
@@ -169,6 +175,8 @@ impl ClientSession {
             missing: BTreeMap::new(),
             frame_unwrap: None,
             capture_unwrap: Unwrapper::new(),
+            send_unwrap: Unwrapper::new(),
+            min_transit: None,
             frames: BTreeMap::new(),
             next_frame: None,
             highest_frame: 0,
@@ -206,15 +214,41 @@ impl ClientSession {
         match wire::parse(datagram) {
             Ok(Packet::Media(header, shard)) => {
                 self.track_seq(header.seq, now_us);
+                self.track_transit(header.send_us, now_us);
                 if header.stream == self.config.stream
                     && header.generation == self.config.generation
                 {
                     self.on_shard(now_us, header, shard);
                 }
             }
-            Ok(Packet::Probe(probe)) => self.track_seq(probe.seq, now_us),
+            Ok(Packet::Probe(probe)) => {
+                self.track_seq(probe.seq, now_us);
+                self.track_transit(probe.send_us, now_us);
+            }
             Ok(Packet::Feedback(_)) | Err(_) => {}
         }
+    }
+
+    fn track_transit(&mut self, send_us: u32, now_us: u64) {
+        const WINDOW_US: u64 = 10_000_000;
+        let transit = now_us as i64 - self.send_unwrap.unwrap(send_us) as i64;
+        let (start, current, previous) = self.min_transit.get_or_insert((now_us, transit, transit));
+        if now_us - *start > WINDOW_US {
+            *previous = *current;
+            *current = transit;
+            *start = now_us;
+        } else {
+            *current = (*current).min(transit);
+        }
+    }
+
+    /// Host clock → local clock offset (see [`ClientConfig::clock_offset_us`]).
+    pub fn clock_offset_us(&self) -> i64 {
+        self.config.clock_offset_us.unwrap_or_else(|| {
+            self.min_transit.map_or(0, |(_, current, previous)| {
+                current.min(previous) - (self.rtt_us / 2) as i64
+            })
+        })
     }
 
     fn track_seq(&mut self, seq: u32, now_us: u64) {
@@ -378,7 +412,7 @@ impl ClientSession {
                 data.extend_from_slice(slice.done.as_ref().expect("complete"));
             }
             let captured_host = self.capture_unwrap.unwrap(header.capture_us);
-            let captured_us = (captured_host as i64 + self.config.clock_offset_us).max(0) as u64;
+            let captured_us = (captured_host as i64 + self.clock_offset_us()).max(0) as u64;
             let unit = AccessUnit {
                 frame,
                 kind,

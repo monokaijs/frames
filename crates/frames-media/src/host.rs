@@ -145,6 +145,17 @@ impl HostSession {
         self.rate.target_bps()
     }
 
+    /// Caps the bitrate, e.g. on a relayed path whose capacity is known to
+    /// be limited (n0's public relays deliver ~8 Mbps).
+    pub fn set_max_bps(&mut self, max_bps: u32) {
+        self.rate.set_max_bps(max_bps);
+    }
+
+    /// Call when the transport's selected path changes.
+    pub fn path_changed(&mut self) {
+        self.rate.path_changed();
+    }
+
     /// Bitrate for the encoder: the target minus FEC and header overhead.
     fn video_bps(&self) -> u32 {
         let parity = 1.0 + f64::from(self.config.parity_per_32) / 32.0;

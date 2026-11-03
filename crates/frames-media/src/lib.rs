@@ -10,6 +10,7 @@
 
 pub mod api;
 pub mod client;
+pub mod clock;
 pub mod fec;
 pub mod host;
 pub mod rate;
