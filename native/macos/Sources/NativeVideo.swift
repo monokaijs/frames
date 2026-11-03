@@ -87,6 +87,7 @@ final class NativeVideoEncoder: @unchecked Sendable {
         }
         guard VTSessionSetProperty(session,key:kVTCompressionPropertyKey_AverageBitRate,value:bitrate as CFNumber) == noErr else{throw Wire.failure("VideoToolbox cannot apply the bitrate budget")}
         VTSessionSetProperty(session,key:kVTCompressionPropertyKey_ExpectedFrameRate,value:fps as CFNumber)
+        // Same periodic safety-net interval as FRAMES_KEYFRAME_INTERVAL in native.c.
         VTSessionSetProperty(session,key:kVTCompressionPropertyKey_MaxKeyFrameInterval,value:60 as CFNumber)
         if codec == kCMVideoCodecType_H264 { VTSessionSetProperty(session,key:kVTCompressionPropertyKey_ProfileLevel,value:kVTProfileLevel_H264_ConstrainedHigh_AutoLevel) }
         VTSessionSetProperty(session,key:kVTCompressionPropertyKey_MaxFrameDelayCount,value:0 as CFNumber)

@@ -26,10 +26,21 @@ static LIB open_library(const char *path) {
 }
 #else
 #include <dlfcn.h>
+
 #define LIB void *
 #define SYMBOL dlsym
 static LIB open_library(const char *path) { return dlopen(path, RTLD_NOW | RTLD_LOCAL); }
 #endif
+/* Periodic keyframe interval for every backend (VideoToolbox, NVENC, QSV,
+ * AMF, MF, libaom, libvpx), in frames. Keyframes are also sent on demand: at
+ * stream start, on a client recovery request, after an encoder restart, and
+ * on a meaningful bitrate increase. The periodic one stays as the safety net
+ * until keyframe-free recovery (NVENC reference invalidation, VideoToolbox
+ * long-term references) lands: a netsim A/B on 2026-11-04 with on-demand-only
+ * keyframes saved ~35% bitrate on a clean LAN (VideoToolbox) but lowered
+ * delivered frames on lossy paths (VideoToolbox 3.2 -> 0.3 fps, NVENC
+ * 7.3 -> 4.5 fps). Keep any value <= 65535 (QSV stores it in 16 bits). */
+#define FRAMES_KEYFRAME_INTERVAL 60
 
 #define API(F) \
  F(unsigned, swresample_version, (void)) \
@@ -243,7 +254,7 @@ static int vt_open(Media *m,const char *name,int fps) {
     m->ready=dispatch_semaphore_create(0);if(!m->ready)return -1;
     if (VTSessionSetProperty(m->vt,kVTCompressionPropertyKey_RealTime,kCFBooleanTrue) ||
         VTSessionSetProperty(m->vt,kVTCompressionPropertyKey_AllowFrameReordering,kCFBooleanFalse)) return -1;
-    int bitrate=m->bitrate?m->bitrate:12000000,gop=60;
+    int bitrate=m->bitrate?m->bitrate:12000000,gop=FRAMES_KEYFRAME_INTERVAL;
     CFNumberRef number=CFNumberCreate(NULL,kCFNumberIntType,&bitrate);
     result=VTSessionSetProperty(m->vt,kVTCompressionPropertyKey_AverageBitRate,number);CFRelease(number);if(result)return result;
     number=CFNumberCreate(NULL,kCFNumberIntType,&fps);
@@ -304,7 +315,7 @@ Media *frames_encoder_open(const char *name, int width, int height, int fps, int
 #endif
     c->width = m->padded_width; c->height = m->padded_height;
     c->time_base = (AVRational){1, fps}; c->framerate = (AVRational){fps, 1};
-    c->bit_rate = bitrate; c->rc_max_rate = bitrate; c->rc_buffer_size = bitrate/30; c->gop_size = 60; c->max_b_frames = 0;
+    c->bit_rate = bitrate; c->rc_max_rate = bitrate; c->rc_buffer_size = bitrate/30; c->gop_size = FRAMES_KEYFRAME_INTERVAL; c->max_b_frames = 0;
     c->flags |= AV_CODEC_FLAG_LOW_DELAY;
     c->thread_count = 2; c->thread_type = FF_THREAD_SLICE;
     c->pix_fmt = AV_PIX_FMT_YUV420P;
@@ -589,7 +600,7 @@ Media *frames_encoder_open_gpu(const char *name,int width,int height,int fps,int
     Media *m=create(codec,width,height);if(!m)return NULL;
     AVCodecContext *c=m->ctx;m->padded_width=(width+1)&~1;m->padded_height=(height+1)&~1;
     c->width=m->padded_width;c->height=m->padded_height;c->time_base=(AVRational){1,fps};c->framerate=(AVRational){fps,1};
-    c->pix_fmt=AV_PIX_FMT_D3D11;c->bit_rate=c->rc_max_rate=bitrate;c->rc_buffer_size=bitrate/30;c->max_b_frames=0;c->gop_size=60;c->flags|=AV_CODEC_FLAG_LOW_DELAY;
+    c->pix_fmt=AV_PIX_FMT_D3D11;c->bit_rate=c->rc_max_rate=bitrate;c->rc_buffer_size=bitrate/30;c->max_b_frames=0;c->gop_size=FRAMES_KEYFRAME_INTERVAL;c->flags|=AV_CODEC_FLAG_LOW_DELAY;
     c->colorspace=AVCOL_SPC_BT709;c->color_range=AVCOL_RANGE_MPEG;
     if(strstr(name,"_nvenc")){option(m,"rc","cbr");option(m,"preset","p1");option(m,"tune","ull");option(m,"zerolatency","1");option(m,"delay","0");option(m,"rc-lookahead","0");option(m,"forced-idr","1");}
     if(strstr(name,"_amf")){option(m,"usage","ultralowlatency");option(m,"quality","speed");option(m,"async_depth","1");option(m,"preanalysis","0");}
