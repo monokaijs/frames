@@ -65,7 +65,8 @@ class ReleaseTests(unittest.TestCase):
         self.original = release.ROOT
         self.addCleanup(setattr, release, "ROOT", self.original)
         release.ROOT = Path(self.directory.name)
-        for name in ["Cargo.toml", "Cargo.lock", "native/macos/Info.plist"]:
+        members = [member + "/Cargo.toml" for member in __import__("tomllib").loads((self.original / "Cargo.toml").read_text())["workspace"]["members"]]
+        for name in ["Cargo.toml", "Cargo.lock", "native/macos/Info.plist", *members]:
             destination = release.ROOT / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(self.original / name, destination)
@@ -110,7 +111,9 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(release.next_version("major"), "2.0.0")
         import tomllib
         packages = tomllib.loads((release.ROOT / "Cargo.lock").read_text())["package"]
-        self.assertEqual([p["version"] for p in packages if p["name"] in ["frames", "frames-core", "frames-native"]], ["1.2.3"] * 3)
+        members = release.workspace_packages()
+        self.assertTrue({"frames", "frames-core", "frames-native", "frames-media"} <= set(members), members)
+        self.assertEqual([p["version"] for p in packages if p["name"] in members], ["1.2.3"] * len(members))
         bundle = plistlib.loads((release.ROOT / "native/macos/Info.plist").read_bytes())
         self.assertEqual(bundle["CFBundleVersion"], "1.2.3")
         self.assertEqual(bundle["CFBundleShortVersionString"], "1.2.3")

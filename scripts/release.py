@@ -33,15 +33,30 @@ def next_version(bump):
     if bump == "minor": return f"{major}.{minor + 1}.0"
     return f"{major}.{minor}.{patch + 1}"
 
+def workspace_packages():
+    """Names of workspace members that inherit `workspace.package.version`."""
+    members = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["members"]
+    names = []
+    for member in members:
+        package = tomllib.loads((ROOT / member / "Cargo.toml").read_text())["package"]
+        if package.get("version") == {"workspace": True}:
+            names.append(package["name"])
+    assert "frames" in names, f"The app package must inherit the workspace version: {names}"
+    return names
+
 def set_version(value):
     value = version(value)
     path = ROOT / "Cargo.toml"
     text, count = re.subn(r'(?m)^version = "[^"]+"$', f'version = "{value}"', path.read_text(), count=1)
     assert count == 1
     path.write_text(text)
+    names = workspace_packages()
     path = ROOT / "Cargo.lock"
-    text, count = re.subn(r'(\[\[package\]\]\nname = "frames(?:-core|-native)?"\nversion = ")[^"]+', r'\g<1>' + value, path.read_text())
-    assert count == 3, f"Expected three workspace packages, found {count}"
+    pattern = r'(\[\[package\]\]\nname = "(?:' + "|".join(map(re.escape, names)) + r')"\nversion = ")[^"]+'
+    text, count = re.subn(pattern, r'\g<1>' + value, path.read_text())
+    # `cargo --locked` in the release jobs fails if any member's lock entry
+    # still carries the previous version.
+    assert count == len(names), f"Expected {len(names)} workspace packages in Cargo.lock, found {count}"
     path.write_text(text)
     path = ROOT / "native/macos/Info.plist"
     data = plistlib.loads(path.read_bytes())
