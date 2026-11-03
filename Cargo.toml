@@ -28,3 +28,12 @@ windows = { version = "0.62.2", features = ["Foundation", "Graphics_Capture", "G
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+# The v2 media engine's simulations run thousands of FEC blocks per second;
+# unoptimized Reed-Solomon makes debug-mode tests ~20x slower.
+[profile.dev.package.reed-solomon-simd]
+opt-level = 3
+[profile.dev.package.frames-media]
+opt-level = 2
+[profile.dev.package.frames-testkit]
+opt-level = 2

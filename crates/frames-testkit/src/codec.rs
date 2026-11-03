@@ -26,25 +26,37 @@ const LONG_TERM_SLOTS: usize = 16;
 const DECODED_PICTURE_BUFFER: usize = 16;
 const CHUNK_HEADER: usize = 11;
 
-/// Output sizes and timing of the synthetic encoder.
+/// Output sizes and timing of the synthetic encoder. Sizes follow the
+/// configured bitrate, as a rate-controlled encoder's do: a predicted frame
+/// is one frame's share of the bitrate; keyframes and refresh frames are
+/// multiples of it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EncoderModel {
-    pub keyframe_bytes: usize,
-    pub predicted_bytes: usize,
-    pub refresh_bytes: usize,
+    pub keyframe_factor: f64,
+    pub refresh_factor: f64,
     /// Time from submit to the last slice.
     pub encode_us: u64,
 }
 
 impl Default for EncoderModel {
     fn default() -> Self {
-        // Roughly 1080p at 20 Mbps, 60 fps.
         Self {
-            keyframe_bytes: 200_000,
-            predicted_bytes: 40_000,
-            refresh_bytes: 60_000,
+            keyframe_factor: 5.0,
+            refresh_factor: 1.5,
             encode_us: 3_000,
         }
+    }
+}
+
+impl EncoderModel {
+    fn bytes(&self, params: &EncodeParams, kind: FrameKind) -> usize {
+        let share = f64::from(params.bitrate_bps) / 8.0 / f64::from(params.fps.max(1));
+        let factor = match kind {
+            FrameKind::Keyframe => self.keyframe_factor,
+            FrameKind::Refresh { .. } => self.refresh_factor,
+            FrameKind::Predicted => 1.0,
+        };
+        (share * factor).round().max(64.0) as usize
     }
 }
 
@@ -98,7 +110,13 @@ impl SyntheticEncoder {
         &self.params
     }
 
-    fn plan(&mut self) -> (FrameKind, FrameReference, usize) {
+    /// Advertises only `features`, e.g. to exercise recovery without
+    /// reference invalidation. Controls stay functional either way.
+    pub fn set_features(&mut self, features: EncoderFeatures) {
+        self.caps.features = features;
+    }
+
+    fn plan(&mut self) -> (FrameKind, FrameReference) {
         let periodic = matches!(self.params.gop, Gop::Frames(n) if self.since_keyframe >= n);
         let previous = self.recent.back().copied();
         if self.force_keyframe || periodic || previous.is_none() {
@@ -106,31 +124,21 @@ impl SyntheticEncoder {
             self.invalidated = None;
             self.refresh_left = None;
             self.use_long_term = None;
-            return (
-                FrameKind::Keyframe,
-                FrameReference::None,
-                self.model.keyframe_bytes,
-            );
+            return (FrameKind::Keyframe, FrameReference::None);
         }
         if let Some(slot) = self.use_long_term.take() {
             self.invalidated = None;
             let reference = FrameReference::LongTerm(slot);
-            return (FrameKind::Predicted, reference, self.model.predicted_bytes);
+            return (FrameKind::Predicted, reference);
         }
         if let Some((first, _)) = self.invalidated.take() {
             // Predict from the newest frame before the loss, if still held.
             match self.recent.iter().rev().find(|f| **f < first) {
                 Some(&good) => {
                     let reference = FrameReference::Frame(good);
-                    return (FrameKind::Predicted, reference, self.model.predicted_bytes);
+                    return (FrameKind::Predicted, reference);
                 }
-                None => {
-                    return (
-                        FrameKind::Keyframe,
-                        FrameReference::None,
-                        self.model.keyframe_bytes,
-                    );
-                }
+                None => return (FrameKind::Keyframe, FrameReference::None),
             }
         }
         let reference = FrameReference::Frame(previous.expect("checked above"));
@@ -139,9 +147,9 @@ impl SyntheticEncoder {
             let kind = FrameKind::Refresh {
                 complete: left == 1,
             };
-            return (kind, reference, self.model.refresh_bytes);
+            return (kind, reference);
         }
-        (FrameKind::Predicted, reference, self.model.predicted_bytes)
+        (FrameKind::Predicted, reference)
     }
 }
 
@@ -218,7 +226,8 @@ impl VideoEncoder for SyntheticEncoder {
     ) -> Result<(), MediaError> {
         let number = self.next_frame;
         self.next_frame += 1;
-        let (kind, reference, bytes) = self.plan();
+        let (kind, reference) = self.plan();
+        let bytes = self.model.bytes(&self.params, kind);
         if kind == FrameKind::Keyframe {
             // An IDR resets every reference, long-term ones included.
             self.since_keyframe = 0;

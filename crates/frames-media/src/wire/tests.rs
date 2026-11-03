@@ -52,6 +52,7 @@ fn feedback() -> Feedback {
                 stream: 1,
                 generation: 7,
                 last_decoded: 40,
+                long_term: Some((1, 30)),
                 request: RecoveryRequest::Invalidate {
                     first: 41,
                     last: 42,
@@ -61,6 +62,7 @@ fn feedback() -> Feedback {
                 stream: 2,
                 generation: 1,
                 last_decoded: 0,
+                long_term: None,
                 request: RecoveryRequest::Keyframe,
             },
         ],
@@ -114,7 +116,7 @@ fn media_validation_rejects_inconsistent_headers() {
         (
             "slot",
             MediaHeader {
-                reference: Reference::LongTerm(16),
+                reference: Reference::LongTerm { slot: 16, back: 1 },
                 ..base
             },
         ),
@@ -174,9 +176,17 @@ fn media_validation_rejects_inconsistent_headers() {
     let mut flags = bytes.clone();
     flags[1] |= 0x80;
     assert!(parse(&flags).is_err(), "reserved flags");
-    let mut both = bytes.clone();
-    both[28] = 1;
-    assert!(parse(&both).is_err(), "frame and long-term reference");
+    let mut long_term = bytes.clone();
+    long_term[28] = 1;
+    let Packet::Media(parsed, _) = parse(&long_term).unwrap() else {
+        panic!("media");
+    };
+    assert_eq!(parsed.reference, Reference::LongTerm { slot: 1, back: 1 });
+    long_term[26] = 0;
+    assert!(
+        parse(&long_term).is_err(),
+        "long-term reference of zero frames back"
+    );
     assert!(parse(&bytes[..bytes.len() - 1]).is_err(), "short shard");
     let mut long = bytes.clone();
     long.push(0);

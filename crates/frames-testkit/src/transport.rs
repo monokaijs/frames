@@ -64,6 +64,12 @@ impl SimEndpoint {
         self.outgoing().lock().unwrap().stats()
     }
 
+    /// Bytes waiting at the bottleneck of the link this endpoint sends on.
+    pub fn send_queued_bytes(&self) -> u64 {
+        let now = self.shared.clock.now_us();
+        self.outgoing().lock().unwrap().queued_bytes(now)
+    }
+
     /// Changes the conditions of the link this endpoint sends on.
     pub fn set_send_config(&self, config: LinkConfig) {
         self.outgoing().lock().unwrap().set_config(config);

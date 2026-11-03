@@ -9,5 +9,9 @@
 //!   the synthetic ones in `frames-testkit`.
 
 pub mod api;
+pub mod client;
+pub mod fec;
+pub mod host;
+pub mod rate;
 pub mod seq;
 pub mod wire;

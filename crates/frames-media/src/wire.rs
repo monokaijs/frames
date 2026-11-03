@@ -9,7 +9,7 @@
 //! | off | size | field |
 //! |----:|-----:|-------|
 //! | 0 | 1 | version/kind |
-//! | 1 | 1 | flags: keyframe, recovery point, retransmission, end of frame |
+//! | 1 | 1 | flags: keyframe, recovery point, retransmission, end of frame, intra refresh |
 //! | 2 | 4 | stream id |
 //! | 6 | 2 | stream generation (configuration epoch) |
 //! | 8 | 4 | transport sequence: per connection, every packet, never reused |
@@ -19,7 +19,7 @@
 //! | 24 | 1 | slice index |
 //! | 25 | 1 | slice count |
 //! | 26 | 2 | reference: frames back (0 = none / intra) |
-//! | 28 | 1 | reference long-term slot, `0xFF` = none |
+//! | 28 | 1 | reference long-term slot, `0xFF` = none; then offset 26 says how many frames back that slot's frame is, so the receiver can check it holds exactly that frame |
 //! | 29 | 1 | marks this frame as long-term slot, `0xFF` = none |
 //! | 30 | 4 | slice length before FEC |
 //! | 34 | 1 | FEC block index |
@@ -60,7 +60,7 @@ pub const ARRIVAL_TICK_US: i64 = 32;
 const NONE_U8: u8 = 0xFF;
 const FEEDBACK_FIXED_BYTES: usize = 16;
 const NACK_BYTES: usize = 6;
-const STREAM_STATE_BYTES: usize = 19;
+const STREAM_STATE_BYTES: usize = 24;
 const PROBE_HEADER_BYTES: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,8 +127,9 @@ pub enum Reference {
     None,
     /// The frame `n` frames earlier in the same stream generation (n >= 1).
     Back(u16),
-    /// A long-term reference slot.
-    LongTerm(u8),
+    /// The frame `back` frames earlier, held in long-term slot `slot`.
+    /// Naming both lets the receiver verify it holds exactly that frame.
+    LongTerm { slot: u8, back: u16 },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -144,7 +145,10 @@ impl MediaFlags {
     pub const RETRANSMISSION: Self = Self(1 << 2);
     /// The last slice of the frame.
     pub const END_OF_FRAME: Self = Self(1 << 3);
-    const KNOWN: u8 = 0x0F;
+    /// Part of an intra-refresh wave: still decodable (though not clean)
+    /// when its reference was lost; the wave ends at a recovery point.
+    pub const INTRA_REFRESH: Self = Self(1 << 4);
+    const KNOWN: u8 = 0x1F;
 
     pub const fn empty() -> Self {
         Self(0)
@@ -229,8 +233,11 @@ impl MediaHeader {
         }
         match self.reference {
             Reference::Back(0) => return invalid("reference of zero frames back"),
-            Reference::LongTerm(slot) if slot >= MAX_LTR_SLOTS => {
+            Reference::LongTerm { slot, .. } if slot >= MAX_LTR_SLOTS => {
                 return invalid("long-term reference slot out of range");
+            }
+            Reference::LongTerm { back: 0, .. } => {
+                return invalid("long-term reference of zero frames back");
             }
             _ => {}
         }
@@ -242,6 +249,11 @@ impl MediaHeader {
         }
         if self.flags.contains(MediaFlags::KEYFRAME) && self.reference != Reference::None {
             return invalid("keyframe with a reference");
+        }
+        if self.flags.contains(MediaFlags::KEYFRAME)
+            && self.flags.contains(MediaFlags::INTRA_REFRESH)
+        {
+            return invalid("keyframe inside an intra-refresh wave");
         }
         if self.kind == MediaKind::Audio
             && (self.slices != 1
@@ -262,7 +274,7 @@ impl MediaHeader {
         let (ref_back, ref_slot) = match self.reference {
             Reference::None => (0, NONE_U8),
             Reference::Back(back) => (back, NONE_U8),
-            Reference::LongTerm(slot) => (0, slot),
+            Reference::LongTerm { slot, back } => (back, slot),
         };
         let kind = match self.kind {
             MediaKind::Video => Kind::Video,
@@ -314,8 +326,12 @@ impl MediaHeader {
         let reference = match (ref_back, ref_slot) {
             (0, NONE_U8) => Reference::None,
             (back, NONE_U8) => Reference::Back(back),
-            (0, slot) => Reference::LongTerm(slot),
-            _ => return Err(WireError::Invalid("both frame and long-term reference")),
+            (0, _) => {
+                return Err(WireError::Invalid(
+                    "long-term reference of zero frames back",
+                ));
+            }
+            (back, slot) => Reference::LongTerm { slot, back },
         };
         let header = Self {
             kind,
@@ -374,6 +390,9 @@ pub struct StreamState {
     pub generation: u16,
     /// Highest frame decoded cleanly; the sender may use it as a reference.
     pub last_decoded: u32,
+    /// The newest long-term reference the receiver holds: `(slot, frame)`.
+    /// The sender only recovers from a long-term slot confirmed here.
+    pub long_term: Option<(u8, u32)>,
     pub request: RecoveryRequest,
 }
 
@@ -422,6 +441,13 @@ impl Feedback {
         if self.nacks.iter().any(|nack| nack.len == 0) {
             return Err(WireError::Invalid("empty retransmission range"));
         }
+        if self
+            .streams
+            .iter()
+            .any(|s| s.long_term.is_some_and(|(slot, _)| slot >= MAX_LTR_SLOTS))
+        {
+            return Err(WireError::Invalid("long-term slot out of range"));
+        }
         let mut ticks = Vec::new();
         let mut previous = 0i64;
         for arrival in self.arrivals.iter().flatten() {
@@ -469,6 +495,9 @@ impl Feedback {
             out.extend_from_slice(&state.stream.to_le_bytes());
             out.extend_from_slice(&state.generation.to_le_bytes());
             out.extend_from_slice(&state.last_decoded.to_le_bytes());
+            let (slot, frame) = state.long_term.unwrap_or((NONE_U8, 0));
+            out.push(slot);
+            out.extend_from_slice(&frame.to_le_bytes());
             out.push(code);
             out.extend_from_slice(&first.to_le_bytes());
             out.extend_from_slice(&last.to_le_bytes());
@@ -520,6 +549,14 @@ impl Feedback {
             let stream = r.u32()?;
             let generation = r.u16()?;
             let last_decoded = r.u32()?;
+            let long_term = match (r.u8()?, r.u32()?) {
+                (NONE_U8, 0) => None,
+                (NONE_U8, _) => return Err(WireError::Invalid("long-term frame without a slot")),
+                (slot, _) if slot >= MAX_LTR_SLOTS => {
+                    return Err(WireError::Invalid("long-term slot out of range"));
+                }
+                (slot, frame) => Some((slot, frame)),
+            };
             let code = r.u8()?;
             let first = r.u32()?;
             let last = r.u32()?;
@@ -533,6 +570,7 @@ impl Feedback {
                 stream,
                 generation,
                 last_decoded,
+                long_term,
                 request,
             });
         }

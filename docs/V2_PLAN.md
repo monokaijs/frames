@@ -243,6 +243,24 @@ Gate additions:
 - **Gate:** frames-proto, frames-media and frames-testkit compile and pass tests on Linux with no FFI, and the wire format is frozen.
 
 ### Phase 2: Media engine on testkit
+
+**Status (2026-11-04): engine and gates done, in virtual time.** The engine is in `frames-media` (`host`, `client`, `fec`, `rate`); scenarios are in `frames-testkit::netsim`, with gates in `crates/frames-testkit/tests/netsim.rs`.
+
+Measured results (60 fps, 1080p synthetic):
+
+| Scenario | Result |
+|---|---|
+| Clean LAN | 0 lost, 1 keyframe, p95 3.8 ms |
+| 1% random loss, 20 ms RTT | 0 lost (NACK), p99 24 ms |
+| Burst loss | 0 lost, p99 55 ms |
+| 80 ms outage | recovered by invalidation, no keyframe |
+| 600 ms outage, no invalidation | recovered from a long-term reference 50 ms after detection, no keyframe |
+| 80→10 Mbps step | ≤10 Mbps within 2 s, settles at 9.2–9.5 Mbps with no standing queue (delay-trend plus 30 ms queue bound) |
+
+- Seeded runs replay exactly.
+- Intra refresh is supported by the API and the synthetic codec but not yet used by the host's recovery ladder. Spike 0-C showed HEVC needs invalidation first.
+- The comparison with 0.2.x netsim waits until the v2 engine drives real codecs (Phase 3).
+
 Host pipeline: capture → encode (slices) → packetize/FEC → pacer. Client pipeline: recv → reassemble → NACK/FEC → decode → present → feedback.
 
 - **NACK:** retransmit a missing shard only while `now + rtt/2 < frame deadline`. FEC covers what retransmission can't reach in time; FEC overhead adapts to measured residual loss.

@@ -1940,6 +1940,7 @@ name = "frames-media"
 version = "0.2.5"
 dependencies = [
  "bytes",
+ "reed-solomon-simd",
 ]
 
 [[package]]

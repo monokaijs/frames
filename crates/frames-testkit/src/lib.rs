@@ -11,6 +11,7 @@
 //!   bottleneck rate, drop-tail queue.
 //! - [`transport`]: a pair of links as a [`frames_media::api::MediaTransport`].
 //! - [`capture`]: synthetic capture source at a fixed frame rate.
+//! - [`netsim`]: virtual-time end-to-end runs of the v2 media engine.
 //! - [`codec`]: synthetic encoder and decoder that track reference chains,
 //!   so recovery (invalidation, long-term references, intra refresh) is
 //!   observable: a frame predicted from a lost frame fails to decode.
@@ -19,5 +20,6 @@ pub mod capture;
 pub mod clock;
 pub mod codec;
 pub mod link;
+pub mod netsim;
 pub mod rng;
 pub mod transport;

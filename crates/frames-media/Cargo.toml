@@ -12,3 +12,4 @@ publish = false
 # frames-codec / frames-platform-* and depend on this crate, not the reverse.
 [dependencies]
 bytes.workspace = true
+reed-solomon-simd = "=3.1.0"
