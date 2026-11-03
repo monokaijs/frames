@@ -1,7 +1,11 @@
 name: Frames
 on:
+  # Work lands directly on main; run the same checks there, not only on PRs.
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "spikes/**"]
   pull_request:
-    paths-ignore: ["**.md"]
+    paths-ignore: ["**.md", "spikes/**"]
   workflow_dispatch:
 jobs:
   windows:
