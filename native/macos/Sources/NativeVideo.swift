@@ -250,6 +250,7 @@ private final class NativeVideoDecoder {
         guard frame.bytes.count>1,frame.bytes.count<=8*1024*1024,frame.bytes[0]<=1 else { throw Wire.failure("Invalid native access unit") }
         let started = DispatchTime.now().uptimeNanoseconds
         let units = Self.nals(Data(frame.bytes.dropFirst()))
+        let coldStart = session == nil
         if session == nil {
             guard frame.bytes[0] == 1 else { return nil }
             let parameters = units.filter { unit in guard let first = unit.first else { return false };let type = frame.kind == 3 ? (first>>1)&63:first&31;return frame.kind == 3 ? [32,33,34].contains(type):[7,8].contains(type) }.map { $0 as NSData }
@@ -280,9 +281,18 @@ private final class NativeVideoDecoder {
         var size=avcc.count;var sample:CMSampleBuffer?
         guard CMSampleBufferCreateReady(allocator:nil,dataBuffer:block,formatDescription:format,sampleCount:1,sampleTimingEntryCount:0,sampleTimingArray:nil,sampleSizeEntryCount:1,sampleSizeArray:&size,sampleBufferOut:&sample) == noErr,let sample else { throw Wire.failure("Cannot create compressed sample") }
         guard let state=callback else{return nil}
+        // A callback that completed after an earlier deadline must not be
+        // mistaken for this picture's completion.
+        while state.complete.wait(timeout:.now()) == .success {}
         state.lock.lock();state.output=nil;state.status=noErr;state.lock.unlock()
+        // The deadline detects a hung decoder. A new session's first picture
+        // and an independent picture (often a detailed full refresh) take
+        // legitimately longer than a steady predicted frame, especially on a
+        // cold or virtualized GPU; one slow picture must not demote the
+        // client to software decoding.
+        let deadline = coldStart ? 1.0 : (frame.bytes[0] == 1 ? 0.25 : 0.05)
         let status=VTDecompressionSessionDecodeFrame(session,sampleBuffer:sample,flags:[._EnableAsynchronousDecompression],frameRefcon:nil,infoFlagsOut:nil)
-        guard status == noErr,state.complete.wait(timeout:.now()+0.05) == .success else { throw Wire.failure("Hardware decoder missed its frame deadline (\(status))") }
+        guard status == noErr,state.complete.wait(timeout:.now()+deadline) == .success else { throw Wire.failure("Hardware decoder missed its frame deadline (\(status))") }
         state.lock.lock();let pixel=state.output,statusOut=state.status;state.output=nil;state.lock.unlock()
         guard statusOut == noErr,let pixel else { throw Wire.failure("Hardware decoder returned no surface") }
         Wire.send(["event":"decoded","window":["id":frame.id,"generation":frame.generation],"generation":frame.streamGeneration,"number":frame.number,"micros":(DispatchTime.now().uptimeNanoseconds-started)/1000])
