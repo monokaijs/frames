@@ -141,6 +141,7 @@ async fn repeated_quality_switches_deliver_idle_pixels_through_the_media_pipelin
                         if let ClientUpdate::Frame(_, frame) = update {
                             let identity = (frame.media_generation, frame.frame_number);
                             if (frame.width, frame.height) == expected && previous.is_none_or(|old| identity > old) {
+                                #[cfg_attr(not(windows), allow(unused_mut))] // GPU readback below is Windows-only.
                                 let mut pixels = frame.bgra.to_vec();
                                 #[cfg(windows)]
                                 if let Some(gpu) = &frame.gpu {

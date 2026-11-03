@@ -37,10 +37,10 @@ impl BackgroundSharing {
                 "Could not pause sharing at login: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            return Ok(Self {
+            Ok(Self {
                 resume: (String::from_utf8_lossy(&output.stdout).trim() == "resume")
                     .then_some(helper),
-            });
+            })
         }
         #[cfg(not(target_os = "macos"))]
         {
