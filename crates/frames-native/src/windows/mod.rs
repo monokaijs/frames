@@ -1,6 +1,7 @@
 mod caption;
 mod capture;
 mod client;
+mod debug_overlay;
 mod devices;
 pub(crate) mod dialogs;
 mod drag;

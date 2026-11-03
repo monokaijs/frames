@@ -510,6 +510,8 @@ pub fn is_keyframe(_codec: Codec, packet: &[u8], _first: bool) -> bool {
 #[derive(Default)]
 pub struct DecodeMetrics {
     pub decoded: AtomicU64,
+    /// The in-process decoder is currently using a hardware context.
+    pub hardware: AtomicBool,
     retained: std::sync::Mutex<std::collections::HashMap<(u32, u64), usize>>,
     pub failed: AtomicBool,
     pub histogram: std::sync::Mutex<crate::media::LatencyHistogram>,
@@ -723,6 +725,7 @@ async fn decode_inner(
             "In-process video decoder started"
         );
         let mut hardware_active = hw_works;
+        worker_metrics.hardware.store(hw_works, Ordering::Relaxed);
         let mut awaiting_keyframe = false;
         loop {
             let packet = handle.block_on(async {
@@ -760,6 +763,7 @@ async fn decode_inner(
                 && (decoded.is_err() || (packet.keyframe && matches!(decoded, Ok(None))))
             {
                 hardware_active = false;
+                worker_metrics.hardware.store(false, Ordering::Relaxed);
                 tracing::warn!(
                     ?codec,
                     "hardware decoder did not produce a picture; using software"

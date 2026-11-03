@@ -42,6 +42,14 @@ const USB_INFO: usize = 0xB005;
 const REMOTE_CURSOR: usize = 0xB006;
 const RELATIVE_MOUSE: usize = 0xB007;
 const COMPATIBILITY: usize = 0xB008;
+const DEBUG_OVERLAY: usize = 0xB009;
+/// Posted to the UI thread after the debug overlay is toggled from any window.
+const DEBUG_TOGGLED: u32 = WM_APP + 44;
+/// The debug overlay is session-wide: every viewer shows it or none does.
+static DEBUG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn debug_label() -> String {
+    format!("Debug overlay · {}", crate::DEBUG_OVERLAY_SHORTCUT)
+}
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 struct Preference {
     mode: SizingMode,
@@ -85,8 +93,43 @@ struct Proxy {
     menu_ids: HashMap<usize, String>,
     menu_open: bool,
     pending_menu: Option<Vec<MenuItem>>,
+    debug_panel: Option<super::debug_overlay::DebugPanel>,
+    debug_snapshot: Option<Box<crate::DebugOverlay>>,
 }
 impl Proxy {
+    /// Shows, moves or hides this window's debug panel for the current state.
+    unsafe fn refresh_debug(&mut self, hwnd: HWND) {
+        let enabled = DEBUG_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+        if !enabled {
+            self.debug_snapshot = None;
+        }
+        let eligible = enabled
+            && !self.hidden
+            && !IsIconic(hwnd).as_bool()
+            && matches!(
+                self.remote.role,
+                WindowRole::Desktop | WindowRole::Window | WindowRole::Dialog
+            );
+        let Some(snapshot) = self.debug_snapshot.as_ref().filter(|_| eligible) else {
+            if let Some(panel) = &self.debug_panel {
+                panel.hide();
+            }
+            return;
+        };
+        if self.debug_panel.is_none() {
+            match super::debug_overlay::DebugPanel::new(hwnd) {
+                Ok(panel) => self.debug_panel = Some(panel),
+                Err(error) => {
+                    tracing::warn!(%error, "debug overlay unavailable");
+                    return;
+                }
+            }
+        }
+        let content = self.content(hwnd);
+        if let Err(error) = self.debug_panel.as_ref().unwrap().show(snapshot, content) {
+            tracing::debug!(%error, "debug overlay draw failed");
+        }
+    }
     fn tray_window(&self) -> super::session_control::SessionWindow {
         use super::tray::{TrayGlyph as G, TrayItem as Item};
         let item = |id: usize, title: &str, glyph| Item::new(id as u32, title, glyph);
@@ -97,6 +140,10 @@ impl Proxy {
                     .checked(self.relative),
             );
             options.push(item(COMPATIBILITY, "Window compatibility", G::Info));
+            options.push(
+                item(DEBUG_OVERLAY, &debug_label(), G::Info)
+                    .checked(DEBUG_ENABLED.load(std::sync::atomic::Ordering::Relaxed)),
+            );
         } else {
             options.extend([
                 item(SHOW_HEADER, "Show remote window header", G::Window)
@@ -112,6 +159,8 @@ impl Proxy {
                 item(REMOTE_MENU, "Refresh application menus", G::Refresh)
                     .enabled(self.remote.role != WindowRole::Desktop),
                 item(FETCH, "Fetch remote file…", G::Folder),
+                item(DEBUG_OVERLAY, &debug_label(), G::Info)
+                    .checked(DEBUG_ENABLED.load(std::sync::atomic::Ordering::Relaxed)),
             ]);
             fn remote_items(
                 items: &[MenuItem],
@@ -478,6 +527,7 @@ unsafe extern "system" fn procedure(
                     }));
                 }
                 DISCONNECT => state.event(ClientEvent::Disconnected),
+                DEBUG_OVERLAY => toggle_debug_overlay(hwnd, state),
                 REMOTE_CURSOR => state.event(ClientEvent::RemoteCursor {
                     visible: !state.show_remote_cursor,
                 }),
@@ -690,6 +740,7 @@ unsafe extern "system" fn procedure(
         WM_EXITSIZEMOVE => state.user_sizing = false,
         WM_SIZE => {
             super::caption::layout(hwnd, state.header);
+            state.refresh_debug(hwnd);
             if state.relative {
                 state.release_mouse();
                 state.event(ClientEvent::ReleaseInput);
@@ -844,6 +895,12 @@ unsafe extern "system" fn procedure(
                 state.event(ClientEvent::ReleaseInput);
                 state.forwarded.clear();
                 state.toggle_relative(hwnd);
+                return LRESULT(0);
+            }
+            if vk == VK_F10.0 && ctrl && alt {
+                if down && lparam.0 & (1 << 30) == 0 {
+                    toggle_debug_overlay(hwnd, state);
+                }
                 return LRESULT(0);
             }
             if down && vk == VK_F12.0 && ctrl && alt {
@@ -1065,6 +1122,10 @@ pub fn run_client(
             .unwrap_or_default();
         let mut windows = HashMap::<WindowId, HWND>::new();
         let mut running = true;
+        if std::env::var("FRAMES_DEBUG_OVERLAY").as_deref() == Ok("1") {
+            DEBUG_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = events.send(ClientEvent::DebugOverlay { enabled: true });
+        }
         let mut shared: Option<frames_core::shared_game::SharedSession> = None;
         let mut shared_cursor = frames_core::shared_game::Cursor::default();
         let mut view_mode = ViewMode::Windows;
@@ -1282,6 +1343,8 @@ pub fn run_client(
                                 menu_ids: HashMap::new(),
                                 menu_open: false,
                                 pending_menu: None,
+                                debug_panel: None,
+                                debug_snapshot: None,
                             });
                             let title = wide(&state.title());
                             let app_id = format!(
@@ -1464,6 +1527,16 @@ pub fn run_client(
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
+                    ClientUpdate::DebugOverlay(key, overlay) => {
+                        if DEBUG_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+                            && let Some(&hwnd) = windows.get(&key)
+                        {
+                            let state =
+                                &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Proxy);
+                            state.debug_snapshot = Some(overlay);
+                            state.refresh_debug(hwnd);
+                        }
+                    }
                     ClientUpdate::Status(key, status) => {
                         if let Some(&hwnd) = windows.get(&key) {
                             let state =
@@ -1554,6 +1627,13 @@ pub fn run_client(
                 if msg.message == WM_QUIT {
                     running = false;
                 }
+                if msg.message == DEBUG_TOGGLED {
+                    for &hwnd in windows.values() {
+                        (&mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Proxy))
+                            .refresh_debug(hwnd);
+                    }
+                    continue;
+                }
                 if msg.message == super::session_control::OPEN {
                     let hwnd = HWND(msg.wParam.0 as *mut _);
                     if let Some((&key, _)) = windows.iter().find(|(_, value)| **value == hwnd) {
@@ -1578,6 +1658,16 @@ pub fn run_client(
     }
 }
 
+unsafe fn toggle_debug_overlay(hwnd: HWND, state: &Proxy) {
+    let enabled = !DEBUG_ENABLED.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+    state.event(ClientEvent::DebugOverlay { enabled });
+    let _ = PostThreadMessageW(
+        GetWindowThreadProcessId(hwnd, None),
+        DEBUG_TOGGLED,
+        WPARAM(0),
+        LPARAM(0),
+    );
+}
 fn stable_hash(value: &str) -> u64 {
     value.bytes().fold(0xcbf29ce484222325, |h, b| {
         (h ^ b as u64).wrapping_mul(0x100000001b3)
@@ -1817,6 +1907,8 @@ mod header_tests {
                 menu_ids: HashMap::new(),
                 menu_open: false,
                 pending_menu: None,
+                debug_panel: None,
+                debug_snapshot: None,
             });
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE(0),

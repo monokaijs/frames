@@ -16,7 +16,7 @@ On macOS, open the Frames DMG, drag Frames.app to Applications, and open it in t
 
 ## Remote windows
 
-The Frames menu controls desktop/window mode, sizing, keyboard mapping, cursor visibility, and file transfers. The host application's exposed menus appear alongside it. Custom application menus remain accessible in the video. **Ctrl+Alt+F12** releases remote input and minimizes the client window.
+The Frames menu controls desktop/window mode, sizing, keyboard mapping, cursor visibility, and file transfers. The host application's exposed menus appear alongside it. Custom application menus remain accessible in the video. **Ctrl+Alt+F12** releases remote input and minimizes the client window. **Ctrl+Alt+F10** (Control+Option+F10 on Mac) or **Show debug overlay** in the Frames menu toggles a per-window panel with codec, frame rate, bitrate, loss, latency and decoder state, plus frame-time and bitrate graphs; set `FRAMES_DEBUG_OVERLAY=1` to start with it on.
 
 Per-window capture excludes standard system chrome when its geometry can be verified. Custom headers remain intact. **Show remote window header** changes the host capture while keeping the local title bar on both Mac and Windows clients. Full desktop view includes every visible application, including applications excluded from per-window sharing.
 

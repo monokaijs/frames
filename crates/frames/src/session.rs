@@ -1240,6 +1240,7 @@ pub async fn client(
                 Some(ClientEvent::MediaRecovery{window,generation})=>media.send(crate::streaming::MediaCommand::Recover(window,generation)).await?,
                 Some(ClientEvent::DecoderFailed{window,generation,reason})=>media.send(crate::streaming::MediaCommand::Failed(window,generation,reason)).await?,
                 Some(ClientEvent::Presented{window,generation,number,at})=>media.send(crate::streaming::MediaCommand::Presented(window,generation,number,at)).await?,
+                Some(ClientEvent::DebugOverlay{enabled})=>media.send(crate::streaming::MediaCommand::Debug(enabled)).await?,
                 Some(ClientEvent::Quality(preset))=>io.send.send(Message::SetQuality{preset}).await?,
                 Some(ClientEvent::RemoteCursor{visible})=>io.send.send(Message::SetRemoteCursor{visible}).await?,
                 Some(ClientEvent::ViewMode(mode))=>{if shared.is_some(){continue;}io.send.send(Message::ReleaseInput).await?;io.send.send(Message::SetViewMode{mode}).await?;},

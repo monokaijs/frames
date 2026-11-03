@@ -788,6 +788,9 @@ pub fn run_client(
                     created: std::time::Instant::now(),
                 }),
                 Some("release") => Some(ClientEvent::ReleaseInput),
+                Some("debug_overlay") => Some(ClientEvent::DebugOverlay {
+                    enabled: value["enabled"].as_bool().unwrap_or(false),
+                }),
                 _ => None,
             };
             if let Some(event) = event {
@@ -868,6 +871,9 @@ pub fn run_client(
             }
             ClientUpdate::Status(window, status) => {
                 json!({"type":"status","window":window,"status":status})
+            }
+            ClientUpdate::DebugOverlay(window, overlay) => {
+                json!({"type":"debug","window":window,"data":overlay})
             }
             ClientUpdate::Ack(window, actual, error) => {
                 json!({"type":"ack","window":window,"actual":actual,"error":error})

@@ -29,6 +29,7 @@ import ImageIO
     var layingOutGroups=false
     var nextSurfaceSerial=0
     var dismissingMenuApps=Set<String>()
+    var debugOverlay=ProcessInfo.processInfo.environment["FRAMES_DEBUG_OVERLAY"] == "1"
     func receiveVideo(_ frames: [ClientVideoFrame]) {
         for frame in frames {
             if pendingVideo[frame.key] == nil && pendingVideo.count >= 16, let key = pendingVideo.keys.first { pendingVideo.removeValue(forKey: key) }
@@ -46,7 +47,12 @@ import ImageIO
     init(host: String) { self.host = host; super.init() }
     deinit { if let session { frames_session_free(session) } }
     static func key(_ object: [String: Any]) -> String { "\(object["id"] ?? 0):\(object["generation"] ?? 0)" }
-    func applicationDidFinishLaunching(_ notification:Notification){let timer=Timer(timeInterval:0.1,repeats:true){[weak self] _ in Task { @MainActor in if self?.sharedSession != nil{Wire.send(["event":"shared_alive"])} }};RunLoop.main.add(timer,forMode:.common);Wire.diagnostic("client_started",["pid":ProcessInfo.processInfo.processIdentifier]);installMenu()}
+    func applicationDidFinishLaunching(_ notification:Notification){let timer=Timer(timeInterval:0.1,repeats:true){[weak self] _ in Task { @MainActor in if self?.sharedSession != nil{Wire.send(["event":"shared_alive"])} }};RunLoop.main.add(timer,forMode:.common);Wire.diagnostic("client_started",["pid":ProcessInfo.processInfo.processIdentifier]);if debugOverlay{Wire.send(["event":"debug_overlay","enabled":true])};installMenu()}
+    @objc func toggleDebugOverlay(){
+        debugOverlay.toggle();Wire.send(["event":"debug_overlay","enabled":debugOverlay])
+        if !debugOverlay{for proxy in windows.values{proxy.view.showDebug(nil)}}
+        installMenu()
+    }
     // A host can temporarily have no shared windows during graph reconciliation.
     // Keep the session alive until an explicit disconnect or a transport failure.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication)->Bool{false}
@@ -168,10 +174,12 @@ import ImageIO
         if sharedSession != nil {
             add("Toggle relative mouse (Control+Option+F11)",#selector(toggleRelative))
             add("Show virtual cursor",#selector(toggleRemoteCursor),showRemoteCursor)
+            add("Show debug overlay (Control+Option+F10)",#selector(toggleDebugOverlay),debugOverlay)
             add("Window compatibility",#selector(showCompatibility));local.addItem(.separator());add("Disconnect",#selector(disconnect));NSApp.mainMenu=bar;return
         }
         add("Per-window view",#selector(windowsView),viewMode=="windows");add("Full desktop view",#selector(desktopView),viewMode=="desktop")
         add("Show remote cursor",#selector(toggleRemoteCursor),showRemoteCursor)
+        add("Show debug overlay (Control+Option+F10)",#selector(toggleDebugOverlay),debugOverlay)
         local.addItem(.separator())
         if let proxy=activeProxy{
             let header=NSMenuItem(title:"Show remote window header",action:#selector(RemoteProxy.toggleHeader),keyEquivalent:"");header.target=proxy;header.state=proxy.showHeader ? .on:.off;header.isEnabled=proxy.remote["role"] as? String != "desktop";local.addItem(header)
@@ -292,6 +300,7 @@ import ImageIO
             for id in Array(docks.keys) where !alive.contains(id) { docks.removeValue(forKey: id)?.terminate() }
             presentVideo()
             if focusAfterSwitch,let proxy=windows.values.first(where:{!$0.hidden}){focusAfterSwitch=false;NSApp.activate(ignoringOtherApps:true);proxy.window.makeKeyAndOrderFront(nil)}
+        case "debug": if debugOverlay,let id=message["window"] as? [String:Any],let proxy=windows[Self.key(id)]{proxy.view.showDebug(message["data"] as? [String:Any])}
         case "status": if let id = message["window"] as? [String: Any], let proxy = windows[Self.key(id)] { if proxy.shared{proxy.sharedNotice=message["status"] as? String}else{proxy.status=message["status"] as? String ?? ""}; proxy.refreshTitle() }
         case "ack": if let id = message["window"] as? [String: Any], let proxy = windows[Self.key(id)] {
             if let actual = message["actual"] as? [String: Any] { proxy.remote = actual }
@@ -470,17 +479,30 @@ final class DockEventReader: @unchecked Sendable {
     var modifiers = KeyboardModifiers()
     var relative=false
     let cursorOverlay=VirtualCursorView(frame:.zero)
+    let debugOverlay=DebugOverlayView(frame:.zero)
     var cursorState:[String:Any]=[:]
     static let emptyCursor=NSCursor(image:NSImage(size:NSSize(width:1,height:1)),hotSpot:.zero)
     var optionPointer = false
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event:NSEvent?)->Bool{proxy?.isPopup == true}
-    override init(frame:NSRect) { super.init(frame:frame);wantsLayer=true;cursorOverlay.imageScaling = .scaleAxesIndependently;addSubview(cursorOverlay);registerForDraggedTypes([.fileURL]);addTrackingArea(NSTrackingArea(rect:.zero,options:[.activeAlways,.inVisibleRect,.mouseMoved],owner:self,userInfo:nil)) }
+    override init(frame:NSRect) { super.init(frame:frame);wantsLayer=true;cursorOverlay.imageScaling = .scaleAxesIndependently;addSubview(cursorOverlay);addSubview(debugOverlay);registerForDraggedTypes([.fileURL]);addTrackingArea(NSTrackingArea(rect:.zero,options:[.activeAlways,.inVisibleRect,.mouseMoved],owner:self,userInfo:nil)) }
     required init?(coder:NSCoder) { fatalError("not used") }
     func display(_ frame:ClientVideoFrame) { if renderer==nil{renderer=try? MetalPicture(view:self)};let changed=picture != CGSize(width:frame.width,height:frame.height);picture=CGSize(width:frame.width,height:frame.height);renderer?.upload(frame);redraw();if changed{proxy?.client?.layoutWindowGroups()} }
     func display(_ bytes:Data,width:Int,height:Int) { if renderer==nil{renderer=try? MetalPicture(view:self)};picture=CGSize(width:width,height:height);renderer?.upload(bytes,width:width,height:height);redraw() }
     func redraw() { renderer?.draw(size:convertToBacking(bounds).size,fill:proxy?.fill ?? false,visible:window?.isVisible == true && window?.isMiniaturized != true) }
-    override func layout() { super.layout();redraw();positionVirtualCursor() }
+    override func layout() { super.layout();redraw();positionVirtualCursor();positionDebugOverlay() }
+    func showDebug(_ data:[String:Any]?) {
+        guard let data else{debugOverlay.isHidden=true;debugOverlay.snapshot=DebugOverlayView.Snapshot();return}
+        debugOverlay.snapshot=DebugOverlayView.Snapshot(data);positionDebugOverlay()
+    }
+    // Popups, tooltips and small windows would be covered entirely; skip them.
+    func positionDebugOverlay(){
+        let rect=contentRect()
+        guard proxy?.client?.debugOverlay == true,proxy?.isPopup != true,!debugOverlay.snapshot.lines.isEmpty,
+              rect.width>=DebugOverlayView.minimumHost.width,rect.height>=DebugOverlayView.minimumHost.height else{debugOverlay.isHidden=true;return}
+        let size=debugOverlay.preferredSize(available:rect.width-16)
+        debugOverlay.frame=NSRect(x:rect.minX+8,y:rect.maxY-8-size.height,width:size.width,height:min(size.height,rect.height-16));debugOverlay.isHidden=false
+    }
     override func resetCursorRects(){if proxy?.shared == true{addCursorRect(bounds,cursor:Self.emptyCursor)}else{super.resetCursorRects()}}
     func contentRect()->NSRect{
         var rect=bounds
@@ -561,6 +583,7 @@ final class DockEventReader: @unchecked Sendable {
         if event.modifierFlags.contains(.command),[48,49].contains(event.keyCode){releaseInput();return} // Local app switching / Spotlight.
         guard let usage=usageToMac.first(where:{$0.value==event.keyCode})?.key else{return}
         if proxy?.shared == true,event.keyCode==103,event.modifierFlags.contains([.control,.option]){toggleRelative();return}
+        if event.keyCode==109,event.modifierFlags.contains([.control,.option]){if !event.isARepeat{proxy?.client?.toggleDebugOverlay()};return}
         if event.keyCode==111,event.modifierFlags.contains([.control,.option]){releaseInput();if proxy?.shared != true{window?.miniaturize(nil)};return}
         let printable=(4...39).contains(usage)||(44...56).contains(usage)
         if proxy?.physical == true || event.modifierFlags.contains(.command) || event.modifierFlags.contains(.control) || !printable {

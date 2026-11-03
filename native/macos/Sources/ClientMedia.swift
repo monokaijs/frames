@@ -41,7 +41,7 @@ final class ClientControlInbox:@unchecked Sendable {
         case "devices":
             let error=(message["data"] as? [String:Any])?["error"]
             return error == nil || error is NSNull ? type:nil
-        case "status","menu":
+        case "status","menu","debug":
             guard let window=message["window"] as? [String:Any],let id=window["id"] as? NSNumber,let generation=window["generation"] as? NSNumber else{return nil}
             return "\(type):\(id):\(generation)"
         default:return nil

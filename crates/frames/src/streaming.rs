@@ -266,6 +266,113 @@ mod ready_tests {
         assert!(messages.try_recv().is_err());
     }
     #[tokio::test]
+    async fn debug_overlay_reports_presented_frames_only_while_enabled() {
+        let (out, _messages) = crate::session::test_outbound();
+        let (ui, updates) = frames_native::client_channel(16);
+        let window = WindowId {
+            id: 913,
+            generation: 1,
+        };
+        let mut client = ClientMedia::default();
+        client
+            .start_prepared(
+                fixture_config(window, 7),
+                ui.clone(),
+                &out,
+                Some(codec::Decoder::external(|_| Ok(()))),
+            )
+            .await
+            .unwrap();
+        // The host clock runs 1 s ahead of ours. Host timestamps then never
+        // underflow: monotonic_micros() counts from the first call in this
+        // process, which can be under 20 ms before this test in a full run.
+        const HOST_AHEAD_US: u64 = 1_000_000;
+        let host_now = || media::monotonic_micros() + HOST_AHEAD_US;
+        let now = media::monotonic_micros();
+        client
+            .clock
+            .observe(now, now + HOST_AHEAD_US, now + HOST_AHEAD_US, now);
+        let deliver = async |client: &mut ClientMedia, number: u64| {
+            let encoded_us = host_now();
+            let frame = EncodedFrame {
+                window,
+                generation: 7,
+                number,
+                // FEC warm-up can make the first picture late; keyframes keep
+                // that one-off recovery from discarding the measured frames.
+                keyframe: true,
+                bytes: vec![1; 4096],
+                captured_us: encoded_us - 20_000,
+                encoded_us,
+            };
+            let late = client.streams[&window].late;
+            for packet in
+                media::fragment_fec(&frame, 1200, Default::default(), frame.captured_us).unwrap()
+            {
+                client.packet(&packet, &out).await.unwrap();
+            }
+            // A scheduler stall on a loaded test machine can age a picture past
+            // its deadline; the client then correctly drops it, so it is never
+            // presented. Report that so the caller retries with a new picture.
+            if client.streams[&window].late != late {
+                return false;
+            }
+            client.presented(window, 7, number, std::time::Instant::now());
+            true
+        };
+        let mut next = 0;
+        let mut present = async |client: &mut ClientMedia| {
+            for _ in 0..10 {
+                next += 1;
+                if deliver(client, next).await {
+                    return;
+                }
+            }
+            panic!("ten consecutive pictures expired before presentation");
+        };
+        present(&mut client).await;
+        client.publish_debug(&ui, Duration::from_millis(2));
+        assert!(
+            updates.try_recv().is_err(),
+            "nothing is published while disabled"
+        );
+
+        client.set_debug(true);
+        for _ in 0..3 {
+            present(&mut client).await;
+        }
+        client.publish_debug(&ui, Duration::from_millis(2));
+        let Ok(ClientUpdate::DebugOverlay(key, overlay)) = updates.try_recv() else {
+            panic!("expected a debug overlay snapshot");
+        };
+        assert_eq!(key, window);
+        assert_eq!(overlay.lines[0].text, "H.264 128×128 · 60 fps · gen 7");
+        assert_eq!(
+            overlay.frames.len(),
+            3,
+            "only frames presented while enabled"
+        );
+        assert!(
+            overlay
+                .frames
+                .iter()
+                .all(|[interval, latency]| *interval > 0 && *latency >= 20_000),
+            "{:?}",
+            overlay.frames
+        );
+        assert!(
+            overlay
+                .lines
+                .iter()
+                .any(|line| line.text == "Decoder  VideoToolbox · native")
+        );
+
+        client.set_debug(false);
+        client.publish_debug(&ui, Duration::from_millis(2));
+        assert!(updates.try_recv().is_err());
+        assert!(client.streams[&window].debug.is_empty());
+    }
+    #[tokio::test]
     async fn completely_lost_idle_frame_is_recovered_and_requests_are_coalesced() {
         let (out, mut messages) = crate::session::test_outbound();
         let (ui, _) = frames_native::client_channel(4);
@@ -857,6 +964,8 @@ struct ClientStream {
     received_at: std::collections::VecDeque<(u64, std::time::Instant)>,
     recovery_started: Option<std::time::Instant>,
     recovery_times: media::LatencyHistogram,
+    keyframe_requests: u64,
+    debug: crate::media_debug::Window,
 }
 impl Drop for ClientStream {
     fn drop(&mut self) {
@@ -889,8 +998,66 @@ pub struct ClientMedia {
     clock: media::ClockEstimator,
     audio: Option<ClientAudio>,
     audio_error: Option<String>,
+    debug: bool,
 }
 impl ClientMedia {
+    pub fn set_debug(&mut self, enabled: bool) {
+        self.debug = enabled;
+        if !enabled {
+            for stream in self.streams.values_mut() {
+                stream.debug = Default::default();
+            }
+        }
+    }
+    /// Sends one overlay snapshot per active window.
+    pub fn publish_debug(&mut self, ui: &frames_native::ClientSender, rtt: Duration) {
+        if !self.debug {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let audio = self
+            .audio
+            .as_ref()
+            .map(|audio| crate::media_debug::AudioStatus {
+                received: audio.jitter.received,
+                concealed: audio.jitter.concealed,
+                underruns: audio.playback.underruns.load(Ordering::Relaxed),
+            });
+        for (&window, s) in &mut self.streams {
+            if s.paused_at.is_some() {
+                continue;
+            }
+            let decoder = if s.decoder.is_external() {
+                crate::media_debug::DecoderKind::Native
+            } else if s.decoder.metrics.hardware.load(Ordering::Relaxed) {
+                crate::media_debug::DecoderKind::Hardware
+            } else {
+                crate::media_debug::DecoderKind::Software
+            };
+            let decode = s.decoder.metrics.histogram.lock().unwrap().clone();
+            let snapshot = s.debug.snapshot(crate::media_debug::Inputs {
+                config: &s.config,
+                counters: crate::media_debug::Counters {
+                    delivery: self.reassembly.stats(window),
+                    decoded: s.decoder.metrics.decoded.load(Ordering::Relaxed),
+                    presented: s.presented,
+                    late: s.late,
+                    gaps: s.gaps,
+                    keyframe_requests: s.keyframe_requests,
+                },
+                decode: &decode,
+                decoder,
+                backlog: s.decoder.in_flight(),
+                recovering: s.recovering,
+                rtt,
+                clock_uncertainty_us: self.clock.uncertainty_us as u64,
+                audio,
+                now,
+            });
+            // Diagnostics are best effort and must never block media.
+            let _ = ui.try_send(ClientUpdate::DebugOverlay(window, Box::new(snapshot)));
+        }
+    }
     pub fn clear_video(&mut self) {
         self.streams.clear();
         self.reassembly = Reassembler::default();
@@ -1067,6 +1234,8 @@ impl ClientMedia {
                 received_at: Default::default(),
                 recovery_started: None,
                 recovery_times: Default::default(),
+                keyframe_requests: 0,
+                debug: Default::default(),
             },
         );
         out.send(Message::StreamReady {
@@ -1181,6 +1350,9 @@ impl ClientMedia {
         }
         if let Some(age) = encoded_age {
             stream.encoded_receive.record(age.as_micros() as u64);
+            if self.debug {
+                stream.debug.received(age);
+            }
         }
         if frame.keyframe {
             if let Some(started) = stream.recovery_started.take() {
@@ -1202,6 +1374,7 @@ impl ClientMedia {
                 stream.recovering = true;
                 stream.recovery_sent = Some(std::time::Instant::now());
                 stream.pending.clear();
+                stream.keyframe_requests += 1;
                 out.send(Message::Keyframe {
                     window: frame.window,
                     generation: frame.generation,
@@ -1263,6 +1436,7 @@ impl ClientMedia {
                 tracing::warn!(window=?frame.window,generation=frame.generation,"video decoder input queue full; requesting fresh stream");
                 stream.recovering = true;
                 stream.recovery_sent = Some(std::time::Instant::now());
+                stream.keyframe_requests += 1;
                 out.send(Message::Keyframe {
                     window: frame.window,
                     generation: frame.generation,
@@ -1296,6 +1470,7 @@ impl ClientMedia {
         if let Some(s) = self.streams.get_mut(&window)
             && s.generation == generation
         {
+            let mut interval = None;
             if let Some((old, previous)) = s.last_presented {
                 if number <= old {
                     return;
@@ -1305,10 +1480,16 @@ impl ClientMedia {
                 if gap > Duration::from_millis(50) {
                     s.gaps += 1;
                 }
+                interval = Some(gap);
             }
+            let mut latency = None;
             if let Some((_, captured)) = s.capture_times.iter().find(|(n, _)| *n == number) {
-                s.capture_to_present
-                    .record(at.saturating_duration_since(*captured).as_micros() as u64);
+                let elapsed = at.saturating_duration_since(*captured);
+                s.capture_to_present.record(elapsed.as_micros() as u64);
+                latency = Some(elapsed);
+            }
+            if self.debug {
+                s.debug.presented(interval, latency);
             }
             s.capture_times.retain(|(n, _)| *n > number);
             s.last_presented = Some((number, at));
@@ -1442,6 +1623,7 @@ impl ClientMedia {
                     generation: s.generation,
                 })
                 .await?;
+                s.keyframe_requests += 1;
                 s.recovery_started.get_or_insert(now);
                 s.recovery_sent = Some(now);
                 // Retire the watchdog until the next sender status or retry.
@@ -1465,6 +1647,7 @@ pub enum MediaCommand {
     Presented(WindowId, u32, u64, std::time::Instant),
     Recover(WindowId, u32),
     Failed(WindowId, u32, String),
+    Debug(bool),
 }
 pub struct ClientMediaWorker {
     commands: tokio::sync::mpsc::Sender<MediaCommand>,
@@ -1496,6 +1679,7 @@ impl ClientMediaWorker {
             let mut software_only = std::collections::HashSet::new();
             let mut requested = std::collections::HashMap::new();
             let mut serial = 0u64;
+            let mut last_debug: Option<std::time::Instant> = None;
             loop {
                 let retry = (connection.rtt() * 2)
                     .clamp(Duration::from_millis(50), Duration::from_millis(250));
@@ -1539,6 +1723,7 @@ impl ClientMediaWorker {
                         Some(MediaCommand::Status(w, g, n)) => media.status(w, g, n),
                         Some(MediaCommand::Decoded(w, g, n, micros)) => { if let Some(s) = media.streams.get_mut(&w) && s.generation == g { s.decoder.acknowledge_external(n, micros); if let Some((_,at)) = s.received_at.iter().find(|(number,_)|*number==n) { s.receive_decode.record(at.elapsed().as_micros() as u64); } s.received_at.retain(|(number,_)|*number>n); } },
                         Some(MediaCommand::Presented(w, g, n, at)) => media.presented(w, g, n, at),
+                        Some(MediaCommand::Debug(enabled)) => { media.set_debug(enabled); last_debug = None; },
                         Some(MediaCommand::Recover(w, g)) => {
                             if let Some(s) = media.streams.get_mut(&w) && s.generation == g {
                                 s.recovering = true; s.pending.clear(); s.decoder.discard_before(s.next);
@@ -1580,6 +1765,10 @@ impl ClientMediaWorker {
                     _ = feedback.tick() => {
                         media.expire_with_retry(&out, retry).await?; media.feedback(&out).await?;
                         feedback_ticks += 1;
+                        if media.debug && last_debug.is_none_or(|at| at.elapsed() + Duration::from_millis(50) >= crate::media_debug::SNAPSHOT_INTERVAL) {
+                            last_debug = Some(std::time::Instant::now());
+                            media.publish_debug(&ui, connection.rtt());
+                        }
                         if feedback_ticks % 10 == 1 { let client_us = media::monotonic_micros(); last_probe = Some(client_us); out.send(Message::ClockProbe { client_us }).await?; }
                         if feedback_ticks % 10 == 0 && std::env::var("FRAMES_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
                             for (window,s) in &media.streams { tracing::info!(?window,generation=s.generation,decoded=s.decoder.metrics.decoded.load(Ordering::Relaxed),presented=s.presented,gaps=s.gaps,

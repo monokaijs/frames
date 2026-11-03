@@ -20,6 +20,9 @@ mod device_setup;
 #[path = "../src/file_worker.rs"]
 mod file_worker;
 #[allow(dead_code)]
+#[path = "../src/media_debug.rs"]
+mod media_debug;
+#[allow(dead_code)]
 #[path = "../src/media_sender.rs"]
 mod media_sender;
 #[allow(dead_code, unused_imports)]

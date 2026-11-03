@@ -37,6 +37,9 @@ pub fn request_permission(kind: &str) -> anyhow::Result<()> {
     macos::request_permission(kind)
 }
 
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+mod debug_raster;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(any(target_os = "macos", test))]
@@ -263,6 +266,10 @@ pub enum ClientEvent {
         event: InputEvent,
     },
     ReleaseInput,
+    /// Starts or stops per-window media diagnostics for the debug overlay.
+    DebugOverlay {
+        enabled: bool,
+    },
     Disconnected,
     SendFiles {
         window: WindowId,
@@ -320,8 +327,47 @@ pub enum ClientUpdate {
     Windows(Vec<RemoteWindow>),
     Frame(WindowId, RawFrame),
     Status(WindowId, String),
+    /// A complete, ready-to-draw debug overlay for one window. Sent only while
+    /// the overlay is enabled; each snapshot replaces the previous one.
+    DebugOverlay(WindowId, Box<DebugOverlay>),
     Ack(WindowId, Option<RemoteWindow>, Option<String>),
     Shutdown,
+}
+
+pub const DEBUG_OVERLAY_SHORTCUT: &str = if cfg!(target_os = "macos") {
+    "⌃⌥F10"
+} else {
+    "Ctrl+Alt+F10"
+};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DebugLevel {
+    #[default]
+    Normal,
+    Dim,
+    Warn,
+    Bad,
+}
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub struct DebugLine {
+    pub text: String,
+    pub level: DebugLevel,
+}
+/// Media diagnostics formatted by the session so every platform draws the
+/// same panel. Text is laid out for a monospaced font.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub struct DebugOverlay {
+    pub lines: Vec<DebugLine>,
+    /// One entry per presented frame, oldest first:
+    /// `[interval since previous frame, capture-to-present latency]` in µs
+    /// (0 when unknown).
+    pub frames: Vec<[u32; 2]>,
+    /// Target frame interval in µs, drawn as a reference line.
+    pub frame_budget_us: u32,
+    /// Received video bitrate per sample in kb/s, oldest first.
+    pub bitrate_kbps: Vec<u32>,
+    pub sample_ms: u32,
 }
 
 pub fn desktop(exclusions: Vec<String>) -> anyhow::Result<Arc<dyn Desktop>> {

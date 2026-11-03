@@ -773,6 +773,22 @@ impl LatencyHistogram {
         self.count += 1;
         self.maximum = self.maximum.max(micros);
     }
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+    /// Samples recorded after `earlier`, a previous clone of this histogram.
+    /// The overflow bucket keeps the overall maximum.
+    pub fn since(&self, earlier: &Self) -> Self {
+        let mut buckets = [0; 512];
+        for (i, bucket) in buckets.iter_mut().enumerate() {
+            *bucket = self.buckets[i].saturating_sub(earlier.buckets[i]);
+        }
+        Self {
+            buckets,
+            count: self.count.saturating_sub(earlier.count),
+            maximum: self.maximum,
+        }
+    }
     pub fn percentile(&self, percent: u64) -> u64 {
         if self.count == 0 {
             return 0;
