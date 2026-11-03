@@ -28,9 +28,16 @@ enum Wire {
         lock.lock(); defer { lock.unlock() }
         FileHandle.standardError.write(bytes); FileHandle.standardError.write(Data([10]))
     }
+    /// Set once the Frames parent process is gone (its stdin pipe closed).
+    /// Writing to its pipes then raises SIGPIPE and kills this process before
+    /// it can clean up (dock proxies, released input), so writes are dropped.
+    nonisolated(unsafe) private static var parentGone = false
+    static func markParentGone() { lock.lock(); parentGone = true; lock.unlock() }
+    static var isParentGone: Bool { lock.lock(); defer { lock.unlock() }; return parentGone }
     static func send(_ object: [String: Any]) {
         guard JSONSerialization.isValidJSONObject(object), let bytes = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { return }
         lock.lock(); defer { lock.unlock() }
+        if parentGone { return }
         FileHandle.standardOutput.write(bytes); FileHandle.standardOutput.write(Data([10]))
     }
     static func sendFrame(handle:UInt64,width:UInt32,height:UInt32,bytes:Data,number:UInt64=0,captured:UInt64=DispatchTime.now().uptimeNanoseconds) {
@@ -42,6 +49,7 @@ enum Wire {
         sendMedia(kind:2,handle:0,width:0,height:0,bytes:bytes)
     }
     private static func sendMedia(kind:UInt32,handle:UInt64,width:UInt32,height:UInt32,bytes:Data,metadata:Data=Data()) {
+        if isParentGone { return }
         let chosen = kind == 3 ? encodedOutput : (kind == 2 ? (audioOutput ?? mediaOutput):mediaOutput)
         guard let mediaOutput = chosen else{fputs("Frames host requires a binary media socket\n",stderr);exit(1)}
         var header=Data("FRM1".utf8)

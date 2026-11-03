@@ -123,12 +123,25 @@ if args.contains("--network-settings"){
             if !controls.push(message){break}
         }
         Wire.diagnostic("client_stdin_closed")
+        Wire.markParentGone()
         DispatchQueue.main.async { app.terminate(nil) }
+        // The Frames process is gone. A modal alert running on the main queue
+        // would keep the terminate request above from ever running, leaving
+        // this process and its remote windows orphaned: exit regardless.
+        Thread.sleep(forTimeInterval: 2)
+        Wire.diagnostic("client_forced_exit")
+        exit(0)
     }
     withExtendedLifetime(client){app.run()}
 } else if args.contains("--dock") {
     let dock = DockProxy(name: args.count > 2 ? args[2] : "Remote app", icon: args.count > 3 ? args[3] : "")
     app.setActivationPolicy(.regular); app.delegate = dock
+    // stdin is a pipe held by the client helper: EOF means the helper is gone
+    // (quit, crash, or killed), so this Dock icon must go too.
+    DispatchQueue.global(qos: .utility).async {
+        while readLine() != nil {}
+        exit(0)
+    }
     withExtendedLifetime(dock){app.run()}
 } else {
     fputs("FramesHelper is launched by the Frames executable.\n", stderr)

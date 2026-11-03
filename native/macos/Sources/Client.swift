@@ -8,6 +8,7 @@ import ImageIO
     var host: String
     var windows: [String: RemoteProxy] = [:]
     var docks: [String: Process] = [:]
+    var dockLifetimes: [String: Pipe] = [:]
     var session = frames_session_new()
     var sequence = 0
     var fileShelf: FileShelf?
@@ -304,7 +305,7 @@ import ImageIO
             if let proxy=restoreFocus,let blocker=modalBlocker(for:proxy){restoreFocus=blocker}
             if let proxy=restoreFocus,windows[Self.key(proxy.id)] === proxy,NSApp.isActive,!proxy.hidden{proxy.window.makeKeyAndOrderFront(nil)}
             let alive = Set(list.compactMap { $0["app_id"] as? String })
-            for id in Array(docks.keys) where !alive.contains(id) { docks.removeValue(forKey: id)?.terminate() }
+            for id in Array(docks.keys) where !alive.contains(id) { docks.removeValue(forKey: id)?.terminate(); dockLifetimes.removeValue(forKey: id) }
             presentVideo()
             if focusAfterSwitch,let proxy=windows.values.first(where:{!$0.hidden}){focusAfterSwitch=false;NSApp.activate(ignoringOtherApps:true);proxy.window.makeKeyAndOrderFront(nil)}
         case "debug": if debugOverlay,let id=message["window"] as? [String:Any],let proxy=windows[Self.key(id)]{proxy.view.showDebug(message["data"] as? [String:Any])}
@@ -322,6 +323,8 @@ import ImageIO
         let process = Process(); process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
         process.arguments = ["--dock",remote["app_name"] as? String ?? "Remote app",remote["icon_png"] as? String ?? ""]
         let pipe = Pipe(); process.standardOutput = pipe
+        // The proxy exits when this pipe closes, i.e. whenever this helper ends.
+        let lifetime = Pipe(); process.standardInput = lifetime; dockLifetimes[id] = lifetime
         let reader = DockEventReader()
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData; if data.isEmpty { handle.readabilityHandler = nil; return }
