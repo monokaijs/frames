@@ -18,15 +18,20 @@ pub const AUDIO_WINDOW: WindowId = WindowId {
     generation: 1,
 };
 
-/// Ordinary references remain short-lived. A detailed text refresh can exceed
-/// 500 KiB; give its protected bytes time to cross the 30 Mbps reference link,
-/// with bounded jitter allowance. This is an expiry ceiling, never a playout wait.
+/// Ordinary references remain short-lived. A keyframe must be able to cross
+/// the slowest supported path in full: sized for a 5 Mbps uplink (a home or
+/// VPN upload), with bounded jitter allowance. A 30 Mbps reference capped at
+/// 200 ms left keyframes 50 ms on a 4 Mbps link, so they expired at every
+/// bitrate and the window never drew. Host and viewer both derive this from
+/// the frame length. It is an expiry ceiling, never a playout wait: on fast
+/// links keyframes complete long before it, and a lost one is reported as
+/// soon as a newer frame of its window completes.
 pub fn assembly_timeout(keyframe: bool, bytes: usize) -> Duration {
     if !keyframe {
         return Duration::from_millis(25);
     }
-    let wire_us = (bytes.min(MAX_FRAME_BYTES) as u64 * 10 * 1_000_000).div_ceil(30_000_000);
-    Duration::from_micros((wire_us + 20_000).clamp(50_000, 200_000))
+    let wire_us = (bytes.min(MAX_FRAME_BYTES) as u64 * 10 * 1_000_000).div_ceil(5_000_000);
+    Duration::from_micros((wire_us + 20_000).clamp(50_000, 1_000_000))
 }
 
 /// A small ownership-aware pool. A picture returns its storage only after the
@@ -962,8 +967,10 @@ mod tests {
         );
         assert_eq!(
             assembly_timeout(true, MAX_FRAME_BYTES),
-            Duration::from_millis(200)
+            Duration::from_millis(1000)
         );
+        // A 165 KB keyframe has time to cross a 4-5 Mbps uplink.
+        assert!(assembly_timeout(true, 165_000) >= Duration::from_millis(330));
     }
     #[test]
     fn malformed_headers_and_metadata_conflicts_are_bounded() {

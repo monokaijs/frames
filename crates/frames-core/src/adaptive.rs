@@ -104,6 +104,13 @@ pub struct Controller {
     preset: QualityPreset,
     source: (u32, u32),
 }
+/// Queueing delay above the propagation round trip that counts as overload
+/// by itself; jitter alone stays below it.
+const QUEUEING_DELAY: Duration = Duration::from_millis(30);
+/// Share of the transport's current sending rate (congestion window per round
+/// trip) that video may use while overloaded, leaving room for parity
+/// rounding, audio and control traffic.
+const TRANSPORT_SHARE: f64 = 0.8;
 impl Controller {
     pub fn new(fps: u32, now: Instant) -> Self {
         Self {
@@ -197,7 +204,14 @@ impl Controller {
         let failed =
             feedback.delivery.unrecoverable_frames > self.previous.delivery.unrecoverable_frames;
         let loss = missing as f64 / (received + missing).max(1) as f64;
+        // A standing queue at a bottleneck: RTT well above the propagation
+        // delay. QUIC on such a path often reports no loss at all, because
+        // frames miss their deadlines before the network can drop them.
+        let queueing = !rtt.is_zero()
+            && !min_rtt.is_zero()
+            && rtt.saturating_sub(min_rtt) > QUEUEING_DELAY.max(min_rtt);
         let overloaded = congested
+            || queueing
             || self.local_pressure_until.is_some_and(|until| now < until)
             || (feedback.congestion_events > self.previous.congestion_events
                 && feedback.transport_lost_packets > self.previous.transport_lost_packets
@@ -212,12 +226,26 @@ impl Controller {
         if overloaded {
             self.stable_since = now;
             self.clean_since = now;
+            let floor = (self.base_bitrate / 12).clamp(128_000, 1_000_000);
+            if feedback.congestion_window_bytes > 0 && !rtt.is_zero() {
+                // While overloaded the sender fills the congestion window, so
+                // window/RTT is what the path carries now. Under random loss
+                // Cubic holds it near 3 Mbit/s and a capped uplink holds it at
+                // the cap; 20% steps every 300 ms took seconds to get there from
+                // a 50 Mbit/s start, and every frame sent meanwhile failed.
+                let parity = 1.0 + f64::from(self.quality.fec.parity_per_32) / 32.0;
+                let path = feedback.congestion_window_bytes as f64 * 8.0 / rtt.as_secs_f64();
+                let ceiling = (path * TRANSPORT_SHARE / parity) as u32;
+                if ceiling < self.quality.bitrate {
+                    self.quality.bitrate = ceiling.max(floor);
+                    self.last_step = now;
+                }
+            }
             let since = *self.overloaded_since.get_or_insert(now);
             if now.saturating_duration_since(since) >= Duration::from_millis(300)
                 && now.saturating_duration_since(self.last_step) >= Duration::from_millis(300)
             {
-                self.quality.bitrate = (self.quality.bitrate * 4 / 5)
-                    .max((self.base_bitrate / 12).clamp(128_000, 1_000_000));
+                self.quality.bitrate = (self.quality.bitrate * 4 / 5).max(floor);
                 self.last_step = now;
             }
             if now.saturating_duration_since(since) >= Duration::from_secs(1) {
@@ -488,6 +516,57 @@ mod tests {
         assert_eq!(controller.quality().fps, 24);
         controller.set_fps(60);
         assert_eq!(controller.quality().fps, 45);
+    }
+    #[test]
+    fn overload_settles_at_the_transport_rate_at_once_but_clean_links_ignore_it() {
+        let now = Instant::now();
+        let mut c = Controller::new(60, now);
+        c.set_preset(QualityPreset::High, now);
+        // Clean link with a small (application-limited) window: no change.
+        let q = c.update(
+            Feedback {
+                congestion_window_bytes: 12_000,
+                ..Default::default()
+            },
+            Duration::from_millis(22),
+            Duration::from_millis(18),
+            false,
+            now + Duration::from_millis(100),
+        );
+        assert_eq!(q.bitrate, 50_000_000);
+        // The sender queue backs up behind a 10 KB window at 22 ms RTT
+        // (about 3.6 Mbit/s): settle below it in one report.
+        let q = c.update(
+            Feedback {
+                congestion_window_bytes: 10_000,
+                queue_micros: 20_000,
+                ..Default::default()
+            },
+            Duration::from_millis(22),
+            Duration::from_millis(18),
+            false,
+            now + Duration::from_millis(200),
+        );
+        assert!(
+            q.bitrate < 3_000_000 && q.bitrate >= 1_000_000,
+            "{}",
+            q.bitrate
+        );
+    }
+    #[test]
+    fn sustained_queueing_delay_is_overload_even_without_losses() {
+        let now = Instant::now();
+        let mut c = Controller::new(60, now);
+        for n in 1..=10 {
+            c.update(
+                Feedback::default(),
+                Duration::from_millis(100),
+                Duration::from_millis(31),
+                false,
+                now + Duration::from_millis(100 * n),
+            );
+        }
+        assert!(c.quality().bitrate < 12_000_000);
     }
     #[test]
     fn extra_protection_consumes_the_existing_wire_budget() {
