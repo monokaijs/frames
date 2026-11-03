@@ -61,6 +61,26 @@ pub fn message(title: &str, text: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_R
     }
 }
 
+/// Shows an informational message without blocking the caller. The remote
+/// window's message loop also presents video and drains session updates, so
+/// a modal box on that thread would freeze the picture and, if left open,
+/// back up delivery until the session ends. The box runs on its own thread,
+/// unowned and topmost, so it stays visible while video keeps playing.
+pub fn notify(title: &str, text: &str, style: MESSAGEBOX_STYLE) {
+    let title = super::wide(title);
+    let text = super::wide(text);
+    let _ = std::thread::Builder::new()
+        .name("frames-message".into())
+        .spawn(move || unsafe {
+            MessageBoxW(
+                None,
+                PCWSTR(text.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                style | MB_SETFOREGROUND | MB_TOPMOST,
+            );
+        });
+}
+
 pub fn connection(name: &str, text: &str) -> anyhow::Result<crate::ConnectionDecision> {
     use windows::Win32::UI::Controls::*;
     let title = super::wide("Frames — Connection request");

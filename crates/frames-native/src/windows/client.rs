@@ -512,7 +512,7 @@ unsafe extern "system" fn procedure(
                     state.toggle_relative(hwnd);
                 }
                 COMPATIBILITY => {
-                    super::dialogs::message(
+                    super::dialogs::notify(
                         "Window compatibility",
                         &state.compatibility.description(),
                         MB_OK | MB_ICONINFORMATION,
@@ -535,9 +535,10 @@ unsafe extern "system" fn procedure(
                     enabled: !state.adb_enabled,
                 }),
                 USB_INFO => {
-                    let _ = crate::show_error(
+                    super::dialogs::notify(
                         "Frames device forwarding",
                         "Choose a locally connected USB/Bluetooth controller under Devices > Gamepads. Receiving requires ViGEmBus on the Windows host. For generic wired USB between Windows computers, set up the local exporter and host receiver under Devices > USB devices, refresh, then select a device. USB audio/video is excluded. The Android ADB bridge remains available.",
+                        MB_OK | MB_ICONINFORMATION,
                     );
                 }
                 MODE_RESIZE | MODE_STRETCH | FILL | SWAP | PHYSICAL | REMOTE_MENU | FETCH
@@ -1189,7 +1190,11 @@ pub fn run_client(
                         device_list = list.clone();
                         session_control.update_devices(list.clone());
                         if let Some(error) = &list.error {
-                            let _ = crate::show_error("Device forwarding", error);
+                            super::dialogs::notify(
+                                "Device forwarding",
+                                error,
+                                MB_OK | MB_ICONWARNING,
+                            );
                         }
                         for &hwnd in windows.values() {
                             let state =
@@ -1221,7 +1226,11 @@ pub fn run_client(
                             install_remote_menu(hwnd, state, items);
                         }
                         if let Some(error) = error {
-                            let _ = crate::show_error("Frames view mode", &error);
+                            super::dialogs::notify(
+                                "Frames view mode",
+                                &error,
+                                MB_OK | MB_ICONWARNING,
+                            );
                         }
                     }
                     ClientUpdate::AdbBridge {
@@ -1239,7 +1248,11 @@ pub fn run_client(
                             install_remote_menu(hwnd, state, items);
                         }
                         if let Some(error) = error {
-                            let _ = crate::show_error("Android ADB bridge", &error);
+                            super::dialogs::notify(
+                                "Android ADB bridge",
+                                &error,
+                                MB_OK | MB_ICONWARNING,
+                            );
                         } else if let Some(address) = address {
                             tracing::info!(%address,"ADB bridge enabled on remote host");
                         }

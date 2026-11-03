@@ -236,7 +236,14 @@ import ImageIO
     }
     @objc func toggleRemoteCursor(){Wire.send(["event":"remote_cursor","visible":!showRemoteCursor])}
     @objc func deviceSupport(){let alert=NSAlert();alert.messageText="Device forwarding";alert.informativeText="Gamepads: pair a controller locally over USB or Bluetooth, then choose it under Devices → Gamepads. Receiving requires a Windows host with ViGEmBus. Standard controls and rumble are supported. Generic USB passthrough is available between Windows computers. The Android ADB bridge remains available on both platforms.";runFramesAlert(alert)}
-    func error(_ title:String,_ message:String){let alert=NSAlert();alert.messageText=title;alert.informativeText=message;runFramesAlert(alert)}
+    // Errors arrive while video plays. A sheet keeps the main run loop, and so
+    // video, input and session updates, running; runModal would stall them all.
+    func error(_ title:String,_ message:String){
+        let alert=NSAlert();alert.messageText=title;alert.informativeText=message
+        let candidates=[NSApp.keyWindow,NSApp.mainWindow].compactMap{$0}+NSApp.windows.filter{$0.isVisible && $0.canBecomeKey}
+        if let window=candidates.first(where:{$0.isVisible && $0.attachedSheet==nil}){alert.beginSheetModal(for:window,completionHandler:nil)}
+        else{runFramesAlert(alert)}
+    }
     func update(_ message: [String: Any]) {
         switch message["type"] as? String {
         case "shared_session":sharedSession=message["data"] as? [String:Any];compatibilityText=message["compatibility_text"] as? String ?? "Untested";for proxy in windows.values{configureShared(proxy)};installMenu()
