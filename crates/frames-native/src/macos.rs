@@ -969,6 +969,12 @@ mod launch_agent_tests {
                 .unwrap()
                 .success()
         );
+        // launchd finishes a bootout asynchronously; under load the service
+        // can still be listed for a moment after launchctl returns.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while launch_agent_loaded(&label).unwrap() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         assert!(
             !launch_agent_loaded(&label).unwrap(),
             "An unloaded service must not block Restart to update"
