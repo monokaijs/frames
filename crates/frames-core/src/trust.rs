@@ -133,8 +133,28 @@ fn load_secret(dir: &Path, _: &str) -> anyhow::Result<Vec<u8>> {
         Ok(bytes)
     }
 }
+/// End-to-end test builds only: the key file for an isolated test identity,
+/// when both `FRAMES_TEST_IDENTITY_FILE=1` and `FRAMES_CONFIG_DIR` are set.
+#[cfg(all(target_os = "macos", feature = "test-identity-file"))]
+fn test_identity_file(dir: &Path) -> Option<PathBuf> {
+    (std::env::var("FRAMES_TEST_IDENTITY_FILE").as_deref() == Ok("1")
+        && std::env::var_os("FRAMES_CONFIG_DIR").is_some())
+    .then(|| dir.join("identity.test-key"))
+}
 #[cfg(target_os = "macos")]
-fn save_secret(_: &Path, id: &str, secret: &[u8]) -> anyhow::Result<()> {
+fn save_secret(dir: &Path, id: &str, secret: &[u8]) -> anyhow::Result<()> {
+    #[cfg(feature = "test-identity-file")]
+    if let Some(path) = test_identity_file(dir) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        return Ok(file.write_all(secret)?);
+    }
+    let _ = dir;
     Ok(security_framework::passwords::set_generic_password(
         "app.frames.identity",
         id,
@@ -142,7 +162,12 @@ fn save_secret(_: &Path, id: &str, secret: &[u8]) -> anyhow::Result<()> {
     )?)
 }
 #[cfg(target_os = "macos")]
-fn load_secret(_: &Path, id: &str) -> anyhow::Result<Vec<u8>> {
+fn load_secret(dir: &Path, id: &str) -> anyhow::Result<Vec<u8>> {
+    #[cfg(feature = "test-identity-file")]
+    if let Some(path) = test_identity_file(dir) {
+        return Ok(std::fs::read(path)?);
+    }
+    let _ = dir;
     Ok(security_framework::passwords::get_generic_password(
         "app.frames.identity",
         id,

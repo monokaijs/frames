@@ -40,6 +40,10 @@ winresource = "0.1"
 windows-service = "0.8"
 windows = { workspace = true, features = ["Win32_System_RemoteDesktop", "Win32_Security", "Win32_System_StationsAndDesktops", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Diagnostics_ToolHelp"] }
 
+[features]
+# See frames-core's feature of the same name. Only for end-to-end test builds.
+test-identity-file = ["frames-core/test-identity-file"]
+
 [dev-dependencies]
 png = "0.17"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }

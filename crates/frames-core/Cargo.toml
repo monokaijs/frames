@@ -37,3 +37,10 @@ windows = { workspace = true, features = ["Win32_System_JobObjects"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
+
+[features]
+# End-to-end test seam (scripts/e2e_matrix.py), never enabled in releases:
+# with FRAMES_TEST_IDENTITY_FILE=1 and FRAMES_CONFIG_DIR set, a macOS identity
+# key lives in a 0600 file in that throwaway folder instead of the login
+# Keychain, which automation contexts without a GUI security session cannot use.
+test-identity-file = []
