@@ -481,6 +481,34 @@ impl Reassembler {
     pub fn take_expired(&mut self) -> Vec<FrameKey> {
         self.expired.drain().collect()
     }
+    /// Gives up on a partial frame: counts it unrecoverable and reports it
+    /// through `take_expired` so the receiver requests recovery.
+    fn lose(&mut self, key: FrameKey, now: Instant) {
+        if let Some(mut frame) = self.frames.remove(&key) {
+            self.total_bytes -= frame.reserved;
+            self.stats.entry(key.0).or_default().unrecoverable_frames += 1;
+            if self.expired.len() < MAX_IN_FLIGHT * 4 {
+                self.expired.insert(key);
+            }
+            self.retire(&mut frame, key, now);
+        }
+    }
+    /// Retires the stalest partial (earliest deadline), optionally of one
+    /// window. Real-time media favors the newest picture: when reassembly is
+    /// full, an old partial is far less likely to complete than a new one.
+    fn evict_stalest(&mut self, window: Option<WindowId>, now: Instant) -> bool {
+        let Some(key) = self
+            .frames
+            .iter()
+            .filter(|((w, _, _), _)| window.is_none_or(|window| *w == window))
+            .min_by_key(|(_, p)| p.deadline)
+            .map(|(k, _)| *k)
+        else {
+            return false;
+        };
+        self.lose(key, now);
+        true
+    }
     fn retire(&mut self, partial: &mut Partial, key: FrameKey, now: Instant) {
         let mut retired = Retired {
             key,
@@ -533,12 +561,29 @@ impl Reassembler {
                 .filter(|((w, _, _), _)| *w == h.window)
                 .map(|(_, p)| p.reserved)
                 .sum();
-            if self.frames.len() >= MAX_IN_FLIGHT
-                || reserved + window_bytes > MAX_WINDOW_BYTES
-                || reserved + self.total_bytes + self.external_bytes > MAX_REASSEMBLY_BYTES
-            {
-                return None;
+            let mut window_bytes = window_bytes;
+            loop {
+                // A single-shard frame (audio, a small delta) completes in this
+                // call, so it never competes with partial frames for a slot.
+                let crowded = h.count > 1 && self.frames.len() >= MAX_IN_FLIGHT;
+                let window_full = reserved + window_bytes > MAX_WINDOW_BYTES;
+                let session_full =
+                    reserved + self.total_bytes + self.external_bytes > MAX_REASSEMBLY_BYTES;
+                if !crowded && !window_full && !session_full {
+                    break;
+                }
+                let scope = (window_full && !crowded && !session_full).then_some(h.window);
+                if !self.evict_stalest(scope, now) {
+                    return None;
+                }
+                window_bytes = self
+                    .frames
+                    .iter()
+                    .filter(|((w, _, _), _)| *w == h.window)
+                    .map(|(_, p)| p.reserved)
+                    .sum();
             }
+            self.refresh_deadline();
             self.frames.insert(
                 key,
                 Partial {
@@ -644,6 +689,21 @@ impl Reassembler {
         stats.completed_frames += 1;
         stats.recovered_frames += u64::from(complete.repaired);
         self.retire(&mut complete, key, now);
+        // Each window's frames are sent one after another, so an older partial
+        // of the same generation can no longer complete. Report it now rather
+        // than at its deadline.
+        let older: Vec<_> = self
+            .frames
+            .keys()
+            .filter(|(w, g, n)| *w == h.window && *g == h.generation && *n < h.number)
+            .copied()
+            .collect();
+        if !older.is_empty() {
+            for key in older {
+                self.lose(key, now);
+            }
+            self.refresh_deadline();
+        }
         Some(EncodedFrame {
             captured_us: h.captured_us,
             encoded_us: h.encoded_us,
@@ -776,6 +836,73 @@ mod tests {
                 assert_eq!(r.stats(f.window).recovered_frames, 1);
             }
         }
+    }
+    #[test]
+    fn full_reassembly_retires_the_stalest_partial_and_single_shards_bypass_it() {
+        let mut r = Reassembler::default();
+        let at = Instant::now();
+        // Twelve windows each hold one incomplete frame.
+        let windows: Vec<_> = (0..MAX_IN_FLIGHT as u64)
+            .map(|n| {
+                let mut f = frame(5000);
+                f.window.id = 100 + n;
+                r.push(
+                    &fragment(&f, 1200).unwrap()[0],
+                    at + Duration::from_millis(n),
+                );
+                f.window
+            })
+            .collect();
+        // A one-datagram frame (audio, a tiny delta) still gets through.
+        let mut small = frame(300);
+        small.window = AUDIO_WINDOW;
+        // Audio is sent without parity, as one datagram per packet.
+        let packets = fragment_fec(&small, 1200, FecProfile { parity_per_32: 0 }, 0).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(r.push(&packets[0], at).unwrap().bytes, small.bytes);
+        assert!(r.take_expired().is_empty());
+        // A new multi-datagram frame displaces the stalest partial, which is
+        // reported for recovery instead of the new frame being dropped.
+        let newest = frame(5000);
+        let completed = fragment(&newest, 1200)
+            .unwrap()
+            .iter()
+            .find_map(|p| r.push(p, at + Duration::from_millis(20)))
+            .unwrap();
+        assert_eq!(completed.bytes, newest.bytes);
+        assert_eq!(
+            r.take_expired(),
+            vec![(windows[0], newest.generation, newest.number)]
+        );
+        assert_eq!(r.stats(windows[0]).unrecoverable_frames, 1);
+    }
+    #[test]
+    fn a_completed_frame_reports_older_partials_of_its_window_at_once() {
+        let mut r = Reassembler::default();
+        let at = Instant::now();
+        let mut older = frame(5000);
+        older.number = 7;
+        let mut other = frame(5000);
+        other.window.id += 1;
+        other.number = 7;
+        r.push(&fragment(&older, 1200).unwrap()[0], at);
+        r.push(&fragment(&other, 1200).unwrap()[0], at);
+        let mut newer = frame(5000);
+        newer.number = 8;
+        assert!(
+            fragment(&newer, 1200)
+                .unwrap()
+                .iter()
+                .find_map(|p| r.push(p, at))
+                .is_some()
+        );
+        // Only the same window and generation is affected, before any deadline.
+        assert_eq!(r.take_expired(), vec![(older.window, older.generation, 7)]);
+        assert_eq!(r.frames.len(), 1);
+        assert!(r.frames.contains_key(&(other.window, other.generation, 7)));
+        // A late fragment of the retired frame is ignored, not resurrected.
+        assert!(r.push(&fragment(&older, 1200).unwrap()[1], at).is_none());
+        assert!(r.take_expired().is_empty());
     }
     #[test]
     fn every_erasure_combination_within_parity_recovers() {

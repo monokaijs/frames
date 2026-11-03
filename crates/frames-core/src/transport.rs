@@ -92,8 +92,25 @@ impl ClientCertVerifier for PairingVerifier {
     }
 }
 
+/// Congestion controller for all session traffic. Cubic is quinn's default;
+/// `FRAMES_CONGESTION=bbr|newreno` selects another for measurement. In the
+/// netsim benchmark quinn's BBR sustained more frames under random loss but
+/// overshot shallow bottleneck queues, so it is not the default.
+fn congestion_controller() -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
+    match std::env::var("FRAMES_CONGESTION")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "bbr" => Arc::new(quinn::congestion::BbrConfig::default()),
+        "newreno" => Arc::new(quinn::congestion::NewRenoConfig::default()),
+        _ => Arc::new(quinn::congestion::CubicConfig::default()),
+    }
+}
+
 fn transport() -> Arc<quinn::TransportConfig> {
     let mut config = quinn::TransportConfig::default();
+    config.congestion_controller_factory(congestion_controller());
     config.keep_alive_interval(Some(Duration::from_secs(5)));
     config.max_idle_timeout(Some(Duration::from_secs(20).try_into().unwrap()));
     config.datagram_receive_buffer_size(Some(8 * 1024 * 1024));

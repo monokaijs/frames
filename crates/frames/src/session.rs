@@ -798,6 +798,9 @@ async fn host_session(
     let mut bandwidth_mbps = 0;
     let mut quality = frames_core::adaptive::QualityPreset::default();
     let mut failures = HashMap::<WindowId, u32>::new();
+    // Failures before the viewer accepted any generation implicate the codec
+    // path; later capture or window failures only back off restarts.
+    let mut codec_failures = HashMap::<WindowId, u32>::new();
     let mut media_losses = HashMap::<WindowId, u64>::new();
     let mut audio = None::<crate::streaming::HostStream>;
     let mut shared_audio_requested = false;
@@ -847,7 +850,7 @@ async fn host_session(
                             stream.shutdown().await;
                             io.send.send(Message::StreamPaused { window: window.key }).await?;
                         }
-                        failures.remove(&window.key);
+                        failures.remove(&window.key);codec_failures.remove(&window.key);
                     }
                 }
                 if sequence==0{sequence=1;io.send.send(Message::Snapshot{sequence,windows:list}).await?;}
@@ -880,7 +883,7 @@ async fn host_session(
                     let d=desktop.clone();scan_mode=view_mode;
                     window_scan=Some(tokio::task::spawn_blocking(move||d.surfaces(view_mode)));
                 }
-                let ended:Vec<_>=streams.iter().filter(|(_,s)|s.task.is_finished()).map(|(&key,_)|key).collect();for key in ended{streams.remove(&key);*failures.entry(key).or_default()+=1;}
+                let ended:Vec<_>=streams.iter().filter(|(_,s)|s.task.is_finished()).map(|(&key,_)|key).collect();for key in ended{if let Some(stream)=streams.remove(&key)&&!stream.delivered(){*codec_failures.entry(key).or_default()+=1;}*failures.entry(key).or_default()+=1;}
                 let desired=frames_core::scheduler::select(subscriptions.iter().map(|(&key,sub)|frames_core::scheduler::Demand{
                     window:key,visible:sub.visible&&known.get(&key).is_some_and(|w|w.visible&&!w.minimized),focused:sub.focused,running:streams.contains_key(&key)
                 }),max_streams);
@@ -891,8 +894,13 @@ async fn host_session(
                     if let Some(stream)=streams.get(&key){stream.set_fps(sub.fps());}
                     if let std::collections::hash_map::Entry::Vacant(entry)=streams.entry(key){
                         if failures.get(&key).copied().unwrap_or(0)>1&&!scan.is_multiple_of(50){continue;}
-                        let selected=if preference.is_none()&&failures.get(&key).copied().unwrap_or(0)>0{Some(Codec::Vp9)}else{preference};
-                        let cap=codec::negotiate(&codecs,&peer.codecs,selected)?;
+                        let selected=if preference.is_none()&&codec_failures.get(&key).copied().unwrap_or(0)>0{Some(Codec::Vp9)}else{preference};
+                        // The VP9 retry is best effort: peers without a VP9 pair keep the
+                        // negotiated codec instead of ending the whole session.
+                        let cap=match codec::negotiate(&codecs,&peer.codecs,selected).or_else(|_|codec::negotiate(&codecs,&peer.codecs,preference)){
+                            Ok(cap)=>cap,
+                            Err(error)=>{tracing::warn!(?key,%error,"no codec for stream retry");continue;}
+                        };
                         entry.insert(crate::streaming::start_host(desktop.clone(),key,cap,crate::streaming::VideoOptions{quality,fps:sub.fps(),show_cursor,bandwidth_mbps},connection.clone(),io.send.clone(),generations.clone()));
                     }
                 }
@@ -919,7 +927,7 @@ async fn host_session(
                 Message::SetRemoteCursor{visible}=>{
                     if show_cursor!=visible{
                         for(key,mut stream)in streams.drain(){stream.shutdown().await;io.send.send(Message::StreamPaused{window:key}).await?;}
-                        show_cursor=visible;failures.clear();
+                        show_cursor=visible;failures.clear();codec_failures.clear();
                     }
                     io.send.send(Message::RemoteCursorChanged{visible:show_cursor}).await?;
                 },
@@ -930,7 +938,7 @@ async fn host_session(
                     match result{
                         Ok(list)=>{
                             input.release()?;for(_,mut stream)in streams.drain(){stream.shutdown().await;}
-                            subscriptions.clear();failures.clear();view_mode=mode;sequence+=1;
+                            subscriptions.clear();failures.clear();codec_failures.clear();view_mode=mode;sequence+=1;
                             known=list.iter().map(|w|(w.key,w.clone())).collect();
                             io.send.send(Message::ViewModeChanged{mode,error:None}).await?;
                             io.send.send(Message::Snapshot{sequence,windows:list}).await?;
@@ -950,7 +958,7 @@ async fn host_session(
                     if shared.is_some() && (!visible||!focused){input.release()?;}
                     subscription.update(visible,focused);if !visible{streams.remove(&window);}else if let Some(stream)=streams.get(&window){stream.set_fps(subscription.fps());}}},
                 Message::SetQuality{preset}=>{quality=preset;for stream in streams.values(){stream.set_quality(preset);}io.send.send(Message::QualityChanged{preset}).await?;},
-                Message::SelectCodec{codec,bandwidth_mbps:limit,quality:preset}=>{quality=preset;io.send.send(Message::QualityChanged{preset}).await?;anyhow::ensure!(limit<=200,"bandwidth limit must be between 1 and 200 Mbps, or 0 for automatic");codec::negotiate(&codecs,&peer.codecs,codec)?;preference=codec;bandwidth_mbps=limit;if let Some(sender)=&io.send.media{sender.set_limit_mbps(limit);}streams.clear();failures.clear();},
+                Message::SelectCodec{codec,bandwidth_mbps:limit,quality:preset}=>{quality=preset;io.send.send(Message::QualityChanged{preset}).await?;anyhow::ensure!(limit<=200,"bandwidth limit must be between 1 and 200 Mbps, or 0 for automatic");codec::negotiate(&codecs,&peer.codecs,codec)?;preference=codec;bandwidth_mbps=limit;if let Some(sender)=&io.send.media{sender.set_limit_mbps(limit);}streams.clear();failures.clear();codec_failures.clear();},
                 Message::StreamReady{window,generation}=>if window==frames_core::media::AUDIO_WINDOW{if let Some(audio)=&audio{audio.acknowledge(generation);}}else if let Some(stream)=streams.get(&window){stream.acknowledge(generation);},
                 Message::ClockProbe{client_us}=>{let received_us=frames_core::media::monotonic_micros();io.send.send(Message::ClockReply{client_us,received_us,sent_us:frames_core::media::monotonic_micros()}).await?;},
                 Message::Feedback{window,generation,mut stats}=>{let previous=media_losses.insert(window,stats.delivery.missing_shards).unwrap_or(0);if stats.delivery.missing_shards>previous && let Some(sender)=&io.send.media{sender.note_loss();}

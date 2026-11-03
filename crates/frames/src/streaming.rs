@@ -16,6 +16,9 @@ use std::{
 use tokio::sync::watch;
 
 #[cfg(test)]
+#[path = "streaming/netsim.rs"]
+mod netsim;
+#[cfg(test)]
 #[path = "streaming/quality_tests.rs"]
 mod quality_tests;
 
@@ -26,6 +29,7 @@ pub struct HostStream {
     rate: Arc<AtomicU32>,
     reset: watch::Sender<u32>,
     tuning: Arc<StreamTuning>,
+    delivered: AtomicBool,
 }
 struct StreamTuning {
     bitrate: AtomicU32,
@@ -113,8 +117,15 @@ impl HostStream {
         if self.generation.load(Ordering::Acquire) != generation {
             return false;
         }
+        self.delivered.store(true, Ordering::Release);
         self.ready.send_replace(generation);
         true
+    }
+    /// True once the client accepted a generation: the negotiated encoder
+    /// produced a picture and the viewer could decode it, even if capture or
+    /// the window later failed.
+    pub fn delivered(&self) -> bool {
+        self.delivered.load(Ordering::Acquire)
     }
     pub fn request_keyframe(&self, generation: u32) {
         if self.generation.load(Ordering::Acquire) == generation {
@@ -464,6 +475,7 @@ mod ready_tests {
             rate: Arc::new(AtomicU32::new(24)),
             reset,
             tuning: Arc::default(),
+            delivered: AtomicBool::new(false),
         };
         stream.request_keyframe(8);
         generation.store(9, Ordering::Release);
@@ -487,6 +499,7 @@ mod ready_tests {
             rate: Arc::new(AtomicU32::new(24)),
             reset: watch::channel(0).0,
             tuning: Arc::default(),
+            delivered: AtomicBool::new(false),
         };
         assert!(!stream.acknowledge(7));
         assert_eq!(*receiver.borrow(), 0);
@@ -627,6 +640,7 @@ pub fn start_audio(
         generation: active_generation,
         rate: Arc::new(AtomicU32::new(0)),
         tuning: Arc::default(),
+        delivered: AtomicBool::new(false),
     }
 }
 pub struct VideoOptions {
@@ -797,6 +811,7 @@ pub fn start_host(
         generation: active_generation,
         rate,
         tuning,
+        delivered: AtomicBool::new(false),
     }
 }
 
@@ -972,6 +987,9 @@ impl ClientMedia {
                 && !stream.decoder.is_external()
                 && !stream.decoder.input.is_closed()
                 && stream.decoder.output.has_changed().is_ok()
+                // A backlogged decoder would delay the new keyframe behind stale
+                // pictures and immediately re-trigger recovery; start a fresh one.
+                && stream.decoder.in_flight() < 2
                 && (stream.paused_at.is_none() || stream.decoder.in_flight() == 0)
         })
     }
@@ -1540,7 +1558,21 @@ impl ClientMediaWorker {
                     },
                     initialized = starting.join_next(), if !starting.is_empty() => {
                         if let Some(Ok((tag, config, decoder))) = initialized && requested.get(&config.window) == Some(&tag) {
-                            media.start_prepared(config, ui.clone(), &out, Some(decoder?)).await?;
+                            match decoder {
+                                Ok(decoder) => media.start_prepared(config, ui.clone(), &out, Some(decoder)).await?,
+                                // One window without a decoder must not close the whole
+                                // connection. Retry once in software; after that the host's
+                                // readiness timeout retries the stream.
+                                Err(error) if software_only.insert(config.window) => {
+                                    tracing::warn!(window = ?config.window, %error, "video decoder failed to start; retrying with software decoding");
+                                    serial += 1; requested.insert(config.window, serial); let tag = serial;
+                                    starting.spawn(async move { let decoder = codec::decode_software(config.codec, config.width, config.height).await; (tag, config, decoder) });
+                                },
+                                Err(error) => {
+                                    tracing::warn!(window = ?config.window, %error, "video decoder failed to start");
+                                    let _ = ui.try_send(ClientUpdate::Status(config.window, format!("Video decoder failed: {error}")));
+                                },
+                            }
                         }
                     },
                     packet = connection.read_datagram() => { media.packet(&packet?, &out).await?; },
