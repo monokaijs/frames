@@ -320,6 +320,43 @@ pub async fn encode(
     )
     .await
 }
+/// Frame-rate limiter that never delays a picture which arrives on schedule.
+/// Credit accrues at `rate` per second, capped at one picture (no bursts);
+/// a picture may start once at least `1 - JITTER` pictures of credit exist.
+/// Spending may leave credit negative, so the long-run rate is exact.
+struct Pacer {
+    credit: f64,
+    updated: Instant,
+}
+impl Pacer {
+    const JITTER: f64 = 0.25;
+    fn new(now: Instant) -> Self {
+        Self {
+            credit: 1.0,
+            updated: now,
+        }
+    }
+    fn accrue(&mut self, now: Instant, rate: u32) {
+        let elapsed = now.saturating_duration_since(self.updated).as_secs_f64();
+        self.credit = (self.credit + elapsed * f64::from(rate)).min(1.0);
+        self.updated = now;
+    }
+    /// How long to wait before the next picture may start.
+    fn wait(&mut self, now: Instant, rate: u32) -> Duration {
+        self.accrue(now, rate);
+        let missing = (1.0 - Self::JITTER) - self.credit;
+        if missing <= 0.0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64(missing / f64::from(rate))
+        }
+    }
+    fn spend(&mut self, now: Instant, rate: u32) {
+        self.accrue(now, rate);
+        self.credit -= 1.0;
+    }
+}
+
 pub async fn encode_paced(
     width: u32,
     height: u32,
@@ -359,26 +396,32 @@ pub async fn encode_paced(
         let mut current_bitrate = 12_000_000;
         let mut current_rate = fps;
         let mut keyframe_serial = 0;
-        let mut next = Instant::now();
+        // Credit-based pacing: credit accrues at the target rate and a picture
+        // is encoded the moment it arrives if enough has accrued. The old fixed
+        // "next = start + 1/rate" sleep left a fresh capture waiting for a
+        // timer whose phase drifts against the capture clock, ~half a frame
+        // (8.5 ms at 60 Hz) on average even when nothing needed throttling.
+        let mut pacer = Pacer::new(Instant::now());
         loop {
             let frame=handle.block_on(async{
                 if !first || input.borrow().is_none() {
                     tokio::select!{biased;_=stopping.changed()=>return None,r=requested_keyframe.changed()=>if r.is_err(){return None},r=input.changed()=>if r.is_err(){return None}}
                 }
-                if Instant::now()<next {
-                    tokio::select!{biased;_=stopping.changed()=>return None,_=tokio::time::sleep_until(next.into())=>{}}
+                let wait = pacer.wait(Instant::now(), rate.load(Ordering::Relaxed).clamp(1, fps));
+                if !wait.is_zero() {
+                    tokio::select!{biased;_=stopping.changed()=>return None,_=tokio::time::sleep(wait)=>{}}
                 }
                 input.borrow_and_update().clone()
             });
             let Some(frame) = frame else { break };
             first = false;
+            pacer.spend(Instant::now(), rate.load(Ordering::Relaxed).clamp(1, fps));
             let requested = *requested_keyframe.borrow_and_update();
             if requested != keyframe_serial {
                 context.request_keyframe();
                 keyframe_serial = requested;
             }
             let rate = rate.load(Ordering::Relaxed).clamp(1, fps);
-            next = Instant::now() + Duration::from_secs_f64(1.0 / rate as f64);
             let target = target_bitrate
                 .load(Ordering::Relaxed)
                 .clamp(128_000, 100_000_000);
@@ -785,6 +828,37 @@ async fn decode_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pacing_never_delays_on_schedule_pictures_and_still_limits_the_rate() {
+        let t = Instant::now();
+        let ms = |n: f64| t + Duration::from_secs_f64(n / 1000.0);
+        // 60 Hz capture, 60 fps target, captures slightly early or late.
+        let mut p = Pacer::new(t);
+        p.spend(t, 60);
+        for (i, jitter) in [0.0, -1.2, 0.8, -1.5, 1.0, 0.0].iter().enumerate() {
+            let at = ms((i as f64 + 1.0) * 1000.0 / 60.0 + jitter);
+            assert!(p.wait(at, 60).is_zero(), "picture {i} delayed");
+            p.spend(at, 60);
+        }
+        // 60 Hz capture throttled to 30 fps: every other picture waits, and the
+        // average rate holds.
+        let mut p = Pacer::new(t);
+        let mut encoded = 0;
+        for i in 0..600 {
+            let at = ms(f64::from(i) * 1000.0 / 60.0);
+            if p.wait(at, 30).is_zero() {
+                p.spend(at, 30);
+                encoded += 1;
+            }
+        }
+        assert!((295..=305).contains(&encoded), "{encoded}");
+        // An idle source resumes at once; credit never stores a burst.
+        let mut p = Pacer::new(t);
+        p.spend(t, 60);
+        assert!(p.wait(ms(5000.0), 60).is_zero());
+        p.spend(ms(5000.0), 60);
+        assert!(!p.wait(ms(5001.0), 60).is_zero());
+    }
     #[test]
     fn negotiation_requires_mutual_codec() {
         let caps = vec![CodecCapability {
