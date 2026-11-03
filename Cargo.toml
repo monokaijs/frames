@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/frames-core", "crates/frames-native", "crates/frames"]
+members = ["crates/frames-core", "crates/frames-native", "crates/frames", "crates/frames-proto", "crates/frames-media", "crates/frames-testkit"]
 resolver = "2"
 exclude = ["vendor/quinn-udp"]
 

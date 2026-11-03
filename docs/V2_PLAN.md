@@ -226,6 +226,13 @@ Gate additions:
 **Gate:** all three spikes pass, the stage breakdown is documented, and the Parsec baseline is recorded.
 
 ### Phase 1: Skeleton, protocol and frozen wire format
+
+**Status (2026-11-04): done.**
+- `crates/frames-proto`: envelope, handshake, feature negotiation.
+- `crates/frames-media`: `wire` (41-byte media header, feedback, probes; strict canonical parsing; 500k-datagram fuzz smoke), `seq`, and the `api` traits.
+- `crates/frames-testkit`: virtual clock, seeded link and transport, synthetic capture, and an encoder/decoder pair that tracks reference chains.
+- `scripts/check_layers.py`, plus a Linux `v2-core` CI job that builds and tests with no C toolchain.
+
 - Create the crates above, with frames-testkit and the dependency-direction CI check.
 - **frames-proto:** envelope, handshake, feature negotiation. ALPN `frames/2`.
 - **Media wire v2** (`frames-media::wire`):

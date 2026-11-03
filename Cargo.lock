@@ -1936,6 +1936,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "frames-media"
+version = "0.2.5"
+dependencies = [
+ "bytes",
+]
+
+[[package]]
 name = "frames-native"
 version = "0.2.5"
 dependencies = [
@@ -1958,6 +1965,22 @@ dependencies = [
  "windows 0.62.2",
  "windows-core 0.62.2",
  "winresource",
+]
+
+[[package]]
+name = "frames-proto"
+version = "0.2.5"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "frames-testkit"
+version = "0.2.5"
+dependencies = [
+ "bytes",
+ "frames-media",
 ]
 
 [[package]]

@@ -1,0 +1,13 @@
+[package]
+name = "frames-proto"
+description = "Frames v2 connection envelope, handshake, and feature negotiation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Layering (scripts/check_layers.py): no dependency on any other Frames crate,
+# and nothing that needs a C toolchain.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

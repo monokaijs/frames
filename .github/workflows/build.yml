@@ -8,6 +8,23 @@ on:
     paths-ignore: ["**.md", "spikes/**"]
   workflow_dispatch:
 jobs:
+  v2-core:
+    # Phase 1 gate: the v2 protocol, media engine, and test kit build and
+    # pass on Linux with no C toolchain or media SDK.
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+      - name: v2 crate layering
+        run: python3 scripts/check_layers.py
+      - name: v2 crates lint and test
+        run: |
+          cargo clippy -p frames-proto -p frames-media -p frames-testkit --all-targets --locked -- -D warnings
+          cargo test --release -p frames-proto -p frames-media -p frames-testkit --locked
   windows:
     timeout-minutes: 60
     runs-on: windows-latest

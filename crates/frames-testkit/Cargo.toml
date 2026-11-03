@@ -1,0 +1,13 @@
+[package]
+name = "frames-testkit"
+description = "Deterministic virtual-time test bed for the Frames v2 media engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Layering (scripts/check_layers.py): may depend on frames-media and
+# frames-proto only, and on nothing that needs a C toolchain.
+[dependencies]
+bytes.workspace = true
+frames-media = { path = "../frames-media" }
