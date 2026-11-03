@@ -1315,6 +1315,13 @@ impl ClientMedia {
             s.presented += 1;
         }
     }
+    /// Requests retransmission of shards that parity cannot replace. Lost
+    /// requests are retried by the reassembler while time remains.
+    fn send_nacks(&mut self, connection: &quinn::Connection) {
+        for nack in self.reassembly.nacks(std::time::Instant::now()) {
+            let _ = connection.send_datagram(nack.encode().into());
+        }
+    }
     pub fn next_deadline(&self, retry: Duration) -> std::time::Instant {
         let mut next = self
             .reassembly
@@ -1499,6 +1506,7 @@ impl ClientMediaWorker {
             loop {
                 let retry = (connection.rtt() * 2)
                     .clamp(Duration::from_millis(50), Duration::from_millis(250));
+                media.reassembly.set_rtt(connection.rtt());
                 let deadline = media.next_deadline(retry);
                 let result: anyhow::Result<()> = async { tokio::select! {
                     _ = connection.closed() => return Ok(()),
@@ -1575,8 +1583,8 @@ impl ClientMediaWorker {
                             }
                         }
                     },
-                    packet = connection.read_datagram() => { media.packet(&packet?, &out).await?; },
-                    _ = tokio::time::sleep_until(deadline.into()) => { media.expire_with_retry(&out, retry).await?; },
+                    packet = connection.read_datagram() => { media.packet(&packet?, &out).await?; media.send_nacks(&connection); },
+                    _ = tokio::time::sleep_until(deadline.into()) => { media.expire_with_retry(&out, retry).await?; media.send_nacks(&connection); },
                     _ = feedback.tick() => {
                         media.expire_with_retry(&out, retry).await?; media.feedback(&out).await?;
                         feedback_ticks += 1;

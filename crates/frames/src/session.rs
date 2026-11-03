@@ -832,7 +832,10 @@ async fn host_session(
     loop {
         tokio::select! {
             _=connection.closed()=>break,
-            _=connection.read_datagram()=>{},
+            datagram=connection.read_datagram()=>{
+                // The viewer's retransmission requests for media shards.
+                if let Ok(datagram)=datagram && let Some(nack)=frames_core::media::Nack::parse(&datagram) && let Some(sender)=&io.send.media {sender.retransmit(&nack);}
+            },
             result=async{window_scan.as_mut().unwrap().await},if window_scan.is_some()=>{
                 window_scan.take();
                 if scan_mode!=view_mode{continue;}

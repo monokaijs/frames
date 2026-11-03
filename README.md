@@ -2,7 +2,7 @@
 
 Native remote control for Windows 11 x64 and macOS 14.2+ on Apple silicon. Open individual remote applications in local windows, or switch to a full desktop view.
 
-[Download the latest release](https://github.com/monokaijs/frames/releases/latest). Media codecs are bundled and run inside Frames; no FFmpeg executable is required. Both computers need matching Frames builds; the current protocol is **10**.
+[Download the latest release](https://github.com/monokaijs/frames/releases/latest). Media codecs are bundled and run inside Frames; no FFmpeg executable is required. Both computers need matching Frames builds; the current protocol is **12**.
 
 On Windows, run **Frames-VERSION-windows-x86_64-setup.exe**. It installs Frames for your account, adds a Start menu shortcut and an Installed Apps entry, and includes an uninstaller. The default installation directory supports automatic updates without administrator access. The ZIP is also available for portable use.
 
@@ -84,6 +84,6 @@ Choose **Settings > Image quality** for saved connection defaults, or change **I
 | Medium | Native resolution, up to 60 fps; may reduce resolution under congestion | 12 Mbps |
 | Low | Starts at 75% resolution and up to 30 fps | 4 Mbps |
 
-Larger source displays scale the budget by pixel count, up to 200/64/24 Mbps respectively. A custom **Settings > Bandwidth limit** of **1-200 Mbps** caps the preset's total connection traffic, shared across video, protection, and audio. Automatic uses the preset budget. Saved defaults apply to new connections; title-bar preset changes apply immediately to that connection. CLI: `frames connect ADDRESS --quality high --bandwidth-mbps 50` (`0` means Automatic). Both peers need the protocol-11 build.
+Larger source displays scale the budget by pixel count, up to 200/64/24 Mbps respectively. A custom **Settings > Bandwidth limit** of **1-200 Mbps** caps the preset's total connection traffic, shared across video, protection, and audio. Automatic uses the preset budget. Saved defaults apply to new connections; title-bar preset changes apply immediately to that connection. CLI: `frames connect ADDRESS --quality high --bandwidth-mbps 50` (`0` means Automatic). Both peers need the protocol-12 build.
 
 The title-bar dropdown replaces each connection's Windows tray icon and the old eye-slash header button. It retains window options, view, devices, remote cursor, and disconnect controls. Choose **Ignore / hide this window** to hide a local proxy without closing the remote application. Restore individual windows under **Windows**, or choose **Show all windows**. When all windows are hidden on Windows, a small connection window provides restore and menu controls. On Mac, the same controls remain in the Frames menu and existing Dock entries can restore hidden windows. The launcher's single tray icon is unchanged.

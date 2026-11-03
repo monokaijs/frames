@@ -41,7 +41,10 @@ impl QualityPreset {
             Self::Medium => (12_000_000, 64_000_000),
             Self::Low => (4_000_000, 24_000_000),
         };
-        (base * width as u64 * height as u64 / (1920 * 1080)).clamp(base, ceiling) as u32
+        // Constant bits per pixel around 1080p. Smaller sources used to keep
+        // the full 1080p budget (52 Mbit/s for a 720p window at High), which
+        // only made every picture larger and slower to cross the network.
+        (base * width as u64 * height as u64 / (1920 * 1080)).clamp(base / 4, ceiling) as u32
     }
     fn scale(self) -> u32 {
         if self == Self::Low { 75 } else { 100 }
@@ -552,6 +555,18 @@ mod tests {
             "{}",
             q.bitrate
         );
+    }
+    #[test]
+    fn smaller_sources_scale_their_budget_with_a_floor() {
+        let now = Instant::now();
+        let mut c = Controller::new(60, now);
+        c.set_preset(QualityPreset::High, now);
+        c.set_source_size(1280, 720);
+        assert_eq!(c.quality().bitrate, 22_222_222);
+        c.set_source_size(320, 200);
+        assert_eq!(c.quality().bitrate, 12_500_000);
+        c.set_source_size(1920, 1080);
+        assert_eq!(c.quality().bitrate, 50_000_000);
     }
     #[test]
     fn sustained_queueing_delay_is_overload_even_without_losses() {

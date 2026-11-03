@@ -34,7 +34,7 @@ fn main() -> anyhow::Result<()> {
             let at = Instant::now();
             let mut result = None;
             for p in &packets {
-                if p[46] != 0 {
+                if frames_core::media::shard_position(p).is_some_and(|s| s.index != 0) {
                     result = receiver.push(p, at).or(result);
                 }
             }

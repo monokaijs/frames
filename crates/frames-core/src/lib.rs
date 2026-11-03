@@ -18,6 +18,6 @@ pub mod trust;
 pub mod usbip;
 mod worker;
 
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 pub const NATIVE_ABI_VERSION: u32 = 2;
 pub const ALPN: &[u8] = b"frames/11";

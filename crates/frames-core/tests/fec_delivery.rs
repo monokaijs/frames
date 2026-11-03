@@ -42,9 +42,9 @@ fn virtual_motion_with_bursts_parity_loss_duplicates_and_mtu_changes() {
             .into_iter()
             .enumerate()
             .filter_map(|(i, p)| {
-                let block = u16::from_be_bytes([p[40], p[41]]);
-                let lost = erased.entry(block).or_default();
-                if i < 4 && *lost < p[45] as usize {
+                let shard = frames_core::media::shard_position(&p).unwrap();
+                let lost = erased.entry(shard.block as u16).or_default();
+                if i < 4 && *lost < shard.parity {
                     *lost += 1;
                     None
                 } else {
@@ -77,14 +77,15 @@ fn parity_only_loss_is_reported_and_an_over_capacity_frame_cannot_resurrect() {
     let packets = fragment(&source, 1200).unwrap();
     let mut receiver = Reassembler::default();
     let mut done = None;
-    for p in packets.iter().filter(|p| p[46] < p[44]) {
+    let parity = |p: &Vec<u8>| frames_core::media::shard_position(p).unwrap().is_parity();
+    for p in packets.iter().filter(|p| !parity(p)) {
         done = receiver.push(p, now).or(done);
     }
     assert_eq!(done.unwrap().bytes, source.bytes);
     receiver.expire(now + Duration::from_millis(26));
     assert_eq!(
         receiver.stats(source.window).missing_shards,
-        packets.iter().filter(|p| p[46] >= p[44]).count() as u64
+        packets.iter().filter(|p| parity(p)).count() as u64
     );
     let source = frame(2, 20_000);
     let packets = fragment(&source, 1200).unwrap();

@@ -8,7 +8,12 @@ use std::{
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_REASSEMBLY_BYTES: usize = 24 * 1024 * 1024;
 pub const DATAGRAM_SEND_BUFFER_BYTES: usize = 16 * 1024;
-pub const HEADER_BYTES: usize = 60;
+/// F7 media header. Per-block shard counts are derived from the frame length,
+/// shard size and protection profile, so they are not repeated per datagram.
+pub const HEADER_BYTES: usize = 41;
+/// Largest media datagram accepted: a 1500-byte Ethernet MTU less IPv4/UDP.
+/// QUIC's path MTU discovery decides what is actually used.
+pub const MAX_DATAGRAM_BYTES: usize = 1472;
 const MAX_IN_FLIGHT: usize = 12;
 const MAX_WINDOW_BYTES: usize = 20 * 1024 * 1024;
 const DATA_PER_BLOCK: usize = 32;
@@ -159,8 +164,19 @@ impl FecProfile {
     pub fn validate(self) -> bool {
         matches!(self.parity_per_32, 0 | 2 | 4 | 8)
     }
-    fn parity(self, data: usize) -> usize {
-        (data * self.parity_per_32 as usize).div_ceil(DATA_PER_BLOCK)
+    /// Recovery shards for a block of `data` shards. Proportional parity
+    /// gave a small picture's single short block one recovery shard, so any
+    /// two-packet burst made it unrecoverable and forced a keyframe; each
+    /// protected block now tolerates at least a burst of 1, 2 or 3 losses.
+    pub fn parity(self, data: usize) -> usize {
+        let nominal = (data * self.parity_per_32 as usize).div_ceil(DATA_PER_BLOCK);
+        let floor = match self.parity_per_32 {
+            0 => 0,
+            2 => 1,
+            4 => 2,
+            _ => 3,
+        };
+        nominal.max(floor)
     }
 }
 
@@ -180,8 +196,12 @@ pub fn fragment_fec(
         "invalid frame size"
     );
     anyhow::ensure!(profile.validate(), "invalid FEC profile");
-    let shard_size =
-        ((mtu.min(1200).saturating_sub(HEADER_BYTES)) & !1).min((frame.bytes.len() + 1) & !1);
+    anyhow::ensure!(
+        frame.window.id <= u64::from(u32::MAX) && frame.number <= u64::from(u32::MAX),
+        "window or frame number exceeds the media header"
+    );
+    let shard_size = ((mtu.min(MAX_DATAGRAM_BYTES).saturating_sub(HEADER_BYTES)) & !1)
+        .min((frame.bytes.len() + 1) & !1);
     anyhow::ensure!(shard_size >= 2, "datagram MTU too small");
     let count = frame.bytes.len().div_ceil(shard_size);
     anyhow::ensure!(count <= u16::MAX as usize, "too many fragments");
@@ -229,30 +249,58 @@ pub fn fragment_fec(
             let Some(shard) = shards.get(index) else {
                 continue;
             };
+            let _ = (data_count, parity);
             let mut p = Vec::with_capacity(HEADER_BYTES + shard_size);
-            p.extend_from_slice(b"F6");
-            p.extend_from_slice(&frame.window.id.to_be_bytes());
+            p.extend_from_slice(b"F7");
+            p.extend_from_slice(&(frame.window.id as u32).to_be_bytes());
             p.extend_from_slice(&frame.window.generation.to_be_bytes());
             p.extend_from_slice(&frame.generation.to_be_bytes());
-            p.extend_from_slice(&frame.number.to_be_bytes());
-            p.extend_from_slice(&captured_us.to_be_bytes());
+            p.extend_from_slice(&(frame.number as u32).to_be_bytes());
+            p.extend_from_slice(&frame.encoded_us.to_be_bytes());
+            p.extend_from_slice(&capture_age(captured_us, frame.encoded_us).to_be_bytes());
             p.extend_from_slice(&(frame.bytes.len() as u32).to_be_bytes());
             p.extend_from_slice(&(shard_size as u16).to_be_bytes());
             p.extend_from_slice(&(block as u16).to_be_bytes());
-            p.extend_from_slice(&(block_count as u16).to_be_bytes());
-            p.push(*data_count as u8);
-            p.push(*parity as u8);
             p.push(index as u8);
-            p.push(u8::from(frame.keyframe));
-            p.extend_from_slice(&(count as u16).to_be_bytes());
-            p.push(SCHEME);
+            p.push(u8::from(frame.keyframe) | (SCHEME << 1));
             p.push(profile.parity_per_32);
-            p.extend_from_slice(&frame.encoded_us.to_be_bytes());
             p.extend_from_slice(shard);
             packets.push(p);
         }
     }
     Ok(packets)
+}
+
+/// Capture time travels as its age at encode time; `u32::MAX` means unknown.
+fn capture_age(captured_us: u64, encoded_us: u64) -> u32 {
+    if captured_us == 0 {
+        u32::MAX
+    } else {
+        encoded_us
+            .saturating_sub(captured_us)
+            .min(u64::from(u32::MAX - 1)) as u32
+    }
+}
+/// Where a media datagram sits in its frame, for diagnostics and tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardPosition {
+    pub block: usize,
+    pub index: usize,
+    pub data: usize,
+    pub parity: usize,
+}
+impl ShardPosition {
+    pub fn is_parity(self) -> bool {
+        self.index >= self.data
+    }
+}
+pub fn shard_position(packet: &[u8]) -> Option<ShardPosition> {
+    Header::parse(packet).map(|h| ShardPosition {
+        block: h.block,
+        index: h.index,
+        data: h.data,
+        parity: h.parity,
+    })
 }
 
 pub fn prewarm_fec() {
@@ -292,51 +340,63 @@ struct Header {
 impl Header {
     fn parse(p: &[u8]) -> Option<Self> {
         if p.len() <= HEADER_BYTES
-            || &p[..2] != b"F6"
-            || p[50] != SCHEME
+            || p.len() > MAX_DATAGRAM_BYTES
+            || &p[..2] != b"F7"
+            || p[39] >> 1 != SCHEME
             || !(FecProfile {
-                parity_per_32: p[51],
+                parity_per_32: p[40],
             })
             .validate()
-            || p[47] > 1
         {
             return None;
         }
+        let encoded_us = u64::from_be_bytes(p[18..26].try_into().ok()?);
+        let age = u32::from_be_bytes(p[26..30].try_into().ok()?);
+        let length = u32::from_be_bytes(p[30..34].try_into().ok()?) as usize;
+        let shard_size = u16::from_be_bytes(p[34..36].try_into().ok()?) as usize;
+        let block = u16::from_be_bytes(p[36..38].try_into().ok()?) as usize;
+        if length == 0
+            || length > MAX_FRAME_BYTES
+            || shard_size < 2
+            || !shard_size.is_multiple_of(2)
+            || p.len() != HEADER_BYTES + shard_size
+        {
+            return None;
+        }
+        let profile = FecProfile {
+            parity_per_32: p[40],
+        };
+        let count = length.div_ceil(shard_size);
+        let blocks = count.div_ceil(DATA_PER_BLOCK);
+        if count > u16::MAX as usize || block >= blocks {
+            return None;
+        }
+        let data = (count - block).div_ceil(blocks);
         let h = Self {
             window: WindowId {
-                id: u64::from_be_bytes(p[2..10].try_into().ok()?),
-                generation: u32::from_be_bytes(p[10..14].try_into().ok()?),
+                id: u64::from(u32::from_be_bytes(p[2..6].try_into().ok()?)),
+                generation: u32::from_be_bytes(p[6..10].try_into().ok()?),
             },
-            generation: u32::from_be_bytes(p[14..18].try_into().ok()?),
-            number: u64::from_be_bytes(p[18..26].try_into().ok()?),
-            captured_us: u64::from_be_bytes(p[26..34].try_into().ok()?),
-            encoded_us: u64::from_be_bytes(p[52..60].try_into().ok()?),
-            length: u32::from_be_bytes(p[34..38].try_into().ok()?) as usize,
-            shard_size: u16::from_be_bytes(p[38..40].try_into().ok()?) as usize,
-            block: u16::from_be_bytes(p[40..42].try_into().ok()?) as usize,
-            blocks: u16::from_be_bytes(p[42..44].try_into().ok()?) as usize,
-            data: p[44] as usize,
-            parity: p[45] as usize,
-            index: p[46] as usize,
-            keyframe: p[47] == 1,
-            count: u16::from_be_bytes(p[48..50].try_into().ok()?) as usize,
-            profile: p[51],
+            generation: u32::from_be_bytes(p[10..14].try_into().ok()?),
+            number: u64::from(u32::from_be_bytes(p[14..18].try_into().ok()?)),
+            captured_us: if age == u32::MAX {
+                0
+            } else {
+                encoded_us.saturating_sub(u64::from(age))
+            },
+            encoded_us,
+            length,
+            shard_size,
+            block,
+            blocks,
+            data,
+            parity: profile.parity(data),
+            index: p[38] as usize,
+            keyframe: p[39] & 1 == 1,
+            count,
+            profile: p[40],
         };
-        if h.length == 0
-            || h.length > MAX_FRAME_BYTES
-            || h.shard_size < 2
-            || !h.shard_size.is_multiple_of(2)
-            || p.len() != HEADER_BYTES + h.shard_size
-            || p.len() > 1200
-            || h.count != h.length.div_ceil(h.shard_size)
-            || h.blocks != h.count.div_ceil(DATA_PER_BLOCK)
-            || h.block >= h.blocks
-            || h.data != (h.count - h.block).div_ceil(h.blocks)
-            || h.data == 0
-            || h.data > DATA_PER_BLOCK
-            || h.parity != (h.data * h.profile as usize).div_ceil(32)
-            || h.index >= h.data + h.parity
-        {
+        if h.data == 0 || h.data > DATA_PER_BLOCK || h.index >= h.data + h.parity {
             return None;
         }
         Some(h)
@@ -371,6 +431,9 @@ struct Partial {
     reserved: usize,
     repaired: bool,
     seen: Vec<u64>,
+    last_at: Instant,
+    nacks: u8,
+    nacked_at: Option<Instant>,
 }
 type FrameKey = (WindowId, u32, u64);
 struct Retired {
@@ -415,7 +478,69 @@ pub struct DeliveryStats {
     pub unrecoverable_frames: u64,
     pub completed_frames: u64,
     pub fec_micros: u64,
+    /// Shards requested again because parity could not cover the loss.
+    #[serde(default)]
+    pub nacked_shards: u64,
+    /// Pictures completed only thanks to retransmitted shards.
+    #[serde(default)]
+    pub retransmit_repaired_frames: u64,
 }
+
+/// Retransmission request (viewer to host datagram): the shards a frame
+/// still needs, by (block, index). On a LAN a round trip is a fraction of a
+/// frame interval, so repairing a picture beats discarding it for a keyframe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Nack {
+    pub window: WindowId,
+    pub generation: u32,
+    pub number: u64,
+    pub shards: Vec<(u16, u8)>,
+}
+const NACK_MAGIC: &[u8; 2] = b"FN";
+const NACK_HEADER: usize = 20;
+/// Entries that fit one 1200-byte datagram.
+pub const NACK_MAX_SHARDS: usize = 390;
+/// Requests per picture; later losses fall back to a keyframe.
+const NACK_ATTEMPTS: u8 = 2;
+impl Nack {
+    pub fn encode(&self) -> Vec<u8> {
+        let shards = &self.shards[..self.shards.len().min(NACK_MAX_SHARDS)];
+        let mut p = Vec::with_capacity(NACK_HEADER + shards.len() * 3);
+        p.extend_from_slice(NACK_MAGIC);
+        p.extend_from_slice(&(self.window.id as u32).to_be_bytes());
+        p.extend_from_slice(&self.window.generation.to_be_bytes());
+        p.extend_from_slice(&self.generation.to_be_bytes());
+        p.extend_from_slice(&(self.number as u32).to_be_bytes());
+        p.extend_from_slice(&(shards.len() as u16).to_be_bytes());
+        for (block, index) in shards {
+            p.extend_from_slice(&block.to_be_bytes());
+            p.push(*index);
+        }
+        p
+    }
+    pub fn parse(p: &[u8]) -> Option<Self> {
+        if p.len() < NACK_HEADER || &p[..2] != NACK_MAGIC {
+            return None;
+        }
+        let count = u16::from_be_bytes(p[18..20].try_into().ok()?) as usize;
+        if count == 0 || count > NACK_MAX_SHARDS || p.len() != NACK_HEADER + count * 3 {
+            return None;
+        }
+        Some(Self {
+            window: WindowId {
+                id: u64::from(u32::from_be_bytes(p[2..6].try_into().ok()?)),
+                generation: u32::from_be_bytes(p[6..10].try_into().ok()?),
+            },
+            generation: u32::from_be_bytes(p[10..14].try_into().ok()?),
+            number: u64::from(u32::from_be_bytes(p[14..18].try_into().ok()?)),
+            shards: p[NACK_HEADER..]
+                .chunks_exact(3)
+                .map(|e| (u16::from_be_bytes([e[0], e[1]]), e[2]))
+                .collect(),
+        })
+    }
+}
+
 #[derive(Default)]
 pub struct Reassembler {
     frames: HashMap<FrameKey, Partial>,
@@ -426,8 +551,104 @@ pub struct Reassembler {
     retired_keys: HashSet<FrameKey>,
     deadline: Option<Instant>,
     stats: HashMap<WindowId, DeliveryStats>,
+    /// Path round trip; zero disables retransmission requests.
+    rtt: Duration,
+    /// Highest frame number seen per (window, generation): a newer frame's
+    /// first datagram means the older one's transmission has ended.
+    latest: HashMap<(WindowId, u32), u64>,
 }
 impl Reassembler {
+    pub fn set_rtt(&mut self, rtt: Duration) {
+        self.rtt = rtt;
+    }
+    fn nack_idle(&self) -> Duration {
+        (self.rtt / 2).max(Duration::from_millis(3))
+    }
+    /// Time a retransmission needs: request, resend and a little jitter.
+    fn nack_window(&self) -> Duration {
+        self.rtt + Duration::from_millis(2)
+    }
+    fn nack_possible(&self, partial: &Partial, now: Instant) -> bool {
+        !self.rtt.is_zero()
+            && partial.header.window != AUDIO_WINDOW
+            && partial.nacks < NACK_ATTEMPTS
+            && partial.deadline > now + self.nack_window()
+    }
+    /// When the next retransmission request could become due.
+    fn next_nack(&self, now: Instant) -> Option<Instant> {
+        self.frames
+            .values()
+            .filter(|p| self.nack_possible(p, now))
+            .map(|p| {
+                let idle = p.last_at + self.nack_idle();
+                p.nacked_at
+                    .map_or(idle, |at| idle.max(at + self.nack_window()))
+            })
+            .min()
+    }
+    /// Retransmission requests that are due now: frames whose transmission
+    /// has ended (a newer frame arrived, or none came for a short idle time)
+    /// with blocks that parity cannot complete, while a round trip still fits
+    /// before their deadline.
+    pub fn nacks(&mut self, now: Instant) -> Vec<Nack> {
+        let idle = self.nack_idle();
+        let window = self.nack_window();
+        let keys: Vec<_> = self
+            .frames
+            .iter()
+            .filter(|(key, p)| {
+                self.nack_possible(p, now)
+                    && p.nacked_at.is_none_or(|at| now >= at + window)
+                    && (self
+                        .latest
+                        .get(&(key.0, key.1))
+                        .is_some_and(|latest| *latest > key.2)
+                        || now >= p.last_at + idle)
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        let mut requests = Vec::new();
+        for key in keys {
+            let Some(p) = self.frames.get_mut(&key) else {
+                continue;
+            };
+            let h = p.header;
+            let mut shards = Vec::new();
+            for (b, block) in p.blocks.iter().enumerate() {
+                let data = (h.count - b).div_ceil(h.blocks);
+                let parity = FecProfile {
+                    parity_per_32: h.profile,
+                }
+                .parity(data);
+                let (received, present): (usize, &[Option<Vec<u8>>]) = match block {
+                    Some(block) if block.complete => continue,
+                    Some(block) => (block.received, &block.shards),
+                    None => (0, &[]),
+                };
+                let need = data.saturating_sub(received);
+                shards.extend(
+                    (0..data + parity)
+                        .filter(|i| present.get(*i).is_none_or(|s| s.is_none()))
+                        .take(need)
+                        .map(|i| (b as u16, i as u8)),
+                );
+            }
+            if shards.is_empty() {
+                continue;
+            }
+            p.nacks += 1;
+            p.nacked_at = Some(now);
+            self.stats.entry(key.0).or_default().nacked_shards += shards.len() as u64;
+            shards.truncate(NACK_MAX_SHARDS);
+            requests.push(Nack {
+                window: key.0,
+                generation: key.1,
+                number: key.2,
+                shards,
+            });
+        }
+        requests
+    }
     pub fn identity(packet: &[u8]) -> Option<FrameKey> {
         Header::parse(packet).map(|h| (h.window, h.generation, h.number))
     }
@@ -435,7 +656,11 @@ impl Reassembler {
         Header::parse(packet).is_some_and(|h| h.keyframe)
     }
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.deadline
+        let nack = self.next_nack(Instant::now());
+        match (self.deadline, nack) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
     pub fn has_keyframe(&self, window: WindowId, generation: u32) -> bool {
         self.frames.values().any(|frame| {
@@ -467,6 +692,7 @@ impl Reassembler {
         self.stats.get(&window).copied().unwrap_or_default()
     }
     pub fn forget_window(&mut self, window: WindowId) {
+        self.latest.retain(|(w, _), _| *w != window);
         self.frames.retain(|(w, _, _), _| *w != window);
         self.expired.retain(|(w, _, _)| *w != window);
         self.retired.retain(|r| r.key.0 != window);
@@ -540,6 +766,11 @@ impl Reassembler {
         self.expire(now);
         let h = Header::parse(packet)?;
         let key = (h.window, h.generation, h.number);
+        let latest = self
+            .latest
+            .entry((h.window, h.generation))
+            .or_insert(h.number);
+        *latest = (*latest).max(h.number);
         if self.retired_keys.contains(&key) {
             let retired = self.retired.iter_mut().find(|r| r.key == key).unwrap();
             if retired.header.same_frame(h)
@@ -605,6 +836,9 @@ impl Reassembler {
                     reserved,
                     repaired: false,
                     seen: vec![0; h.blocks],
+                    last_at: now,
+                    nacks: 0,
+                    nacked_at: None,
                 },
             );
             self.total_bytes += reserved;
@@ -616,6 +850,7 @@ impl Reassembler {
             return None;
         }
         frame.seen[h.block] |= 1u64 << h.index;
+        frame.last_at = now;
         let stats = self.stats.entry(h.window).or_default();
         stats.received_bytes += packet.len() as u64;
         stats.received_shards += 1;
@@ -693,19 +928,25 @@ impl Reassembler {
         self.total_bytes -= complete.reserved;
         stats.completed_frames += 1;
         stats.recovered_frames += u64::from(complete.repaired);
+        stats.retransmit_repaired_frames += u64::from(complete.nacks > 0);
         self.retire(&mut complete, key, now);
         // Each window's frames are sent one after another, so an older partial
-        // of the same generation can no longer complete. Report it now rather
-        // than at its deadline.
+        // of the same generation cannot complete from its first transmission.
+        // Give it one retransmission round trip if that fits its deadline;
+        // otherwise report it now rather than at its deadline.
+        let grace = self.nack_window() * 2 + Duration::from_millis(4);
         let older: Vec<_> = self
             .frames
-            .keys()
-            .filter(|(w, g, n)| *w == h.window && *g == h.generation && *n < h.number)
-            .copied()
+            .iter()
+            .filter(|((w, g, n), _)| *w == h.window && *g == h.generation && *n < h.number)
+            .map(|(k, p)| (*k, self.nack_possible(p, now)))
             .collect();
         if !older.is_empty() {
-            for key in older {
-                self.lose(key, now);
+            for (key, repairable) in older {
+                match self.frames.get_mut(&key) {
+                    Some(p) if repairable => p.deadline = p.deadline.min(now + grace),
+                    _ => self.lose(key, now),
+                }
             }
             self.refresh_deadline();
         }
@@ -829,7 +1070,11 @@ mod tests {
                 let mut r = Reassembler::default();
                 let now = Instant::now();
                 let mut result = None;
-                for p in packets.iter().rev().filter(|p| p[46] != 0) {
+                for p in packets
+                    .iter()
+                    .rev()
+                    .filter(|p| shard_position(p).is_some_and(|s| s.index != 0))
+                {
                     if let Some(decoded) = r.push(p, now) {
                         assert!(result.is_none());
                         result = Some(decoded);
@@ -977,7 +1222,8 @@ mod tests {
         let f = frame(10000);
         let packets = fragment(&f, 1200).unwrap();
         let at = Instant::now();
-        for offset in [34, 38, 40, 42, 44, 45, 46, 47, 48, 50, 51] {
+        // Length, shard size, block, index, flags/scheme and profile.
+        for offset in [30, 34, 35, 36, 38, 39, 40] {
             let mut p = packets[0].clone();
             p[offset] = 255;
             let mut r = Reassembler::default();
@@ -991,6 +1237,117 @@ mod tests {
         conflict[26] ^= 1;
         assert!(r.push(&conflict, at).is_none());
         assert_eq!(r.total_bytes, charged);
+    }
+    #[test]
+    fn small_protected_frames_survive_bursts_and_path_mtu_datagrams_roundtrip() {
+        // A 3-shard delta at the moderate profile now carries 2 recovery
+        // shards (proportional parity gave 1), so any 2-packet burst repairs.
+        let f = frame(3000);
+        let packets = fragment_fec(&f, 1200, FecProfile { parity_per_32: 4 }, 7).unwrap();
+        assert_eq!(packets.len(), 3 + 2);
+        for first in 0..packets.len() - 1 {
+            let mut r = Reassembler::default();
+            let decoded = packets
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != first && *i != first + 1)
+                .find_map(|(_, p)| r.push(p, Instant::now()))
+                .unwrap_or_else(|| panic!("burst at {first} unrecoverable"));
+            assert_eq!(decoded.bytes, f.bytes);
+            assert_eq!(decoded.captured_us, f.encoded_us - 7.min(f.encoded_us));
+        }
+        // Ethernet path MTU: fewer, larger datagrams; oversize is rejected.
+        let f = frame(100_000);
+        let large = fragment(&f, 1452).unwrap();
+        assert!(large.iter().all(|p| p.len() <= 1452));
+        assert!(large.len() < fragment(&f, 1200).unwrap().len() * 85 / 100);
+        let mut r = Reassembler::default();
+        let decoded = large
+            .iter()
+            .find_map(|p| r.push(p, Instant::now()))
+            .unwrap();
+        assert_eq!(decoded.bytes, f.bytes);
+        let mut oversize = large[0].clone();
+        oversize.resize(MAX_DATAGRAM_BYTES + 1, 0);
+        assert!(shard_position(&oversize).is_none());
+    }
+    #[test]
+    fn lost_shards_beyond_parity_are_requested_once_transmission_ends_and_repair() {
+        let mut f = frame(20_000);
+        f.number = 10;
+        let packets = fragment_fec(&f, 1200, FecProfile { parity_per_32: 2 }, 0).unwrap();
+        let t = Instant::now();
+        let mut r = Reassembler::default();
+        r.set_rtt(Duration::from_millis(2));
+        // Lose three consecutive datagrams: more than one block's parity.
+        let lost: Vec<_> = (0..3).collect();
+        for (i, p) in packets.iter().enumerate() {
+            if !lost.contains(&i) {
+                assert!(r.push(p, t).is_none());
+            }
+        }
+        // Still within the idle window and no newer frame: nothing yet.
+        assert!(r.nacks(t + Duration::from_millis(1)).is_empty());
+        // The next picture's first datagram ends this one's transmission.
+        let mut next = frame(20_000);
+        next.number = 11;
+        r.push(
+            &fragment(&next, 1200).unwrap()[0],
+            t + Duration::from_millis(1),
+        );
+        let nacks = r.nacks(t + Duration::from_millis(1));
+        assert_eq!(nacks.len(), 1);
+        let nack = &nacks[0];
+        assert_eq!(
+            (nack.window, nack.generation, nack.number),
+            (f.window, f.generation, 10)
+        );
+        assert!(!nack.shards.is_empty() && nack.shards.len() <= lost.len());
+        assert_eq!(Nack::parse(&nack.encode()).as_ref(), Some(nack));
+        // Not asked again within one round trip.
+        assert!(r.nacks(t + Duration::from_millis(2)).is_empty());
+        // Resending exactly the requested shards completes the picture.
+        let repaired = packets
+            .iter()
+            .filter(|p| {
+                shard_position(p)
+                    .is_some_and(|s| nack.shards.contains(&(s.block as u16, s.index as u8)))
+            })
+            .find_map(|p| r.push(p, t + Duration::from_millis(4)))
+            .expect("retransmitted shards complete the picture");
+        assert_eq!(repaired.bytes, f.bytes);
+        assert_eq!(r.stats(f.window).retransmit_repaired_frames, 1);
+        assert!(r.stats(f.window).nacked_shards >= 1);
+    }
+    #[test]
+    fn retransmission_requests_are_bounded_and_need_a_known_round_trip() {
+        let f = frame(20_000);
+        let packets = fragment_fec(&f, 1200, FecProfile { parity_per_32: 0 }, 0).unwrap();
+        let t = Instant::now();
+        // Unknown RTT: no requests; the frame is reported at its deadline.
+        let mut r = Reassembler::default();
+        r.push(&packets[1], t);
+        assert!(r.nacks(t + Duration::from_millis(10)).is_empty());
+        // Known RTT: at most two attempts per picture.
+        let mut r = Reassembler::default();
+        r.set_rtt(Duration::from_millis(1));
+        r.push(&packets[1], t);
+        let mut attempts = 0;
+        for ms in (4..24).step_by(4) {
+            attempts += r.nacks(t + Duration::from_millis(ms)).len();
+        }
+        assert_eq!(attempts, 2);
+        // Malformed requests are rejected.
+        let mut bad = Nack {
+            window: f.window,
+            generation: 1,
+            number: 2,
+            shards: vec![(0, 1)],
+        }
+        .encode();
+        bad.push(0);
+        assert!(Nack::parse(&bad).is_none());
+        assert!(Nack::parse(b"FN").is_none());
     }
     #[test]
     fn session_budget_includes_pending_and_reconstruction() {

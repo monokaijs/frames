@@ -47,6 +47,30 @@ struct Shared {
     loss_until: Mutex<Option<std::time::Instant>>,
     pressure_until: Mutex<Option<std::time::Instant>>,
     timings: Mutex<SendTimings>,
+    /// Recently sent pictures, for retransmission requests.
+    recent: Mutex<std::collections::VecDeque<Sent>>,
+    retransmit: Mutex<RetransmitBudget>,
+    retransmitted: AtomicU64,
+}
+/// Packets of one sent picture, kept briefly so lost shards can be resent.
+struct Sent {
+    window: WindowId,
+    generation: u32,
+    number: u64,
+    at: std::time::Instant,
+    packets: Vec<bytes::Bytes>,
+}
+const RECENT_PICTURES: usize = 32;
+const RECENT_AGE: Duration = Duration::from_millis(300);
+/// A retransmission is only useful while the viewer can still assemble the
+/// picture; it goes ahead of newer pictures, which decode after it anyway.
+const RETRANSMIT_DEADLINE: Duration = Duration::from_millis(25);
+/// Retransmissions may use at most this share of the stream's wire rate, so
+/// repairs cannot feed the congestion that caused the loss.
+const RETRANSMIT_SHARE: f64 = 0.25;
+struct RetransmitBudget {
+    credit: f64,
+    updated: std::time::Instant,
 }
 #[derive(Default)]
 struct SendTimings {
@@ -242,6 +266,12 @@ impl MediaSender {
             pressure_until: Mutex::new(None),
             timings: Mutex::default(),
             bulk_next: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+            recent: Mutex::new(std::collections::VecDeque::new()),
+            retransmit: Mutex::new(RetransmitBudget {
+                credit: 0.0,
+                updated: std::time::Instant::now(),
+            }),
+            retransmitted: AtomicU64::new(0),
         });
         let task = tokio::spawn(run(connection, shared.clone()));
         Self(Arc::new(Owner { shared, task }))
@@ -337,8 +367,82 @@ impl MediaSender {
             queue_p95_us = timings.queue_age.percentile(95),
             late = self.late(),
             bytes = self.bytes(),
+            retransmitted = self.retransmitted(),
             "media sender timing"
         );
+    }
+    /// Resends the shards a viewer could not recover, if the picture is still
+    /// cached and the retransmission budget allows. Returns the packets queued.
+    pub fn retransmit(&self, nack: &media::Nack) -> usize {
+        if nack.window == media::AUDIO_WINDOW || nack.shards.is_empty() {
+            return 0;
+        }
+        let shared = &self.0.shared;
+        let wanted: std::collections::HashSet<(u16, u8)> = nack.shards.iter().copied().collect();
+        let packets: std::collections::VecDeque<bytes::Bytes> = {
+            let recent = shared.recent.lock().unwrap();
+            let Some(sent) = recent.iter().rev().find(|s| {
+                s.window == nack.window
+                    && s.generation == nack.generation
+                    && s.number == nack.number
+            }) else {
+                return 0;
+            };
+            if sent.at.elapsed() > RECENT_AGE {
+                return 0;
+            }
+            sent.packets
+                .iter()
+                .filter(|p| {
+                    media::shard_position(p)
+                        .is_some_and(|s| wanted.contains(&(s.block as u16, s.index as u8)))
+                })
+                .cloned()
+                .collect()
+        };
+        let bytes: usize = packets.iter().map(|p| p.len()).sum();
+        {
+            let mut budget = shared.retransmit.lock().unwrap();
+            let now = std::time::Instant::now();
+            let rate = shared.wire_bps.load(Ordering::Relaxed) as f64 / 8.0 * RETRANSMIT_SHARE;
+            // At most 50 ms of budget may accumulate: no repair bursts.
+            budget.credit = (budget.credit
+                + now.duration_since(budget.updated).as_secs_f64() * rate)
+                .min(rate * 0.05);
+            budget.updated = now;
+            if packets.is_empty() || budget.credit < bytes as f64 {
+                return 0;
+            }
+            budget.credit -= bytes as f64;
+        }
+        let count = packets.len();
+        let (done, result) = oneshot::channel();
+        {
+            let mut queue = shared.queue.lock().unwrap();
+            if queue.len() >= 16 {
+                return 0;
+            }
+            queue.push(Work {
+                window: nack.window,
+                packets,
+                deadline: tokio::time::Instant::now() + RETRANSMIT_DEADLINE,
+                focused: true,
+                submitted: tokio::time::Instant::now(),
+                done,
+            });
+        }
+        // The dispatcher drops work whose requester has gone away; keep it.
+        tokio::spawn(async move {
+            let _ = result.await;
+        });
+        shared
+            .retransmitted
+            .fetch_add(count as u64, Ordering::Relaxed);
+        shared.wake.notify_one();
+        count
+    }
+    pub fn retransmitted(&self) -> u64 {
+        self.0.shared.retransmitted.load(Ordering::Relaxed)
     }
     pub fn queue_micros(&self) -> u32 {
         self.0.shared.queue_micros.load(Ordering::Relaxed)
@@ -394,6 +498,7 @@ impl MediaSender {
             return Ok(false);
         }
         let window = frame.window;
+        let (generation, number) = (frame.generation, frame.number);
         let payload = frame.bytes.len();
         let (packets, cost) = tokio::task::spawn_blocking(move || {
             let start = std::time::Instant::now();
@@ -416,18 +521,37 @@ impl MediaSender {
                 .record(extra, now);
         }
         let (done, result) = oneshot::channel();
+        let packets: Vec<bytes::Bytes> = packets.into_iter().map(bytes::Bytes::from).collect();
         {
             let mut queue = self.0.shared.queue.lock().unwrap();
             let retained: usize = queue.iter().flat_map(|w| &w.packets).map(|p| p.len()).sum();
             if queue.len() >= 12
-                || retained + packets.iter().map(Vec::len).sum::<usize>()
+                || retained + packets.iter().map(|p| p.len()).sum::<usize>()
                     > media::MAX_REASSEMBLY_BYTES
             {
                 return Ok(false);
             }
+            if window != media::AUDIO_WINDOW {
+                let mut recent = self.0.shared.recent.lock().unwrap();
+                let now = std::time::Instant::now();
+                while recent.len() >= RECENT_PICTURES
+                    || recent
+                        .front()
+                        .is_some_and(|s| now.duration_since(s.at) > RECENT_AGE)
+                {
+                    recent.pop_front();
+                }
+                recent.push_back(Sent {
+                    window,
+                    generation,
+                    number,
+                    at: now,
+                    packets: packets.clone(),
+                });
+            }
             queue.push(Work {
                 window,
-                packets: packets.into_iter().map(bytes::Bytes::from).collect(),
+                packets: packets.into(),
                 deadline,
                 focused,
                 submitted: tokio::time::Instant::now(),

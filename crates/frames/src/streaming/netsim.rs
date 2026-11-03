@@ -518,6 +518,12 @@ async fn run(name: &str, link: Impairment, seconds: u64) -> serde_json::Value {
                 }
                 _ => {}
             },
+            // As session.rs: the viewer's retransmission requests.
+            datagram = host.read_datagram() => {
+                if let Ok(datagram) = datagram && let Some(nack) = media::Nack::parse(&datagram) {
+                    sender.retransmit(&nack);
+                }
+            }
             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
     }
@@ -559,6 +565,7 @@ async fn run(name: &str, link: Impairment, seconds: u64) -> serde_json::Value {
         "link_loss_pct": link_loss * 100.0,
         "mbps": bytes as f64 * 8.0 / 1e6 / seconds as f64,
         "quic_lost_packets": path.lost_packets,
+        "retransmitted": sender.retransmitted(),
         "quic_congestion_events": path.congestion_events,
         "errors": errors,
     })
