@@ -22,6 +22,8 @@ use std::{
 mod device_catalog;
 #[path = "launcher_close.rs"]
 mod launcher_close;
+#[path = "launcher_instance.rs"]
+mod launcher_instance;
 #[cfg(any(windows, target_os = "macos"))]
 #[path = "launcher_tray.rs"]
 mod launcher_tray;
@@ -1020,6 +1022,13 @@ fn local_address() -> String {
 }
 
 pub fn run() -> Result<()> {
+    // Before anything with process-wide effect: a second launcher only asks
+    // the running one to show itself. It must not register the macOS exit
+    // hook, which would stop background sharing when this process exits.
+    let instance = match launcher_instance::acquire()? {
+        launcher_instance::Launch::Primary(instance) => instance,
+        launcher_instance::Launch::Secondary => return Ok(()),
+    };
     window_style::initialize()?;
     #[cfg(target_os = "macos")]
     frames_native::stop_background_sharing_on_exit();
@@ -1264,6 +1273,12 @@ pub fn run() -> Result<()> {
     let mut permission_notice = false;
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(100), move || {
         let Some(ui) = weak.upgrade() else { return; };
+        if instance.take_show_request() {
+            // Another launch of Frames: bring this launcher back instead,
+            // including from the tray or menu bar.
+            ui.window().set_minimized(false);
+            let _ = ui.show();
+        }
         for event in event_rx.try_iter() {
             match event {
                 Event::ShareWindows(request,result)=>sharing_picker::apply_windows(&ui,request,result),
