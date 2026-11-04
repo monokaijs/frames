@@ -359,3 +359,80 @@ fn runs_replay_exactly_from_a_seed() {
         "the seed drives the losses"
     );
 }
+
+/// Phase 5: probing at the start finds the path's capacity instead of
+/// climbing to it from a low guess.
+#[test]
+fn startup_probing_reaches_capacity_quickly() {
+    let link = LinkConfig {
+        rate_bps: Some(50_000_000),
+        ..internet(20)
+    };
+    let rate = RateConfig {
+        min_bps: 1_000_000,
+        max_bps: 80_000_000,
+        start_bps: 5_000_000,
+    };
+    let run_with = |probe: bool| {
+        let mut s = scenario(link, 3.0);
+        s.host = HostConfig::new(1, 1, rate);
+        s.host.probe_at_start = probe;
+        s.encoder.bitrate_bps = rate.start_bps;
+        run(&s)
+    };
+    let probed = run_with(true);
+    let plain = run_with(false);
+    summary("probed", &probed);
+    summary("unprobed", &plain);
+    let (with, without) = (probed.target_at(1_000_000), plain.target_at(1_000_000));
+    println!("target at 1 s: probed {with} unprobed {without}");
+    assert!(with >= 25_000_000, "probed target at 1 s: {with}");
+    assert!(with > without, "probing must help: {with} vs {without}");
+    assert!(with <= 50_000_000, "never above the link: {with}");
+    assert_eq!(probed.client.frames_lost, 0);
+    assert_eq!(probed.host.keyframes, 1);
+}
+
+/// Phase 5 gate (docs/V2_PLAN.md): on an internet path with 50 ms RTT and
+/// 1% loss, p95 frame latency at most RTT/2 + 20 ms, under 0.5% of frames
+/// frozen (lost or skipped), and no keyframe storms. Starts low (5 Mbps), as
+/// a real session does, so probing and the delay-based controller both count.
+#[test]
+fn internet_path_meets_the_phase_5_gate() {
+    let rate = RateConfig {
+        min_bps: 1_000_000,
+        max_bps: 80_000_000,
+        start_bps: 5_000_000,
+    };
+    let mut s = scenario(
+        LinkConfig {
+            loss: 0.01,
+            rate_bps: Some(50_000_000),
+            ..internet(50)
+        },
+        10.0,
+    );
+    s.host = HostConfig::new(1, 1, rate);
+    s.encoder.bitrate_bps = rate.start_bps;
+    let report = run(&s);
+    summary("phase5", &report);
+    let frozen = report.client.frames_lost + report.client.frames_skipped;
+    let p95 = report.latency_percentile_us(95);
+    assert!(p95 <= 25_000 + 20_000, "p95 {p95} µs");
+    assert!(
+        frozen * 200 < report.captured,
+        "{frozen} frozen of {}",
+        report.captured
+    );
+    assert!(
+        report.host.keyframes <= 2,
+        "keyframes {}",
+        report.host.keyframes
+    );
+    assert!(
+        report.target_at(9_000_000) >= 25_000_000,
+        "the stream should still use the path: {}",
+        report.target_at(9_000_000)
+    );
+    assert_no_broken_submissions(&report);
+}

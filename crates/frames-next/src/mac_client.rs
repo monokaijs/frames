@@ -156,8 +156,8 @@ fn view(
         }
         let path = media.path();
         client.set_rtt(path.rtt_us);
-        while let Some(datagram) = media.try_recv() {
-            client.on_datagram(clock.now_us(), &datagram);
+        while let Some((datagram, arrived)) = media.try_recv_timed() {
+            client.on_datagram(arrived.unwrap_or_else(|| clock.now_us()), &datagram);
         }
         for frame in client.poll(clock.now_us(), &mut decoder) {
             let captured = frame.captured_us;

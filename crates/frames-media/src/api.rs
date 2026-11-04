@@ -389,6 +389,14 @@ pub trait MediaTransport: Send + Sync {
     fn try_send(&self, datagram: Bytes) -> Result<(), Backpressure>;
     /// The next received datagram, if one is ready.
     fn try_recv(&self) -> Option<Bytes>;
+    /// The next received datagram with when it arrived (µs on
+    /// [`crate::clock::SystemClock`]), for transports that stamp datagrams
+    /// as they come in. Delay-based rate control and bandwidth probes need
+    /// that time, not when a polling loop got around to the datagram.
+    /// `None` arrival means "now" (the default).
+    fn try_recv_timed(&self) -> Option<(Bytes, Option<u64>)> {
+        self.try_recv().map(|datagram| (datagram, None))
+    }
     /// The media rate controller's target; drives the transport's pacing.
     fn set_target_rate(&self, bits_per_second: u64);
 }

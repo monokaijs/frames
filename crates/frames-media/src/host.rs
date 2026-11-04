@@ -40,6 +40,9 @@ pub struct HostConfig {
     pub rate: RateConfig,
     /// Mark a long-term reference every this many frames (0 = never).
     pub long_term_interval: u64,
+    /// Probe the path's capacity at the start of the session, so the stream
+    /// does not open at a guess (docs/V2_PLAN.md, Phase 5).
+    pub probe_at_start: bool,
 }
 
 impl HostConfig {
@@ -55,6 +58,7 @@ impl HostConfig {
             pacing_factor: 2.5,
             rate,
             long_term_interval: 30,
+            probe_at_start: true,
         }
     }
 }
@@ -84,7 +88,10 @@ struct Sent {
     seq: u64,
     send_us: u64,
     bytes: usize,
-    header: MediaHeader,
+    /// `None` for probes, which are never retransmitted.
+    header: Option<MediaHeader>,
+    /// The probe cluster this packet belonged to.
+    cluster: Option<u16>,
     shard: Bytes,
     captured_us: u64,
     retransmitted: bool,
@@ -111,6 +118,48 @@ pub struct HostSession {
     feedback_unwrap: Unwrapper,
     last_feedback_seq: Option<u32>,
     stats: HostStats,
+    probing: Probing,
+}
+
+/// Probe packets per cluster, and their size.
+const PROBE_PACKETS: u32 = 10;
+const PROBE_BYTES: usize = 1200;
+/// A cluster that delivered at least this share of its rate fit the path.
+const PROBE_FIT: f64 = 0.8;
+/// Feedback for a cluster later than this after its last packet: give up.
+const PROBE_TIMEOUT_US: u64 = 500_000;
+
+/// A train of probe packets offered at one rate (sent back to back, with
+/// the transport pacing at that rate); the receiver's arrival times show
+/// whether the path carried it.
+struct Cluster {
+    id: u16,
+    rate_bps: f64,
+    sent: u32,
+    next_us: u64,
+    last_send_us: u64,
+    received: u32,
+    first_arrival: Option<i64>,
+    last_arrival: Option<i64>,
+}
+
+impl Cluster {
+    /// What the path delivered: bytes after the first packet over the
+    /// arrival spread (the train's dispersion at the bottleneck).
+    fn delivered_bps(&self) -> Option<f64> {
+        let (first, last) = (self.first_arrival?, self.last_arrival?);
+        let span = (last - first) as f64;
+        (self.received >= 2 && span > 0.0)
+            .then(|| f64::from(self.received - 1) * PROBE_BYTES as f64 * 8.0 * 1e6 / span)
+    }
+}
+
+#[derive(Default)]
+struct Probing {
+    started: bool,
+    clusters: Vec<Cluster>,
+    current: usize,
+    finished: bool,
 }
 
 impl HostSession {
@@ -136,6 +185,158 @@ impl HostSession {
             feedback_unwrap: Unwrapper::new(),
             last_feedback_seq: None,
             stats: HostStats::default(),
+            probing: Probing::default(),
+        }
+    }
+
+    /// The rate the transport underneath should allow: the target, or a
+    /// probe cluster's rate while one is in flight (a congestion controller
+    /// pacing at the target would otherwise flatten the probe train).
+    pub fn transport_target_bps(&self) -> u32 {
+        let probing = (!self.probing.finished)
+            .then(|| self.probing.clusters.get(self.probing.current))
+            .flatten()
+            .map_or(0.0, |cluster| cluster.rate_bps);
+        (f64::from(self.rate.target_bps()).max(probing)) as u32
+    }
+
+    /// Each probe cluster so far: `(offered bps, sent, received, delivered
+    /// bps)`, for diagnostics.
+    pub fn probe_report(&self) -> Vec<(f64, u32, u32, Option<f64>)> {
+        self.probing
+            .clusters
+            .iter()
+            .map(|c| (c.rate_bps, c.sent, c.received, c.delivered_bps()))
+            .collect()
+    }
+
+    /// Rates to probe: 2x, 4x, 8x the start rate, up to the maximum.
+    fn start_probing(&mut self, now_us: u64) {
+        self.probing.started = true;
+        if !self.config.probe_at_start {
+            self.probing.finished = true;
+            return;
+        }
+        let rate = self.config.rate;
+        let start = f64::from(rate.start_bps);
+        let max = f64::from(rate.max_bps);
+        for (id, factor) in [2.0, 4.0, 8.0].into_iter().enumerate() {
+            let rate_bps = (start * factor).min(max);
+            if rate_bps <= self.probing.clusters.last().map_or(start, |c| c.rate_bps) {
+                break;
+            }
+            self.probing.clusters.push(Cluster {
+                id: id as u16,
+                rate_bps,
+                sent: 0,
+                next_us: now_us,
+                last_send_us: now_us,
+                received: 0,
+                first_arrival: None,
+                last_arrival: None,
+            });
+        }
+        self.probing.finished = self.probing.clusters.is_empty();
+    }
+
+    /// The next probe packet, if the current cluster has one due. Probing
+    /// waits for the receiver's first feedback: until then it may still be
+    /// starting up and discarding what arrives.
+    fn poll_probe(&mut self, now_us: u64) -> Option<Bytes> {
+        if !self.probing.started || self.probing.finished {
+            return None;
+        }
+        let seq = self.next_seq;
+        let cluster = self.probing.clusters.get_mut(self.probing.current)?;
+        if cluster.sent >= PROBE_PACKETS || now_us < cluster.next_us {
+            return None;
+        }
+        let id = cluster.id;
+        // The whole train goes out back to back: the bottleneck (or the
+        // transport's pacer, at a multiple of the cluster rate) spreads it,
+        // and the spread on arrival measures the path. Pacing it here would
+        // measure only how often the caller polls.
+        cluster.sent += 1;
+        cluster.last_send_us = now_us;
+        let probe = wire::Probe {
+            seq: seq as u32,
+            send_us: now_us as u32,
+            cluster: id,
+            padding: (PROBE_BYTES - probe_header_bytes()) as u16,
+        };
+        self.next_seq += 1;
+        let mut datagram = Vec::with_capacity(PROBE_BYTES);
+        probe.encode(&mut datagram);
+        self.stats.packets += 1;
+        self.stats.bytes += datagram.len() as u64;
+        self.sent.push_back(Sent {
+            seq,
+            send_us: now_us,
+            bytes: datagram.len(),
+            header: None,
+            cluster: Some(id),
+            shard: Bytes::new(),
+            captured_us: now_us,
+            retransmitted: true,
+        });
+        Some(Bytes::from(datagram))
+    }
+
+    /// Records a probe's arrival; returns true if `seq` was a probe.
+    fn probe_arrival(&mut self, seq: u64, arrival_us: i64) -> bool {
+        let Some(index) = self.sent_index(seq) else {
+            return false;
+        };
+        let Some(id) = self.sent[index].cluster else {
+            return false;
+        };
+        // A late arrival from an earlier cluster must not stretch the
+        // current one's arrival span.
+        let Some(cluster) = self.probing.clusters.iter_mut().find(|c| c.id == id) else {
+            return true;
+        };
+        cluster.received += 1;
+        cluster.first_arrival = Some(
+            cluster
+                .first_arrival
+                .map_or(arrival_us, |f| f.min(arrival_us)),
+        );
+        cluster.last_arrival = Some(
+            cluster
+                .last_arrival
+                .map_or(arrival_us, |l| l.max(arrival_us)),
+        );
+        true
+    }
+
+    /// After feedback: judge the current cluster once it has been answered.
+    fn advance_probing(&mut self, now_us: u64) {
+        if self.probing.finished {
+            return;
+        }
+        let Some(cluster) = self.probing.clusters.get(self.probing.current) else {
+            self.probing.finished = true;
+            return;
+        };
+        let all_sent = cluster.sent >= PROBE_PACKETS;
+        let answered = cluster.received >= PROBE_PACKETS - 1;
+        let timed_out = all_sent && now_us.saturating_sub(cluster.last_send_us) > PROBE_TIMEOUT_US;
+        if !(all_sent && (answered || timed_out)) {
+            return;
+        }
+        let delivered = cluster.delivered_bps();
+        let fit = delivered.is_some_and(|d| d >= PROBE_FIT * cluster.rate_bps);
+        if let Some(delivered) = delivered {
+            // Never above what was offered or what arrived.
+            self.rate
+                .probe_result(0.85 * delivered.min(cluster.rate_bps));
+        }
+        if fit && self.probing.current + 1 < self.probing.clusters.len() {
+            self.probing.current += 1;
+            let next = &mut self.probing.clusters[self.probing.current];
+            next.next_us = now_us;
+        } else {
+            self.probing.finished = true;
         }
     }
 
@@ -383,6 +584,9 @@ impl HostSession {
 
     /// The next datagram to send now, if pacing allows one.
     pub fn poll_transmit(&mut self, now_us: u64) -> Option<Bytes> {
+        if let Some(probe) = self.poll_probe(now_us) {
+            return Some(probe);
+        }
         self.drop_stale(now_us);
         self.refill(now_us);
         let from_retransmit = !self.retransmit.is_empty();
@@ -421,7 +625,8 @@ impl HostSession {
             seq,
             send_us: now_us,
             bytes: datagram.len(),
-            header: pending.header,
+            header: Some(pending.header),
+            cluster: None,
             shard: pending.shard,
             captured_us: pending.captured_us,
             retransmitted: false,
@@ -468,6 +673,9 @@ impl HostSession {
             return; // duplicate or reordered older report
         }
         self.last_feedback_seq = Some(feedback.feedback_seq);
+        if !self.probing.started {
+            self.start_probing(now_us);
+        }
         if self.next_seq > 0 {
             self.feedback_unwrap = Unwrapper::starting_at(self.next_seq - 1);
         }
@@ -481,9 +689,12 @@ impl HostSession {
             match arrival {
                 Some(offset) => {
                     received += 1;
-                    let sent = &self.sent[index];
                     let arrival_us = i64::from(feedback.reference_us) + offset;
-                    self.rate.on_packet(sent.send_us, arrival_us, sent.bytes);
+                    let sent = &self.sent[index];
+                    let (send_us, bytes) = (sent.send_us, sent.bytes);
+                    if !self.probe_arrival(base + i as u64, arrival_us) {
+                        self.rate.on_packet(send_us, arrival_us, bytes);
+                    }
                 }
                 None if highest_received.is_some_and(|h| i < h) => lost += 1,
                 None => {}
@@ -491,6 +702,7 @@ impl HostSession {
         }
         self.rate.on_loss(received, lost);
         self.rate.update(now_us, rtt_us);
+        self.advance_probing(now_us);
 
         for range in &feedback.nacks {
             let first = self.feedback_unwrap.peek(range.first);
@@ -500,12 +712,15 @@ impl HostSession {
                 };
                 let sent = &mut self.sent[index];
                 let deadline = sent.captured_us + self.config.frame_budget_us;
+                let Some(header) = sent.header else {
+                    continue;
+                };
                 if sent.retransmitted || now_us + rtt_us / 2 > deadline {
                     continue;
                 }
                 sent.retransmitted = true;
                 self.retransmit.push_back(Pending {
-                    header: sent.header,
+                    header,
                     shard: sent.shard.clone(),
                     ready_us: now_us,
                     captured_us: sent.captured_us,
@@ -590,4 +805,14 @@ impl HostSession {
             RecoveryRequest::None => unreachable!("handled above"),
         });
     }
+}
+
+fn probe_header_bytes() -> usize {
+    wire::Probe {
+        seq: 0,
+        send_us: 0,
+        cluster: 0,
+        padding: 0,
+    }
+    .encoded_len()
 }

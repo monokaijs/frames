@@ -264,7 +264,8 @@ impl Session {
 /// Media datagrams for the engine: non-blocking send, polled receive.
 pub struct MediaChannel {
     connection: Connection,
-    inbox: Mutex<VecDeque<Bytes>>,
+    /// Datagrams with their arrival time (SystemClock µs).
+    inbox: Mutex<VecDeque<(Bytes, u64)>>,
     target: MediaTarget,
 }
 
@@ -277,13 +278,15 @@ impl MediaChannel {
         });
         let weak = Arc::downgrade(&channel);
         tokio::spawn(async move {
+            let clock = frames_media::clock::SystemClock::new();
             while let Ok(datagram) = connection.read_datagram().await {
+                let arrived = frames_media::api::MediaClock::now_us(&clock);
                 let Some(channel) = weak.upgrade() else { break };
                 let mut inbox = channel.inbox.lock().unwrap();
                 if inbox.len() >= INBOX_LIMIT {
                     inbox.pop_front();
                 }
-                inbox.push_back(datagram);
+                inbox.push_back((datagram, arrived));
             }
         });
         channel
@@ -345,7 +348,19 @@ impl MediaTransport for MediaChannel {
     }
 
     fn try_recv(&self) -> Option<Bytes> {
-        self.inbox.lock().unwrap().pop_front()
+        self.inbox
+            .lock()
+            .unwrap()
+            .pop_front()
+            .map(|(datagram, _)| datagram)
+    }
+
+    fn try_recv_timed(&self) -> Option<(Bytes, Option<u64>)> {
+        self.inbox
+            .lock()
+            .unwrap()
+            .pop_front()
+            .map(|(datagram, arrived)| (datagram, Some(arrived)))
     }
 
     fn set_target_rate(&self, bits_per_second: u64) {

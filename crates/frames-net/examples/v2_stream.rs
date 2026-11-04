@@ -86,7 +86,7 @@ async fn host(seconds: u64, relay_only: bool) -> Result<()> {
             && let Ok(CaptureEvent::Frame(frame)) = capture.next(now)
         {
             host.encode(now, &mut encoder, &frame)?;
-            media.set_target_rate(u64::from(host.target_bps()));
+            media.set_target_rate(u64::from(host.transport_target_bps()));
         }
         while let Some(datagram) = host.poll_transmit(now) {
             let _ = media.try_send(datagram);

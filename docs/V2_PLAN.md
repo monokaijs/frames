@@ -385,6 +385,14 @@ Still open: the NAT matrix (needs other networks), production relays, a graphica
   - migration verified against a real 0.2.x `trusted.json` and the service identity.
 
 ### Phase 5: Internet quality hardening
+
+**Status (2026-11-05): started.**
+- Bandwidth probing at session start (`HostSession`, `probe_at_start`): after the receiver's first feedback, trains of 10 probe packets at 2x, 4x and 8x the start rate; each train goes out back to back with the transport paced at its rate (`transport_target_bps`), and its spread on arrival is the delivered rate. A train that delivers 80% of its rate moves on to the next; the target rises to 85% of what was delivered, never down. Netsim, 50 Mbps link, 5 Mbps start: target 36-37 Mbps at 1 s against 10.5 without probing. On the PC the first train (20 Mbps) delivered 31 Mbps and the stream went straight to its 20 Mbps ceiling.
+- The delay-based controller now treats a standing queue above 10 ms (was 30) as overuse. Steady state on a 50 Mbps link: p95 25.4 ms at 20 ms RTT (was 44.8), 40.4 ms at 50 ms RTT (was 62.5), at about 82% of the link.
+- Phase 5 gate in netsim (`internet_path_meets_the_phase_5_gate`: 50 ms RTT, 1% loss, 50 Mbps, 10 s from a 5 Mbps start): p95 40.7 ms (gate 45), no frames frozen, one keyframe, target 38-41 Mbps.
+- frames-net stamps each datagram when it arrives (`MediaTransport::try_recv_timed`), so rate control and probes see arrival times instead of when a polling loop drained the inbox.
+- Still to do: codec preference on constrained paths, Wi-Fi/Ethernet and sleep/wake handling, per-path stats in an overlay, and the relay-path gate on real relays. Real-hardware latency A/Bs on the test PC vary run to run (p95 3.5-17 ms for the same build) while its owner uses it; comparisons need a quiet machine.
+
 - Bandwidth probing at session start and after a step-down: padding or FEC probes, so the stream doesn't open at a guess.
 - Codec preference for constrained paths: HEVC or AV1 over H.264 when both ends support it.
 - Network-change handling covering Wi-Fi to Ethernet and sleep/wake.

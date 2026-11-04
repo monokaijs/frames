@@ -26,7 +26,7 @@ const THRESHOLD_DOWN: f64 = 0.039;
 const ACKED_WINDOW_US: i64 = 500_000;
 const ACKED_MIN_SPAN_US: i64 = 200_000;
 /// A standing queue above this is overuse even when the delay trend is flat.
-const QUEUE_LIMIT_MS: f64 = 30.0;
+const QUEUE_LIMIT_MS: f64 = 10.0;
 /// The empty-queue one-way delay is the minimum over two windows this long,
 /// so clock drift between the machines cannot accumulate.
 const BASE_WINDOW_US: i64 = 5_000_000;
@@ -115,6 +115,15 @@ impl RateController {
     pub fn set_max_bps(&mut self, max_bps: u32) {
         self.config.max_bps = max_bps.max(self.config.min_bps);
         self.target = self.target.min(f64::from(self.config.max_bps));
+    }
+
+    /// A probe showed the path carries `bps`: raise the target to it (never
+    /// lower it) and forget older capacity estimates.
+    pub fn probe_result(&mut self, bps: f64) {
+        if bps > self.target {
+            self.target = bps.min(f64::from(self.config.max_bps));
+            self.congestion_bps = None;
+        }
     }
 
     pub fn signal(&self) -> Signal {

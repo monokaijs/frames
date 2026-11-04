@@ -122,7 +122,7 @@ async fn the_media_engine_streams_over_real_quic() {
         {
             captured += 1;
             host.encode(now, &mut encoder, &frame).unwrap();
-            host_media.set_target_rate(u64::from(host.target_bps()));
+            host_media.set_target_rate(u64::from(host.transport_target_bps()));
         }
         while let Some(datagram) = host.poll_transmit(now) {
             if host_media.try_send(datagram).is_err() {
@@ -143,7 +143,10 @@ async fn the_media_engine_streams_over_real_quic() {
     }
 
     let stats = client.stats();
-    let latency_p95 = percentile(&stats.latency_us, 95);
+    // Steady state: the first half second includes connection start-up and
+    // the engine's bandwidth probes.
+    let steady = &stats.latency_us[stats.latency_us.len().min(30)..];
+    let latency_p95 = percentile(steady, 95);
     println!(
         "real QUIC loopback: captured {captured} clean {} lost {} keyframes {} p50 {:.1} ms p95 {:.1} ms target {:.1} Mbps send failures {send_failures}",
         stats.frames_clean,

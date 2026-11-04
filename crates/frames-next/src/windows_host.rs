@@ -271,22 +271,25 @@ fn stream(
             let before = clock.now_us();
             host.encode(before, encoder.as_mut(), &frame)?;
             encode_us.push(clock.now_us().saturating_sub(before));
-            media.set_target_rate(u64::from(host.target_bps()));
             frames += 1;
         }
         let now = clock.now_us();
+        // Every iteration, not per frame: probe clusters go out between
+        // frames and need the transport paced at their rate.
+        media.set_target_rate(u64::from(host.transport_target_bps()));
         while let Some(datagram) = host.poll_transmit(now) {
             let _ = media.try_send(datagram);
         }
         let rtt = path.rtt_us;
-        while let Some(datagram) = media.try_recv() {
+        while let Some((datagram, arrived)) = media.try_recv_timed() {
+            let arrived = arrived.unwrap_or_else(|| clock.now_us());
             match Pointer::decode(&datagram) {
                 // A view-only device's input is dropped here, on the host.
                 Some(pointer) if o.control => {
                     injector.pointer(&pointer);
                 }
                 Some(_) => {}
-                None => host.on_datagram(clock.now_us(), &datagram, rtt),
+                None => host.on_datagram(arrived, &datagram, rtt),
             }
         }
         while let Ok(event) = events.try_recv() {
@@ -295,6 +298,15 @@ fn stream(
             }
         }
         if started.elapsed() >= next_report {
+            if next_report.as_secs() == 2 {
+                for (offered, sent, received, delivered) in host.probe_report() {
+                    println!(
+                        "  probe {:.1} Mbps: sent {sent} received {received} delivered {}",
+                        offered / 1e6,
+                        delivered.map_or("-".into(), |d| format!("{:.1} Mbps", d / 1e6))
+                    );
+                }
+            }
             let stats = host.stats();
             let p50 = crate::stats::percentile_ms(&mut encode_us, 50);
             println!(
