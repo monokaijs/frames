@@ -107,6 +107,8 @@ pub struct Options {
     pub audio: audio::Mode,
     /// Viewer: files to send to the host once connected.
     pub send_files: Vec<std::path::PathBuf>,
+    /// Viewer: files to fetch from the host's home folder.
+    pub get_files: Vec<String>,
     /// Host: where received files go (default ~/Downloads/Frames).
     pub receive_dir: Option<std::path::PathBuf>,
     /// Viewer: post generated mouse and key messages to its own window.
@@ -145,6 +147,7 @@ impl Options {
             name: None,
             audio: audio::Mode::Off,
             send_files: Vec::new(),
+            get_files: Vec::new(),
             receive_dir: None,
             synthetic_input: false,
             encoder: "nvenc".into(),
@@ -185,6 +188,7 @@ impl Options {
                 "--audio" => o.audio = audio::parse_mode(value()?)?,
                 "--name" => o.name = Some(value()?.to_string()),
                 "--send" => o.send_files.push(value()?.into()),
+                "--get" => o.get_files.push(value()?.to_string()),
                 "--receive-dir" => o.receive_dir = Some(value()?.into()),
                 "--clipboard" => {
                     o.clipboard = match value()? {
@@ -315,6 +319,24 @@ async fn connect(id: &str, o: Options) -> Result<()> {
         }
     };
     admit::send_hello(&session, &node.id(), o.migrate_v1, viewer_decoders()).await?;
+    for path in o.get_files.clone() {
+        let session = session.clone();
+        let dir = o
+            .receive_dir
+            .clone()
+            .unwrap_or_else(transfer::default_receive_dir);
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            match transfer::fetch(&session, &path, dir).await {
+                Ok(saved) => println!(
+                    "FILE fetched {path} in {:.1} s to {}",
+                    started.elapsed().as_secs_f64(),
+                    saved.display()
+                ),
+                Err(error) => println!("FILE fetching {path} failed: {error:#}"),
+            }
+        });
+    }
     for path in o.send_files.clone() {
         let session = session.clone();
         tokio::spawn(async move {

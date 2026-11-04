@@ -1,5 +1,5 @@
 //! A host's per-session services fed by the viewer's tagged streams:
-//! input events, clipboard, and incoming files.
+//! input events, clipboard, incoming files, and file fetches.
 
 use crate::streams::{Routes, Streams, route};
 use crate::{Options, clip, transfer};
@@ -27,10 +27,13 @@ impl HostServices {
         let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Streams>();
         let (clipboard_tx, clipboard) = std::sync::mpsc::channel();
         let (file_tx, mut file_rx) = tokio::sync::mpsc::unbounded_channel::<Streams>();
+        let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::unbounded_channel::<Streams>();
         let routes = Routes {
             input: Some(input_tx),
             clipboard: (o.clipboard != clip::Mode::Off).then_some(clipboard_tx),
             file: o.control.then_some(file_tx),
+            // Reading this user's files also needs control trust.
+            fetch: o.control.then_some(fetch_tx),
         };
         let mut tasks = vec![tokio::spawn(route(session.clone(), routes))];
         let count = event_count.clone();
@@ -59,6 +62,16 @@ impl HostServices {
                     match transfer::receive(streams, dir).await {
                         Ok(path) => println!("received {}", path.display()),
                         Err(error) => println!("file transfer failed: {error:#}"),
+                    }
+                });
+            }
+        }));
+        tasks.push(tokio::spawn(async move {
+            while let Some(streams) = fetch_rx.recv().await {
+                tokio::spawn(async move {
+                    match transfer::serve_fetch(streams).await {
+                        Ok(saved) => println!("sent a file to the viewer ({saved})"),
+                        Err(error) => println!("file fetch failed: {error:#}"),
                     }
                 });
             }

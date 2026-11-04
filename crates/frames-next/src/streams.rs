@@ -5,6 +5,8 @@
 pub const INPUT: u8 = 1;
 pub const CLIPBOARD: u8 = 2;
 pub const FILE: u8 = 3;
+/// The viewer asks for a file from the host's home folder.
+pub const FETCH: u8 = 4;
 
 pub type Streams = (iroh::endpoint::SendStream, iroh::endpoint::RecvStream);
 
@@ -20,6 +22,7 @@ pub struct Routes {
     pub input: Option<tokio::sync::mpsc::UnboundedSender<Streams>>,
     pub clipboard: Option<std::sync::mpsc::Sender<Streams>>,
     pub file: Option<tokio::sync::mpsc::UnboundedSender<Streams>>,
+    pub fetch: Option<tokio::sync::mpsc::UnboundedSender<Streams>>,
 }
 
 /// Host: accepts the viewer's streams until the session ends and hands each
@@ -47,6 +50,11 @@ pub async fn route(session: frames_net::Session, routes: Routes) {
             }
             FILE => {
                 if let Some(route) = &routes.file {
+                    let _ = route.send(streams);
+                }
+            }
+            FETCH => {
+                if let Some(route) = &routes.fetch {
                     let _ = route.send(streams);
                 }
             }

@@ -78,6 +78,12 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Viewer: sends `path`; returns the name the host saved it under.
 pub async fn send(session: &frames_net::Session, path: &Path) -> Result<String> {
+    let streams = crate::streams::open(session, crate::streams::FILE).await?;
+    send_on(streams, path).await
+}
+
+/// Sends `path` over a file stream (either direction).
+pub async fn send_on((mut send, mut recv): crate::streams::Streams, path: &Path) -> Result<String> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -85,7 +91,6 @@ pub async fn send(session: &frames_net::Session, path: &Path) -> Result<String> 
         .to_string();
     let size = tokio::fs::metadata(path).await?.len();
     let sha256 = sha256_of(path).await?;
-    let (mut send, mut recv) = crate::streams::open(session, crate::streams::FILE).await?;
     write_line(&mut send, &Offer { name, size, sha256 }).await?;
     let resume: Resume = read_line(&mut recv).await?;
     ensure!(
@@ -113,8 +118,8 @@ pub async fn send(session: &frames_net::Session, path: &Path) -> Result<String> 
     let done: Done = read_line(&mut recv).await?;
     match (done.saved, done.error) {
         (Some(saved), _) => Ok(saved),
-        (None, Some(error)) => bail!("the host rejected the file: {error}"),
-        _ => bail!("the host did not confirm the file"),
+        (None, Some(error)) => bail!("the receiver rejected the file: {error}"),
+        _ => bail!("the receiver did not confirm the file"),
     }
 }
 
@@ -158,7 +163,12 @@ pub async fn receive(
     (mut send, mut recv): crate::streams::Streams,
     dir: PathBuf,
 ) -> Result<PathBuf> {
-    let offer: Offer = read_line(&mut recv).await?;
+    // A fetch the host refuses answers with {"error"} instead of an offer.
+    let first: serde_json::Value = read_line(&mut recv).await?;
+    if let Some(error) = first.get("error").and_then(|e| e.as_str()) {
+        bail!("the host refused: {error}");
+    }
+    let offer: Offer = serde_json::from_value(first)?;
     let result = receive_offer(&offer, &mut send, &mut recv, &dir).await;
     let done = match &result {
         Ok(path) => Done {
@@ -274,5 +284,88 @@ mod tests {
             unused_path(dir.path(), "Makefile"),
             dir.path().join("Makefile (2)")
         );
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Fetch {
+    /// Relative to the host user's home folder.
+    path: String,
+}
+
+/// Viewer: fetches `path` (relative to the host user's home folder) into
+/// `dir`, resuming an interrupted fetch of the same file.
+pub async fn fetch(session: &frames_net::Session, path: &str, dir: PathBuf) -> Result<PathBuf> {
+    let (mut send, recv) = crate::streams::open(session, crate::streams::FETCH).await?;
+    write_line(&mut send, &Fetch { path: path.into() }).await?;
+    receive((send, recv), dir).await
+}
+
+/// `relative` inside `home`, refusing anything that leaves it (`..`,
+/// absolute paths, symlinks pointing outside).
+pub fn resolve_in_home(home: &Path, relative: &str) -> Result<PathBuf> {
+    let candidate = Path::new(relative);
+    ensure!(
+        !candidate.is_absolute(),
+        "give a path inside the home folder"
+    );
+    let home = home.canonicalize()?;
+    let target = home
+        .join(candidate)
+        .canonicalize()
+        .context("no such file")?;
+    ensure!(
+        target.starts_with(&home),
+        "that path leaves the home folder"
+    );
+    ensure!(target.is_file(), "not a regular file");
+    Ok(target)
+}
+
+/// Host: answers a fetch stream by sending the requested file.
+pub async fn serve_fetch((mut send, mut recv): crate::streams::Streams) -> Result<String> {
+    let request: Fetch = read_line(&mut recv).await?;
+    let path = directories::UserDirs::new()
+        .map(|dirs| dirs.home_dir().to_path_buf())
+        .context("no home folder")
+        .and_then(|home| resolve_in_home(&home, &request.path));
+    match path {
+        Ok(path) => send_on((send, recv), &path).await,
+        Err(error) => {
+            let reply = serde_json::json!({ "error": format!("{error:#}") });
+            write_line(&mut send, &reply).await?;
+            let _ = send.finish();
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::*;
+
+    #[test]
+    fn fetches_stay_inside_the_home_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("Docs")).unwrap();
+        std::fs::write(home.path().join("Docs/report.pdf"), b"pdf").unwrap();
+        std::fs::write(outside.path().join("secret"), b"x").unwrap();
+        assert!(resolve_in_home(home.path(), "Docs/report.pdf").is_ok());
+        assert!(resolve_in_home(home.path(), "../secret").is_err());
+        assert!(
+            resolve_in_home(home.path(), outside.path().join("secret").to_str().unwrap()).is_err()
+        );
+        assert!(resolve_in_home(home.path(), "Docs").is_err(), "a folder");
+        assert!(resolve_in_home(home.path(), "missing").is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path().join("secret"), home.path().join("link"))
+                .unwrap();
+            assert!(
+                resolve_in_home(home.path(), "link").is_err(),
+                "symlink out of home"
+            );
+        }
     }
 }
