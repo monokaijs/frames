@@ -1021,6 +1021,8 @@ fn local_address() -> String {
 
 pub fn run() -> Result<()> {
     window_style::initialize()?;
+    #[cfg(target_os = "macos")]
+    frames_native::stop_background_sharing_on_exit();
     let ui = Launcher::new()?;
     #[cfg(any(windows, target_os = "macos"))]
     let mut tray = launcher_tray::LauncherTray::new()?;

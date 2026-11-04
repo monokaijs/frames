@@ -82,18 +82,61 @@ pub fn permission_status(request: bool) -> anyhow::Result<Value> {
     let mut permissions: Value = serde_json::from_slice(&output.stdout)?;
     // SMAppService.status describes the login preference, not whether launchd
     // still has the service loaded. A stopped login agent must not block updates.
-    permissions["sharing_running"] = launch_agent_loaded("dev.creaton.frames.agent")?.into();
+    permissions["sharing_running"] = launch_agent_loaded(SHARING_AGENT)?.into();
     Ok(permissions)
 }
 
+const SHARING_AGENT: &str = "dev.creaton.frames.agent";
+
 fn launch_agent_loaded(label: &str) -> anyhow::Result<bool> {
-    let service = format!("gui/{}/{label}", unsafe { libc::getuid() });
     Ok(Command::new("/bin/launchctl")
-        .args(["print", &service])
+        .args(["print", &launch_agent_service(label)])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?
         .success())
+}
+
+fn launch_agent_service(label: &str) -> String {
+    format!("gui/{}/{label}", unsafe { libc::getuid() })
+}
+
+/// Asks launchd to unload a launch agent from this login session only. Its
+/// registration (and for sharing at login, the Login Items entry) is
+/// untouched, so launchd loads it again at the next login. Killing the process
+/// instead would not work: the agent is KeepAlive, so launchd restarts it.
+///
+/// Never waits: the request is handed to a detached `launchctl`, which finishes
+/// on its own after Frames is gone. Booting out an agent that is not loaded
+/// fails harmlessly, so there is no check first either.
+fn stop_launch_agent(label: &str) -> std::io::Result<Child> {
+    Command::new("/bin/launchctl")
+        .args(["bootout", &launch_agent_service(label)])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+}
+
+/// Quitting Frames must stop all of Frames, including sharing at login, which
+/// otherwise keeps running (and is restarted by launchd) after the launcher
+/// exits. AppKit ends a Cmd+Q or Dock Quit with `exit()`, skipping the
+/// launcher's own shutdown code, so this runs as an exit handler: it covers
+/// those, the menu bar's Quit Frames and a normal return alike.
+///
+/// The handler also runs during logout, restart and shutdown, so it must not
+/// delay exit: it only spawns `launchctl` (no waiting, no logging, whose
+/// writers may already be torn down) and ignores every failure.
+pub fn stop_background_sharing_on_exit() {
+    extern "C" fn stop() {
+        let _ = stop_launch_agent(SHARING_AGENT);
+    }
+    static REGISTERED: std::sync::Once = std::sync::Once::new();
+    REGISTERED.call_once(|| {
+        if unsafe { libc::atexit(stop) } != 0 {
+            tracing::warn!("cannot stop sharing at login when Frames quits");
+        }
+    });
 }
 
 pub fn configure_login_item() -> anyhow::Result<()> {
@@ -984,6 +1027,74 @@ mod launch_agent_tests {
         assert!(
             !launch_agent_loaded(&label).unwrap(),
             "An unloaded service must not block Restart to update"
+        );
+    }
+
+    #[test]
+    fn quitting_stops_a_keepalive_agent_for_good() {
+        let domain = format!("gui/{}", unsafe { libc::getuid() });
+        if !Command::new("/bin/launchctl")
+            .args(["print", &domain])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+        {
+            eprintln!("No Aqua login domain; launch agent integration requires a logged-in Mac");
+            return;
+        }
+        let label = format!("dev.frames.quit-test.{}", std::process::id());
+        let path = std::env::temp_dir().join(format!("{label}.plist"));
+        struct Cleanup(String, std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = Command::new("/bin/launchctl")
+                    .args(["bootout", &self.0])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let _ = std::fs::remove_file(&self.1);
+            }
+        }
+        let _cleanup = Cleanup(launch_agent_service(&label), path.clone());
+        // Nothing loaded: the request fails quietly instead of erroring.
+        stop_launch_agent(&label).unwrap().wait().unwrap();
+        assert!(!launch_agent_loaded(&label).unwrap());
+        // Same lifecycle keys as dev.creaton.frames.agent.plist.
+        std::fs::write(
+            &path,
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>Label</key><string>{label}</string>
+<key>ProgramArguments</key><array><string>/bin/sleep</string><string>60</string></array>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+</dict></plist>"#
+            ),
+        )
+        .unwrap();
+        assert!(
+            Command::new("/bin/launchctl")
+                .args(["bootstrap", &domain])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(launch_agent_loaded(&label).unwrap());
+        // Quit does not wait for launchctl; the request must still take effect.
+        drop(stop_launch_agent(&label).unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while launch_agent_loaded(&label).unwrap() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // KeepAlive restarts a killed agent within about a second; an unloaded
+        // one must stay gone.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        assert!(
+            !launch_agent_loaded(&label).unwrap(),
+            "launchd must not restart sharing at login after Quit"
         );
     }
 }

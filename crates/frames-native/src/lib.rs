@@ -36,6 +36,11 @@ pub fn configure_login_item() -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+pub fn stop_background_sharing_on_exit() {
+    macos::stop_background_sharing_on_exit()
+}
+
+#[cfg(target_os = "macos")]
 pub fn open_network_settings() -> anyhow::Result<()> {
     macos::open_network_settings()
 }
