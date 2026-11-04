@@ -21,6 +21,8 @@ use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 mod mac_client;
+#[cfg(target_os = "macos")]
+mod mac_host;
 mod stats;
 #[cfg(windows)]
 mod win;
@@ -148,9 +150,14 @@ async fn run_host(session: frames_net::Session, o: Options) -> Result<()> {
     windows_host::run(session, o).await
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+async fn run_host(session: frames_net::Session, o: Options) -> Result<()> {
+    mac_host::run(session, o).await
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 async fn run_host(_: frames_net::Session, _: Options) -> Result<()> {
-    bail!("hosting needs the Windows backends (the macOS backends are not wired in yet)")
+    bail!("hosting needs the Windows or macOS backends")
 }
 
 async fn connect(id: &str, o: Options) -> Result<()> {

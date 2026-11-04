@@ -278,6 +278,29 @@ impl MediaChannel {
         channel
     }
 
+    /// Every known path, for diagnostics: `local -> remote`, selected first.
+    pub fn describe_paths(&self) -> Vec<String> {
+        let mut out: Vec<(bool, String)> = self
+            .connection
+            .paths()
+            .iter()
+            .map(|path| {
+                (
+                    path.is_selected(),
+                    format!(
+                        "{}{:?} -> {:?} rtt {:.1} ms",
+                        if path.is_selected() { "* " } else { "  " },
+                        path.local_addr(),
+                        path.remote_addr(),
+                        path.rtt().as_secs_f64() * 1e3
+                    ),
+                )
+            })
+            .collect();
+        out.sort_by_key(|(selected, _)| !selected);
+        out.into_iter().map(|(_, text)| text).collect()
+    }
+
     /// The selected path: relay or direct, its RTT, and datagram limit.
     fn selected_path(&self) -> (PathKind, Option<Duration>) {
         for path in self.connection.paths().iter() {
