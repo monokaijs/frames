@@ -21,7 +21,14 @@ ALLOWED = {
     "frames-proto": set(),
     "frames-media": {"frames-proto"},
     "frames-testkit": {"frames-media", "frames-proto"},
+    # Backends. frames-core is allowed only until the v2 cutover moves its
+    # FFmpeg runtime into frames-codec.
+    "frames-codec": {"frames-media", "frames-proto", "frames-core"},
+    "frames-platform-windows": {"frames-media", "frames-proto", "frames-codec", "frames-core"},
 }
+# Backend crates wrap native SDKs and may need a C toolchain; the engine
+# crates above them may not.
+NATIVE_ALLOWED = {"frames-codec", "frames-platform-windows"}
 V1_CRATES = {"frames-core", "frames-native", "frames"}
 # Build-time C toolchain users.
 NATIVE_BUILD = {"cc", "cmake", "bindgen", "pkg-config", "vcpkg"}
@@ -71,7 +78,7 @@ def main() -> int:
             problem = None
             if name in frames_crates and name not in allowed:
                 problem = "is outside its allowed layers"
-            elif name in NATIVE_BUILD:
+            elif name in NATIVE_BUILD and crate not in NATIVE_ALLOWED:
                 problem = "needs a C toolchain"
             if problem:
                 chain, at = [name], dep

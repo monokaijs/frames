@@ -11,7 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot, watch};
-pub(crate) mod runtime;
+/// Public so the v2 `frames-codec` crate can wrap the FFmpeg runtime until the
+/// v2 cutover moves it there (docs/V2_PLAN.md, Phase 3).
+pub mod runtime;
 #[cfg(windows)]
 pub use runtime::GpuConverter;
 

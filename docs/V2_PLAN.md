@@ -282,6 +282,17 @@ Host pipeline: capture → encode (slices) → packetize/FEC → pacer. Client p
   - no regression in frames delivered compared with 0.2.x netsim.
 
 ### Phase 3: Platform layers
+
+**Status (2026-11-05): Windows media path working on hardware, not yet in the app.** `crates/frames-codec` (NVENC direct: HEVC/H.264, infinite GOP, 1-frame VBV, 4 slices with sub-frame output, invalidation, intra refresh; FFmpeg D3D11VA decode) and `crates/frames-platform-windows` (WGC capture with the cursor kept separate, flip-model presenter with tearing, MMCSS, GPU priority, WLAN streaming mode, qWAVE DSCP). `examples/hw_loop` runs capture → NVENC → v2 host engine → simulated LAN link in real time → v2 client engine → D3D11VA → present on the RTX 3080 Ti:
+
+| Run | capture → present p50 | p95 |
+|---|---|---|
+| 1080p60 HEVC, window capture | 3.55 ms | 4.33 ms |
+| 1080p120 HEVC, window capture | 4.43 ms | 5.36 ms |
+| 1080p60, GPU clocks not held | 6.99 ms | 8.91 ms |
+
+"Presented" is when `Present` returns, not photons. The clock hold is a dummy GPU load (about 140 W extra) and must be replaced by a per-application driver profile applied only during a session. Still open: the macOS half (`frames-platform-macos`, on a branch), AMF/QSV through FFmpeg, Desktop Duplication, the input lane and client model, and running this path inside the app over real QUIC.
+
 **Windows** (`frames-platform-windows`, `frames-codec`):
 - Capture:
   - WGC with `MinUpdateInterval` set to the target fps;

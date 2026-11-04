@@ -1,0 +1,25 @@
+[package]
+name = "frames-platform-windows"
+description = "Windows platform layer for the Frames v2 media engine: capture, presentation, scheduling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Layering (scripts/check_layers.py): frames-media and frames-codec only.
+# Everything is cfg(windows); the crate is empty elsewhere.
+[dependencies]
+frames-media = { path = "../frames-media" }
+
+[target.'cfg(windows)'.dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+frames-codec = { path = "../frames-codec", default-features = false }
+tracing.workspace = true
+windows.workspace = true
+
+[dev-dependencies]
+frames-testkit = { path = "../frames-testkit" }
+
+[target.'cfg(windows)'.dev-dependencies]
+frames-codec = { path = "../frames-codec" }

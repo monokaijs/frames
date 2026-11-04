@@ -1,0 +1,22 @@
+[package]
+name = "frames-codec"
+description = "Codec backends for the Frames v2 media engine (NVENC direct, FFmpeg)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Layering (scripts/check_layers.py): frames-media and frames-proto, plus
+# frames-core temporarily for the FFmpeg runtime (inverted at the v2 cutover).
+# May use native toolchains.
+[features]
+default = ["ffmpeg"]
+ffmpeg = ["dep:frames-core"]
+
+[dependencies]
+anyhow.workspace = true
+frames-core = { path = "../frames-core", optional = true }
+frames-media = { path = "../frames-media" }
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

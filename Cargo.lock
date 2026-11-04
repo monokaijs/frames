@@ -1908,6 +1908,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "frames-codec"
+version = "0.3.3"
+dependencies = [
+ "anyhow",
+ "frames-core",
+ "frames-media",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "frames-core"
 version = "0.3.3"
 dependencies = [
@@ -1969,6 +1979,19 @@ dependencies = [
  "windows 0.62.2",
  "windows-core 0.62.2",
  "winresource",
+]
+
+[[package]]
+name = "frames-platform-windows"
+version = "0.3.3"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "frames-codec",
+ "frames-media",
+ "frames-testkit",
+ "tracing",
+ "windows 0.62.2",
 ]
 
 [[package]]
