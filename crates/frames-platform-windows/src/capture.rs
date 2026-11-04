@@ -364,25 +364,43 @@ impl CaptureSource for WgcCapture {
     }
 }
 
-/// Renders a cursor into premultiplied BGRA.
+/// Renders a cursor into premultiplied BGRA at its own size (so the hotspot,
+/// which is in cursor pixels, stays exact).
 fn cursor_shape(cursor: HCURSOR) -> Option<CursorShape> {
     use windows::Win32::Graphics::Gdi::*;
     use windows::Win32::UI::WindowsAndMessaging::{
         DI_NORMAL, DrawIconEx, GetIconInfo, HICON, ICONINFO,
     };
-    const SIZE: i32 = 64;
     unsafe {
         let mut icon = ICONINFO::default();
         GetIconInfo(HICON(cursor.0), &mut icon).ok()?;
+        let size_of = |bitmap: HBITMAP| {
+            let mut info = BITMAP::default();
+            let read = GetObjectW(
+                bitmap.into(),
+                std::mem::size_of::<BITMAP>() as i32,
+                Some((&mut info as *mut BITMAP).cast()),
+            );
+            (read != 0).then_some((info.bmWidth, info.bmHeight))
+        };
+        // Monochrome cursors have no colour bitmap; their mask stacks the AND
+        // and XOR masks, so it is twice the cursor's height.
+        let size = if icon.hbmColor.is_invalid() {
+            size_of(icon.hbmMask).map(|(w, h)| (w, h / 2))
+        } else {
+            size_of(icon.hbmColor)
+        };
         let _ = DeleteObject(icon.hbmColor.into());
         let _ = DeleteObject(icon.hbmMask.into());
+        let (width, height) =
+            size.filter(|&(w, h)| (1..=256).contains(&w) && (1..=256).contains(&h))?;
         let screen = GetDC(None);
         let dc = CreateCompatibleDC(Some(screen));
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: SIZE,
-                biHeight: -SIZE,
+                biWidth: width,
+                biHeight: -height,
                 biPlanes: 1,
                 biBitCount: 32,
                 ..Default::default()
@@ -392,9 +410,10 @@ fn cursor_shape(cursor: HCURSOR) -> Option<CursorShape> {
         let mut bits = std::ptr::null_mut();
         let bitmap = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
         let old = SelectObject(dc, bitmap.into());
-        let drawn = DrawIconEx(dc, 0, 0, HICON(cursor.0), SIZE, SIZE, 0, None, DI_NORMAL).is_ok();
+        let drawn =
+            DrawIconEx(dc, 0, 0, HICON(cursor.0), width, height, 0, None, DI_NORMAL).is_ok();
         let mut bgra =
-            std::slice::from_raw_parts(bits as *const u8, (SIZE * SIZE * 4) as usize).to_vec();
+            std::slice::from_raw_parts(bits as *const u8, (width * height * 4) as usize).to_vec();
         SelectObject(dc, old);
         let _ = DeleteObject(bitmap.into());
         let _ = DeleteDC(dc);
@@ -409,11 +428,29 @@ fn cursor_shape(cursor: HCURSOR) -> Option<CursorShape> {
             }
         }
         Some(CursorShape {
-            width: SIZE as u32,
-            height: SIZE as u32,
+            width: width as u32,
+            height: height as u32,
             hotspot_x: icon.xHotspot,
             hotspot_y: icon.yHotspot,
             bgra: bgra.into(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{IDC_ARROW, IDC_IBEAM, LoadCursorW};
+
+    #[test]
+    fn system_cursors_render_at_their_own_size_with_the_hotspot_inside() {
+        for id in [IDC_ARROW, IDC_IBEAM] {
+            let cursor = unsafe { LoadCursorW(None, id) }.unwrap();
+            let shape = cursor_shape(cursor).expect("rendered");
+            assert!(shape.width >= 16 && shape.width <= 256, "{shape:?}");
+            assert!(shape.hotspot_x < shape.width && shape.hotspot_y < shape.height);
+            assert_eq!(shape.bgra.len() as u32, shape.width * shape.height * 4);
+            assert!(shape.bgra.chunks(4).any(|p| p[3] > 0), "some opaque pixels");
+        }
     }
 }

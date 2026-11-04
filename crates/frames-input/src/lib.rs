@@ -25,6 +25,7 @@
 //! [`Event::encode`]). Unknown kinds are skipped by length, so new kinds can
 //! be added without breaking older hosts.
 
+pub mod cursor;
 pub mod keys;
 
 /// First byte of an input datagram. Media packets start with

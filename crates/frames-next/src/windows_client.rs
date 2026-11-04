@@ -23,6 +23,28 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
         "stream: {:?} {}x{} at {} fps",
         info.codec, info.width, info.height, info.fps
     );
+    // The host's cursor shape and visibility, applied on the viewer thread.
+    let (cursor_tx, cursor_rx) = std::sync::mpsc::channel();
+    let cursor_reader = {
+        let session = session.clone();
+        tokio::spawn(async move {
+            let Ok((_send, mut recv)) = session.accept_channel().await else {
+                return;
+            };
+            let mut reader = frames_input::cursor::CursorReader::default();
+            let mut buffer = vec![0u8; 64 * 1024];
+            while let Ok(Some(n)) = recv.read(&mut buffer).await {
+                let Some(messages) = reader.push(&buffer[..n]) else {
+                    return;
+                };
+                for message in messages {
+                    if cursor_tx.send(message).is_err() {
+                        return;
+                    }
+                }
+            }
+        })
+    };
     // Buttons, keys, and wheel: one reliable stream, written by this task.
     let (mut input_stream, _) = session.open_channel().await?;
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -34,8 +56,10 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
         }
         let _ = input_stream.finish();
     });
-    let result = tokio::task::spawn_blocking(move || view(&session, info, &o, input_tx)).await?;
+    let result =
+        tokio::task::spawn_blocking(move || view(&session, info, &o, input_tx, cursor_rx)).await?;
     let _ = writer.await;
+    cursor_reader.abort();
     result
 }
 
@@ -86,6 +110,7 @@ fn view(
     info: crate::StreamInfo,
     o: &Options,
     input_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    cursor_rx: std::sync::mpsc::Receiver<frames_input::cursor::CursorMessage>,
 ) -> Result<()> {
     win::dpi_aware();
     let _mmcss = Mmcss::games();
@@ -121,6 +146,7 @@ fn view(
         seconds: 0,
     });
     let mut pointer_seq = 0u32;
+    let mut cursor_shapes = 0u64;
     let mut input_wire = Samples::new(0);
     let (mut sent_moves, mut sent_events) = (0u64, 0u64);
     let mut next_report = Duration::from_secs(1);
@@ -139,6 +165,15 @@ fn view(
         if let Some(synthetic) = &mut synthetic {
             synthetic.tick();
         }
+        let mut cursor_updates = 0u64;
+        while let Ok(message) = cursor_rx.try_recv() {
+            win::apply_cursor(&message);
+            cursor_updates += 1;
+        }
+        if cursor_updates > 0 && cursor_shapes == 0 {
+            println!("client cursor: host cursor shown");
+        }
+        cursor_shapes += cursor_updates;
         win::pump();
         send_input(
             &media,
@@ -204,7 +239,7 @@ fn view(
     });
     let (inputs, input_p50, input_p95, _) = input_wire.summary();
     println!(
-        "INPUT moves={sent_moves} events={sent_events} measured={inputs} input_to_wire p50={:.0} p95={:.0} us",
+        "INPUT moves={sent_moves} events={sent_events} cursor_updates={cursor_shapes} measured={inputs} input_to_wire p50={:.0} p95={:.0} us",
         input_p50 * 1e3,
         input_p95 * 1e3
     );

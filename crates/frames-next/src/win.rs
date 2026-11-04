@@ -49,6 +49,121 @@ pub enum Captured {
 
 thread_local! {
     static CAPTURED: RefCell<Vec<Captured>> = const { RefCell::new(Vec::new()) };
+    /// The host's cursor as shown over the viewer; `None` hides it.
+    static CURSOR: RefCell<Option<HCURSOR>> = const { RefCell::new(None) };
+    static CURSOR_SHAPE: RefCell<Option<HCURSOR>> = const { RefCell::new(None) };
+}
+
+/// Applies a cursor message from the host (viewer thread only).
+pub fn apply_cursor(message: &frames_input::cursor::CursorMessage) {
+    use frames_input::cursor::CursorMessage;
+    match message {
+        CursorMessage::Shape {
+            width,
+            height,
+            hotspot_x,
+            hotspot_y,
+            bgra,
+        } => {
+            let Some(cursor) = make_cursor(*width, *height, *hotspot_x, *hotspot_y, bgra) else {
+                eprintln!("could not create a {width}x{height} cursor from the host's shape");
+                return;
+            };
+            let old = CURSOR_SHAPE.with(|c| c.borrow_mut().replace(cursor));
+            CURSOR.with(|c| *c.borrow_mut() = Some(cursor));
+            unsafe {
+                let _ = SetCursor(Some(cursor));
+                if let Some(old) = old {
+                    let _ = DestroyCursor(old);
+                }
+            }
+        }
+        CursorMessage::Visible(visible) => {
+            let shape = CURSOR_SHAPE.with(|c| *c.borrow());
+            let shown = if *visible { shape } else { None };
+            CURSOR.with(|c| *c.borrow_mut() = shown);
+            unsafe {
+                let _ = SetCursor(shown);
+            }
+        }
+    }
+}
+
+/// An OS cursor from premultiplied BGRA (Windows wants straight alpha).
+fn make_cursor(
+    width: u16,
+    height: u16,
+    hotspot_x: u16,
+    hotspot_y: u16,
+    bgra: &[u8],
+) -> Option<HCURSOR> {
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
+        DeleteObject,
+    };
+    let (w, h) = (i32::from(width), i32::from(height));
+    unsafe {
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let color = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        let pixels = std::slice::from_raw_parts_mut(bits as *mut u8, bgra.len());
+        for (out, pixel) in pixels.chunks_exact_mut(4).zip(bgra.chunks_exact(4)) {
+            let alpha = u32::from(pixel[3]);
+            for channel in 0..3 {
+                out[channel] = if alpha == 0 {
+                    0
+                } else {
+                    (u32::from(pixel[channel]) * 255 / alpha).min(255) as u8
+                };
+            }
+            out[3] = pixel[3];
+        }
+        // All-zero AND mask: the colour bitmap's alpha decides transparency.
+        let mask_bytes = vec![0u8; (w as usize).div_ceil(16) * 2 * h as usize];
+        let mask = CreateBitmap(w, h, 1, 1, Some(mask_bytes.as_ptr().cast()));
+        let icon = ICONINFO {
+            fIcon: false.into(),
+            xHotspot: u32::from(hotspot_x),
+            yHotspot: u32::from(hotspot_y),
+            hbmMask: mask,
+            hbmColor: color,
+        };
+        let cursor = CreateIconIndirect(&icon).ok();
+        let _ = DeleteObject(color.into());
+        let _ = DeleteObject(mask.into());
+        cursor.map(|icon| HCURSOR(icon.0))
+    }
+}
+
+/// A 16x16 arrow, for QA runs whose source has no real cursor over it.
+pub fn qa_cursor() -> frames_input::cursor::CursorMessage {
+    let (width, height) = (16u16, 16u16);
+    let mut bgra = vec![0u8; 16 * 16 * 4];
+    for y in 0..16usize {
+        for x in 0..=y.min(10) {
+            let edge = x == 0 || x == y.min(10) || y == 15;
+            let value = if edge { 0 } else { 255 };
+            bgra[(y * 16 + x) * 4..][..4].copy_from_slice(&[value, value, value, 255]);
+        }
+    }
+    frames_input::cursor::CursorMessage::Shape {
+        width,
+        height,
+        hotspot_x: 0,
+        hotspot_y: 0,
+        bgra,
+    }
 }
 
 /// Input captured since the last call (viewer thread only).
@@ -139,6 +254,17 @@ unsafe extern "system" fn viewer_procedure(
     w: WPARAM,
     l: LPARAM,
 ) -> LRESULT {
+    // Over the video, show the host's cursor (or none) instead of the arrow.
+    if message == WM_SETCURSOR && (l.0 & 0xffff) as u32 == HTCLIENT {
+        let cursor = CURSOR.with(|c| *c.borrow());
+        let shape_known = CURSOR_SHAPE.with(|c| c.borrow().is_some());
+        if shape_known {
+            unsafe {
+                let _ = SetCursor(cursor);
+            }
+            return LRESULT(1);
+        }
+    }
     if let Some(captured) = viewer_input(hwnd, message, w, l) {
         CAPTURED.with(|c| c.borrow_mut().push(captured));
         // Keys go to the host only; F10/Alt must not open the system menu.

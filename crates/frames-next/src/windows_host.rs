@@ -4,6 +4,7 @@ use crate::{Options, StreamInfo, send_info, win};
 use anyhow::{Context, Result, bail};
 use frames_codec::d3d11::nvidia_device;
 use frames_codec::nvenc::NvencEncoder;
+use frames_input::cursor::CursorMessage;
 use frames_input::{Event, EventReader, Pointer};
 use frames_media::api::{
     CaptureConfig, CaptureEvent, CaptureSource, EncodeParams, Gop, MediaClock, MediaTransport,
@@ -119,6 +120,28 @@ fn stream(
     handle
         .block_on(send_info(session, info))
         .context("sending the stream description")?;
+    // Cursor shape and visibility, opened after the description so the
+    // viewer accepts the two streams in that order.
+    let (mut cursor_stream, _) = handle.block_on(session.open_channel())?;
+    let (cursor_tx, mut cursor_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    handle.spawn(async move {
+        while let Some(bytes) = cursor_rx.recv().await {
+            if cursor_stream.write_all(&bytes).await.is_err() {
+                break;
+            }
+        }
+    });
+    let send_cursor = |message: CursorMessage| {
+        let mut bytes = Vec::new();
+        message.encode(&mut bytes);
+        let _ = cursor_tx.send(bytes);
+    };
+    if qa.is_some() {
+        // The real cursor is not over the QA window; show a known shape.
+        send_cursor(win::qa_cursor());
+        send_cursor(CursorMessage::Visible(true));
+    }
+    let mut cursor_visible = None;
 
     let params = EncodeParams {
         width,
@@ -181,6 +204,23 @@ fn stream(
                 Err(error) => bail!("capture failed: {error}"),
             },
         };
+        if qa.is_none()
+            && let Some(update) = capture.cursor()
+        {
+            if let Some(shape) = update.shape {
+                send_cursor(CursorMessage::Shape {
+                    width: shape.width as u16,
+                    height: shape.height as u16,
+                    hotspot_x: shape.hotspot_x as u16,
+                    hotspot_y: shape.hotspot_y as u16,
+                    bgra: shape.bgra.to_vec(),
+                });
+            }
+            if cursor_visible != Some(update.visible) {
+                cursor_visible = Some(update.visible);
+                send_cursor(CursorMessage::Visible(update.visible));
+            }
+        }
         if let Some(frame) = frame {
             host.encode(clock.now_us(), &mut encoder, &frame)?;
             media.set_target_rate(u64::from(host.target_bps()));
