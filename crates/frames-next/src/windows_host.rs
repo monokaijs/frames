@@ -66,20 +66,6 @@ fn stream(
     // Capture on the encoder's GPU: hardware encoders only accept textures
     // from their own adapter.
     let nvenc = o.encoder == "nvenc";
-    // NVENC slows 2-2.5x when the GPU idles in a low power state; ask the
-    // driver to keep this program at full clocks, before the device exists.
-    let _gpu_profile = (nvenc && o.gpu_profile).then(|| {
-        match frames_platform_windows::nvprofile::PreferMaxPerformance::apply() {
-            Ok(guard) => {
-                println!("GPU power: prefer maximum performance (restored on exit)");
-                Some(guard)
-            }
-            Err(error) => {
-                println!("GPU power profile unavailable: {error}");
-                None
-            }
-        }
-    });
     let (device, _context, adapter) = match o.encoder.as_str() {
         "amf" => vendor_device(AMD)?,
         "qsv" => vendor_device(INTEL)?,

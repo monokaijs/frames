@@ -1,7 +1,7 @@
 //! `frames-next`: the v2 stack end to end (docs/V2_PLAN.md, Phase 3).
 //!
 //! ```text
-//! frames-next host [--source monitor|qa] [--window TITLE] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software]
+//! frames-next host [--source monitor|qa] [--window TITLE]... [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software]
 //!                  [--fps 60] [--mbps 30]
 //!                  [--hold N] [--seconds N] [--relay-only]
 //! frames-next discover | peers | revoke | windows <device-id> [--config-dir DIR]\n       frames-next connect <endpoint-id> [--vsync] [--synthetic-input] [--seconds N] [--relay-only]
@@ -101,9 +101,13 @@ pub struct Options {
     pub pacing: Option<f64>,
     /// Clipboard sharing (both ends must turn it on).
     pub clipboard: clip::Mode,
-    /// Host: share one window (first whose title contains this) instead of
-    /// the screen.
+    /// Host: share these windows (each the first whose title contains the
+    /// text) instead of the screen, one viewer session per window.
+    pub windows: Vec<String>,
+    /// Host, set at admission: the window this session shares.
     pub window: Option<String>,
+    /// Viewer: how many of the host's shared windows to open.
+    pub open_windows: u32,
     /// ADB bridge: the viewer forwards its ADB server to the host.
     pub adb: bool,
     /// Viewer: the ADB server to forward (default 127.0.0.1:5037).
@@ -153,7 +157,9 @@ impl Options {
             migrate_v1: false,
             pacing: None,
             clipboard: clip::Mode::Off,
+            windows: Vec::new(),
             window: None,
+            open_windows: 1,
             adb: false,
             adb_server: ([127, 0, 0, 1], 5037).into(),
             adb_listen: ([127, 0, 0, 1], 15037).into(),
@@ -201,7 +207,8 @@ impl Options {
                 "--audio" => o.audio = audio::parse_mode(value()?)?,
                 "--name" => o.name = Some(value()?.to_string()),
                 "--adb" => o.adb = true,
-                "--window" => o.window = Some(value()?.to_string()),
+                "--window" => o.windows.push(value()?.to_string()),
+                "--windows" => o.open_windows = value()?.parse::<u32>()?.clamp(1, 16),
                 "--adb-server" => o.adb_server = value()?.parse()?,
                 "--adb-listen" => {
                     let address: std::net::SocketAddr = value()?.parse()?;
@@ -265,7 +272,7 @@ fn node_config(o: &Options) -> Result<frames_net::NodeConfig> {
     })
 }
 
-async fn host(mut o: Options) -> Result<()> {
+async fn host(o: Options) -> Result<()> {
     let config = admit::config_dir(o.config_dir.as_ref())?;
     let key = admit::device_key(&config)?;
     let node = frames_net::Node::bind(&key, node_config(&o)?).await?;
@@ -278,27 +285,74 @@ async fn host(mut o: Options) -> Result<()> {
     let _advertised = frames_net::local::advertise(&node, &device_name(&o))
         .map_err(|error| println!("not advertised on the local network: {error:#}"))
         .ok();
-    loop {
-        let session = node.accept().await.context("node closed")??;
-        match admit::decide(&config, &session, o.approve).await? {
-            Some(admitted) => {
-                o.control = admitted.control;
-                o.viewer_decoders = admitted.decoders;
-                let audio = tokio::spawn({
-                    let session = session.clone();
-                    let mode = o.audio;
-                    async move {
-                        if let Err(error) = audio::host(session, mode).await {
-                            println!("audio stopped: {error:#}");
-                        }
-                    }
-                });
-                let result = run_host(session, o).await;
-                audio.abort();
-                return result;
+    // Once per process: every session's encoder benefits, and nested
+    // per-session guards would restore each other's settings.
+    #[cfg(windows)]
+    let _gpu_profile = (o.encoder == "nvenc" && o.gpu_profile).then(|| {
+        match frames_platform_windows::nvprofile::PreferMaxPerformance::apply() {
+            Ok(guard) => {
+                println!("GPU power: prefer maximum performance (restored on exit)");
+                Some(guard)
             }
-            None => session.close("not approved"),
+            Err(error) => {
+                println!("GPU power profile unavailable: {error}");
+                None
+            }
         }
+    });
+    // Each viewer session (one per shared window) runs on its own; the host
+    // ends when the last one has.
+    let mut sessions = tokio::task::JoinSet::new();
+    let mut audio_taken = false;
+    loop {
+        let session = tokio::select! {
+            accepted = node.accept() => accepted.context("node closed")??,
+            Some(done) = sessions.join_next(), if !sessions.is_empty() => {
+                if let Ok(Err(error)) = done {
+                    println!("session ended: {error:#}");
+                }
+                if sessions.is_empty() {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        let Some(admitted) = admit::decide(&config, &session, o.approve).await? else {
+            session.close("not approved");
+            continue;
+        };
+        let mut session_options = o.clone();
+        session_options.control = admitted.control;
+        session_options.viewer_decoders = admitted.decoders;
+        let index = admitted.window.unwrap_or(0) as usize;
+        session_options.window = match (o.windows.get(index), o.windows.is_empty()) {
+            (Some(title), _) => Some(title.clone()),
+            (None, true) => None,
+            (None, false) => {
+                session.close("no such window");
+                continue;
+            }
+        };
+        // Audio goes with the first session only.
+        let audio_mode = if audio_taken {
+            audio::Mode::Off
+        } else {
+            o.audio
+        };
+        audio_taken |= o.audio != audio::Mode::Off;
+        sessions.spawn(async move {
+            let audio = tokio::spawn({
+                let session = session.clone();
+                async move {
+                    if let Err(error) = audio::host(session, audio_mode).await {
+                        println!("audio stopped: {error:#}");
+                    }
+                }
+            });
+            let result = run_host(session, session_options).await;
+            audio.abort();
+            result
+        });
     }
 }
 
@@ -329,20 +383,63 @@ async fn connect(id: &str, o: Options) -> Result<()> {
     let nearby = frames_net::local::find(id, Duration::from_millis(1500))
         .await
         .unwrap_or_default();
-    let session = match &nearby {
+    let target: iroh::EndpointAddr = match &nearby {
         Some(host) => {
             println!("found {} on this network", host.name);
-            node.connect(host.addr.clone()).await?
+            host.addr.clone()
         }
-        _ => {
-            node.connect(
-                id.parse::<iroh::EndpointId>()
-                    .context("not a device id, and no single nearby device starts with it")?,
-            )
-            .await?
-        }
+        None => id
+            .parse::<iroh::EndpointId>()
+            .context("not a device id, and no single nearby device starts with it")?
+            .into(),
     };
-    admit::send_hello(&session, &node.id(), o.migrate_v1, viewer_decoders()).await?;
+    // One session per shared window the viewer opens (--windows N).
+    let mut viewers = tokio::task::JoinSet::new();
+    for index in 0..o.open_windows {
+        let session = node.connect(target.clone()).await?;
+        let window = (o.open_windows > 1).then_some(index);
+        admit::send_hello(
+            &session,
+            &node.id(),
+            o.migrate_v1,
+            viewer_decoders(),
+            window,
+        )
+        .await?;
+        if index == 0 {
+            start_transfers(&session, &o);
+        }
+        println!(
+            "connected in {:.0} ms, pairing code {} (a new host shows the same code)",
+            started.elapsed().as_secs_f64() * 1e3,
+            session.pairing_code()?
+        );
+        let session_options = o.clone();
+        viewers.spawn(async move {
+            let result = run_client(session.clone(), session_options).await;
+            match (&result, session.close_reason()) {
+                (Err(_), Some(reason)) if reason == "not approved" => {
+                    anyhow::bail!("the host refused this device (not approved there)")
+                }
+                (Err(_), Some(reason)) if reason == "no such window" => {
+                    anyhow::bail!("the host shares fewer windows than asked for")
+                }
+                _ => result,
+            }
+        });
+    }
+    let mut outcome = Ok(());
+    while let Some(done) = viewers.join_next().await {
+        if let Err(error) = done? {
+            println!("viewer ended: {error:#}");
+            outcome = Err(error);
+        }
+    }
+    outcome
+}
+
+/// The files given with --get and --send, on the first session.
+fn start_transfers(session: &frames_net::Session, o: &Options) {
     for path in o.get_files.clone() {
         let session = session.clone();
         let dir = o
@@ -374,18 +471,6 @@ async fn connect(id: &str, o: Options) -> Result<()> {
                 Err(error) => println!("FILE sending {} failed: {error:#}", path.display()),
             }
         });
-    }
-    println!(
-        "connected in {:.0} ms, pairing code {} (a new host shows the same code)",
-        started.elapsed().as_secs_f64() * 1e3,
-        session.pairing_code()?
-    );
-    let result = run_client(session.clone(), o).await;
-    match (&result, session.close_reason()) {
-        (Err(_), Some(reason)) if reason == "not approved" => {
-            anyhow::bail!("the host refused this device (not approved there)")
-        }
-        _ => result,
     }
 }
 

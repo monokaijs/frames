@@ -47,6 +47,9 @@ struct Hello {
     /// Codecs the viewer can decode, best first.
     #[serde(default)]
     decoders: Vec<crate::Codec>,
+    /// Which of the host's shared windows this session shows (0-based).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     v1_certificate: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -63,9 +66,11 @@ pub async fn send_hello(
     own_id: &iroh::EndpointId,
     migrate: bool,
     decoders: Vec<crate::Codec>,
+    window: Option<u32>,
 ) -> Result<()> {
     let mut hello = Hello {
         decoders,
+        window,
         ..Hello::default()
     };
     if migrate {
@@ -118,6 +123,8 @@ pub struct Admitted {
     pub control: bool,
     /// What the viewer can decode, best first (empty if it did not say).
     pub decoders: Vec<crate::Codec>,
+    /// The shared window the viewer asked for.
+    pub window: Option<u32>,
 }
 
 /// Host: a device that proves it is a v1-trusted device gets that trust
@@ -172,9 +179,11 @@ pub async fn decide(
 ) -> Result<Option<Admitted>> {
     let hello = receive_hello(session).await;
     let decoders = hello.decoders.clone();
+    let window = hello.window;
     let admit = |control| Admitted {
         control,
         decoders: decoders.clone(),
+        window,
     };
     Ok(admit_device(config, session, preset, &hello)
         .await?
