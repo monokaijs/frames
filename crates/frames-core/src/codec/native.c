@@ -42,6 +42,28 @@ static LIB open_library(const char *path) { return dlopen(path, RTLD_NOW | RTLD_
  * 7.3 -> 4.5 fps). Keep any value <= 65535 (QSV stores it in 16 bits). */
 #define FRAMES_KEYFRAME_INTERVAL 60
 
+/* Rate shape for encoders opened on this thread: GOP length and VBV size as
+ * a divisor of the bitrate (30 = 1/30 s). v1 never changes it. The v2 engine
+ * (frames-codec) sets an infinite GOP, since it recovers from loss without
+ * keyframes, and a one-frame VBV (divisor = fps). */
+#if defined(_MSC_VER)
+#define FRAMES_THREAD_LOCAL __declspec(thread)
+#else
+#define FRAMES_THREAD_LOCAL __thread
+#endif
+static FRAMES_THREAD_LOCAL int frames_shape_gop = FRAMES_KEYFRAME_INTERVAL;
+static FRAMES_THREAD_LOCAL int frames_shape_vbv_divisor = 30;
+/* gop <= 0 means keyframes only on request. */
+void frames_encoder_shape(int gop, int vbv_divisor) {
+    frames_shape_gop = gop;
+    frames_shape_vbv_divisor = vbv_divisor > 0 ? vbv_divisor : 30;
+}
+static int shape_gop(const char *name, int gop) {
+    if (gop > 0) return gop;
+    /* QSV stores the GOP in 16 bits; elsewhere a value no session reaches. */
+    return strstr(name, "_qsv") ? 65535 : 1000000;
+}
+
 #define API(F) \
  F(unsigned, swresample_version, (void)) \
  F(int, swr_alloc_set_opts2, (struct SwrContext **, const AVChannelLayout *, enum AVSampleFormat, int, const AVChannelLayout *, enum AVSampleFormat, int, int, void *)) \
@@ -147,6 +169,7 @@ typedef struct Media {
     struct SwsContext *scale;
     uint8_t *scaled;
     int bitrate;
+    int gop, vbv_divisor;
     void *gpu_converter;
     int gpu_encoder;
 #ifdef __APPLE__
@@ -189,6 +212,7 @@ static Media *create(const AVCodec *codec, int width, int height) {
     m->frame = p_av_frame_alloc(); m->cpu = p_av_frame_alloc();
     m->converted = p_av_frame_alloc(); m->packet = p_av_packet_alloc();
     m->width = width; m->height = height; m->hw_format = AV_PIX_FMT_NONE;
+    m->gop = shape_gop(codec->name, frames_shape_gop); m->vbv_divisor = frames_shape_vbv_divisor;
     if (!m->ctx || !m->frame || !m->cpu || !m->converted || !m->packet) { frames_media_close(m); return NULL; }
     return m;
 }
@@ -254,7 +278,7 @@ static int vt_open(Media *m,const char *name,int fps) {
     m->ready=dispatch_semaphore_create(0);if(!m->ready)return -1;
     if (VTSessionSetProperty(m->vt,kVTCompressionPropertyKey_RealTime,kCFBooleanTrue) ||
         VTSessionSetProperty(m->vt,kVTCompressionPropertyKey_AllowFrameReordering,kCFBooleanFalse)) return -1;
-    int bitrate=m->bitrate?m->bitrate:12000000,gop=FRAMES_KEYFRAME_INTERVAL;
+    int bitrate=m->bitrate?m->bitrate:12000000,gop=m->gop;
     CFNumberRef number=CFNumberCreate(NULL,kCFNumberIntType,&bitrate);
     result=VTSessionSetProperty(m->vt,kVTCompressionPropertyKey_AverageBitRate,number);CFRelease(number);if(result)return result;
     number=CFNumberCreate(NULL,kCFNumberIntType,&fps);
@@ -315,7 +339,7 @@ Media *frames_encoder_open(const char *name, int width, int height, int fps, int
 #endif
     c->width = m->padded_width; c->height = m->padded_height;
     c->time_base = (AVRational){1, fps}; c->framerate = (AVRational){fps, 1};
-    c->bit_rate = bitrate; c->rc_max_rate = bitrate; c->rc_buffer_size = bitrate/30; c->gop_size = FRAMES_KEYFRAME_INTERVAL; c->max_b_frames = 0;
+    c->bit_rate = bitrate; c->rc_max_rate = bitrate; c->rc_buffer_size = bitrate/m->vbv_divisor; c->gop_size = m->gop; c->max_b_frames = 0;
     c->flags |= AV_CODEC_FLAG_LOW_DELAY;
     c->thread_count = 2; c->thread_type = FF_THREAD_SLICE;
     c->pix_fmt = AV_PIX_FMT_YUV420P;
@@ -384,7 +408,7 @@ int frames_encoder_set_rate(Media *m, int bitrate, int fps) {
         m->fps=fps;m->bitrate=bitrate;return 0;
     }
 #endif
-    m->ctx->bit_rate=bitrate; m->ctx->rc_max_rate=bitrate; m->ctx->rc_buffer_size=bitrate/30;
+    m->ctx->bit_rate=bitrate; m->ctx->rc_max_rate=bitrate; m->ctx->rc_buffer_size=bitrate/m->vbv_divisor;
     m->ctx->framerate=(AVRational){fps,1};
     m->bitrate=bitrate;
     /* libaom does not consume live AVCodecContext rate changes. Media Foundation
@@ -600,7 +624,7 @@ Media *frames_encoder_open_gpu(const char *name,int width,int height,int fps,int
     Media *m=create(codec,width,height);if(!m)return NULL;
     AVCodecContext *c=m->ctx;m->padded_width=(width+1)&~1;m->padded_height=(height+1)&~1;
     c->width=m->padded_width;c->height=m->padded_height;c->time_base=(AVRational){1,fps};c->framerate=(AVRational){fps,1};
-    c->pix_fmt=AV_PIX_FMT_D3D11;c->bit_rate=c->rc_max_rate=bitrate;c->rc_buffer_size=bitrate/30;c->max_b_frames=0;c->gop_size=FRAMES_KEYFRAME_INTERVAL;c->flags|=AV_CODEC_FLAG_LOW_DELAY;
+    c->pix_fmt=AV_PIX_FMT_D3D11;c->bit_rate=c->rc_max_rate=bitrate;c->rc_buffer_size=bitrate/m->vbv_divisor;c->max_b_frames=0;c->gop_size=m->gop;c->flags|=AV_CODEC_FLAG_LOW_DELAY;
     c->colorspace=AVCOL_SPC_BT709;c->color_range=AVCOL_RANGE_MPEG;
     if(strstr(name,"_nvenc")){option(m,"rc","cbr");option(m,"preset","p1");option(m,"tune","ull");option(m,"zerolatency","1");option(m,"delay","0");option(m,"rc-lookahead","0");option(m,"forced-idr","1");}
     if(strstr(name,"_amf")){option(m,"usage","ultralowlatency");option(m,"quality","speed");option(m,"async_depth","1");option(m,"preanalysis","0");}

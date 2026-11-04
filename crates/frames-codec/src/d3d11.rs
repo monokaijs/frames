@@ -147,3 +147,17 @@ pub fn nvidia_device() -> anyhow::Result<(ID3D11Device, ID3D11DeviceContext, Str
     let (device, context) = create_device(Some(&adapter.adapter))?;
     Ok((device, context, adapter.name))
 }
+
+/// A device on the first adapter from `vendor` (PCI vendor id), for encoders
+/// that only open on their own GPU (AMF on AMD, QSV on Intel).
+pub fn vendor_device(vendor: u32) -> anyhow::Result<(ID3D11Device, ID3D11DeviceContext, String)> {
+    let adapter = adapters()?
+        .into_iter()
+        .find(|a| a.vendor == vendor)
+        .ok_or_else(|| anyhow::anyhow!("no adapter from vendor {vendor:#06x}"))?;
+    let (device, context) = create_device(Some(&adapter.adapter))?;
+    Ok((device, context, adapter.name))
+}
+
+pub const AMD: u32 = 0x1002;
+pub const INTEL: u32 = 0x8086;

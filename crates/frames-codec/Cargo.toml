@@ -11,10 +11,11 @@ publish = false
 # May use native toolchains.
 [features]
 default = ["ffmpeg"]
-ffmpeg = ["dep:frames-core"]
+ffmpeg = ["dep:frames-core", "dep:bytes"]
 
 [dependencies]
 anyhow.workspace = true
+bytes = { workspace = true, optional = true }
 frames-core = { path = "../frames-core", optional = true }
 frames-media = { path = "../frames-media" }
 

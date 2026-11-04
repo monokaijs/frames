@@ -1,7 +1,8 @@
 //! `frames-next`: the v2 stack end to end (docs/V2_PLAN.md, Phase 3).
 //!
 //! ```text
-//! frames-next host [--source monitor|qa] [--codec hevc|h264] [--fps 60] [--mbps 30]
+//! frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software]
+//!                  [--fps 60] [--mbps 30]
 //!                  [--hold N] [--seconds N] [--relay-only]
 //! frames-next connect <endpoint-id> [--vsync] [--synthetic-input] [--seconds N] [--relay-only]
 //! ```
@@ -39,6 +40,7 @@ pub struct StreamInfo {
 pub enum Codec {
     H264,
     Hevc,
+    Av1,
 }
 
 impl From<Codec> for frames_media::api::Codec {
@@ -46,6 +48,7 @@ impl From<Codec> for frames_media::api::Codec {
         match codec {
             Codec::H264 => Self::H264,
             Codec::Hevc => Self::Hevc,
+            Codec::Av1 => Self::Av1,
         }
     }
 }
@@ -62,6 +65,9 @@ pub struct Options {
     pub relay_only: bool,
     /// Viewer: post generated mouse and key messages to its own window.
     pub synthetic_input: bool,
+    /// Host: `nvenc` (direct), or an FFmpeg backend: `amf`, `qsv`, `mf`,
+    /// `software`.
+    pub encoder: String,
 }
 
 impl Options {
@@ -76,6 +82,7 @@ impl Options {
             seconds: 0,
             relay_only: false,
             synthetic_input: false,
+            encoder: "nvenc".into(),
         };
         let mut args = args.iter();
         while let Some(arg) = args.next() {
@@ -90,6 +97,7 @@ impl Options {
                     o.codec = match value()? {
                         "h264" => Codec::H264,
                         "hevc" => Codec::Hevc,
+                        "av1" => Codec::Av1,
                         other => bail!("unknown codec {other}"),
                     }
                 }
@@ -100,6 +108,7 @@ impl Options {
                 "--vsync" => o.vsync = true,
                 "--relay-only" => o.relay_only = true,
                 "--synthetic-input" => o.synthetic_input = true,
+                "--encoder" => o.encoder = value()?.to_string(),
                 other => bail!("unknown option {other}"),
             }
         }
@@ -190,7 +199,7 @@ async fn main() -> Result<()> {
             connect(id, Options::parse(&args[2..])?).await
         }
         _ => bail!(
-            "usage: frames-next host [--source monitor|qa] [--codec hevc|h264] [--fps N] [--mbps N] [--hold N] [--seconds N]\n       frames-next connect <endpoint-id> [--vsync] [--seconds N]"
+            "usage: frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software] [--fps N] [--mbps N] [--hold N] [--seconds N]\n       frames-next connect <endpoint-id> [--vsync] [--seconds N]"
         ),
     }
 }

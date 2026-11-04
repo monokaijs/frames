@@ -46,6 +46,7 @@ unsafe extern "C" {
         capacity: i32,
     ) -> *mut c_void;
     fn frames_encoder_request_keyframe(context: *mut c_void);
+    fn frames_encoder_shape(gop: i32, vbv_divisor: i32);
     fn frames_encoder_set_rate(context: *mut c_void, bitrate: i32, fps: i32) -> i32;
     fn frames_encoder_send_scaled(
         context: *mut c_void,
@@ -324,6 +325,16 @@ fn check(code: i32, error: &[i8]) -> anyhow::Result<i32> {
     Ok(code)
 }
 /// Constructed and used on one blocking worker only; intentionally not Send.
+/// GOP and VBV for encoders this thread opens from now on (including the
+/// D3D11 encoder an encoder context opens on its first GPU frame). `gop`
+/// `None` means keyframes only on request; the VBV holds `1 / vbv_divisor`
+/// seconds of bitrate. v1 never calls this and keeps a 60-frame GOP and a
+/// 1/30 s VBV.
+pub fn set_encoder_shape(gop: Option<u32>, vbv_divisor: u32) {
+    let gop = gop.map_or(0, |g| g.min(i32::MAX as u32) as i32);
+    unsafe { frames_encoder_shape(gop, vbv_divisor.min(i32::MAX as u32) as i32) }
+}
+
 pub struct Context {
     hardware: bool,
     bitrate: u32,

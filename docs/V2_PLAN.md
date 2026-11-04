@@ -295,6 +295,8 @@ Over real QUIC (`crates/frames-next`, host and viewer as two processes on the PC
 
 Input lane (`crates/frames-input`, `frames-platform-windows::input`, viewer and host in `frames-next`): pointer positions as datagrams (newest wins), buttons, wheel and keys (USB HID usages) on a reliable stream, release-all on focus loss or exit. With generated mouse and key messages: input to wire p50 8 µs, p95 20 µs from the viewer's window procedure (gate: p95 ≤ 1 ms), every click, wheel step and key delivered to the host's QA window, video unaffected (p50 3.93 ms, p95 5.86 ms).
 
+FFmpeg encoders (`frames-codec::ffmpeg::FfmpegEncoder`) for GPUs NVENC direct does not cover: AMF, QSV, Media Foundation, and software AV1 (the bundled LGPL FFmpeg has no software H.264/HEVC). They run with an infinite GOP and a one-frame VBV through a per-thread encoder shape in the v1 runtime; v1 keeps its 60-frame GOP. On the PC's AMD iGPU, `h264_amf` over frames-next: capture → present p50 10.8 ms, p95 13.6 ms, one keyframe in 12 s, nothing lost (encode 7.7 ms on the iGPU). Software AV1 is not real time at 1080p (42 ms per frame; the engine then drops frames as stale and asks for keyframes).
+
 "Presented" is when `Present` returns, not photons. The clock hold is a dummy GPU load (about 140 W extra) and must be replaced by a per-application driver profile applied only during a session. Still open: the macOS half (`frames-platform-macos`, on a branch), AMF/QSV through FFmpeg, Desktop Duplication, the input lane and client model, and running this path inside the app over real QUIC.
 
 **Windows** (`frames-platform-windows`, `frames-codec`):

@@ -126,7 +126,13 @@ fn view(
         (info.height / 2).max(180),
     )?;
     win::pump();
-    let mut decoder = FfmpegDecoder::new(info.codec.into(), info.width, info.height, true)?;
+    let mut decoder = match FfmpegDecoder::new(info.codec.into(), info.width, info.height, true) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            println!("hardware decode unavailable ({error}); decoding in software");
+            FfmpegDecoder::new(info.codec.into(), info.width, info.height, false)?
+        }
+    };
     let mut presenter = D3D11Presenter::new(viewer, shared);
     let media = session.media();
     let mut config = ClientConfig::new(1, 1);

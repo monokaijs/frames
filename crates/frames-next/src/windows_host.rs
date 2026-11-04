@@ -2,13 +2,14 @@
 
 use crate::{Options, StreamInfo, send_info, win};
 use anyhow::{Context, Result, bail};
-use frames_codec::d3d11::nvidia_device;
+use frames_codec::d3d11::{AMD, INTEL, nvidia_device, vendor_device};
+use frames_codec::ffmpeg::{FfmpegEncoder, encoder_name};
 use frames_codec::nvenc::NvencEncoder;
 use frames_input::cursor::CursorMessage;
 use frames_input::{Event, EventReader, Pointer};
 use frames_media::api::{
     CaptureConfig, CaptureEvent, CaptureSource, EncodeParams, Gop, MediaClock, MediaTransport,
-    PathKind, VideoFrame,
+    PathKind, VideoEncoder, VideoFrame,
 };
 use frames_media::clock::SystemClock;
 use frames_media::host::{HostConfig, HostSession};
@@ -82,11 +83,18 @@ fn stream(
     let _timer = TimerResolution::one_millisecond();
     let clock = SystemClock::new();
     let shared: Arc<dyn MediaClock> = Arc::new(clock);
-    let (device, _context, adapter) = nvidia_device()?;
+    // Capture on the encoder's GPU: hardware encoders only accept textures
+    // from their own adapter.
+    let nvenc = o.encoder == "nvenc";
+    let (device, _context, adapter) = match o.encoder.as_str() {
+        "amf" => vendor_device(AMD)?,
+        "qsv" => vendor_device(INTEL)?,
+        _ => nvidia_device()?,
+    };
     raise_gpu_priority(&device);
     // NVENC runs 2-2.5x slower when the GPU idles in a low power state
     // (spike 0-C). This holds clocks with a small GPU load for the session.
-    let _hold = (o.hold > 0)
+    let _hold = (nvenc && o.hold > 0)
         .then(|| GpuClockHold::start(&device, Duration::from_millis(1), o.hold))
         .transpose()?;
     println!("adapter: {adapter}");
@@ -153,7 +161,24 @@ fn stream(
         intra_refresh_frames: Some(6),
         slices: 4,
     };
-    let mut encoder = NvencEncoder::new(&device, o.codec.into(), params, shared.clone())?;
+    let mut encoder: Box<dyn VideoEncoder> = if nvenc {
+        Box::new(NvencEncoder::new(
+            &device,
+            o.codec.into(),
+            params,
+            shared.clone(),
+        )?)
+    } else {
+        let name = encoder_name(o.codec.into(), &o.encoder).with_context(|| {
+            format!(
+                "no {} encoder for {:?} (software encodes AV1 only)",
+                o.encoder, o.codec
+            )
+        })?;
+        let encoder = FfmpegEncoder::new(&name, o.codec.into(), params, shared.clone())?;
+        println!("encoder: FFmpeg {}", encoder.name());
+        Box::new(encoder)
+    };
     let media = session.media();
     let rate = RateConfig {
         min_bps: 2_000_000,
@@ -222,10 +247,10 @@ fn stream(
             }
         }
         if let Some(frame) = frame {
-            host.encode(clock.now_us(), &mut encoder, &frame)?;
+            let before = clock.now_us();
+            host.encode(before, encoder.as_mut(), &frame)?;
+            encode_us.push(clock.now_us().saturating_sub(before));
             media.set_target_rate(u64::from(host.target_bps()));
-            let timing = encoder.last_timing();
-            encode_us.push(timing.done_us.saturating_sub(timing.submit_us));
             frames += 1;
         }
         let now = clock.now_us();

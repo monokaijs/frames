@@ -2246,6 +2246,7 @@ name = "frames-codec"
 version = "0.3.3"
 dependencies = [
  "anyhow",
+ "bytes",
  "frames-core",
  "frames-media",
  "windows 0.62.2",
