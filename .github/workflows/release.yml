@@ -307,6 +307,7 @@ jobs:
           python scripts/release.py staple dist/macos/Frames.app
           spctl --assess --type execute --verbose=2 dist/macos/Frames.app
           python scripts/release.py package macos-aarch64 "$RELEASE_VERSION"
+          python -m pip install --quiet dmgbuild==1.6.7
           python scripts/release.py dmg "$RELEASE_VERSION"
           image="dist/release/Frames-$RELEASE_VERSION-macos-aarch64.dmg"
           source native/macos/sign.sh

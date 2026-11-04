@@ -154,7 +154,9 @@ jobs:
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
           python3 scripts/release.py package macos-aarch64 "$version"
-          python3 scripts/release.py dmg "$version"
+          python3 -m venv "$RUNNER_TEMP/dmgbuild"
+          "$RUNNER_TEMP/dmgbuild/bin/python" -m pip install --quiet dmgbuild==1.6.7
+          "$RUNNER_TEMP/dmgbuild/bin/python" scripts/release.py dmg "$version"
           python3 scripts/release.py verify-dmg "dist/release/Frames-$version-macos-aarch64.dmg" "$version"
       - name: Mac modifier routing regression checks
         run: |

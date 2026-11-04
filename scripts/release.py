@@ -120,28 +120,53 @@ def verify_package(archive, platform):
                     raise ValueError(f"Mac release executable is not executable: {name}")
 
 
+# Installer window layout in points, shared with generate_dmg_background.py.
+# The artwork is taller than the window so a taller title bar never exposes
+# an unpainted strip; nothing essential sits in the extra height.
+DMG_CANVAS = (640, 440)
+DMG_WINDOW = (640, 428)
+DMG_ICON_SIZE = 128
+DMG_ICON_Y = 190
+DMG_APP_X = 170
+DMG_APPLICATIONS_X = 470
+DMGBUILD_VERSION = "1.6.7"
+
+
 def disk_image(value):
-    """A standard drag-to-Applications installer; the ZIP remains the updater payload."""
+    """A designed drag-to-Applications window; the ZIP remains the updater payload.
+
+    dmgbuild writes the Finder layout straight into .DS_Store, so no Finder
+    scripting (and no automation permission) is involved on build machines.
+    """
     value = version(value)
+    try:
+        import dmgbuild
+    except ImportError:
+        raise SystemExit(f"Building the installer needs dmgbuild: python3 -m pip install dmgbuild=={DMGBUILD_VERSION}") from None
     app = ROOT / "dist/macos/Frames.app"
     info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
     if info["CFBundleIdentifier"] != BUNDLE_ID or info["CFBundleShortVersionString"] != value:
         raise ValueError("Installer identity/version does not match the app")
     output = ROOT / "dist/release" / f"Frames-{value}-macos-aarch64.dmg"
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="frames-dmg-") as temporary:
-        stage = Path(temporary) / "installer"
-        stage.mkdir()
-        subprocess.run(["ditto", str(app), str(stage / "Frames.app")], check=True)
-        (stage / "Applications").symlink_to("/Applications", target_is_directory=True)
-        (stage / "Install Frames.txt").write_text(
-            "Frames\n\nDrag Frames.app to Applications, then open Frames from Applications.\n"
-            "Eject this disk image after installing.\n\nRequires macOS 14.2 or later on Apple silicon.\n"
-            "Allow Local Network, Screen Recording, and Accessibility when requested.\n"
-            "Media codecs are included; no additional installation is required.\n\n"
-            "In Frames, open Settings to check for updates. Updates install after all sessions close.\n"
-        )
-        subprocess.run(["hdiutil", "create", "-ov", "-volname", "Frames", "-fs", "HFS+", "-format", "UDZO", "-srcfolder", str(stage), str(output)], check=True)
+    output.unlink(missing_ok=True)
+    width, height = DMG_WINDOW
+    dmgbuild.build_dmg(str(output), "Frames", settings={
+        "files": [str(app)],
+        "symlinks": {"Applications": "/Applications"},
+        "icon": str(app / "Contents/Resources/Frames.icns"),
+        # The @2x file beside it is picked up and joined into a HiDPI TIFF.
+        "background": str(ROOT / "assets/installer/dmg-background.png"),
+        "window_rect": ((200, 140), (width, height)),
+        "default_view": "icon-view",
+        "icon_size": DMG_ICON_SIZE,
+        "text_size": 13,
+        "icon_locations": {"Frames.app": (DMG_APP_X, DMG_ICON_Y), "Applications": (DMG_APPLICATIONS_X, DMG_ICON_Y)},
+        "hide_extensions": ["Frames.app"],
+        "include_list_view_settings": False,
+        "format": "UDZO",
+        "filesystem": "HFS+",
+    })
     print(output)
     return output
 
@@ -156,6 +181,11 @@ def verify_disk_image(image, value):
         try:
             if (mount / "Applications").readlink() != Path("/Applications"):
                 raise ValueError("Installer is missing its Applications shortcut")
+            visible = sorted(entry.name for entry in mount.iterdir() if not entry.name.startswith("."))
+            if visible != ["Applications", "Frames.app"]:
+                raise ValueError(f"Installer window shows unexpected items: {visible}")
+            if not (mount / ".DS_Store").is_file() or not any(mount.glob(".background.*")):
+                raise ValueError("Installer is missing its window layout")
             installed = root / "Applications/Frames.app"
             subprocess.run(["ditto", str(mount / "Frames.app"), str(installed)], check=True)
             info = plistlib.loads((installed / "Contents/Info.plist").read_bytes())
