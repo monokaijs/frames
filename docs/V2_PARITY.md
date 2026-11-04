@@ -20,7 +20,7 @@ launcher, installer, updater, and service still run v1.
 | Trusted devices reconnect without a prompt | **Done** (`trusted-v2.json`). |
 | v1 trust carries over | **Done** on Windows (`--migrate-v1`); macOS Keychain path untested. |
 | Unattended access (sharing at login, Windows service) | **Not started**. |
-| Remove / revoke a trusted device | **Not started** (edit `trusted-v2.json`). |
+| Remove / revoke a trusted device | **Partial**: `frames-next peers` lists trusted devices, `frames-next revoke <id or prefix>` removes one (ambiguous prefixes refused); no launcher UI yet. |
 | Device cards with screenshots, recent devices | **Not started**. |
 | Sessions tab with live progress | **Not started**. |
 

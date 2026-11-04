@@ -4,7 +4,7 @@
 //! frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software]
 //!                  [--fps 60] [--mbps 30]
 //!                  [--hold N] [--seconds N] [--relay-only]
-//! frames-next connect <endpoint-id> [--vsync] [--synthetic-input] [--seconds N] [--relay-only]
+//! frames-next peers | revoke <device-id> [--config-dir DIR]\n       frames-next connect <endpoint-id> [--vsync] [--synthetic-input] [--seconds N] [--relay-only]
 //! ```
 //!
 //! The host prints its endpoint id; the client dials it by id (iroh finds a
@@ -408,6 +408,47 @@ fn main() -> Result<()> {
 async fn run(args: Vec<String>) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("host") => host(Options::parse(&args[1..])?).await,
+        Some("peers") => {
+            let o = Options::parse(&args[1..])?;
+            let config = admit::config_dir(o.config_dir.as_ref())?;
+            let list = frames_net::trust::TrustList::load(&frames_net::trust::TrustList::path_in(
+                &config,
+            ))?;
+            println!("this device: {}", admit::device_key(&config)?.id());
+            if list.is_empty() {
+                println!("no trusted devices");
+            }
+            for (id, device) in list.devices() {
+                println!(
+                    "{id}  {}  {}{}",
+                    device.name,
+                    if device.allow_control {
+                        "view and control"
+                    } else {
+                        "view only"
+                    },
+                    if device.legacy_fingerprint.is_some() {
+                        "  (from v1)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Ok(())
+        }
+        Some("revoke") => {
+            let prefix = args
+                .get(1)
+                .context("revoke needs a device id (or its start)")?;
+            let o = Options::parse(&args[2..])?;
+            let config = admit::config_dir(o.config_dir.as_ref())?;
+            let path = frames_net::trust::TrustList::path_in(&config);
+            let mut list = frames_net::trust::TrustList::load(&path)?;
+            let removed = list.remove_by_prefix(prefix)?;
+            list.save(&path)?;
+            println!("removed {removed}; it must be approved again to connect");
+            Ok(())
+        }
         Some("connect") => {
             let id = args.get(1).context("connect needs an endpoint id")?;
             connect(id, Options::parse(&args[2..])?).await

@@ -66,6 +66,34 @@ impl TrustList {
         self.devices.remove(&device.to_string()).is_some()
     }
 
+    /// Every listed device: its id (hex) and entry.
+    pub fn devices(&self) -> impl Iterator<Item = (&str, &TrustedDevice)> {
+        self.devices
+            .iter()
+            .map(|(id, device)| (id.as_str(), device))
+    }
+
+    /// Removes the device whose id starts with `prefix`, if exactly one does.
+    pub fn remove_by_prefix(&mut self, prefix: &str) -> Result<String> {
+        let matches: Vec<String> = self
+            .devices
+            .keys()
+            .filter(|id| id.starts_with(prefix))
+            .cloned()
+            .collect();
+        match matches.as_slice() {
+            [id] => {
+                self.devices.remove(id);
+                Ok(id.clone())
+            }
+            [] => anyhow::bail!("no trusted device id starts with {prefix}"),
+            _ => anyhow::bail!(
+                "{} trusted devices start with {prefix}; give more of the id",
+                matches.len()
+            ),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.devices.len()
     }
@@ -137,6 +165,27 @@ mod tests {
             Admission::Trusted { control: false }
         );
         assert_eq!(admission(&list, &stranger), Admission::Ask);
+    }
+
+    #[test]
+    fn devices_are_removed_by_an_unambiguous_prefix() {
+        let mut list = TrustList::default();
+        let (a, b) = (DeviceKey::generate().id(), DeviceKey::generate().id());
+        for id in [&a, &b] {
+            list.insert(
+                id,
+                TrustedDevice {
+                    name: "x".into(),
+                    allow_control: false,
+                    legacy_fingerprint: None,
+                },
+            );
+        }
+        assert!(list.remove_by_prefix("").is_err(), "ambiguous");
+        assert!(list.remove_by_prefix("zz").is_err(), "no match");
+        let removed = list.remove_by_prefix(&a.to_string()[..12]).unwrap();
+        assert_eq!(removed, a.to_string());
+        assert!(list.get(&a).is_none() && list.get(&b).is_some());
     }
 
     #[test]
