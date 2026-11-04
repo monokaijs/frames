@@ -761,5 +761,11 @@ private final class MetalPresenter:NSObject,CAMetalDisplayLinkDelegate,@unchecke
     init(name:String,icon:String){super.init();ProcessInfo.processInfo.processName=name;if let data=Data(base64Encoded:icon),let image=NSImage(data:data){NSApp.applicationIconImage=image}}
     func applicationDidBecomeActive(_ notification:Notification){Wire.send(["event":"activate"])}
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows flag:Bool)->Bool{Wire.send(["event":"activate"]);return false}
-    func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply{Wire.send(["event":"quit"]);return .terminateCancel}
+    func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply{
+        // Logout, restart and shutdown send a quit with a reason; cancelling it
+        // would abort them for the whole Mac. Only a user's Quit of this Dock
+        // icon means "close the remote app's windows", as closing them would.
+        if NSAppleEventManager.shared().currentAppleEvent?.attributeDescriptor(forKeyword:kAEQuitReason) != nil{return .terminateNow}
+        Wire.send(["event":"quit"]);return .terminateCancel
+    }
 }
