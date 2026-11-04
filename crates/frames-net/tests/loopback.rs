@@ -156,10 +156,13 @@ async fn the_media_engine_streams_over_real_quic() {
     assert_eq!(stats.decoder_broken, 0);
     assert_eq!(host.stats().keyframes, 1, "{:?}", host.stats());
     assert!(stats.frames_clean * 100 >= captured * 95, "{stats:?}");
-    // Loopback, synthetic 3 ms encode, scheduler sleeps of 0.5 ms. Debug
-    // builds run QUIC and crypto unoptimized, alongside other tests.
+    // Loopback, synthetic 3 ms encode, scheduler sleeps of 0.5 ms. The
+    // release run (the v2-core CI job) is the latency gate. Debug builds run
+    // QUIC and crypto unoptimized beside the rest of the workspace's tests;
+    // on shared macOS CI runners their p95 ranged 10.7-73.7 ms across six
+    // runs of the same code, so they only catch gross regressions.
     let bound_us = if cfg!(debug_assertions) {
-        40_000
+        150_000
     } else {
         15_000
     };
