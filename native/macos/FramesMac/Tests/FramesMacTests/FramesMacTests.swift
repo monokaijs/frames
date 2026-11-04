@@ -25,6 +25,20 @@ private final class Sink: @unchecked Sendable {
     }
 }
 
+
+/// Long-term reference behaviour needs Apple-silicon VideoToolbox; virtual
+/// Macs (CI runners) hand out no tokens and time out decoding.
+private func skipOnVirtualMac() throws {
+    var size = 0
+    sysctlbyname("hw.model", nil, &size, nil, 0)
+    var model = [CChar](repeating: 0, count: max(size, 1))
+    sysctlbyname("hw.model", &model, &size, nil, 0)
+    let name = String(cString: model)
+    if name.contains("VirtualMac") {
+        throw XCTSkip("VideoToolbox long-term references need a physical Mac (\(name))")
+    }
+}
+
 private func callbacks(_ sink: Sink) -> FramesMacCallbacks {
     FramesMacCallbacks(
         context: Unmanaged.passUnretained(sink).toOpaque(),
@@ -58,6 +72,7 @@ final class FramesMacTests: XCTestCase {
     }
 
     func testHardwareRoundTripWithInfiniteGopAndLongTermRecovery() throws {
+        try skipOnVirtualMac()
         for codec in [UInt32(FRAMES_MAC_CODEC_H264), UInt32(FRAMES_MAC_CODEC_HEVC)] {
             let sink = Sink()
             let encoder = try XCTUnwrap(
@@ -115,6 +130,7 @@ final class FramesMacTests: XCTestCase {
     /// acknowledged, as the receiver confirms them; VideoToolbox must keep
     /// offering tokens and recover from the acknowledged one.
     func testSparseAcknowledgementStillRecoversWithoutKeyframe() throws {
+        try skipOnVirtualMac()
         for codec in [UInt32(FRAMES_MAC_CODEC_H264), UInt32(FRAMES_MAC_CODEC_HEVC)] {
             let sink = Sink()
             let encoder = try XCTUnwrap(
