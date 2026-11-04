@@ -449,7 +449,9 @@ export component Launcher inherits Window {
                                 detail: root.search != "" ? "Try a different name." : root.device-tab == 0 ? "Your connected devices will appear here." : "Trust a device when accepting a connection or from Recent.";
                             }
                             DeviceGrid {
-                                devices: root.filter-devices(root.device-tab == 0 ? root.recent : root.trusted, root.search);
+                                // The live list unless searching: a filtered copy is a new model,
+                                // which rebuilds every card and swallows the click in progress.
+                                devices: root.search == "" ? (root.device-tab == 0 ? root.recent : root.trusted) : root.filter-devices(root.device-tab == 0 ? root.recent : root.trusted, root.search);
                                 connect(address, id, audio, desktop) => { root.address = address; root.connect-device(address, id, audio, desktop); }
                                 options-edited(address, id, audio, desktop) => { root.connection-options-edited(address, id, audio, desktop); }
                                 trust(id) => { root.trust(id); }

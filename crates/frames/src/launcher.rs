@@ -278,6 +278,30 @@ impl From<Device> for DeviceRow {
 fn model<T: Clone + 'static>(rows: Vec<T>) -> ModelRc<T> {
     Rc::new(VecModel::from(rows)).into()
 }
+/// Updates a list the user may be clicking in place. Replacing the model
+/// recreated every card, and each window focus triggers a refresh: the first
+/// click on an unfocused launcher hit a card that no longer existed, so
+/// Connect (and Disconnect) needed a second click. Unchanged rows are left
+/// alone and changed rows patched; only a change in length rebuilds the list.
+fn refresh_rows<T: Clone + PartialEq + 'static>(
+    current: ModelRc<T>,
+    rows: Vec<T>,
+    replace: impl FnOnce(ModelRc<T>),
+) {
+    let Some(list) = current.as_any().downcast_ref::<VecModel<T>>() else {
+        replace(model(rows));
+        return;
+    };
+    if list.row_count() != rows.len() {
+        list.set_vec(rows);
+        return;
+    }
+    for (index, row) in rows.into_iter().enumerate() {
+        if list.row_data(index).as_ref() != Some(&row) {
+            list.set_row_data(index, row);
+        }
+    }
+}
 fn recent_rows(prefs: &Preferences) -> Vec<Device> {
     prefs
         .recent
@@ -1331,15 +1355,15 @@ pub fn run() -> Result<()> {
                     ui.set_notice_error(true);
                 }
                 Event::Recent(rows) => {
-                    ui.set_recent(model(rows.into_iter().map(Into::into).collect()));
+                    refresh_rows(ui.get_recent(), rows.into_iter().map(Into::into).collect(), |m| ui.set_recent(m));
                     ui.invoke_connection_address_edited();
                 }
-                Event::Trusted(rows) => ui.set_trusted(model(rows.into_iter().map(Into::into).collect())),
+                Event::Trusted(rows) => refresh_rows(ui.get_trusted(), rows.into_iter().map(Into::into).collect(), |m| ui.set_trusted(m)),
                 Event::Nearby(result) => {
                     ui.set_discovering(false);
                     match result {
                         Ok(rows) => {
-                            ui.set_nearby(model(rows.into_iter().map(Into::into).collect()));
+                            refresh_rows(ui.get_nearby(), rows.into_iter().map(Into::into).collect(), |m| ui.set_nearby(m));
                         }
                         Err(error) => { ui.set_notice(format!("Network discovery failed: {error}").into()); ui.set_notice_error(true); }
                     }
@@ -1373,7 +1397,7 @@ pub fn run() -> Result<()> {
                 Event::Sessions(rows) => {
                     if rows.iter().any(|row| !row.3) { ui.set_connection_tab(1); }
                     ui.set_sharing(rows.iter().any(|s| s.3));
-                    ui.set_sessions(model(rows.into_iter().map(|(id, name, detail, hosting)| SessionRow { id, name: name.into(), detail: detail.into(), hosting }).collect()));
+                    refresh_rows(ui.get_sessions(), rows.into_iter().map(|(id, name, detail, hosting)| SessionRow { id, name: name.into(), detail: detail.into(), hosting }).collect(), |m| ui.set_sessions(m));
                 }
             }
         }
