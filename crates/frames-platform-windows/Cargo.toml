@@ -16,6 +16,7 @@ anyhow.workspace = true
 bytes.workspace = true
 frames-codec = { path = "../frames-codec", default-features = false }
 frames-input = { path = "../frames-input" }
+frames-clipboard = { path = "../frames-clipboard" }
 tracing.workspace = true
 windows.workspace = true
 

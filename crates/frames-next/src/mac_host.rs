@@ -24,16 +24,29 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+type ClipStreams = (iroh::endpoint::SendStream, iroh::endpoint::RecvStream);
+
 pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     let handle = tokio::runtime::Handle::current();
     let events = Arc::new(AtomicU64::new(0));
     let (events_tx, events_rx) = std::sync::mpsc::channel::<Event>();
+    let clipboard_on = o.clipboard != crate::clip::Mode::Off;
+    let (clip_tx, clip_rx) = std::sync::mpsc::channel::<ClipStreams>();
     let reader = {
         let (session, events) = (session.clone(), events.clone());
         tokio::spawn(async move {
             let Ok((_send, mut recv)) = session.accept_channel().await else {
                 return;
             };
+            // The viewer opens its clipboard stream right after this one.
+            if clipboard_on {
+                let session = session.clone();
+                tokio::spawn(async move {
+                    if let Ok(streams) = session.accept_channel().await {
+                        let _ = clip_tx.send(streams);
+                    }
+                });
+            }
             let mut decoder = EventReader::default();
             let mut buffer = [0u8; 1024];
             while let Ok(Some(n)) = recv.read(&mut buffer).await {
@@ -46,9 +59,10 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
             }
         })
     };
-    let result =
-        tokio::task::spawn_blocking(move || stream(&handle, &session, &o, &events, events_rx))
-            .await?;
+    let result = tokio::task::spawn_blocking(move || {
+        stream(&handle, &session, &o, &events, events_rx, clip_rx)
+    })
+    .await?;
     reader.abort();
     result
 }
@@ -72,6 +86,7 @@ fn stream(
     o: &Options,
     events: &AtomicU64,
     inputs: std::sync::mpsc::Receiver<Event>,
+    clipboard_streams: std::sync::mpsc::Receiver<ClipStreams>,
 ) -> Result<()> {
     let frame_time = Duration::from_micros(1_000_000 / u64::from(o.fps.max(1)));
     let _ = system::set_realtime_thread(frame_time, frame_time / 4, frame_time / 2);
@@ -159,6 +174,7 @@ fn stream(
         host.set_max_bps(relay_max_bps);
     }
 
+    let mut clipboard: Option<crate::clip::ClipboardLink> = None;
     let started = Instant::now();
     let mut next_report = Duration::from_secs(1);
     let mut pending = Some(first);
@@ -205,6 +221,19 @@ fn stream(
             host.encode(before, &mut encoder, &frame)?;
             encode_us.push(clock.now_us().saturating_sub(before));
             frames += 1;
+        }
+        if clipboard.is_none()
+            && let Ok(streams) = clipboard_streams.try_recv()
+        {
+            clipboard = Some(crate::clip::ClipboardLink::start(
+                handle,
+                streams,
+                o.clipboard,
+                false,
+            ));
+        }
+        if let Some(clipboard) = &mut clipboard {
+            clipboard.tick();
         }
         let now = clock.now_us();
         // Every iteration, not per frame: probe clusters go out between
@@ -266,6 +295,14 @@ fn stream(
             }
             next_report += Duration::from_secs(1);
         }
+    }
+    if let Some(clipboard) = &clipboard {
+        println!(
+            "CLIPBOARD sent={} received={} now={:?}",
+            clipboard.sent,
+            clipboard.received,
+            clipboard.current()
+        );
     }
     session.close("host stopped");
     Ok(())

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 mod admit;
+mod clip;
 mod lane;
 #[cfg(target_os = "macos")]
 mod mac_client;
@@ -79,6 +80,8 @@ pub struct Options {
     pub migrate_v1: bool,
     /// Host: pacing rate as a multiple of the target (experiments).
     pub pacing: Option<f64>,
+    /// Clipboard sharing (both ends must turn it on).
+    pub clipboard: clip::Mode,
     /// Viewer: post generated mouse and key messages to its own window.
     pub synthetic_input: bool,
     /// Host: `nvenc` (direct), or an FFmpeg backend: `amf`, `qsv`, `mf`,
@@ -111,6 +114,7 @@ impl Options {
             relays: Vec::new(),
             migrate_v1: false,
             pacing: None,
+            clipboard: clip::Mode::Off,
             synthetic_input: false,
             encoder: "nvenc".into(),
             config_dir: None,
@@ -147,6 +151,14 @@ impl Options {
                 "--relay" => o.relays.push(value()?.to_string()),
                 "--migrate-v1" => o.migrate_v1 = true,
                 "--pacing" => o.pacing = Some(value()?.parse()?),
+                "--clipboard" => {
+                    o.clipboard = match value()? {
+                        "on" => clip::Mode::On,
+                        "off" => clip::Mode::Off,
+                        "qa" => clip::Mode::Qa,
+                        other => bail!("--clipboard takes on, off or qa, not {other}"),
+                    }
+                }
                 "--synthetic-input" => o.synthetic_input = true,
                 "--encoder" => o.encoder = value()?.to_string(),
                 "--config-dir" => o.config_dir = Some(value()?.into()),

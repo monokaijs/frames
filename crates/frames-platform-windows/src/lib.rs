@@ -3,6 +3,8 @@
 //! - [`capture`]: Windows Graphics Capture as a `CaptureSource`, with the
 //!   cursor reported separately and the update interval matched to the target
 //!   frame rate.
+//! - [`clipboard`]: the Windows clipboard (text and PNG) for clipboard
+//!   sharing.
 //! - [`input`]: applies v2 input events with `SendInput`, or by message to
 //!   one window for QA runs.
 //! - [`nvprofile`]: the NVIDIA driver profile that holds the GPU in its
@@ -14,6 +16,8 @@
 
 #[cfg(windows)]
 pub mod capture;
+#[cfg(windows)]
+pub mod clipboard;
 #[cfg(windows)]
 pub mod input;
 #[cfg(windows)]

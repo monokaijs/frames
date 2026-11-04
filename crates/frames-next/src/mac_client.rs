@@ -50,8 +50,21 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
         })
     };
     let (lane, writer) = InputLane::open(&session).await?;
+    // Clipboard sharing: one two-way stream, opened after the input stream.
+    let clipboard = if o.clipboard == crate::clip::Mode::Off {
+        None
+    } else {
+        let streams = session.open_channel().await?;
+        Some(crate::clip::ClipboardLink::start(
+            &tokio::runtime::Handle::current(),
+            streams,
+            o.clipboard,
+            true,
+        ))
+    };
     let result =
-        tokio::task::spawn_blocking(move || view(&session, info, &o, lane, cursor_rx)).await?;
+        tokio::task::spawn_blocking(move || view(&session, info, &o, lane, cursor_rx, clipboard))
+            .await?;
     let _ = writer.await;
     drain.abort();
     result
@@ -106,6 +119,7 @@ fn view(
     o: &Options,
     lane: InputLane,
     cursor_rx: std::sync::mpsc::Receiver<frames_input::cursor::CursorMessage>,
+    mut clipboard: Option<crate::clip::ClipboardLink>,
 ) -> Result<()> {
     let frame = Duration::from_micros(1_000_000 / u64::from(info.fps.max(1)));
     let _ = system::set_realtime_thread(frame, frame / 4, frame / 2);
@@ -189,6 +203,9 @@ fn view(
             }
             cursor_updates += 1;
         }
+        if let Some(clipboard) = &mut clipboard {
+            clipboard.tick();
+        }
         let path = media.path();
         client.set_rtt(path.rtt_us);
         while let Some((datagram, arrived)) = media.try_recv_timed() {
@@ -231,6 +248,14 @@ fn view(
     let mut lane = lane.lock().unwrap();
     lane.release_all();
     lane.print_summary(cursor_updates);
+    if let Some(clipboard) = &clipboard {
+        println!(
+            "CLIPBOARD sent={} received={} now={:?}",
+            clipboard.sent,
+            clipboard.received,
+            clipboard.current()
+        );
+    }
     let stats = client.stats();
     let (n, p50, p95, p99) = latency.summary();
     println!(

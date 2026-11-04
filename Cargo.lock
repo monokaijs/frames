@@ -2242,6 +2242,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "frames-clipboard"
+version = "0.3.3"
+
+[[package]]
 name = "frames-codec"
 version = "0.3.3"
 dependencies = [
@@ -2351,6 +2355,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "directories",
+ "frames-clipboard",
  "frames-codec",
  "frames-core",
  "frames-input",
@@ -2370,6 +2375,7 @@ name = "frames-platform-macos"
 version = "0.3.3"
 dependencies = [
  "bytes",
+ "frames-clipboard",
  "frames-input",
  "frames-media",
  "frames-testkit",
@@ -2381,6 +2387,7 @@ version = "0.3.3"
 dependencies = [
  "anyhow",
  "bytes",
+ "frames-clipboard",
  "frames-codec",
  "frames-input",
  "frames-media",

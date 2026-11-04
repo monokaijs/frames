@@ -14,6 +14,7 @@ build = "build.rs"
 bytes.workspace = true
 frames-media = { path = "../frames-media" }
 frames-input = { path = "../frames-input" }
+frames-clipboard = { path = "../frames-clipboard" }
 
 [dev-dependencies]
 frames-testkit = { path = "../frames-testkit" }

@@ -139,6 +139,16 @@ void frames_mac_presenter_post_synthetic_input(void *presenter, uint64_t step);
 double frames_mac_presenter_refresh_hz(void *presenter);
 void frames_mac_presenter_free(void *presenter);
 
+// The general pasteboard (ABI 2), for clipboard sharing. Reads return the
+// length and a malloc'd copy in *out (free it with frames_mac_free), or -1
+// when the pasteboard has no such content.
+uint64_t frames_mac_clipboard_change_count(void);
+int64_t frames_mac_clipboard_text(uint8_t **out);
+int64_t frames_mac_clipboard_png(uint8_t **out);
+int32_t frames_mac_clipboard_set_text(const uint8_t *utf8, size_t length);
+int32_t frames_mac_clipboard_set_png(const uint8_t *png, size_t length);
+void frames_mac_free(void *pointer);
+
 // Runs NSApplication on the calling (main) thread until stopped or `seconds`
 // elapse (0 = until stopped). Never call while another toolkit owns it.
 void frames_mac_run_app(double seconds);

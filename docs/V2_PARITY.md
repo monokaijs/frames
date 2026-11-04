@@ -53,7 +53,7 @@ launcher, installer, updater, and service still run v1.
 
 | v1 feature | v2 status |
 |---|---|
-| Clipboard (text and PNG) | **Not started**. |
+| Clipboard (text and PNG) | **Partial**: `frames-clipboard` sync (no echo, the pre-session clipboard stays local), Windows and macOS clipboards, `frames-next --clipboard on|qa` (off by default). QA run PC host ↔ Mac viewer: 4 of 4 copies arrived. The real clipboards were not exercised automatically (tests must not overwrite the user's clipboard). |
 | File drop, fetch, resume, checksums | **Not started**. |
 | Android ADB bridge | **Not started**. |
 | Gamepad forwarding | **Not started**. |

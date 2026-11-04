@@ -1,0 +1,10 @@
+[package]
+name = "frames-clipboard"
+description = "Frames v2 clipboard service: sync logic and wire format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Layering (scripts/check_layers.py): no Frames dependencies, no C toolchain.
+[dependencies]
