@@ -127,6 +127,12 @@ typedef void (*FramesMacInputCallback)(void *context, uint32_t kind, int32_t a, 
 // Installs (or with NULL, removes) the input callback. Removing waits for a
 // callback in progress, so the context may be freed once this returns.
 void frames_mac_presenter_set_input(void *presenter, void *context, FramesMacInputCallback callback);
+// The host's cursor over the presenter's view (ABI 2): straight-alpha BGRA,
+// top row first (borrowed). Without a shape, or with visible false, the
+// system cursor is hidden over the view.
+void frames_mac_presenter_set_cursor(void *presenter, const uint8_t *bgra, uint32_t width,
+                                     uint32_t height, uint32_t hotspot_x, uint32_t hotspot_y);
+void frames_mac_presenter_set_cursor_visible(void *presenter, bool visible);
 // Feeds generated mouse, wheel and key events for `step` through the same
 // conversion as real ones (unattended tests). Runs on the main thread.
 void frames_mac_presenter_post_synthetic_input(void *presenter, uint64_t step);

@@ -1,7 +1,7 @@
 //! macOS viewer: frames-net → v2 client engine → VideoToolbox → Metal.
 //!
-//! Input from the window goes to the host on the shared input lane. The
-//! host's cursor shape is not shown yet (the Mac's own cursor stays).
+//! Input from the window goes to the host on the shared input lane, and the
+//! host's cursor shape is shown over the video by the window itself.
 
 use crate::lane::{Captured, InputLane};
 use crate::stats::Samples;
@@ -27,18 +27,31 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
         "stream: {:?} {}x{} at {} fps",
         info.codec, info.width, info.height, info.fps
     );
-    // Accept (and drain) the host's cursor stream so its writes never block.
+    // The host's cursor shape and visibility, applied on the viewer thread.
+    let (cursor_tx, cursor_rx) = std::sync::mpsc::channel();
     let drain = {
         let session = session.clone();
         tokio::spawn(async move {
-            if let Ok((_send, mut recv)) = session.accept_channel().await {
-                let mut buffer = vec![0u8; 64 * 1024];
-                while let Ok(Some(_)) = recv.read(&mut buffer).await {}
+            let Ok((_send, mut recv)) = session.accept_channel().await else {
+                return;
+            };
+            let mut reader = frames_input::cursor::CursorReader::default();
+            let mut buffer = vec![0u8; 64 * 1024];
+            while let Ok(Some(n)) = recv.read(&mut buffer).await {
+                let Some(messages) = reader.push(&buffer[..n]) else {
+                    return;
+                };
+                for message in messages {
+                    if cursor_tx.send(message).is_err() {
+                        return;
+                    }
+                }
             }
         })
     };
     let (lane, writer) = InputLane::open(&session).await?;
-    let result = tokio::task::spawn_blocking(move || view(&session, info, &o, lane)).await?;
+    let result =
+        tokio::task::spawn_blocking(move || view(&session, info, &o, lane, cursor_rx)).await?;
     let _ = writer.await;
     drain.abort();
     result
@@ -92,6 +105,7 @@ fn view(
     info: crate::StreamInfo,
     o: &Options,
     lane: InputLane,
+    cursor_rx: std::sync::mpsc::Receiver<frames_input::cursor::CursorMessage>,
 ) -> Result<()> {
     let frame = Duration::from_micros(1_000_000 / u64::from(info.fps.max(1)));
     let _ = system::set_realtime_thread(frame, frame / 4, frame / 2);
@@ -134,6 +148,7 @@ fn view(
     }
     let started = Instant::now();
     let mut synthetic_step = 0u64;
+    let mut cursor_updates = 0u64;
     let mut next_report = Duration::from_secs(1);
     let mut latency = Samples::new(30);
     let mut presented = 0u64;
@@ -153,6 +168,26 @@ fn view(
                 synthetic_step += 1;
                 presenter.post_synthetic_input(synthetic_step);
             }
+        }
+        while let Ok(message) = cursor_rx.try_recv() {
+            match message {
+                frames_input::cursor::CursorMessage::Shape {
+                    width,
+                    height,
+                    hotspot_x,
+                    hotspot_y,
+                    bgra,
+                } => presenter.set_cursor(
+                    u32::from(width),
+                    u32::from(height),
+                    (u32::from(hotspot_x), u32::from(hotspot_y)),
+                    &bgra,
+                ),
+                frames_input::cursor::CursorMessage::Visible(visible) => {
+                    presenter.set_cursor_visible(visible)
+                }
+            }
+            cursor_updates += 1;
         }
         let path = media.path();
         client.set_rtt(path.rtt_us);
@@ -195,7 +230,7 @@ fn view(
     drop(presenter);
     let mut lane = lane.lock().unwrap();
     lane.release_all();
-    lane.print_summary(0);
+    lane.print_summary(cursor_updates);
     let stats = client.stats();
     let (n, p50, p95, p99) = latency.summary();
     println!(

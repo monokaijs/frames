@@ -106,6 +106,15 @@ unsafe extern "C" {
         callback: Option<OnInput>,
     );
     pub fn frames_mac_presenter_post_synthetic_input(presenter: *mut c_void, step: u64);
+    pub fn frames_mac_presenter_set_cursor(
+        presenter: *mut c_void,
+        bgra: *const u8,
+        width: u32,
+        height: u32,
+        hotspot_x: u32,
+        hotspot_y: u32,
+    );
+    pub fn frames_mac_presenter_set_cursor_visible(presenter: *mut c_void, visible: bool);
     pub fn frames_mac_run_app(seconds: f64);
     pub fn frames_mac_stop_app();
 }

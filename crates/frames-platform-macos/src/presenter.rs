@@ -142,6 +142,44 @@ impl MacPresenter {
         }
     }
 
+    /// Shows the host's cursor over the window: premultiplied BGRA, top row
+    /// first (as the host sends it).
+    pub fn set_cursor(&self, width: u32, height: u32, hotspot: (u32, u32), premultiplied: &[u8]) {
+        if premultiplied.len() != (width * height * 4) as usize {
+            return;
+        }
+        let straight: Vec<u8> = premultiplied
+            .chunks_exact(4)
+            .flat_map(|p| {
+                let alpha = u32::from(p[3]);
+                let channel = |c: u8| {
+                    if alpha == 0 {
+                        0
+                    } else {
+                        (u32::from(c) * 255 / alpha).min(255) as u8
+                    }
+                };
+                [channel(p[0]), channel(p[1]), channel(p[2]), p[3]]
+            })
+            .collect();
+        // SAFETY: live presenter; the pixels outlive the call (copied there).
+        unsafe {
+            ffi::frames_mac_presenter_set_cursor(
+                self.handle,
+                straight.as_ptr(),
+                width,
+                height,
+                hotspot.0,
+                hotspot.1,
+            )
+        };
+    }
+
+    pub fn set_cursor_visible(&self, visible: bool) {
+        // SAFETY: live presenter.
+        unsafe { ffi::frames_mac_presenter_set_cursor_visible(self.handle, visible) };
+    }
+
     /// Feeds one step of generated input through the window's real event
     /// handlers (unattended tests).
     pub fn post_synthetic_input(&self, step: u64) {

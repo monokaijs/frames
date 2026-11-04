@@ -1,3 +1,4 @@
+import AppKit
 import CFramesMac
 import CoreVideo
 import XCTest
@@ -171,5 +172,45 @@ final class FramesMacTests: XCTestCase {
         let (status, time) = presenter.present(source, vsync: false)
         XCTAssertEqual(status, 0)
         XCTAssertGreaterThan(time, 0)
+    }
+
+    @MainActor
+    func testInputViewShowsTheHostCursorAndHidesIt() {
+        let view = InputView(frame: NSRect(x: 0, y: 0, width: 200, height: 100), relay: InputRelay())
+        XCTAssertNil(view.shownCursor, "the system cursor until the host sends one")
+        let image = NSImage(size: NSSize(width: 16, height: 16))
+        view.setHostCursor(image, hotspot: NSPoint(x: 2, y: 3), visible: nil)
+        XCTAssertEqual(view.shownCursor?.hotSpot, NSPoint(x: 2, y: 3))
+        view.setHostCursor(nil, hotspot: .zero, visible: false)
+        XCTAssertNotNil(view.shownCursor)
+        XCTAssertNotEqual(view.shownCursor?.hotSpot, NSPoint(x: 2, y: 3), "hidden: a blank cursor")
+        view.setHostCursor(nil, hotspot: .zero, visible: true)
+        XCTAssertEqual(view.shownCursor?.hotSpot, NSPoint(x: 2, y: 3), "shown again")
+    }
+
+    @MainActor
+    func testInputViewReportsNormalizedPositionsTopLeft() {
+        final class Box: @unchecked Sendable { var events: [(UInt32, Int32, Int32)] = [] }
+        let box = Box()
+        let relay = InputRelay()
+        let callback: FramesMacInputCallback = { context, kind, a, b, _, _, _ in
+            Unmanaged<Box>.fromOpaque(context!).takeUnretainedValue().events.append((kind, a, b))
+        }
+        relay.set(context: Unmanaged.passUnretained(box).toOpaque(), callback: callback)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 100), styleMask: [.titled], backing: .buffered,
+            defer: true)
+        let view = InputView(frame: NSRect(x: 0, y: 0, width: 200, height: 100), relay: relay)
+        window.contentView = view
+        // Window coordinates: origin bottom left.
+        let event = NSEvent.mouseEvent(
+            with: .mouseMoved, location: NSPoint(x: 200, y: 100), modifierFlags: [], timestamp: 1,
+            windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 0, pressure: 0)!
+        view.mouseMoved(with: event)
+        relay.set(context: nil, callback: nil)
+        XCTAssertEqual(box.events.count, 1)
+        XCTAssertEqual(box.events.first?.0, UInt32(FRAMES_MAC_INPUT_MOVE))
+        XCTAssertEqual(box.events.first?.1, 65535, "right edge")
+        XCTAssertEqual(box.events.first?.2, 0, "top edge")
     }
 }

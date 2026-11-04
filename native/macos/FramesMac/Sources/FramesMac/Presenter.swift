@@ -94,6 +94,17 @@ final class Presenter: @unchecked Sendable {
         refreshHz = refresh
     }
 
+    /// Shows the host's cursor over the view (`nil` image hides it).
+    func setCursor(_ image: NSImage?, hotspot: NSPoint, visible: Bool?) {
+        guard let inputView else { return }
+        let apply = { @MainActor in inputView.setHostCursor(image, hotspot: hotspot, visible: visible) }
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { apply() }
+        } else {
+            DispatchQueue.main.async { MainActor.assumeIsolated { apply() } }
+        }
+    }
+
     /// Generated events for unattended tests, through `InputView`'s handlers.
     func postSyntheticInput(step: UInt64) {
         guard let inputView else { return }
@@ -251,6 +262,26 @@ final class InputView: NSView {
     /// Modifier keys currently down, by key code (flagsChanged reports one
     /// key at a time).
     private var modifiersDown: Set<UInt16> = []
+    /// The host's cursor, shown over the video by the view's cursor rect.
+    private var hostCursor: NSCursor?
+    private var hostCursorVisible = true
+    private static let blank = NSCursor(image: NSImage(size: NSSize(width: 1, height: 1)), hotSpot: .zero)
+
+    func setHostCursor(_ image: NSImage?, hotspot: NSPoint, visible: Bool?) {
+        if let image { hostCursor = NSCursor(image: image, hotSpot: hotspot) }
+        if let visible { hostCursorVisible = visible }
+        window?.invalidateCursorRects(for: self)
+    }
+
+    /// The cursor the view shows now (for tests).
+    var shownCursor: NSCursor? {
+        guard hostCursor != nil || !hostCursorVisible else { return nil }
+        return hostCursorVisible ? hostCursor : InputView.blank
+    }
+
+    override func resetCursorRects() {
+        if let cursor = shownCursor { addCursorRect(bounds, cursor: cursor) }
+    }
 
     init(frame: NSRect, relay: InputRelay) {
         self.relay = relay
@@ -388,4 +419,36 @@ public func framesMacPresenterSetInput(
 public func framesMacPresenterPostSyntheticInput(_ handle: UnsafeMutableRawPointer?, _ step: UInt64) {
     guard let handle else { return }
     borrowed(handle, as: Presenter.self).postSyntheticInput(step: step)
+}
+
+@_cdecl("frames_mac_presenter_set_cursor")
+public func framesMacPresenterSetCursor(
+    _ handle: UnsafeMutableRawPointer?, _ bgra: UnsafePointer<UInt8>?, _ width: UInt32, _ height: UInt32,
+    _ hotspotX: UInt32, _ hotspotY: UInt32
+) {
+    guard let handle, let bgra, width > 0, height > 0, width <= 256, height <= 256 else { return }
+    let (w, h) = (Int(width), Int(height))
+    guard
+        let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h, bitsPerSample: 8, samplesPerPixel: 4,
+            hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: w * 4, bitsPerPixel: 32),
+        let pixels = bitmap.bitmapData
+    else { return }
+    // BGRA (straight alpha) to RGBA.
+    for i in 0..<(w * h) {
+        pixels[i * 4] = bgra[i * 4 + 2]
+        pixels[i * 4 + 1] = bgra[i * 4 + 1]
+        pixels[i * 4 + 2] = bgra[i * 4]
+        pixels[i * 4 + 3] = bgra[i * 4 + 3]
+    }
+    let image = NSImage(size: NSSize(width: w, height: h))
+    image.addRepresentation(bitmap)
+    borrowed(handle, as: Presenter.self).setCursor(
+        image, hotspot: NSPoint(x: Int(hotspotX), y: Int(hotspotY)), visible: nil)
+}
+
+@_cdecl("frames_mac_presenter_set_cursor_visible")
+public func framesMacPresenterSetCursorVisible(_ handle: UnsafeMutableRawPointer?, _ visible: Bool) {
+    guard let handle else { return }
+    borrowed(handle, as: Presenter.self).setCursor(nil, hotspot: .zero, visible: visible)
 }
