@@ -18,9 +18,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
-    let info = tokio::time::timeout(Duration::from_secs(10), receive_info(&session))
+    // A host seeing this device for the first time asks its user (60 s).
+    println!("waiting for the host (it may be asking to approve this device)");
+    let info = tokio::time::timeout(Duration::from_secs(90), receive_info(&session))
         .await
-        .context("the host did not describe its stream within 10 s")??;
+        .context("the host did not start the stream within 90 s")??;
     println!(
         "stream: {:?} {}x{} at {} fps",
         info.codec, info.width, info.height, info.fps

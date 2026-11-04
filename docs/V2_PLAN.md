@@ -357,7 +357,9 @@ Across machines (`frames-next`, PC host with NVENC H.264 on a QA window → MacB
 
 Self-hosted relays (`docs/RELAY.md`): `frames-next --relay URL` uses our own `iroh-relay` (vendored) instead of n0's. Relay-only through a relay on the PC: 1080p60 at 36 Mbps, capture → present p50 4.32 ms, p95 5.73 ms, nothing lost. Only n0's public relays get the 6 Mbps cap. Deploying relays in 2-3 regions needs servers and hostnames (to decide).
 
-Still open: the NAT matrix (needs other networks), production relays, a graphical pairing flow, and migration against real 0.2.x data. The dual-interface Mac case did not reproduce: Mac host → PC viewer selected the Mac's Ethernet address and streamed normally (spike 0-A's failure was host → client on the same subnet before the noq-udp patch).
+v1 trust migration (`frames-next connect --migrate-v1`): the viewer's first stream carries a proof made with its v1 key, bound to this connection's TLS exporter and its v2 device id; the host verifies it, looks the v1 certificate fingerprint up in v1's `trusted.json`, and trusts the device under its v2 id with v1's name and control permission, without asking. Checked on the PC with scratch v1 identities (DPAPI): an untrusted v1 identity was verified and then asked about; after adding it to v1 trust, the next connection was migrated as "Old laptop" with control, its fingerprint recorded, and its input applied. Viewers now wait up to 90 s for a host that is asking its user.
+
+Still open: the NAT matrix (needs other networks), production relays, a graphical pairing flow, migration against a real 0.2.x install (and the Keychain path on macOS), and deriving the v2 key from the v1 key at cutover. The dual-interface Mac case did not reproduce: Mac host → PC viewer selected the Mac's Ethernet address and streamed normally (spike 0-A's failure was host → client on the same subnet before the noq-udp patch).
 
 - **iroh `Endpoint`:**
   - One endpoint per process, used for both serving and connecting, with IPv4 and IPv6.

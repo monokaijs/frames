@@ -7,7 +7,10 @@
 //! test runs only and says so when used.
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
+use frames_net::migration::{self, LegacyProof};
 use frames_net::trust::{Admission, TrustList, TrustedDevice, admission};
+use serde::{Deserialize, Serialize};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -37,6 +40,112 @@ pub enum Approve {
     Control,
 }
 
+/// The viewer's first stream: an optional proof that it is a device this
+/// host already trusted in v1 (docs/V2_PLAN.md, Phase 4 identity migration).
+#[derive(Default, Serialize, Deserialize)]
+struct Hello {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    v1_certificate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    v1_signature: Option<String>,
+}
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+/// Viewer: always opens the hello stream first (it fixes the order of the
+/// viewer's streams); with `migrate`, it carries a proof made with this
+/// device's v1 key, bound to this connection and this device's v2 id.
+pub async fn send_hello(
+    session: &frames_net::Session,
+    own_id: &iroh::EndpointId,
+    migrate: bool,
+) -> Result<()> {
+    let mut hello = Hello::default();
+    if migrate {
+        match v1_proof(session, own_id) {
+            Ok(proof) => {
+                hello.v1_certificate = Some(B64.encode(&proof.certificate));
+                hello.v1_signature = Some(B64.encode(&proof.signature));
+                println!("offering this device's v1 identity for trust migration");
+            }
+            Err(error) => println!("no v1 identity to offer: {error:#}"),
+        }
+    }
+    let (mut send, _) = session.open_channel().await?;
+    send.write_all(&serde_json::to_vec(&hello)?).await?;
+    send.finish()?;
+    Ok(())
+}
+
+fn v1_proof(session: &frames_net::Session, own_id: &iroh::EndpointId) -> Result<LegacyProof> {
+    // FRAMES_CONFIG_DIR (set from --config-dir at start-up) selects the
+    // directory v1 reads.
+    let identity = frames_core::trust::Identity::load()?;
+    let pkcs8 = identity.key.secret_der();
+    let exporter = session.exporter(migration::EXPORTER_LABEL)?;
+    migration::prove(&identity.certificate, pkcs8, own_id, &exporter)
+}
+
+async fn receive_hello(session: &frames_net::Session) -> Option<LegacyProof> {
+    let read = async {
+        let (_send, mut recv) = session.accept_channel().await.ok()?;
+        let bytes = recv.read_to_end(64 * 1024).await.ok()?;
+        serde_json::from_slice::<Hello>(&bytes).ok()
+    };
+    let hello = tokio::time::timeout(Duration::from_secs(5), read)
+        .await
+        .ok()
+        .flatten()?;
+    Some(LegacyProof {
+        certificate: B64.decode(hello.v1_certificate?).ok()?,
+        signature: B64.decode(hello.v1_signature?).ok()?,
+    })
+}
+
+/// Host: a device that proves it is a v1-trusted device gets that trust
+/// under its v2 id, with v1's name and control permission.
+fn migrate(
+    session: &frames_net::Session,
+    proof: &LegacyProof,
+    list: &mut TrustList,
+    path: &std::path::Path,
+) -> Result<Option<bool>> {
+    let device = session.remote();
+    let exporter = session.exporter(migration::EXPORTER_LABEL)?;
+    let fingerprint = match migration::verify(proof, &device, &exporter) {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            println!("v1 identity proof rejected: {error:#}");
+            return Ok(None);
+        }
+    };
+    let v1 = frames_core::trust::TrustStore::load()?;
+    let Some(peer) = v1.peers.get(&fingerprint) else {
+        println!("its v1 identity is not trusted here");
+        return Ok(None);
+    };
+    list.insert(
+        &device,
+        TrustedDevice {
+            name: peer.name.clone(),
+            allow_control: peer.allow_control,
+            legacy_fingerprint: Some(fingerprint),
+        },
+    );
+    list.save(path)?;
+    println!(
+        "migrated v1 trust for {} ({}): {}",
+        peer.name,
+        short(&device),
+        if peer.allow_control {
+            "view and control"
+        } else {
+            "view only"
+        }
+    );
+    Ok(Some(peer.allow_control))
+}
+
 /// `Some(control)` to stream (with input when `control`), `None` to refuse.
 pub async fn decide(
     config: &std::path::Path,
@@ -46,6 +155,7 @@ pub async fn decide(
     let path = TrustList::path_in(config);
     let mut list = TrustList::load(&path)?;
     let device = session.remote();
+    let proof = receive_hello(session).await;
     if let Admission::Trusted { control } = admission(&list, &device) {
         let name = list
             .get(&device)
@@ -60,6 +170,11 @@ pub async fn decide(
                 "view only"
             }
         );
+        return Ok(Some(control));
+    }
+    if let Some(proof) = &proof
+        && let Some(control) = migrate(session, proof, &mut list, &path)?
+    {
         return Ok(Some(control));
     }
     let code = session.pairing_code()?;

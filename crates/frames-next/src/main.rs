@@ -74,6 +74,9 @@ pub struct Options {
     pub relay_only: bool,
     /// Self-hosted relays to use instead of n0's (repeatable).
     pub relays: Vec<String>,
+    /// Viewer: offer this device's v1 identity so a host that trusted it in
+    /// v1 trusts it now.
+    pub migrate_v1: bool,
     /// Viewer: post generated mouse and key messages to its own window.
     pub synthetic_input: bool,
     /// Host: `nvenc` (direct), or an FFmpeg backend: `amf`, `qsv`, `mf`,
@@ -100,6 +103,7 @@ impl Options {
             seconds: 0,
             relay_only: false,
             relays: Vec::new(),
+            migrate_v1: false,
             synthetic_input: false,
             encoder: "nvenc".into(),
             config_dir: None,
@@ -131,6 +135,7 @@ impl Options {
                 "--vsync" => o.vsync = true,
                 "--relay-only" => o.relay_only = true,
                 "--relay" => o.relays.push(value()?.to_string()),
+                "--migrate-v1" => o.migrate_v1 = true,
                 "--synthetic-input" => o.synthetic_input = true,
                 "--encoder" => o.encoder = value()?.to_string(),
                 "--config-dir" => o.config_dir = Some(value()?.into()),
@@ -212,6 +217,7 @@ async fn connect(id: &str, o: Options) -> Result<()> {
     let node = frames_net::Node::bind(&admit::device_key(&config)?, node_config(&o)?).await?;
     let started = std::time::Instant::now();
     let session = node.connect(id.parse::<iroh::EndpointId>()?).await?;
+    admit::send_hello(&session, &node.id(), o.migrate_v1).await?;
     println!(
         "connected in {:.0} ms, pairing code {} (a new host shows the same code)",
         started.elapsed().as_secs_f64() * 1e3,
@@ -259,6 +265,16 @@ pub async fn receive_info(session: &frames_net::Session) -> Result<StreamInfo> {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // v1's identity and trust store read FRAMES_CONFIG_DIR; point them at
+    // --config-dir before any other thread exists.
+    if let Some(dir) = args
+        .iter()
+        .position(|a| a == "--config-dir")
+        .and_then(|i| args.get(i + 1))
+    {
+        // SAFETY: single-threaded here (the runtime starts below).
+        unsafe { std::env::set_var("FRAMES_CONFIG_DIR", dir) };
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

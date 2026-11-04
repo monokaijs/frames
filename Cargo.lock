@@ -2348,9 +2348,11 @@ name = "frames-next"
 version = "0.3.3"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
  "directories",
  "frames-codec",
+ "frames-core",
  "frames-input",
  "frames-media",
  "frames-net",
