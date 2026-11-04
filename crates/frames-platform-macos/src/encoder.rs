@@ -87,8 +87,6 @@ pub struct MacEncoder {
     mark: Option<u8>,
     /// Frames encoded since a mark was requested without a token arriving.
     mark_waiting: u32,
-    /// VideoToolbox has produced at least one long-term token.
-    tokens_seen: bool,
     use_long_term: Option<u8>,
     slots: [Option<Slot>; SLOTS],
     acknowledge: Vec<i64>,
@@ -136,7 +134,6 @@ impl MacEncoder {
             force_keyframe: true,
             mark: None,
             mark_waiting: 0,
-            tokens_seen: false,
             use_long_term: None,
             slots: [None; SLOTS],
             acknowledge: Vec::new(),
@@ -310,14 +307,11 @@ impl VideoEncoder for MacEncoder {
             ))?;
             (FrameKind::Predicted, FrameReference::Frame(previous))
         };
-        if output.token >= 0 {
-            self.tokens_seen = true;
-        }
-        if self.mark.is_some() && output.token < 0 && !self.tokens_seen {
+        if self.mark.is_some() && output.token < 0 {
             self.mark_waiting += 1;
             // Some VideoToolbox implementations (paravirtualized Macs, such
-            // as CI runners) accept long-term references but never hand out
-            // a token. Stop advertising them so the engine recovers with
+            // as CI runners) accept long-term references but hand out no
+            // token after a mark (at most one on the first keyframe). Stop advertising them so the engine recovers with
             // keyframes instead of waiting for a slot that never comes.
             if self.mark_waiting >= NO_TOKEN_FRAMES
                 && self
