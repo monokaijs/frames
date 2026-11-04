@@ -50,6 +50,17 @@ pub enum MacInput {
     FocusLost {
         at_us: u64,
     },
+    /// Relative mouse motion in points; positive is right and down.
+    Motion {
+        dx: i32,
+        dy: i32,
+        at_us: u64,
+    },
+    /// Relative mouse turned on or off (Control+Option+F11).
+    Mode {
+        relative: bool,
+        at_us: u64,
+    },
 }
 
 type InputHandler = Box<dyn FnMut(MacInput) + Send>;
@@ -89,6 +100,15 @@ unsafe extern "C" fn on_input(
             at_us,
         },
         ffi::INPUT_FOCUS_LOST => MacInput::FocusLost { at_us },
+        ffi::INPUT_MOTION => MacInput::Motion {
+            dx: a,
+            dy: b,
+            at_us,
+        },
+        ffi::INPUT_MODE => MacInput::Mode {
+            relative: a != 0,
+            at_us,
+        },
         _ => return,
     };
     // SAFETY: the context is the handler installed by `set_input`, which
@@ -191,6 +211,13 @@ impl MacPresenter {
     pub fn post_synthetic_input(&self, step: u64) {
         // SAFETY: live presenter.
         unsafe { ffi::frames_mac_presenter_post_synthetic_input(self.handle, step) };
+    }
+
+    /// Relative mouse on or off, as Control+Option+F11 does; without
+    /// `lock_pointer` the system pointer is left alone (unattended tests).
+    pub fn set_relative(&self, relative: bool, lock_pointer: bool) {
+        // SAFETY: live presenter.
+        unsafe { ffi::frames_mac_presenter_set_relative(self.handle, relative, lock_pointer) };
     }
 
     /// When the most recently presented frame reached the glass

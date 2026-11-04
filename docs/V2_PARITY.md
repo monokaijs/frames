@@ -49,7 +49,7 @@ launcher, installer, updater, and service still run v1.
 | Ctrl/Command swap, physical-key profile | **Partial**: the host states its OS in the stream description and a viewer on the other OS swaps Control and Command (both sides), as v1 does by default; Mac viewer of a PC host swaps, PC of PC does not. No physical-key profile switch yet. |
 | Ctrl+Alt+F12 release shortcut, menus | **Partial**: Ctrl+Alt+F12 (Control+Option+F12 on a Mac) releases remote input and minimizes the viewer, never reaching the host (Swift test on the Mac; Windows compiled, not exercised: it reads the real keyboard state). No Frames menu yet. |
 | Host cursor shown locally | **Done** on both viewers. |
-| Relative mouse (games) | **Not started**. |
+| Relative mouse (games) | **Partial**: Control+Option+F11 on the Mac viewer holds the pointer (hidden, not following the mouse) and sends motion as running-total datagrams (a lost or reordered one costs no motion; the newest is repeated once 4 ms later); the host presses buttons where its pointer is. Swift test for the toggle and deltas with a stand-in lock; loopback QA run: 750 motion datagrams, host applied exactly (2250, -750). Hosts inject it (macOS: Quartz delta fields; Windows: relative `SendInput`), neither exercised (they move the real cursor). No Windows viewer toggle yet. |
 
 ## Data and devices
 

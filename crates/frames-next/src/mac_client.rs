@@ -123,6 +123,14 @@ fn captured(input: MacInput) -> Option<Captured> {
             event: Event::ReleaseAll,
             at_us,
         },
+        MacInput::Motion { dx, dy, at_us } => Captured::Motion { dx, dy, at_us },
+        MacInput::Mode { relative, at_us } => {
+            println!("relative mouse {}", if relative { "on" } else { "off" });
+            Captured::Event {
+                event: Event::Mode { relative },
+                at_us,
+            }
+        }
     })
 }
 
@@ -153,6 +161,9 @@ fn view(
                     .send(&media, &SystemClock::new(), vec![item]);
             }
         });
+    }
+    if o.relative_qa {
+        presenter.set_relative(true, false);
     }
     let media = session.media();
     let mut config = ClientConfig::new(1, 1);
@@ -201,6 +212,7 @@ fn view(
                 presenter.post_synthetic_input(synthetic_step);
             }
         }
+        lane.lock().unwrap().tick(&media, clock.now_us());
         while let Ok(message) = cursor_rx.try_recv() {
             match message {
                 frames_input::cursor::CursorMessage::Shape {

@@ -5,8 +5,8 @@ use anyhow::{Context, Result, bail};
 use frames_codec::d3d11::{AMD, INTEL, nvidia_device, vendor_device};
 use frames_codec::ffmpeg::{FfmpegEncoder, encoder_name};
 use frames_codec::nvenc::NvencEncoder;
-use frames_input::Pointer;
 use frames_input::cursor::CursorMessage;
+use frames_input::{Motion, Pointer};
 use frames_media::api::{
     CaptureConfig, CaptureEvent, CaptureSource, EncodeParams, Gop, MediaClock, MediaTransport,
     PathKind, VideoEncoder, VideoFrame,
@@ -325,7 +325,13 @@ fn stream(
                     injector.pointer(&pointer);
                 }
                 Some(_) => {}
-                None => host.on_datagram(arrived, &datagram, rtt),
+                None => match Motion::decode(&datagram) {
+                    Some(motion) if o.control => {
+                        injector.motion(&motion);
+                    }
+                    Some(_) => {}
+                    None => host.on_datagram(arrived, &datagram, rtt),
+                },
             }
         }
         while let Ok(event) = events.try_recv() {

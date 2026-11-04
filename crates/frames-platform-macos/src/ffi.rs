@@ -3,7 +3,7 @@
 
 use std::ffi::c_void;
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 pub const CODEC_H264: u32 = 0;
 pub const CODEC_HEVC: u32 = 1;
@@ -31,6 +31,8 @@ pub const INPUT_BUTTON: u32 = 2;
 pub const INPUT_WHEEL: u32 = 3;
 pub const INPUT_KEY: u32 = 4;
 pub const INPUT_FOCUS_LOST: u32 = 5;
+pub const INPUT_MOTION: u32 = 6;
+pub const INPUT_MODE: u32 = 7;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -106,6 +108,11 @@ unsafe extern "C" {
         callback: Option<OnInput>,
     );
     pub fn frames_mac_presenter_post_synthetic_input(presenter: *mut c_void, step: u64);
+    pub fn frames_mac_presenter_set_relative(
+        presenter: *mut c_void,
+        relative: bool,
+        lock_pointer: bool,
+    );
     pub fn frames_mac_presenter_set_cursor(
         presenter: *mut c_void,
         bgra: *const u8,

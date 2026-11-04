@@ -5,7 +5,9 @@
 //! is how QA runs exercise the whole lane without moving the real cursor or
 //! typing into the user's applications.
 
-use frames_input::{Button, Event, Held, Pointer, PointerFilter, denormalize, keys};
+use frames_input::{
+    Button, Event, Held, Motion, MotionReceiver, Pointer, PointerFilter, denormalize, keys,
+};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -32,6 +34,10 @@ pub enum InputTarget {
 pub struct InputInjector {
     target: InputTarget,
     filter: PointerFilter,
+    /// Relative mouse (games): motion datagrams move the pointer by deltas
+    /// and buttons press where the pointer is.
+    relative: bool,
+    motion: MotionReceiver,
     held: Held,
     /// Last applied normalized position.
     position: (u16, u16),
@@ -47,6 +53,8 @@ impl InputInjector {
         Self {
             target,
             filter: PointerFilter::default(),
+            relative: false,
+            motion: MotionReceiver::default(),
             held: Held::default(),
             position: (0, 0),
             applied: 0,
@@ -64,7 +72,29 @@ impl InputInjector {
         true
     }
 
+    /// Relative motion; ignored unless the viewer turned relative mode on.
+    /// Real targets get relative `SendInput` moves, which games read as raw
+    /// input; a QA window target only counts it.
+    pub fn motion(&mut self, motion: &Motion) -> bool {
+        if !self.relative {
+            return false;
+        }
+        let Some((dx, dy)) = self.motion.accept(motion) else {
+            return false;
+        };
+        if (dx, dy) != (0, 0) && !matches!(self.target, InputTarget::Window(_)) {
+            send(&[mouse(MOUSEEVENTF_MOVE, dx, dy, 0)]);
+        }
+        self.applied += 1;
+        true
+    }
+
     pub fn event(&mut self, event: Event) {
+        if let Event::Mode { relative } = event {
+            self.relative = relative;
+            self.motion.restart();
+            return;
+        }
         if event == Event::ReleaseAll {
             let (x, y) = self.position;
             for release in self.held.release_all(x, y) {
@@ -85,8 +115,12 @@ impl InputInjector {
     fn apply(&mut self, event: Event) {
         match event {
             Event::Button { button, down, x, y } => {
-                self.position = (x, y);
-                self.move_to(x, y);
+                // In relative mode the viewer's position means nothing: press
+                // where the pointer is.
+                if !self.relative {
+                    self.position = (x, y);
+                    self.move_to(x, y);
+                }
                 self.button(button, down);
             }
             Event::Wheel { dx, dy } => self.wheel(dx, dy),
@@ -95,7 +129,7 @@ impl InputInjector {
                     self.key(scan, down);
                 }
             }
-            Event::ReleaseAll => {}
+            Event::ReleaseAll | Event::Mode { .. } => {}
         }
     }
 

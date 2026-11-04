@@ -118,6 +118,16 @@ final class Presenter: @unchecked Sendable {
         }
     }
 
+    func setRelative(_ relative: Bool, lockPointer: Bool) {
+        guard let inputView else { return }
+        let apply = { @MainActor in inputView.setRelative(relative, lockPointer: lockPointer) }
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { apply() }
+        } else {
+            DispatchQueue.main.async { MainActor.assumeIsolated { apply() } }
+        }
+    }
+
     /// Generated events for unattended tests, through `InputView`'s handlers.
     func postSyntheticInput(step: UInt64) {
         guard let inputView else { return }
@@ -133,7 +143,13 @@ final class Presenter: @unchecked Sendable {
         input.set(context: nil, callback: nil)
         guard let window else { return }
         self.window = nil
-        let close = { @MainActor in window.close() }
+        // The pointer is given back before the window goes (the callback is
+        // already removed, so the host is not told twice).
+        let view = inputView
+        let close = { @MainActor in
+            view?.setRelative(false)
+            window.close()
+        }
         if Thread.isMainThread {
             MainActor.assumeIsolated { close() }
         } else {
@@ -298,9 +314,49 @@ final class InputRelay: @unchecked Sendable {
     }
 }
 
+/// Holds the system pointer still and hidden while relative mouse is on.
+@MainActor
+protocol PointerLock {
+    func lock() -> Bool
+    func unlock()
+}
+
+/// The real lock: the pointer stops following the mouse (events still carry
+/// its motion as deltas) and is hidden.
+struct SystemPointerLock: PointerLock {
+    func lock() -> Bool {
+        guard CGAssociateMouseAndMouseCursorPosition(0) == .success else { return false }
+        NSCursor.hide()
+        return true
+    }
+
+    func unlock() {
+        CGAssociateMouseAndMouseCursorPosition(1)
+        NSCursor.unhide()
+    }
+}
+
+/// Leaves the system pointer alone (unattended tests).
+struct NoPointerLock: PointerLock {
+    func lock() -> Bool { true }
+    func unlock() {}
+}
+
+/// Lets a notification observer reach the view without capturing it.
+private final class WeakInputView: @unchecked Sendable {
+    weak var view: InputView?
+}
+
 /// The presenter window's content: forwards mouse, wheel, and key events.
 final class InputView: NSView {
     private let relay: InputRelay
+    /// What Control+Option+F11 locks; tests replace it.
+    var pointerLock: any PointerLock = SystemPointerLock()
+    private var heldLock: (any PointerLock)?
+    /// Relative mouse (games): motion goes as deltas, not positions.
+    private(set) var relative = false
+    /// Sub-point motion not sent yet.
+    private var remainder = CGPoint.zero
     private var tracking: NSTrackingArea?
     /// Modifier keys currently down, by key code (flagsChanged reports one
     /// key at a time).
@@ -353,7 +409,37 @@ final class InputView: NSView {
         return (Int32((x * 65535).rounded()), Int32((y * 65535).rounded()))
     }
 
+    /// Turns relative mouse on or off and tells the host.
+    func setRelative(_ on: Bool, lockPointer: Bool = true, at seconds: TimeInterval = 0) {
+        guard on != relative else { return }
+        if on {
+            let lock: any PointerLock = lockPointer ? pointerLock : NoPointerLock()
+            guard lock.lock() else { return }
+            heldLock = lock
+            remainder = .zero
+        } else {
+            heldLock?.unlock()
+            heldLock = nil
+        }
+        relative = on
+        relay.send(Int32(FRAMES_MAC_INPUT_MODE), on ? 1 : 0, at: seconds)
+    }
+
+    private func motion(dx: CGFloat, dy: CGFloat, at seconds: TimeInterval) {
+        let x = dx + remainder.x, y = dy + remainder.y
+        let (sx, sy) = (x.rounded(.towardZero), y.rounded(.towardZero))
+        remainder = CGPoint(x: x - sx, y: y - sy)
+        if sx != 0 || sy != 0 {
+            relay.send(Int32(FRAMES_MAC_INPUT_MOTION), Int32(sx), Int32(sy), at: seconds)
+        }
+    }
+
     private func move(_ event: NSEvent) {
+        if relative {
+            // NSEvent deltas are points, positive right and down.
+            motion(dx: event.deltaX, dy: event.deltaY, at: event.timestamp)
+            return
+        }
         let (x, y) = position(event)
         relay.send(Int32(FRAMES_MAC_INPUT_MOVE), x, y, at: event.timestamp)
     }
@@ -397,9 +483,16 @@ final class InputView: NSView {
         // Control+Option+F12 (kVK_F12 = 111): release remote input and
         // minimize, as in v1; the shortcut never reaches the host.
         if event.keyCode == 111, event.modifierFlags.contains([.control, .option]) {
+            setRelative(false, at: event.timestamp)
             modifiersDown.removeAll()
             relay.send(Int32(FRAMES_MAC_INPUT_FOCUS_LOST), 0, at: event.timestamp)
             window?.miniaturize(nil)
+            return
+        }
+        // Control+Option+F11 (kVK_F11 = 103): relative mouse on or off, as in
+        // v1; the shortcut never reaches the host.
+        if event.keyCode == 103, event.modifierFlags.contains([.control, .option]) {
+            setRelative(!relative, at: event.timestamp)
             return
         }
         relay.send(Int32(FRAMES_MAC_INPUT_KEY), Int32(event.keyCode), 1, at: event.timestamp)
@@ -417,6 +510,7 @@ final class InputView: NSView {
     }
 
     override func resignFirstResponder() -> Bool {
+        setRelative(false)
         modifiersDown.removeAll()
         relay.send(Int32(FRAMES_MAC_INPUT_FOCUS_LOST), 0, at: 0)
         return super.resignFirstResponder()
@@ -424,9 +518,15 @@ final class InputView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        // Leaving the window gives the pointer back and releases input.
+        let weak = WeakInputView()
+        weak.view = self
         NotificationCenter.default.addObserver(
             forName: NSWindow.didResignKeyNotification, object: window, queue: .main
-        ) { [relay] _ in relay.send(Int32(FRAMES_MAC_INPUT_FOCUS_LOST), 0, at: 0) }
+        ) { [relay] _ in
+            MainActor.assumeIsolated { weak.view?.setRelative(false) }
+            relay.send(Int32(FRAMES_MAC_INPUT_FOCUS_LOST), 0, at: 0)
+        }
     }
 
     /// One step of generated input: a circling pointer every step, and a
@@ -448,7 +548,13 @@ final class InputView: NSView {
                 with: type, location: location, modifierFlags: [], timestamp: now, windowNumber: number,
                 context: nil, characters: "a", charactersIgnoringModifiers: "a", isARepeat: false, keyCode: 0)
         }
-        if let event = mouse(.mouseMoved) { mouseMoved(with: event) }
+        if relative {
+            // Generated events carry no deltas: send the motion directly,
+            // 3 right and 1 up per step.
+            motion(dx: 3, dy: -1, at: now)
+        } else if let event = mouse(.mouseMoved) {
+            mouseMoved(with: event)
+        }
         guard step % 125 == 0 else { return }
         if let event = mouse(.leftMouseDown) { mouseDown(with: event) }
         if let event = mouse(.leftMouseUp) { mouseUp(with: event) }
@@ -470,6 +576,12 @@ public func framesMacPresenterSetInput(
 public func framesMacPresenterPostSyntheticInput(_ handle: UnsafeMutableRawPointer?, _ step: UInt64) {
     guard let handle else { return }
     borrowed(handle, as: Presenter.self).postSyntheticInput(step: step)
+}
+
+@_cdecl("frames_mac_presenter_set_relative")
+public func framesMacPresenterSetRelative(_ handle: UnsafeMutableRawPointer?, _ relative: Bool, _ lockPointer: Bool) {
+    guard let handle else { return }
+    borrowed(handle, as: Presenter.self).setRelative(relative, lockPointer: lockPointer)
 }
 
 @_cdecl("frames_mac_presenter_set_cursor")

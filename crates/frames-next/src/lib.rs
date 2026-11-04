@@ -137,6 +137,9 @@ pub struct Options {
     pub receive_dir: Option<std::path::PathBuf>,
     /// Viewer: post generated mouse and key messages to its own window.
     pub synthetic_input: bool,
+    /// Viewer: start in relative mouse mode without locking the pointer
+    /// (unattended tests; users press Control+Option+F11).
+    pub relative_qa: bool,
     /// Host: `nvenc` (direct), or an FFmpeg backend: `amf`, `qsv`, `mf`,
     /// `software`.
     pub encoder: String,
@@ -183,6 +186,7 @@ impl Options {
             get_files: Vec::new(),
             receive_dir: None,
             synthetic_input: false,
+            relative_qa: false,
             encoder: "nvenc".into(),
             config_dir: None,
             approve: None,
@@ -247,6 +251,7 @@ impl Options {
                     }
                 }
                 "--synthetic-input" => o.synthetic_input = true,
+                "--relative-qa" => o.relative_qa = true,
                 "--encoder" => o.encoder = value()?.to_string(),
                 "--config-dir" => o.config_dir = Some(value()?.into()),
                 "--approve" => {

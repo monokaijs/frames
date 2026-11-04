@@ -19,6 +19,22 @@
 //! | 9 | 2 | x |
 //! | 11 | 2 | y |
 //!
+//! # Relative motion datagram (client → host, games)
+//!
+//! While the viewer has relative mouse on ([`Event::Mode`]), motion goes as
+//! [`Motion`] datagrams instead: each carries the running total of motion
+//! since relative mode began, so the host applies the difference from the
+//! last total it saw. A lost or reordered datagram costs no motion, only
+//! the delay until the next one.
+//!
+//! | off | size | field |
+//! |----:|-----:|-------|
+//! | 0 | 1 | [`MOTION_TAG`] |
+//! | 1 | 4 | sequence, increasing; older datagrams are dropped |
+//! | 5 | 4 | client event time, µs (wraps) |
+//! | 9 | 4 | total x motion, i32, wraps |
+//! | 13 | 4 | total y motion (positive is down), i32, wraps |
+//!
 //! # Stream record
 //!
 //! One byte length `n`, then `n` bytes: a kind byte and its fields (see
@@ -32,6 +48,104 @@ pub mod keys;
 /// `VERSION << 4 | kind` (`0x2_`), so the two never collide.
 pub const DATAGRAM_TAG: u8 = 0x01;
 const DATAGRAM_LEN: usize = 13;
+
+/// First byte of a [`Motion`] datagram (0x02 is host audio).
+pub const MOTION_TAG: u8 = 0x03;
+const MOTION_LEN: usize = 17;
+
+/// Relative mouse motion as running totals (see the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Motion {
+    pub seq: u32,
+    pub time_us: u32,
+    pub total_x: i32,
+    pub total_y: i32,
+}
+
+impl Motion {
+    pub fn encode(&self) -> [u8; MOTION_LEN] {
+        let mut out = [0u8; MOTION_LEN];
+        out[0] = MOTION_TAG;
+        out[1..5].copy_from_slice(&self.seq.to_le_bytes());
+        out[5..9].copy_from_slice(&self.time_us.to_le_bytes());
+        out[9..13].copy_from_slice(&self.total_x.to_le_bytes());
+        out[13..17].copy_from_slice(&self.total_y.to_le_bytes());
+        out
+    }
+
+    /// `None` unless `datagram` is exactly a motion datagram.
+    pub fn decode(datagram: &[u8]) -> Option<Self> {
+        if datagram.len() != MOTION_LEN || datagram[0] != MOTION_TAG {
+            return None;
+        }
+        let at = |i: usize| <[u8; 4]>::try_from(&datagram[i..i + 4]).unwrap();
+        Some(Self {
+            seq: u32::from_le_bytes(at(1)),
+            time_us: u32::from_le_bytes(at(5)),
+            total_x: i32::from_le_bytes(at(9)),
+            total_y: i32::from_le_bytes(at(13)),
+        })
+    }
+}
+
+/// Viewer: accumulates motion and numbers the datagrams.
+#[derive(Debug, Default)]
+pub struct MotionSender {
+    seq: u32,
+    total: (i32, i32),
+}
+
+impl MotionSender {
+    /// Relative mode starts again: totals count from zero (the host resets
+    /// its baseline on the same [`Event::Mode`]). Sequence numbers keep
+    /// increasing, so datagrams from an earlier period are dropped.
+    pub fn restart(&mut self) {
+        self.total = (0, 0);
+    }
+
+    pub fn add(&mut self, dx: i32, dy: i32, time_us: u32) -> Motion {
+        self.seq = self.seq.wrapping_add(1);
+        self.total = (self.total.0.wrapping_add(dx), self.total.1.wrapping_add(dy));
+        Motion {
+            seq: self.seq,
+            time_us,
+            total_x: self.total.0,
+            total_y: self.total.1,
+        }
+    }
+}
+
+/// Host: turns motion datagrams back into deltas, applying each bit of
+/// motion once whatever was lost or reordered.
+#[derive(Debug, Default)]
+pub struct MotionReceiver {
+    last_seq: Option<u32>,
+    applied: (i32, i32),
+}
+
+impl MotionReceiver {
+    /// The viewer turned relative mode on: its totals restart from zero.
+    pub fn restart(&mut self) {
+        self.applied = (0, 0);
+    }
+
+    /// The motion not yet applied, or `None` for an old or duplicate datagram.
+    pub fn accept(&mut self, motion: &Motion) -> Option<(i32, i32)> {
+        let newer = self
+            .last_seq
+            .is_none_or(|last| (motion.seq.wrapping_sub(last) as i32) > 0);
+        if !newer {
+            return None;
+        }
+        self.last_seq = Some(motion.seq);
+        let delta = (
+            motion.total_x.wrapping_sub(self.applied.0),
+            motion.total_y.wrapping_sub(self.applied.1),
+        );
+        self.applied = (motion.total_x, motion.total_y);
+        Some(delta)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pointer {
@@ -138,12 +252,16 @@ pub enum Event {
     Key { usage: u16, down: bool },
     /// The viewer lost focus: the host releases every held key and button.
     ReleaseAll,
+    /// Relative mouse (games) turned on or off. While on, motion arrives as
+    /// [`Motion`] datagrams and button presses do not move the pointer.
+    Mode { relative: bool },
 }
 
 const KIND_BUTTON: u8 = 1;
 const KIND_WHEEL: u8 = 2;
 const KIND_KEY: u8 = 3;
 const KIND_RELEASE_ALL: u8 = 4;
+const KIND_MODE: u8 = 5;
 
 impl Event {
     /// Appends the length-prefixed record to `out`.
@@ -167,6 +285,7 @@ impl Event {
                 out.push(u8::from(down));
             }
             Self::ReleaseAll => out.push(KIND_RELEASE_ALL),
+            Self::Mode { relative } => out.extend([KIND_MODE, u8::from(relative)]),
         }
         out[start] = (out.len() - start - 1) as u8;
     }
@@ -223,6 +342,7 @@ fn decode_record(record: &[u8]) -> Option<Event> {
             down: flag(2)?,
         },
         KIND_RELEASE_ALL if body.is_empty() => Event::ReleaseAll,
+        KIND_MODE if body.len() == 1 => Event::Mode { relative: flag(0)? },
         _ => return None,
     };
     Some(event)
@@ -251,7 +371,7 @@ impl Held {
                     self.buttons.push(button);
                 }
             }
-            Event::Wheel { .. } | Event::ReleaseAll => {}
+            Event::Wheel { .. } | Event::ReleaseAll | Event::Mode { .. } => {}
         }
     }
 
@@ -307,6 +427,80 @@ mod tests {
         media[0] = 0x21;
         assert_eq!(Pointer::decode(&media), None);
         assert_eq!(Pointer::decode(&pointer.encode()[..12]), None);
+    }
+
+    #[test]
+    fn motion_datagrams_round_trip_and_stay_apart_from_other_datagrams() {
+        let motion = Motion {
+            seq: 9,
+            time_us: 77,
+            total_x: -5,
+            total_y: i32::MAX,
+        };
+        assert_eq!(Motion::decode(&motion.encode()), Some(motion));
+        assert_eq!(Pointer::decode(&motion.encode()), None);
+        let pointer = Pointer {
+            seq: 1,
+            time_us: 0,
+            x: 0,
+            y: 0,
+        };
+        assert_eq!(Motion::decode(&pointer.encode()), None);
+        assert_eq!(Motion::decode(&motion.encode()[..16]), None);
+    }
+
+    #[test]
+    fn motion_is_applied_once_despite_loss_and_reordering() {
+        let mut sender = MotionSender::default();
+        let mut receiver = MotionReceiver::default();
+        let sent: Vec<Motion> = [(3, 1), (4, -2), (-1, 0), (10, 10), (2, 2)]
+            .iter()
+            .map(|&(dx, dy)| sender.add(dx, dy, 0))
+            .collect();
+        // Lose the second, deliver the fourth before the third, repeat one.
+        let mut applied = (0, 0);
+        for motion in [sent[0], sent[3], sent[2], sent[3], sent[4]] {
+            if let Some((dx, dy)) = receiver.accept(&motion) {
+                applied = (applied.0 + dx, applied.1 + dy);
+            }
+        }
+        assert_eq!(applied, (18, 11), "every bit of motion, once");
+
+        // A new relative period counts from zero on both ends; a straggler
+        // from the old one is dropped by its sequence number.
+        sender.restart();
+        receiver.restart();
+        let straggler = sent[1];
+        let next = sender.add(5, -5, 0);
+        assert_eq!(receiver.accept(&next), Some((5, -5)));
+        assert_eq!(receiver.accept(&straggler), None);
+    }
+
+    #[test]
+    fn motion_totals_wrap() {
+        let mut receiver = MotionReceiver::default();
+        let at = |seq, total_x| Motion {
+            seq,
+            time_us: 0,
+            total_x,
+            total_y: 0,
+        };
+        receiver.accept(&at(1, i32::MAX - 1));
+        assert_eq!(receiver.accept(&at(2, i32::MIN + 2)), Some((4, 0)));
+    }
+
+    #[test]
+    fn mode_records_round_trip() {
+        let mut bytes = Vec::new();
+        Event::Mode { relative: true }.encode(&mut bytes);
+        Event::Mode { relative: false }.encode(&mut bytes);
+        assert_eq!(
+            EventReader::default().push(&bytes),
+            vec![
+                Event::Mode { relative: true },
+                Event::Mode { relative: false }
+            ]
+        );
     }
 
     #[test]

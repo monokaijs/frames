@@ -8,7 +8,7 @@
 
 use crate::{Options, StreamInfo, send_info};
 use anyhow::{Context, Result, bail};
-use frames_input::Pointer;
+use frames_input::{Motion, MotionReceiver, Pointer};
 use frames_media::api::{
     CaptureConfig, CaptureEvent, CaptureSource, EncodeParams, Gop, MediaClock, MediaTransport,
     PathKind, VideoFrame,
@@ -153,6 +153,10 @@ fn stream(
     let frame_interval_us = 1_000_000 / u64::from(o.fps.max(1));
     let mut pending = Some(first);
     let (mut frames, mut pointers) = (0u64, 0u64);
+    // QA runs have no injector: relative motion is summed here instead, so
+    // a run can check that all of it arrived once.
+    let (mut qa_relative, mut qa_motion, mut qa_total) =
+        (false, MotionReceiver::default(), (0i64, 0i64));
     let mut encode_us = Vec::new();
     loop {
         if o.deadline().is_some_and(|d| started.elapsed() >= d) {
@@ -242,11 +246,32 @@ fn stream(
                 if let Some(injector) = &mut injector {
                     injector.pointer(&pointer);
                 }
+            } else if let Some(motion) = Motion::decode(&datagram) {
+                match &mut injector {
+                    Some(injector) => {
+                        injector.motion(&motion);
+                    }
+                    None if qa_relative => {
+                        if let Some((dx, dy)) = qa_motion.accept(&motion) {
+                            qa_total.0 += i64::from(dx);
+                            qa_total.1 += i64::from(dy);
+                        }
+                    }
+                    None => {}
+                }
             } else {
                 host.on_datagram(arrived, &datagram, rtt);
             }
         }
         while let Ok(event) = inputs.try_recv() {
+            if let frames_input::Event::Mode { relative } = event {
+                println!(
+                    "input: relative mouse {}",
+                    if relative { "on" } else { "off" }
+                );
+                qa_relative = relative;
+                qa_motion.restart();
+            }
             if let Some(injector) = &mut injector {
                 injector.event(event);
             }
@@ -287,6 +312,9 @@ fn stream(
             }
             next_report += Duration::from_secs(1);
         }
+    }
+    if injector.is_none() && qa_total != (0, 0) {
+        println!("MOTION total_x={} total_y={}", qa_total.0, qa_total.1);
     }
     if let Some(clipboard) = &clipboard {
         println!(

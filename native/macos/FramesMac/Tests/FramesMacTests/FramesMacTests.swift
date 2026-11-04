@@ -250,4 +250,58 @@ final class FramesMacTests: XCTestCase {
         relay.set(context: nil, callback: nil)
         XCTAssertEqual(box.kinds, [UInt32(FRAMES_MAC_INPUT_FOCUS_LOST), UInt32(FRAMES_MAC_INPUT_KEY)])
     }
+
+    @MainActor
+    func testControlOptionF11TogglesRelativeMouseWithoutSendingTheKey() {
+        final class Box: @unchecked Sendable { var events: [(UInt32, Int32, Int32)] = [] }
+        @MainActor final class FakeLock: PointerLock {
+            var locked = false
+            func lock() -> Bool {
+                locked = true
+                return true
+            }
+            func unlock() { locked = false }
+        }
+        let box = Box()
+        let relay = InputRelay()
+        let callback: FramesMacInputCallback = { context, kind, a, b, _, _, _ in
+            Unmanaged<Box>.fromOpaque(context!).takeUnretainedValue().events.append((kind, a, b))
+        }
+        relay.set(context: Unmanaged.passUnretained(box).toOpaque(), callback: callback)
+        let view = InputView(frame: NSRect(x: 0, y: 0, width: 100, height: 100), relay: relay)
+        let lock = FakeLock()
+        view.pointerLock = lock
+        func key(_ code: UInt16) -> NSEvent {
+            NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [.control, .option], timestamp: 1, windowNumber: 0,
+                context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: code)!
+        }
+        // A mouse event with deltas, built but never posted.
+        func moved(_ dx: Int64, _ dy: Int64) -> NSEvent {
+            let event = CGEvent(
+                mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: .zero, mouseButton: .left)!
+            event.setIntegerValueField(.mouseEventDeltaX, value: dx)
+            event.setIntegerValueField(.mouseEventDeltaY, value: dy)
+            return NSEvent(cgEvent: event)!
+        }
+        view.keyDown(with: key(103))
+        XCTAssertTrue(view.relative)
+        XCTAssertTrue(lock.locked, "the pointer is held while relative")
+        view.mouseMoved(with: moved(5, -3))
+        view.mouseMoved(with: moved(0, 0))
+        view.keyDown(with: key(103))
+        XCTAssertFalse(view.relative)
+        XCTAssertFalse(lock.locked, "given back")
+        view.keyDown(with: key(103))
+        view.keyDown(with: key(111))
+        XCTAssertFalse(lock.locked, "Control+Option+F12 also gives the pointer back")
+        relay.set(context: nil, callback: nil)
+        let mode = UInt32(FRAMES_MAC_INPUT_MODE), motion = UInt32(FRAMES_MAC_INPUT_MOTION)
+        XCTAssertEqual(box.events.map(\.0), [mode, motion, mode, mode, mode, UInt32(FRAMES_MAC_INPUT_FOCUS_LOST)])
+        XCTAssertEqual(box.events[0].1, 1, "on")
+        XCTAssertEqual(box.events[1].1, 5)
+        XCTAssertEqual(box.events[1].2, -3, "up is negative")
+        XCTAssertEqual(box.events[2].1, 0, "off")
+        XCTAssertFalse(box.events.contains { $0.0 == UInt32(FRAMES_MAC_INPUT_KEY) }, "F11 never reaches the host")
+    }
 }

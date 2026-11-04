@@ -11,7 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define FRAMES_MAC_ABI_VERSION 2u
+#define FRAMES_MAC_ABI_VERSION 3u
 
 typedef struct FramesMacCallbacks {
     void *context;
@@ -121,6 +121,8 @@ enum {
     FRAMES_MAC_INPUT_WHEEL = 3,      // a = dx, b = dy, in 1/120 notches, positive = right / up
     FRAMES_MAC_INPUT_KEY = 4,        // a = macOS virtual key code, b = down
     FRAMES_MAC_INPUT_FOCUS_LOST = 5, // the window stopped being key
+    FRAMES_MAC_INPUT_MOTION = 6,     // relative mouse (ABI 3): a = dx, b = dy in points, positive = right / down
+    FRAMES_MAC_INPUT_MODE = 7,       // relative mouse turned on (a = 1) or off (a = 0) (ABI 3)
 };
 typedef void (*FramesMacInputCallback)(void *context, uint32_t kind, int32_t a, int32_t b,
                                        int32_t c, int32_t d, uint64_t event_ns);
@@ -138,6 +140,9 @@ void frames_mac_presenter_set_title(void *presenter, const uint8_t *utf8, size_t
 // Feeds generated mouse, wheel and key events for `step` through the same
 // conversion as real ones (unattended tests). Runs on the main thread.
 void frames_mac_presenter_post_synthetic_input(void *presenter, uint64_t step);
+// Turns relative mouse on or off as Control+Option+F11 does (ABI 3). With
+// `lock_pointer` false the system pointer is left alone (unattended tests).
+void frames_mac_presenter_set_relative(void *presenter, bool relative, bool lock_pointer);
 double frames_mac_presenter_refresh_hz(void *presenter);
 void frames_mac_presenter_free(void *presenter);
 
