@@ -94,10 +94,13 @@ final class Presenter: @unchecked Sendable {
         refreshHz = refresh
     }
 
-    /// Shows the host's cursor over the view (`nil` image hides it).
-    func setCursor(_ image: NSImage?, hotspot: NSPoint, visible: Bool?) {
+    /// Shows the host's cursor over the view: straight-alpha BGRA pixels
+    /// (built into an image on the main thread; images are not Sendable).
+    func setCursor(_ shape: CursorShape?, visible: Bool?) {
         guard let inputView else { return }
-        let apply = { @MainActor in inputView.setHostCursor(image, hotspot: hotspot, visible: visible) }
+        let apply = { @MainActor in
+            inputView.setHostCursor(shape.flatMap(cursorImage), hotspot: shape?.hotspot ?? .zero, visible: visible)
+        }
         if Thread.isMainThread {
             MainActor.assumeIsolated { apply() }
         } else {
@@ -178,6 +181,36 @@ final class Presenter: @unchecked Sendable {
 private final class Retained: @unchecked Sendable {
     let value: AnyObject
     init(_ value: AnyObject) { self.value = value }
+}
+
+/// A cursor as it crosses threads: plain values only.
+struct CursorShape: Sendable {
+    let bgra: Data
+    let width: Int
+    let height: Int
+    let hotspot: NSPoint
+}
+
+@MainActor
+private func cursorImage(_ shape: CursorShape) -> NSImage? {
+    let (w, h) = (shape.width, shape.height)
+    guard
+        let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h, bitsPerSample: 8, samplesPerPixel: 4,
+            hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: w * 4, bitsPerPixel: 32),
+        let pixels = bitmap.bitmapData, shape.bgra.count == w * h * 4
+    else { return nil }
+    shape.bgra.withUnsafeBytes { (bgra: UnsafeRawBufferPointer) in
+        for i in 0..<(w * h) {
+            pixels[i * 4] = bgra[i * 4 + 2]
+            pixels[i * 4 + 1] = bgra[i * 4 + 1]
+            pixels[i * 4 + 2] = bgra[i * 4]
+            pixels[i * 4 + 3] = bgra[i * 4 + 3]
+        }
+    }
+    let image = NSImage(size: NSSize(width: w, height: h))
+    image.addRepresentation(bitmap)
+    return image
 }
 
 final class PresentedTime: @unchecked Sendable {
@@ -428,27 +461,14 @@ public func framesMacPresenterSetCursor(
 ) {
     guard let handle, let bgra, width > 0, height > 0, width <= 256, height <= 256 else { return }
     let (w, h) = (Int(width), Int(height))
-    guard
-        let bitmap = NSBitmapImageRep(
-            bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h, bitsPerSample: 8, samplesPerPixel: 4,
-            hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: w * 4, bitsPerPixel: 32),
-        let pixels = bitmap.bitmapData
-    else { return }
-    // BGRA (straight alpha) to RGBA.
-    for i in 0..<(w * h) {
-        pixels[i * 4] = bgra[i * 4 + 2]
-        pixels[i * 4 + 1] = bgra[i * 4 + 1]
-        pixels[i * 4 + 2] = bgra[i * 4]
-        pixels[i * 4 + 3] = bgra[i * 4 + 3]
-    }
-    let image = NSImage(size: NSSize(width: w, height: h))
-    image.addRepresentation(bitmap)
-    borrowed(handle, as: Presenter.self).setCursor(
-        image, hotspot: NSPoint(x: Int(hotspotX), y: Int(hotspotY)), visible: nil)
+    let shape = CursorShape(
+        bgra: Data(bytes: bgra, count: w * h * 4), width: w, height: h,
+        hotspot: NSPoint(x: Int(hotspotX), y: Int(hotspotY)))
+    borrowed(handle, as: Presenter.self).setCursor(shape, visible: nil)
 }
 
 @_cdecl("frames_mac_presenter_set_cursor_visible")
 public func framesMacPresenterSetCursorVisible(_ handle: UnsafeMutableRawPointer?, _ visible: Bool) {
     guard let handle else { return }
-    borrowed(handle, as: Presenter.self).setCursor(nil, hotspot: .zero, visible: visible)
+    borrowed(handle, as: Presenter.self).setCursor(nil, visible: visible)
 }
