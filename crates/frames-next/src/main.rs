@@ -3,13 +3,16 @@
 //! ```text
 //! frames-next host [--source monitor|qa] [--codec hevc|h264] [--fps 60] [--mbps 30]
 //!                  [--hold N] [--seconds N] [--relay-only]
-//! frames-next connect <endpoint-id> [--vsync] [--seconds N] [--relay-only]
+//! frames-next connect <endpoint-id> [--vsync] [--synthetic-input] [--seconds N] [--relay-only]
 //! ```
 //!
 //! The host prints its endpoint id; the client dials it by id (iroh finds a
 //! direct path or relays). Once a second the client prints delivery,
-//! capture-to-present latency, recovery, and the path. `--source qa` captures
-//! a generated test window instead of the screen.
+//! capture-to-present latency, input-to-wire latency, recovery, and the path.
+//! `--source qa` captures a generated test window instead of the screen, and
+//! input then goes to that window by message instead of `SendInput`.
+//! `--synthetic-input` makes the viewer generate its own mouse and key
+//! messages, for unattended runs.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -57,6 +60,8 @@ pub struct Options {
     pub vsync: bool,
     pub seconds: u64,
     pub relay_only: bool,
+    /// Viewer: post generated mouse and key messages to its own window.
+    pub synthetic_input: bool,
 }
 
 impl Options {
@@ -70,6 +75,7 @@ impl Options {
             vsync: false,
             seconds: 0,
             relay_only: false,
+            synthetic_input: false,
         };
         let mut args = args.iter();
         while let Some(arg) = args.next() {
@@ -93,6 +99,7 @@ impl Options {
                 "--seconds" => o.seconds = value()?.parse()?,
                 "--vsync" => o.vsync = true,
                 "--relay-only" => o.relay_only = true,
+                "--synthetic-input" => o.synthetic_input = true,
                 other => bail!("unknown option {other}"),
             }
         }

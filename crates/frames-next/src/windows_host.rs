@@ -4,6 +4,7 @@ use crate::{Options, StreamInfo, send_info, win};
 use anyhow::{Context, Result, bail};
 use frames_codec::d3d11::nvidia_device;
 use frames_codec::nvenc::NvencEncoder;
+use frames_input::{Event, EventReader, Pointer};
 use frames_media::api::{
     CaptureConfig, CaptureEvent, CaptureSource, EncodeParams, Gop, MediaClock, MediaTransport,
     PathKind, VideoFrame,
@@ -12,13 +13,47 @@ use frames_media::clock::SystemClock;
 use frames_media::host::{HostConfig, HostSession};
 use frames_media::rate::RateConfig;
 use frames_platform_windows::capture::WgcCapture;
+use frames_platform_windows::input::{InputInjector, InputTarget};
 use frames_platform_windows::system::{GpuClockHold, Mmcss, TimerResolution, raise_gpu_priority};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || stream(&handle, &session, &o)).await?
+    // The viewer's reliable input stream, decoded here and applied on the
+    // streaming thread with the pointer datagrams.
+    let (events_tx, events_rx) = std::sync::mpsc::channel::<Event>();
+    let reader = {
+        let session = session.clone();
+        tokio::spawn(async move {
+            let Ok((_send, mut recv)) = session.accept_channel().await else {
+                return;
+            };
+            let mut decoder = EventReader::default();
+            let mut buffer = [0u8; 1024];
+            while let Ok(Some(n)) = recv.read(&mut buffer).await {
+                for event in decoder.push(&buffer[..n]) {
+                    if events_tx.send(event).is_err() {
+                        return;
+                    }
+                }
+            }
+        })
+    };
+    let result =
+        tokio::task::spawn_blocking(move || stream(&handle, &session, &o, events_rx)).await?;
+    reader.abort();
+    result
+}
+
+fn primary_monitor_rect() -> windows::Win32::Foundation::RECT {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    windows::Win32::Foundation::RECT {
+        left: 0,
+        top: 0,
+        right: unsafe { GetSystemMetrics(SM_CXSCREEN) },
+        bottom: unsafe { GetSystemMetrics(SM_CYSCREEN) },
+    }
 }
 
 fn first_frame(capture: &mut WgcCapture, clock: &SystemClock) -> Result<VideoFrame> {
@@ -39,6 +74,7 @@ fn stream(
     handle: &tokio::runtime::Handle,
     session: &frames_net::Session,
     o: &Options,
+    events: std::sync::mpsc::Receiver<Event>,
 ) -> Result<()> {
     win::dpi_aware();
     let _mmcss = Mmcss::games();
@@ -63,6 +99,10 @@ fn stream(
         Some(source) => WgcCapture::window(source.hwnd(), &device, shared.clone())?,
         None => WgcCapture::primary_monitor(&device, shared.clone())?,
     };
+    let mut injector = InputInjector::new(match &qa {
+        Some(source) => InputTarget::Window(source.hwnd()),
+        None => InputTarget::Desktop(primary_monitor_rect()),
+    });
     capture.configure(CaptureConfig {
         fps: o.fps,
         separate_cursor: true,
@@ -154,7 +194,15 @@ fn stream(
         }
         let rtt = path.rtt_us;
         while let Some(datagram) = media.try_recv() {
-            host.on_datagram(clock.now_us(), &datagram, rtt);
+            match Pointer::decode(&datagram) {
+                Some(pointer) => {
+                    injector.pointer(&pointer);
+                }
+                None => host.on_datagram(clock.now_us(), &datagram, rtt),
+            }
+        }
+        while let Ok(event) = events.try_recv() {
+            injector.event(event);
         }
         if started.elapsed() >= next_report {
             let stats = host.stats();
@@ -170,9 +218,24 @@ fn stream(
                 path.rtt_us as f64 / 1e3,
             );
             encode_us.clear();
+            if qa.is_some() {
+                let counts = &win::QA_INPUT;
+                let load =
+                    |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+                println!(
+                    "host input: applied {} | QA window received moves {} buttons {} wheels {} keys {}",
+                    injector.applied,
+                    load(&counts.moves),
+                    load(&counts.buttons),
+                    load(&counts.wheels),
+                    load(&counts.keys),
+                );
+            }
             next_report += Duration::from_secs(1);
         }
     }
+    injector.release_all();
+    win::pump();
     session.close("host stopped");
     Ok(())
 }

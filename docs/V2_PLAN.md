@@ -293,6 +293,8 @@ Host pipeline: capture → encode (slices) → packetize/FEC → pacer. Client p
 
 Over real QUIC (`crates/frames-next`, host and viewer as two processes on the PC, iroh direct path, 1080p60 HEVC QA window, 20 s): capture → present p50 4.90 ms, p95 6.96 ms, p99 52 ms (one 130 ms stall at t=3 s, under investigation), 0 lost of 1,186, 1 keyframe.
 
+Input lane (`crates/frames-input`, `frames-platform-windows::input`, viewer and host in `frames-next`): pointer positions as datagrams (newest wins), buttons, wheel and keys (USB HID usages) on a reliable stream, release-all on focus loss or exit. With generated mouse and key messages: input to wire p50 8 µs, p95 20 µs from the viewer's window procedure (gate: p95 ≤ 1 ms), every click, wheel step and key delivered to the host's QA window, video unaffected (p50 3.93 ms, p95 5.86 ms).
+
 "Presented" is when `Present` returns, not photons. The clock hold is a dummy GPU load (about 140 W extra) and must be replaced by a per-application driver profile applied only during a session. Still open: the macOS half (`frames-platform-macos`, on a branch), AMF/QSV through FFmpeg, Desktop Duplication, the input lane and client model, and running this path inside the app over real QUIC.
 
 **Windows** (`frames-platform-windows`, `frames-codec`):

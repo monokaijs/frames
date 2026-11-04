@@ -1,0 +1,10 @@
+[package]
+name = "frames-input"
+description = "Frames v2 input service: event types and their wire format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Layering (scripts/check_layers.py): no Frames dependencies, no C toolchain.
+[dependencies]

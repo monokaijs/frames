@@ -22,13 +22,14 @@ ALLOWED = {
     "frames-media": {"frames-proto"},
     "frames-testkit": {"frames-media", "frames-proto"},
     "frames-net": {"frames-media", "frames-proto"},
+    "frames-input": set(),
     # The v2 application: every v2 crate. frames-core only through
     # frames-codec's FFmpeg runtime, until the v2 cutover moves it.
-    "frames-next": {"frames-media", "frames-proto", "frames-net", "frames-codec", "frames-platform-windows", "frames-core"},
+    "frames-next": {"frames-media", "frames-proto", "frames-net", "frames-codec", "frames-platform-windows", "frames-input", "frames-core"},
     # Backends. frames-core is allowed only until the v2 cutover moves its
     # FFmpeg runtime into frames-codec.
     "frames-codec": {"frames-media", "frames-proto", "frames-core"},
-    "frames-platform-windows": {"frames-media", "frames-proto", "frames-codec", "frames-core"},
+    "frames-platform-windows": {"frames-media", "frames-proto", "frames-codec", "frames-input", "frames-core"},
 }
 # Backend crates wrap native SDKs and may need a C toolchain; the engine
 # crates above them may not.

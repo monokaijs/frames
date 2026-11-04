@@ -2280,6 +2280,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "frames-input"
+version = "0.3.3"
+
+[[package]]
 name = "frames-media"
 version = "0.3.3"
 dependencies = [
@@ -2340,7 +2344,9 @@ name = "frames-next"
 version = "0.3.3"
 dependencies = [
  "anyhow",
+ "bytes",
  "frames-codec",
+ "frames-input",
  "frames-media",
  "frames-net",
  "frames-platform-windows",
@@ -2358,6 +2364,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "frames-codec",
+ "frames-input",
  "frames-media",
  "frames-testkit",
  "tracing",

@@ -11,6 +11,8 @@ publish = false
 # v2 crate. It never depends on the v1 crates directly.
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
+frames-input = { path = "../frames-input" }
 frames-media = { path = "../frames-media" }
 frames-net = { path = "../frames-net" }
 iroh = "=1.4.1"

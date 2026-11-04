@@ -15,6 +15,7 @@ frames-media = { path = "../frames-media" }
 anyhow.workspace = true
 bytes.workspace = true
 frames-codec = { path = "../frames-codec", default-features = false }
+frames-input = { path = "../frames-input" }
 tracing.workspace = true
 windows.workspace = true
 

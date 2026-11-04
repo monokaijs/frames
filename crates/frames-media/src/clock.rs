@@ -1,9 +1,17 @@
 //! Real-time [`MediaClock`] for running the engine on real transports.
 
 use crate::api::MediaClock;
+use std::sync::OnceLock;
 use std::time::Instant;
 
-/// Microseconds since the clock was created.
+fn process_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// Monotonic microseconds since the first clock in this process. Every
+/// instance shares that epoch, so timestamps taken by different pipeline
+/// stages and threads compare directly.
 #[derive(Clone, Copy, Debug)]
 pub struct SystemClock {
     epoch: Instant,
@@ -12,7 +20,7 @@ pub struct SystemClock {
 impl SystemClock {
     pub fn new() -> Self {
         Self {
-            epoch: Instant::now(),
+            epoch: process_epoch(),
         }
     }
 }
@@ -39,6 +47,15 @@ impl MediaClock for SystemClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instances_share_one_epoch() {
+        let a = SystemClock::new();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = SystemClock::new();
+        let (ta, tb) = (a.now_us(), b.now_us());
+        assert!(tb >= ta && tb - ta < 1_000, "{ta} {tb}");
+    }
 
     #[test]
     fn advances_monotonically() {

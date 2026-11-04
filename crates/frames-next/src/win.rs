@@ -1,8 +1,12 @@
 //! Win32 windows for the host's QA source and the client's viewer.
 
 use anyhow::Result;
+use frames_input::{Button, Event, keys, normalize};
+use frames_media::api::MediaClock;
+use frames_media::clock::SystemClock;
+use std::cell::RefCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -27,7 +31,7 @@ pub fn close_requested() -> bool {
     CLOSED.load(Ordering::Relaxed) > 0
 }
 
-unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     if message == WM_CLOSE {
         CLOSED.fetch_add(1, Ordering::Relaxed);
         return LRESULT(0);
@@ -35,13 +39,163 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
     unsafe { DefWindowProcW(hwnd, message, w, l) }
 }
 
+/// Input the viewer window received, stamped with the engine clock when its
+/// message was handled.
+#[derive(Clone, Copy, Debug)]
+pub enum Captured {
+    Move { x: u16, y: u16, at_us: u64 },
+    Event { event: Event, at_us: u64 },
+}
+
+thread_local! {
+    static CAPTURED: RefCell<Vec<Captured>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Input captured since the last call (viewer thread only).
+pub fn take_input() -> Vec<Captured> {
+    CAPTURED.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+fn client_extent(hwnd: HWND) -> (u32, u32) {
+    let mut rect = RECT::default();
+    let _ = unsafe { GetClientRect(hwnd, &mut rect) };
+    (
+        (rect.right - rect.left).max(1) as u32,
+        (rect.bottom - rect.top).max(1) as u32,
+    )
+}
+
+fn position(hwnd: HWND, l: LPARAM) -> (u16, u16) {
+    let (width, height) = client_extent(hwnd);
+    let x = (l.0 & 0xffff) as i16 as i32;
+    let y = ((l.0 >> 16) & 0xffff) as i16 as i32;
+    (normalize(x, width), normalize(y, height))
+}
+
+fn viewer_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<Captured> {
+    let at_us = SystemClock::new().now_us();
+    let button = |button, down| {
+        let (x, y) = position(hwnd, l);
+        Some(Captured::Event {
+            event: Event::Button { button, down, x, y },
+            at_us,
+        })
+    };
+    let xbutton = |down| {
+        let which = if (w.0 >> 16) & 0xffff == 2 {
+            Button::Forward
+        } else {
+            Button::Back
+        };
+        button(which, down)
+    };
+    match message {
+        WM_MOUSEMOVE => {
+            let (x, y) = position(hwnd, l);
+            Some(Captured::Move { x, y, at_us })
+        }
+        WM_LBUTTONDOWN => button(Button::Left, true),
+        WM_LBUTTONUP => button(Button::Left, false),
+        WM_RBUTTONDOWN => button(Button::Right, true),
+        WM_RBUTTONUP => button(Button::Right, false),
+        WM_MBUTTONDOWN => button(Button::Middle, true),
+        WM_MBUTTONUP => button(Button::Middle, false),
+        WM_XBUTTONDOWN => xbutton(true),
+        WM_XBUTTONUP => xbutton(false),
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            let delta = ((w.0 >> 16) & 0xffff) as u16 as i16;
+            let (dx, dy) = if message == WM_MOUSEWHEEL {
+                (0, delta)
+            } else {
+                (delta, 0)
+            };
+            Some(Captured::Event {
+                event: Event::Wheel { dx, dy },
+                at_us,
+            })
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
+            let code = ((l.0 >> 16) & 0xff) as u16;
+            let extended = (l.0 >> 24) & 1 == 1;
+            let scan = if extended { 0xe000 | code } else { code };
+            let usage = keys::scan_to_usage(scan)?;
+            let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+            Some(Captured::Event {
+                event: Event::Key { usage, down },
+                at_us,
+            })
+        }
+        WM_KILLFOCUS => Some(Captured::Event {
+            event: Event::ReleaseAll,
+            at_us,
+        }),
+        _ => None,
+    }
+}
+
+unsafe extern "system" fn viewer_procedure(
+    hwnd: HWND,
+    message: u32,
+    w: WPARAM,
+    l: LPARAM,
+) -> LRESULT {
+    if let Some(captured) = viewer_input(hwnd, message, w, l) {
+        CAPTURED.with(|c| c.borrow_mut().push(captured));
+        // Keys go to the host only; F10/Alt must not open the system menu.
+        if matches!(message, WM_SYSKEYDOWN | WM_SYSKEYUP) {
+            return LRESULT(0);
+        }
+    }
+    procedure(hwnd, message, w, l)
+}
+
+/// Messages the QA source window received from the host's input injector.
+pub struct QaInputCounts {
+    pub moves: AtomicU64,
+    pub buttons: AtomicU64,
+    pub wheels: AtomicU64,
+    pub keys: AtomicU64,
+}
+
+pub static QA_INPUT: QaInputCounts = QaInputCounts {
+    moves: AtomicU64::new(0),
+    buttons: AtomicU64::new(0),
+    wheels: AtomicU64::new(0),
+    keys: AtomicU64::new(0),
+};
+
+unsafe extern "system" fn qa_procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    let counter = match message {
+        WM_MOUSEMOVE => Some(&QA_INPUT.moves),
+        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
+        | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => Some(&QA_INPUT.buttons),
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => Some(&QA_INPUT.wheels),
+        WM_KEYDOWN | WM_KEYUP => Some(&QA_INPUT.keys),
+        _ => None,
+    };
+    if let Some(counter) = counter {
+        counter.fetch_add(1, Ordering::Relaxed);
+        return LRESULT(0);
+    }
+    procedure(hwnd, message, w, l)
+}
+
+#[derive(Clone, Copy)]
+pub enum Kind {
+    Viewer,
+    QaSource,
+}
+
 /// A top-level window with a client area of `width` x `height`.
-pub fn window(title: PCWSTR, x: i32, width: u32, height: u32) -> Result<HWND> {
+pub fn window(title: PCWSTR, kind: Kind, x: i32, width: u32, height: u32) -> Result<HWND> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
-        let class = w!("FramesNext");
+        let (class, handler): (PCWSTR, WNDPROC) = match kind {
+            Kind::Viewer => (w!("FramesNextViewer"), Some(viewer_procedure)),
+            Kind::QaSource => (w!("FramesNextQa"), Some(qa_procedure)),
+        };
         let wc = WNDCLASSW {
-            lpfnWndProc: Some(procedure),
+            lpfnWndProc: handler,
             hInstance: instance.into(),
             lpszClassName: class,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
@@ -93,7 +247,7 @@ pub struct QaSource {
 
 impl QaSource {
     pub fn start(width: u32, height: u32, fps: u32) -> Result<Self> {
-        let hwnd = window(w!("Frames QA source"), 0, width, height)?;
+        let hwnd = window(w!("Frames QA source"), Kind::QaSource, 0, width, height)?;
         pump();
         paint(hwnd, 0, width, height);
         let running = Arc::new(AtomicBool::new(true));

@@ -3,7 +3,9 @@
 use crate::stats::Samples;
 use crate::{Options, receive_info, win};
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use frames_codec::ffmpeg::FfmpegDecoder;
+use frames_input::{Event, Pointer};
 use frames_media::api::{MediaClock, MediaTransport, PresentMode, Presenter};
 use frames_media::client::{ClientConfig, ClientSession};
 use frames_media::clock::SystemClock;
@@ -21,10 +23,70 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
         "stream: {:?} {}x{} at {} fps",
         info.codec, info.width, info.height, info.fps
     );
-    tokio::task::spawn_blocking(move || view(&session, info, &o)).await?
+    // Buttons, keys, and wheel: one reliable stream, written by this task.
+    let (mut input_stream, _) = session.open_channel().await?;
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let writer = tokio::spawn(async move {
+        while let Some(bytes) = input_rx.recv().await {
+            if input_stream.write_all(&bytes).await.is_err() {
+                break;
+            }
+        }
+        let _ = input_stream.finish();
+    });
+    let result = tokio::task::spawn_blocking(move || view(&session, info, &o, input_tx)).await?;
+    let _ = writer.await;
+    result
 }
 
-fn view(session: &frames_net::Session, info: crate::StreamInfo, o: &Options) -> Result<()> {
+/// Generated mouse and key messages for unattended runs: a circling pointer
+/// at 125 Hz, and a click, a wheel notch, and an "A" key press each second.
+struct SyntheticInput {
+    hwnd: windows::Win32::Foundation::HWND,
+    started: Instant,
+    moves: u64,
+    seconds: u64,
+}
+
+impl SyntheticInput {
+    fn post(&self, message: u32, wparam: usize, lparam: isize) {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+        let _ = unsafe { PostMessageW(Some(self.hwnd), message, WPARAM(wparam), LPARAM(lparam)) };
+    }
+
+    fn tick(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let elapsed = self.started.elapsed();
+        let due_moves = elapsed.as_millis() as u64 / 8;
+        if due_moves > self.moves {
+            self.moves = due_moves;
+            let angle = self.moves as f64 * 0.05;
+            let (x, y) = (
+                (240.0 + 160.0 * angle.cos()) as i32,
+                (135.0 + 90.0 * angle.sin()) as i32,
+            );
+            self.post(WM_MOUSEMOVE, 0, ((y as isize) << 16) | x as isize);
+        }
+        if elapsed.as_secs() > self.seconds {
+            self.seconds = elapsed.as_secs();
+            let at = (135isize << 16) | 240;
+            self.post(WM_LBUTTONDOWN, 1, at);
+            self.post(WM_LBUTTONUP, 0, at);
+            self.post(WM_MOUSEWHEEL, (120usize) << 16, at);
+            // Scan code 0x1e ("A") in bits 16-23.
+            self.post(WM_KEYDOWN, 0x41, 1 | (0x1e << 16));
+            self.post(WM_KEYUP, 0x41, 1 | (0x1e << 16) | (3 << 30));
+        }
+    }
+}
+
+fn view(
+    session: &frames_net::Session,
+    info: crate::StreamInfo,
+    o: &Options,
+    input_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+) -> Result<()> {
     win::dpi_aware();
     let _mmcss = Mmcss::games();
     let _timer = TimerResolution::one_millisecond();
@@ -33,6 +95,7 @@ fn view(session: &frames_net::Session, info: crate::StreamInfo, o: &Options) -> 
     // Half size keeps the viewer beside the source on one screen.
     let viewer = win::window(
         w!("Frames Next"),
+        win::Kind::Viewer,
         200,
         (info.width / 2).max(320),
         (info.height / 2).max(180),
@@ -51,6 +114,15 @@ fn view(session: &frames_net::Session, info: crate::StreamInfo, o: &Options) -> 
     };
 
     let started = Instant::now();
+    let mut synthetic = o.synthetic_input.then_some(SyntheticInput {
+        hwnd: viewer,
+        started,
+        moves: 0,
+        seconds: 0,
+    });
+    let mut pointer_seq = 0u32;
+    let mut input_wire = Samples::new(0);
+    let (mut sent_moves, mut sent_events) = (0u64, 0u64);
     let mut next_report = Duration::from_secs(1);
     let mut latency = Samples::new(30);
     let mut presented = 0u64;
@@ -64,7 +136,18 @@ fn view(session: &frames_net::Session, info: crate::StreamInfo, o: &Options) -> 
             println!("the host left");
             break;
         }
+        if let Some(synthetic) = &mut synthetic {
+            synthetic.tick();
+        }
         win::pump();
+        send_input(
+            &media,
+            &input_tx,
+            &clock,
+            &mut pointer_seq,
+            &mut input_wire,
+            (&mut sent_moves, &mut sent_events),
+        );
         let path = media.path();
         client.set_rtt(path.rtt_us);
         while let Some(datagram) = media.try_recv() {
@@ -102,10 +185,29 @@ fn view(session: &frames_net::Session, info: crate::StreamInfo, o: &Options) -> 
                 path.rtt_us as f64 / 1e3,
             );
             reported_clean = stats.frames_clean;
+            let (inputs, input_p50, input_p95) = input_wire.take_window();
+            if inputs > 0 {
+                println!(
+                    "client input: {inputs} sent, input to wire p50 {:.0} p95 {:.0} µs",
+                    input_p50 * 1e3,
+                    input_p95 * 1e3
+                );
+            }
             next_report += Duration::from_secs(1);
         }
         std::thread::sleep(Duration::from_micros(200));
     }
+    let _ = input_tx.send({
+        let mut release = Vec::new();
+        Event::ReleaseAll.encode(&mut release);
+        release
+    });
+    let (inputs, input_p50, input_p95, _) = input_wire.summary();
+    println!(
+        "INPUT moves={sent_moves} events={sent_events} measured={inputs} input_to_wire p50={:.0} p95={:.0} us",
+        input_p50 * 1e3,
+        input_p95 * 1e3
+    );
     let stats = client.stats();
     let (n, p50, p95, p99) = latency.summary();
     println!(
@@ -114,4 +216,55 @@ fn view(session: &frames_net::Session, info: crate::StreamInfo, o: &Options) -> 
     );
     session.close("viewer closed");
     Ok(())
+}
+
+/// Sends what the viewer window captured: the newest pointer position as one
+/// datagram, everything else on the reliable stream, in order.
+fn send_input(
+    media: &frames_net::MediaChannel,
+    input_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    clock: &SystemClock,
+    pointer_seq: &mut u32,
+    input_wire: &mut Samples,
+    (sent_moves, sent_events): (&mut u64, &mut u64),
+) {
+    let captured = win::take_input();
+    if captured.is_empty() {
+        return;
+    }
+    let mut latest = None;
+    let mut records = Vec::new();
+    let mut stamps = Vec::new();
+    for item in captured {
+        match item {
+            win::Captured::Move { x, y, at_us } => latest = Some((x, y, at_us)),
+            win::Captured::Event { event, at_us } => {
+                event.encode(&mut records);
+                stamps.push(at_us);
+                *sent_events += 1;
+            }
+        }
+    }
+    if !records.is_empty() && input_tx.send(records).is_ok() {
+        let now = clock.now_us();
+        for at in stamps {
+            input_wire.push(now.saturating_sub(at));
+        }
+    }
+    if let Some((x, y, at_us)) = latest {
+        *pointer_seq = pointer_seq.wrapping_add(1);
+        let pointer = Pointer {
+            seq: *pointer_seq,
+            time_us: at_us as u32,
+            x,
+            y,
+        };
+        if media
+            .try_send(Bytes::copy_from_slice(&pointer.encode()))
+            .is_ok()
+        {
+            input_wire.push(clock.now_us().saturating_sub(at_us));
+            *sent_moves += 1;
+        }
+    }
 }
