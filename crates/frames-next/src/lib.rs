@@ -249,11 +249,12 @@ impl Options {
                 "--encoder" => o.encoder = value()?.to_string(),
                 "--config-dir" => o.config_dir = Some(value()?.into()),
                 "--approve" => {
-                    o.approve = Some(match value()? {
-                        "view" => admit::Approve::View,
-                        "control" => admit::Approve::Control,
-                        other => bail!("--approve takes view or control, not {other}"),
-                    })
+                    let text = value()?;
+                    o.approve = Some(admit::Approve::parse(text).with_context(|| {
+                        format!(
+                            "--approve takes view, control, view-once or control-once, not {text}"
+                        )
+                    })?)
                 }
                 other => bail!("unknown option {other}"),
             }
@@ -679,7 +680,7 @@ async fn run(args: Vec<String>) -> Result<()> {
             connect(id, Options::parse(&args[2..])?).await
         }
         _ => bail!(
-            "usage: frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software] [--fps N] [--mbps N] [--hold N] [--seconds N] [--approve view|control] [--config-dir DIR] [--relay URL] [--relay-only] [--receive-dir DIR] [--clipboard on|off|qa] [--audio on|off|qa]\n       frames-next connect <endpoint-id> [--vsync] [--seconds N]"
+            "usage: frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software] [--fps N] [--mbps N] [--hold N] [--seconds N] [--approve view|control[-once]] [--config-dir DIR] [--relay URL] [--relay-only] [--receive-dir DIR] [--clipboard on|off|qa] [--audio on|off|qa]\n       frames-next connect <endpoint-id> [--vsync] [--seconds N]"
         ),
     }
 }

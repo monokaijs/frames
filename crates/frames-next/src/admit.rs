@@ -34,10 +34,38 @@ pub fn device_key(config: &std::path::Path) -> Result<frames_net::DeviceKey> {
     frames_net::DeviceKey::load_or_create(&config.join("device-v2.key"))
 }
 
+/// What the person at the host allowed a new device to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Approve {
-    View,
-    Control,
+pub struct Approve {
+    pub control: bool,
+    /// Saved to the trust list; otherwise this session only, and the device
+    /// is asked about again next time.
+    pub remember: bool,
+}
+
+impl Approve {
+    /// `view`, `control`, or either with `-once` (this session only).
+    pub fn parse(text: &str) -> Option<Self> {
+        let (kind, remember) = match text.strip_suffix("-once") {
+            Some(kind) => (kind, false),
+            None => (text, true),
+        };
+        let control = match kind {
+            "view" => false,
+            "control" => true,
+            _ => return None,
+        };
+        Some(Self { control, remember })
+    }
+
+    fn describe(self) -> &'static str {
+        match (self.control, self.remember) {
+            (false, true) => "view only",
+            (true, true) => "view and control",
+            (false, false) => "view only, this session only",
+            (true, false) => "view and control, this session only",
+        }
+    }
 }
 
 /// The viewer's first stream: an optional proof that it is a device this
@@ -230,7 +258,10 @@ async fn admit_device(
     );
     let choice = match preset {
         Some(choice) => {
-            println!("approved by --approve {choice:?} (unattended test runs only)");
+            println!(
+                "approved by --approve: {} (unattended test runs only)",
+                choice.describe()
+            );
             Some(choice)
         }
         None if std::io::stdin().is_terminal() => ask().await,
@@ -242,7 +273,11 @@ async fn admit_device(
     let Some(choice) = choice else {
         return Ok(None);
     };
-    let control = choice == Approve::Control;
+    let control = choice.control;
+    if !choice.remember {
+        println!("not saved: this device will be asked about again next time");
+        return Ok(Some(control));
+    }
     list.insert(
         &device,
         TrustedDevice {
@@ -257,17 +292,15 @@ async fn admit_device(
 }
 
 async fn ask() -> Option<Approve> {
-    println!("Allow it? [v] view only  [c] view and control  [anything else] refuse (60 s)");
+    println!(
+        "Allow it? [v] view only  [c] view and control  (vo, co: this session only, not remembered)  [anything else] refuse (60 s)"
+    );
     let line = tokio::task::spawn_blocking(|| {
         let mut line = String::new();
         std::io::stdin().read_line(&mut line).map(|_| line)
     });
     match tokio::time::timeout(Duration::from_secs(60), line).await {
-        Ok(Ok(Ok(line))) => match line.trim() {
-            "v" | "V" => Some(Approve::View),
-            "c" | "C" => Some(Approve::Control),
-            _ => None,
-        },
+        Ok(Ok(Ok(line))) => answer(&line),
         _ => {
             println!("no answer: refused");
             None
@@ -275,6 +308,41 @@ async fn ask() -> Option<Approve> {
     }
 }
 
+/// The host's typed answer: `v`/`c`, or `vo`/`co` for this session only.
+fn answer(line: &str) -> Option<Approve> {
+    let line = line.trim().to_ascii_lowercase();
+    let (kind, remember) = match line.strip_suffix('o') {
+        Some(kind) => (kind, false),
+        None => (line.as_str(), true),
+    };
+    let control = match kind {
+        "v" => false,
+        "c" => true,
+        _ => return None,
+    };
+    Some(Approve { control, remember })
+}
+
 fn short(device: &iroh::EndpointId) -> String {
     device.to_string()[..8].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_answers() {
+        let a = |control, remember| Some(Approve { control, remember });
+        assert_eq!(answer("v\n"), a(false, true));
+        assert_eq!(answer(" C "), a(true, true));
+        assert_eq!(answer("vo"), a(false, false));
+        assert_eq!(answer("CO\r\n"), a(true, false));
+        for refused in ["", "o", "yes", "x", "voo", "cv"] {
+            assert_eq!(answer(refused), None, "{refused:?}");
+        }
+        assert_eq!(Approve::parse("control-once"), a(true, false));
+        assert_eq!(Approve::parse("view"), a(false, true));
+        assert_eq!(Approve::parse("once"), None);
+    }
 }
