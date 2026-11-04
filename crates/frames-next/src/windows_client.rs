@@ -144,6 +144,16 @@ fn view(
         PresentMode::Immediate
     };
 
+    // Media sent while the window and decoder were being created is stale:
+    // drop it and let the engine recover from the newest frames instead of
+    // presenting a second-old backlog.
+    let mut stale = 0;
+    while media.try_recv().is_some() {
+        stale += 1;
+    }
+    if stale > 0 {
+        println!("dropped {stale} datagrams queued during start-up");
+    }
     let started = Instant::now();
     let mut synthetic = o.synthetic_input.then_some(SyntheticInput {
         hwnd: viewer,

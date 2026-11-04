@@ -26,7 +26,7 @@ ALLOWED = {
     "frames-platform-macos": {"frames-media", "frames-proto"},
     # The v2 application: every v2 crate. frames-core only through
     # frames-codec's FFmpeg runtime, until the v2 cutover moves it.
-    "frames-next": {"frames-media", "frames-proto", "frames-net", "frames-codec", "frames-platform-windows", "frames-input", "frames-core"},
+    "frames-next": {"frames-media", "frames-proto", "frames-net", "frames-codec", "frames-platform-windows", "frames-platform-macos", "frames-input", "frames-core"},
     # Backends. frames-core is allowed only until the v2 cutover moves its
     # FFmpeg runtime into frames-codec.
     "frames-codec": {"frames-media", "frames-proto", "frames-core"},

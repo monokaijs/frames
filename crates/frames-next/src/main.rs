@@ -19,6 +19,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
+mod mac_client;
 mod stats;
 #[cfg(windows)]
 mod win;
@@ -168,9 +170,14 @@ async fn run_client(session: frames_net::Session, o: Options) -> Result<()> {
     windows_client::run(session, o).await
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+async fn run_client(session: frames_net::Session, o: Options) -> Result<()> {
+    mac_client::run(session, o).await
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 async fn run_client(_: frames_net::Session, _: Options) -> Result<()> {
-    bail!("viewing needs the Windows backends (the macOS backends are not wired in yet)")
+    bail!("viewing needs the Windows or macOS backends")
 }
 
 /// Writes one JSON line on a fresh channel.
@@ -189,9 +196,28 @@ pub async fn receive_info(session: &frames_net::Session) -> Result<StreamInfo> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    #[cfg(target_os = "macos")]
+    {
+        // AppKit (the viewer window) needs the main thread: run the session on
+        // a worker and NSApplication here until the session ends.
+        let worker = std::thread::spawn(move || {
+            let result = runtime.block_on(run(args));
+            frames_platform_macos::system::stop_app();
+            result
+        });
+        frames_platform_macos::system::run_app(0.0);
+        worker.join().expect("session thread")
+    }
+    #[cfg(not(target_os = "macos"))]
+    runtime.block_on(run(args))
+}
+
+async fn run(args: Vec<String>) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("host") => host(Options::parse(&args[1..])?).await,
         Some("connect") => {

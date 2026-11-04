@@ -299,6 +299,8 @@ FFmpeg encoders (`frames-codec::ffmpeg::FfmpegEncoder`) for GPUs NVENC direct do
 
 **macOS half** (`crates/frames-platform-macos`, SwiftPM package `native/macos/FramesMac` linked into the Rust binary, versioned C ABI with an injected callback table, no helper process): ScreenCaptureKit capture with the cursor separate, VideoToolbox encode with acknowledged long-term references and decode, Metal presenter with on-glass timestamps. `examples/mac_pipeline` on an M2 Pro (generated 1080p60 → VideoToolbox → v2 engine over a simulated LAN → VideoToolbox → Metal window): H.264 capture → present p50 10.96 ms, p95 11.63 ms; HEVC p50 12.54 ms, p95 18.53 ms, recovering from a 300 ms outage through a long-term reference with no keyframe. Encode (8-9 ms) dominates; VideoToolbox has no slice output.
 
+Across machines (`frames-next`, PC host with NVENC H.264 on a QA window → MacBook viewer with VideoToolbox and Metal, iroh direct path on the LAN, RTT about 1 ms): capture → present p50 11.66 ms, p95 18.30 ms, p99 24.15 ms over 20 s, one frame lost, one keyframe. Viewers drop media that queued while their window and decoder started (497 datagrams on the Mac), which had made the first seconds 0.4-0.8 s late. The Mac viewer is view-only so far (no input lane or host cursor yet).
+
 "Presented" is when `Present` returns, not photons. The clock hold is a dummy GPU load (about 140 W extra) and must be replaced by a per-application driver profile applied only during a session. Still open: the macOS half (`frames-platform-macos`, on a branch), AMF/QSV through FFmpeg, Desktop Duplication, the input lane and client model, and running this path inside the app over real QUIC.
 
 **Windows** (`frames-platform-windows`, `frames-codec`):

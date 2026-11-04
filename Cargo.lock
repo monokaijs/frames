@@ -2350,6 +2350,7 @@ dependencies = [
  "frames-input",
  "frames-media",
  "frames-net",
+ "frames-platform-macos",
  "frames-platform-windows",
  "iroh",
  "serde",
