@@ -202,9 +202,16 @@ fn stream(
     let mut config = HostConfig::new(1, 1, rate);
     config.max_datagram = media.path().max_datagram.min(1200);
     let mut host = HostSession::new(config);
+    // n0's public relays deliver about 8-10 Mbps; self-hosted ones are
+    // sized by whoever runs them, so only the public ones are capped.
+    let relay_max_bps = if o.relays.is_empty() {
+        frames_net::N0_RELAY_MAX_BPS
+    } else {
+        rate.max_bps
+    };
     let mut path_kind = media.path().kind;
     if path_kind == PathKind::Relay {
-        host.set_max_bps(frames_net::N0_RELAY_MAX_BPS);
+        host.set_max_bps(relay_max_bps);
     }
 
     let started = Instant::now();
@@ -226,7 +233,7 @@ fn stream(
             path_kind = path.kind;
             host.path_changed();
             host.set_max_bps(match path.kind {
-                PathKind::Relay => frames_net::N0_RELAY_MAX_BPS,
+                PathKind::Relay => relay_max_bps,
                 PathKind::Direct => rate.max_bps,
             });
             println!("path changed to {path_kind:?}");

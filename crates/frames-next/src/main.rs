@@ -72,6 +72,8 @@ pub struct Options {
     pub vsync: bool,
     pub seconds: u64,
     pub relay_only: bool,
+    /// Self-hosted relays to use instead of n0's (repeatable).
+    pub relays: Vec<String>,
     /// Viewer: post generated mouse and key messages to its own window.
     pub synthetic_input: bool,
     /// Host: `nvenc` (direct), or an FFmpeg backend: `amf`, `qsv`, `mf`,
@@ -97,6 +99,7 @@ impl Options {
             vsync: false,
             seconds: 0,
             relay_only: false,
+            relays: Vec::new(),
             synthetic_input: false,
             encoder: "nvenc".into(),
             config_dir: None,
@@ -127,6 +130,7 @@ impl Options {
                 "--seconds" => o.seconds = value()?.parse()?,
                 "--vsync" => o.vsync = true,
                 "--relay-only" => o.relay_only = true,
+                "--relay" => o.relays.push(value()?.to_string()),
                 "--synthetic-input" => o.synthetic_input = true,
                 "--encoder" => o.encoder = value()?.to_string(),
                 "--config-dir" => o.config_dir = Some(value()?.into()),
@@ -149,17 +153,31 @@ impl Options {
     }
 }
 
-fn node_config(o: &Options) -> frames_net::NodeConfig {
-    frames_net::NodeConfig {
+fn node_config(o: &Options) -> Result<frames_net::NodeConfig> {
+    let relays = if o.relays.is_empty() {
+        frames_net::Relays::N0
+    } else {
+        let urls = o
+            .relays
+            .iter()
+            .map(|url| {
+                url.parse()
+                    .with_context(|| format!("invalid relay URL {url}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        frames_net::Relays::Custom(urls)
+    };
+    Ok(frames_net::NodeConfig {
         relay_only: o.relay_only,
+        relays,
         ..frames_net::NodeConfig::default()
-    }
+    })
 }
 
 async fn host(mut o: Options) -> Result<()> {
     let config = admit::config_dir(o.config_dir.as_ref())?;
     let key = admit::device_key(&config)?;
-    let node = frames_net::Node::bind(&key, node_config(&o)).await?;
+    let node = frames_net::Node::bind(&key, node_config(&o)?).await?;
     node.online(Duration::from_secs(10)).await?;
     println!("endpoint id: {}", node.id());
     loop {
@@ -191,7 +209,7 @@ async fn run_host(_: frames_net::Session, _: Options) -> Result<()> {
 
 async fn connect(id: &str, o: Options) -> Result<()> {
     let config = admit::config_dir(o.config_dir.as_ref())?;
-    let node = frames_net::Node::bind(&admit::device_key(&config)?, node_config(&o)).await?;
+    let node = frames_net::Node::bind(&admit::device_key(&config)?, node_config(&o)?).await?;
     let started = std::time::Instant::now();
     let session = node.connect(id.parse::<iroh::EndpointId>()?).await?;
     println!(
@@ -268,7 +286,7 @@ async fn run(args: Vec<String>) -> Result<()> {
             connect(id, Options::parse(&args[2..])?).await
         }
         _ => bail!(
-            "usage: frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software] [--fps N] [--mbps N] [--hold N] [--seconds N] [--approve view|control] [--config-dir DIR]\n       frames-next connect <endpoint-id> [--vsync] [--seconds N]"
+            "usage: frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software] [--fps N] [--mbps N] [--hold N] [--seconds N] [--approve view|control] [--config-dir DIR] [--relay URL] [--relay-only]\n       frames-next connect <endpoint-id> [--vsync] [--seconds N]"
         ),
     }
 }
