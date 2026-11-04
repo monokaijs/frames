@@ -41,6 +41,8 @@ impl VideoEncoder for NvencEncoder {
             EncoderControl::MarkLongTerm(_) | EncoderControl::UseLongTerm(_) => {
                 return Err(MediaError::Unsupported("long-term references"));
             }
+            // Only encoders that advertise long-term references receive it.
+            EncoderControl::ConfirmLongTerm(_) => {}
             EncoderControl::Reconfigure(params) => self.pending.reconfigure = Some(params),
         }
         Ok(())

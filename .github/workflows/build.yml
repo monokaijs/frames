@@ -145,6 +145,8 @@ jobs:
           key: ${{ steps.media-cache.outputs.cache-primary-key }}
       - run: cargo test --workspace --locked -- --nocapture
         timeout-minutes: 20
+      - name: v2 macOS media package (SwiftPM, Swift 6)
+        run: swift test --package-path native/macos/FramesMac
       - name: Signing identity regression checks
         run: python3 native/macos/Tests/SigningTests.py
       - run: bash native/macos/build.sh

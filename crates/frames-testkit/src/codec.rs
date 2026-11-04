@@ -196,6 +196,8 @@ impl VideoEncoder for SyntheticEncoder {
                 }
                 self.mark = Some(slot);
             }
+            // Synthetic long-term references need no acknowledgement.
+            EncoderControl::ConfirmLongTerm(_) => {}
             EncoderControl::UseLongTerm(slot) => {
                 if self
                     .long_term

@@ -2359,6 +2359,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "frames-platform-macos"
+version = "0.3.3"
+dependencies = [
+ "bytes",
+ "frames-media",
+ "frames-testkit",
+]
+
+[[package]]
 name = "frames-platform-windows"
 version = "0.3.3"
 dependencies = [

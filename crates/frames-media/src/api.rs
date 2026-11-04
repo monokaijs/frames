@@ -234,6 +234,10 @@ pub enum EncoderControl {
     Refresh,
     /// Keep the next frame in long-term slot `slot`.
     MarkLongTerm(u8),
+    /// The receiver confirmed decoding the frame in long-term slot `slot`.
+    /// Encoders whose long-term references need acknowledgement (VideoToolbox
+    /// tokens) only predict from confirmed frames; others may ignore this.
+    ConfirmLongTerm(u8),
     /// Predict the next frame from long-term slot `slot`.
     UseLongTerm(u8),
     Reconfigure(EncodeParams),

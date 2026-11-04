@@ -274,6 +274,8 @@ impl VideoEncoder for FfmpegEncoder {
                     self.clock.clone(),
                 )?;
             }
+            // Only encoders that advertise long-term references receive it.
+            EncoderControl::ConfirmLongTerm(_) => {}
             EncoderControl::Invalidate { .. }
             | EncoderControl::Refresh
             | EncoderControl::MarkLongTerm(_)

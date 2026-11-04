@@ -100,11 +100,12 @@ pub struct HostSession {
     budget_bytes: f64,
     last_pace_us: Option<u64>,
     applied_bps: u32,
-    control: Option<EncoderControl>,
+    controls: VecDeque<EncoderControl>,
     handled: Option<(RecoveryRequest, u64)>,
     last_encoded: Option<u64>,
     features: EncoderFeatures,
     slot_frames: [Option<u64>; MAX_LTR_SLOTS as usize],
+    mark_after_keyframe: bool,
     confirmed: Option<(u64, u8)>,
     next_slot: u8,
     feedback_unwrap: Unwrapper,
@@ -124,11 +125,12 @@ impl HostSession {
             budget_bytes: 0.0,
             last_pace_us: None,
             applied_bps: 0,
-            control: None,
+            controls: VecDeque::new(),
             handled: None,
             last_encoded: None,
             features: EncoderFeatures::empty(),
             slot_frames: [None; MAX_LTR_SLOTS as usize],
+            mark_after_keyframe: false,
             confirmed: None,
             next_slot: 0,
             feedback_unwrap: Unwrapper::new(),
@@ -176,7 +178,7 @@ impl HostSession {
             encoder.control(EncoderControl::Bitrate(video_bps))?;
             self.applied_bps = video_bps;
         }
-        if let Some(control) = self.control.take() {
+        while let Some(control) = self.controls.pop_front() {
             encoder.control(control)?;
         }
         let caps = *encoder.caps();
@@ -187,8 +189,9 @@ impl HostSession {
                 .features
                 .contains(EncoderFeatures::LONG_TERM_REFERENCES)
             && caps.long_term_slots >= 2
-            && next.is_multiple_of(self.config.long_term_interval)
+            && (next.is_multiple_of(self.config.long_term_interval) || self.mark_after_keyframe)
         {
+            self.mark_after_keyframe = false;
             // Keep the confirmed slot as the recovery anchor; mark the other.
             let slot = match self.confirmed {
                 Some((_, confirmed)) => confirmed ^ 1,
@@ -218,6 +221,11 @@ impl HostSession {
                 self.stats.frames += 1;
                 if kind == FrameKind::Keyframe {
                     self.stats.keyframes += 1;
+                    // A keyframe clears every long-term reference; mark a new
+                    // one right away (some encoders, like VideoToolbox, only
+                    // offer long-term candidates shortly after a keyframe until
+                    // one is acknowledged).
+                    self.mark_after_keyframe = true;
                     self.slot_frames = [None; MAX_LTR_SLOTS as usize];
                     self.confirmed = None;
                 }
@@ -511,11 +519,18 @@ impl HostSession {
             }
             // Only a slot the receiver reports holding, with the same frame
             // the encoder keeps there, is safe to recover from.
-            self.confirmed = state.long_term.and_then(|(slot, frame)| {
+            let confirmed = state.long_term.and_then(|(slot, frame)| {
                 let frame = self.frame_near(frame);
                 (self.slot_frames.get(usize::from(slot)).copied().flatten() == Some(frame))
                     .then_some((frame, slot))
             });
+            if let Some((_, slot)) = confirmed
+                && confirmed != self.confirmed
+            {
+                self.controls
+                    .push_back(EncoderControl::ConfirmLongTerm(slot));
+            }
+            self.confirmed = confirmed;
             self.recover(now_us, rtt_us, state.request);
         }
     }
@@ -546,7 +561,7 @@ impl HostSession {
         }
         self.handled = Some((request, now_us));
         let newest = self.last_encoded.unwrap_or(0);
-        self.control = Some(match request {
+        self.controls.push_back(match request {
             RecoveryRequest::Keyframe => {
                 self.stats.forced_keyframes += 1;
                 EncoderControl::ForceKeyframe

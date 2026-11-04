@@ -1,0 +1,21 @@
+[package]
+name = "frames-platform-macos"
+description = "Frames v2 macOS backends: ScreenCaptureKit, VideoToolbox, and Metal behind the frames-media traits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+build = "build.rs"
+
+# Layering (scripts/check_layers.py): depends on frames-media and frames-proto
+# only. The Swift package is built by build.rs on macOS; elsewhere the crate
+# is empty.
+[dependencies]
+bytes.workspace = true
+frames-media = { path = "../frames-media" }
+
+[dev-dependencies]
+frames-testkit = { path = "../frames-testkit" }
+
+[[example]]
+name = "mac_pipeline"
