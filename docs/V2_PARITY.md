@@ -69,5 +69,5 @@ launcher, installer, updater, and service still run v1.
 | Installer, signed updates, update channel | **Not started** ("Frames Next" channel). |
 | Windows service, secure desktop | **Not started**. |
 | macOS menu bar item, Dock behaviour | **Not started**. |
-| `frames doctor`, `discover`, `peers`, `revoke` | **Partial**: `frames next discover`, `peers`, `revoke` and `windows` work from the app binary (Mac and Windows); no `doctor` yet. |
+| `frames doctor`, `discover`, `peers`, `revoke` | **Partial**: `frames next discover`, `peers`, `revoke` and `windows` work from the app binary (Mac and Windows); `frames next doctor` reports identity and trust, macOS permissions (Screen Recording, Accessibility), whether VideoToolbox opens each codec, relay reachability, direct addresses and nearby hosts (checked on the Mac; the Windows section only lists the encoder and shareable windows and has not been run). |
 | Single process on macOS (no helper) | **Done** for media; the launcher still uses the v1 helper. |

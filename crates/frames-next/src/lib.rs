@@ -23,6 +23,7 @@ use std::time::Duration;
 mod admit;
 mod audio;
 mod clip;
+mod doctor;
 mod impair;
 mod lane;
 #[cfg(target_os = "macos")]
@@ -627,6 +628,7 @@ async fn run(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         Some("impair") => impair::run(&args[1..]).await,
+        Some("doctor") => doctor::run(Options::parse(&args[1..])?).await,
         Some("discover") => {
             for device in frames_net::local::browse(Duration::from_secs(3)).await? {
                 let addrs: Vec<String> = device.addr.ip_addrs().map(ToString::to_string).collect();
@@ -680,7 +682,8 @@ async fn run(args: Vec<String>) -> Result<()> {
             connect(id, Options::parse(&args[2..])?).await
         }
         _ => bail!(
-            "usage: frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software] [--fps N] [--mbps N] [--hold N] [--seconds N] [--approve view|control[-once]] [--config-dir DIR] [--relay URL] [--relay-only] [--receive-dir DIR] [--clipboard on|off|qa] [--audio on|off|qa]\n       frames-next connect <endpoint-id> [--vsync] [--seconds N]"
+            "usage: frames-next doctor [--config-dir DIR] [--relay URL]
+       frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software] [--fps N] [--mbps N] [--hold N] [--seconds N] [--approve view|control[-once]] [--config-dir DIR] [--relay URL] [--relay-only] [--receive-dir DIR] [--clipboard on|off|qa] [--audio on|off|qa]\n       frames-next connect <endpoint-id> [--vsync] [--seconds N]"
         ),
     }
 }
