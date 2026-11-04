@@ -15,6 +15,11 @@ concurrency:
   cancel-in-progress: false
 permissions:
   contents: write
+  # Reads the CI result for the commit being released.
+  actions: read
+env:
+  # Same as build.yml, so release jobs restore the dependency caches CI saved.
+  CARGO_PROFILE_DEV_DEBUG: '0'
 
 jobs:
   prepare:
@@ -23,11 +28,30 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      ci_run: ${{ steps.ci.outputs.run }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
+      # CI (build.yml) runs every regression check on each push to main. When
+      # it ran for this commit, the release skips its copies of those checks,
+      # builds at once, and ci-gate holds publishing until CI has passed.
+      - name: Find CI for this commit
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          read -r run conclusion < <(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?head_sha=$GITHUB_SHA&per_page=20" \
+            --jq '[.workflow_runs[] | select(.conclusion != "cancelled" and .conclusion != "skipped")] | sort_by(.created_at) | last | "\(.id // "none") \(.conclusion // "pending")"')
+          [ "$run" = none ] && run=""
+          if [ "$conclusion" = failure ] || [ "$conclusion" = timed_out ]; then
+            echo "::error::CI failed for $GITHUB_SHA (run $run); fix it before releasing"
+            exit 1
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "CI run for this commit: ${run:-none, running the checks in this release}"
       - name: Prepare draft
         id: version
         env:
@@ -42,10 +66,24 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           gh release create "$tag" --draft --target "$GITHUB_SHA" --title "Frames $version" --generate-notes
 
+  ci-gate:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Wait for CI on this commit
+        if: needs.prepare.outputs.ci_run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh run watch "${{ needs.prepare.outputs.ci_run }}" --exit-status --interval 30 > /dev/null
+
   windows:
     needs: prepare
     runs-on: windows-latest
     timeout-minutes: 60
+    outputs:
+      checksums: ${{ steps.package.outputs.checksums }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -55,6 +93,11 @@ jobs:
         with:
           toolchain: 1.94.1
           components: rustfmt, clippy
+      # Before set-version, so the key matches the cache CI saved for main.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows
+          save-if: false
       - name: Set version
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
@@ -64,9 +107,12 @@ jobs:
       - name: Prepare bundled media SDK
         run: python scripts/prepare_media.py
       - run: cargo fmt --all --check
+        if: needs.prepare.outputs.ci_run == ''
       - name: Game compatibility catalog documentation
+        if: needs.prepare.outputs.ci_run == ''
         run: python scripts/game_compatibility.py --check
       - name: Shared input adapter regression checks
+        if: needs.prepare.outputs.ci_run == ''
         run: |
           python scripts/build_shared_input.py
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -82,8 +128,10 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & target/shared-input/native/Release/shared_ipc_fixture.exe
       - run: cargo test --workspace --locked -- --nocapture
+        if: needs.prepare.outputs.ci_run == ''
         timeout-minutes: 20
       - name: Shared game production input session and network lease
+        if: needs.prepare.outputs.ci_run == ''
         run: |
           cargo build -p frames --bin frames --example shared_probe --locked
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -93,12 +141,15 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python scripts/test_shared_session.py --picker --input-only
       - name: Host-selected window identity and privacy guards
+        if: needs.prepare.outputs.ci_run == ''
         run: |
           cargo test -p frames-native window_selection::tests::selected_windows_reject --locked -- --include-ignored --nocapture
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo test -p frames-native window_selection::tests::one_window_picker --locked -- --include-ignored --nocapture
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        if: needs.prepare.outputs.ci_run == ''
       - name: Codec and audio checks
+        if: needs.prepare.outputs.ci_run == ''
         run: |
           cargo test -p frames-core --locked --test media_roundtrip -- --nocapture
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -110,6 +161,7 @@ jobs:
       - name: Verify Windows installation and upgrade
         run: ./scripts/test_windows_installer.ps1
       - name: Package and upload to draft
+        id: package
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
@@ -119,12 +171,21 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python scripts/release.py windows-installer $env:RELEASE_VERSION
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          gh release upload $env:RELEASE_TAG dist/release/* --clobber
+          # The installer is the download; the ZIP is the package every installed
+          # copy's updater requires (update.rs validate_asset). Checksums travel
+          # to the publish job as an output and into the release notes.
+          $v = $env:RELEASE_VERSION
+          gh release upload $env:RELEASE_TAG "dist/release/Frames-$v-windows-x86_64-setup.exe" "dist/release/Frames-$v-windows-x86_64.zip" --clobber
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $sums = (Get-Content "dist/release/Frames-$v-windows-x86_64-setup.exe.sha256", "dist/release/Frames-$v-windows-x86_64.zip.sha256") -join ';'
+          "checksums=$sums" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
   macos:
     needs: prepare
     runs-on: macos-15
     timeout-minutes: 60
+    outputs:
+      checksums: ${{ steps.upload.outputs.checksums }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -134,6 +195,18 @@ jobs:
         with:
           toolchain: 1.94.1
           targets: aarch64-apple-darwin
+      # Before set-version, so the key matches the cache CI saved for main.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos
+          save-if: false
+      - name: Restore bundled media SDK
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .media-runtime/macos
+            .media-runtime/macos-deps
+          key: media-macos-${{ hashFiles('scripts/prepare_media_macos.sh', 'scripts/prepare_media_macos_deps.py') }}
       - name: Set version
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
@@ -145,12 +218,15 @@ jobs:
           brew list --versions openssl@3 >/dev/null || brew install openssl@3
           python scripts/test_release.py
       - name: Codec source download regression checks
+        if: needs.prepare.outputs.ci_run == ''
         run: python scripts/test_prepare_media_macos_deps.py
       - name: Prepare bundled media SDK
         run: bash scripts/prepare_media_macos.sh
       - run: cargo test --workspace --locked -- --nocapture
+        if: needs.prepare.outputs.ci_run == ''
         timeout-minutes: 20
       - name: Swift checks
+        if: needs.prepare.outputs.ci_run == ''
         run: |
           set -euo pipefail
           python native/macos/Tests/SigningTests.py
@@ -165,6 +241,7 @@ jobs:
           swiftc native/macos/Sources/Wire.swift native/macos/Tests/BridgeOutputTests.swift -framework AppKit -framework ScreenCaptureKit -framework ServiceManagement -o "$RUNNER_TEMP/bridge-tests"
           "$RUNNER_TEMP/bridge-tests"
       - name: Native compressed video, text quality, and source backpressure
+        if: needs.prepare.outputs.ci_run == ''
         run: |
           set -euo pipefail
           swiftc -O -swift-version 5 native/macos/Sources/Wire.swift native/macos/Sources/ClientMedia.swift native/macos/Sources/NativeVideo.swift native/macos/Tests/NativeVideoTests.swift -o "$RUNNER_TEMP/native-video-tests"
@@ -195,8 +272,10 @@ jobs:
           FRAMES_SIGN_IDENTITY: ${{ vars.MACOS_SIGN_IDENTITY }}
         run: bash native/macos/build.sh
       - name: Mac dialog and popup behavior regression checks
+        if: needs.prepare.outputs.ci_run == ''
         run: bash scripts/test_macos_window_surfaces.sh
       - name: Shared game macOS viewer regression checks
+        if: needs.prepare.outputs.ci_run == ''
         run: |
           set -euo pipefail
           sources=()
@@ -240,6 +319,7 @@ jobs:
           python scripts/release.py verify-dmg "$image" "$RELEASE_VERSION"
           (cd dist/release && shasum -a 256 "Frames-$RELEASE_VERSION-macos-aarch64.dmg" > "Frames-$RELEASE_VERSION-macos-aarch64.dmg.sha256")
       - name: Remote header regression checks
+        if: needs.prepare.outputs.ci_run == ''
         run: |
           sources=()
           for source in native/macos/Sources/*.swift; do
@@ -248,10 +328,18 @@ jobs:
           swiftc -swift-version 5 -target arm64-apple-macos14.2 -import-objc-header native/include/frames.h "${sources[@]}" native/macos/Tests/RemoteHeaderTests.swift target/aarch64-apple-darwin/release/libframes_core.a -framework AppKit -framework ScreenCaptureKit -framework Metal -framework QuartzCore -framework VideoToolbox -framework Security -framework CoreGraphics -framework ServiceManagement -framework UniformTypeIdentifiers -framework AudioToolbox -o "$RUNNER_TEMP/header-tests"
           "$RUNNER_TEMP/header-tests"
       - name: Upload signed package to draft
+        id: upload
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-        run: gh release upload "$RELEASE_TAG" dist/release/* --clobber
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The DMG is the download; the ZIP is the package every installed
+          # copy's updater requires (update.rs validate_asset).
+          base="dist/release/Frames-$RELEASE_VERSION-macos-aarch64"
+          gh release upload "$RELEASE_TAG" "$base.dmg" "$base.zip" --clobber
+          echo "checksums=$(cat "$base.dmg.sha256" "$base.zip.sha256" | paste -sd ';' -)" >> "$GITHUB_OUTPUT"
       - name: Remove signing material
         if: always()
         run: |
@@ -259,7 +347,7 @@ jobs:
           rm -f "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/notary-key.p8" "$RUNNER_TEMP/notary-result.json"
 
   publish:
-    needs: [prepare, windows, macos]
+    needs: [prepare, ci-gate, windows, macos]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -273,16 +361,39 @@ jobs:
           UPDATE_PRIVATE_KEY: ${{ secrets.UPDATE_PRIVATE_KEY }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          WINDOWS_CHECKSUMS: ${{ needs.windows.outputs.checksums }}
+          MACOS_CHECKSUMS: ${{ needs.macos.outputs.checksums }}
         run: |
           set -euo pipefail
           umask 077
           mkdir -p dist/release
           gh release download "$RELEASE_TAG" --dir dist/release
-          (cd dist/release && sha256sum --check *.sha256)
+          # Checksums from the jobs that built the packages, not from the draft.
+          printf '%s;%s' "$WINDOWS_CHECKSUMS" "$MACOS_CHECKSUMS" | tr ';' '\n' | sed '/^$/d' > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 4
+          (cd dist/release && sha256sum --check ../../SHA256SUMS)
           printf '%s' "$UPDATE_PRIVATE_KEY" > "$RUNNER_TEMP/update-key.pem"
           trap 'rm -f "$RUNNER_TEMP/update-key.pem"' EXIT
           python scripts/release.py manifest "$RELEASE_VERSION" dist/release "$RUNNER_TEMP/update-key.pem"
           gh release upload "$RELEASE_TAG" dist/release/update.json dist/release/update.json.sig --clobber
+          # Downloads and checksums in the notes, instead of a .sha256 asset per file.
+          body=$(gh release view "$RELEASE_TAG" --json body --jq .body)
+          if ! grep -q '^### SHA-256' <<<"$body"; then
+            {
+              printf '%s\n\n' "$body"
+              echo '### Downloads'
+              echo "- **macOS** (Apple silicon): \`Frames-$RELEASE_VERSION-macos-aarch64.dmg\`"
+              echo "- **Windows**: \`Frames-$RELEASE_VERSION-windows-x86_64-setup.exe\`"
+              echo
+              echo 'The `.zip` files are the packages Frames installs through automatic updates (the Windows ZIP also runs as a portable app); `update.json` is the signed update manifest.'
+              echo
+              echo '### SHA-256'
+              echo '```'
+              cat SHA256SUMS
+              echo '```'
+            } > notes.md
+            gh release edit "$RELEASE_TAG" --notes-file notes.md
+          fi
       - name: Commit version, tag and publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -303,7 +414,7 @@ jobs:
 
   cleanup:
     if: always() && needs.prepare.outputs.tag != '' && needs.publish.result != 'success'
-    needs: [prepare, windows, macos, publish]
+    needs: [prepare, ci-gate, windows, macos, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:

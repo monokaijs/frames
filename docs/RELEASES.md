@@ -26,7 +26,11 @@ The workflow imports the certificate into a temporary keychain, signs with harde
 
 Apple ticket stapling and validation retry CloudKit lookup failures (exit 68) up to five attempts, waiting 5, 10, 20, and 40 seconds between attempts. Other errors fail immediately; exhausted retries still block publication. This applies to both the app and DMG. After a failed release has removed its draft, start a new Release workflow run from `main` so the draft is recreated.
 
-Packages upload directly to a draft GitHub Release. No Actions artifacts or dependency caches are created. Ordinary CI runs on pull requests or manual dispatch; release builds run the checks themselves, avoiding a duplicate build on each release push. Successful releases retain the install archives, checksums, and signed update manifest as release assets. Runner files disappear when GitHub destroys the hosted runner. Deleting artifacts does not recover execution minutes.
+Packages upload directly to a draft GitHub Release; no Actions artifacts are created. A release publishes the two installers (DMG, setup EXE), the two signed ZIPs that every installed copy's updater downloads (the Windows ZIP also runs as a portable app), and the signed update manifest. SHA-256 checksums are listed in the release notes rather than as separate assets.
+
+CI (`build.yml`) runs every regression check on each push to `main` and on pull requests. A release looks up the CI run for the commit it releases. If CI failed, the release stops at once. If CI passed or is still running, the release skips its copies of those checks, builds immediately, and `ci-gate` holds publishing until CI has passed. If CI never ran for the commit (for example, a documentation-only change), the release runs the checks itself. Release-only checks always run: installer install/upgrade, the signed macOS updater test, notarization, Gatekeeper and the DMG check.
+
+Builds reuse dependency caches: one Rust cache per platform (`Swatinem/rust-cache`, saved only from `main`, without debug info) and the built macOS codec SDK, keyed on its pinned sources. Each CI run on `main` deletes superseded Rust caches (`scripts/prune_caches.sh`), keeping usage well inside the repository's 10 GB cache allowance; release jobs only restore. Runner files disappear when GitHub destroys the hosted runner.
 
 ## Automatic updates
 

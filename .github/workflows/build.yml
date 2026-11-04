@@ -7,6 +7,15 @@ on:
   pull_request:
     paths-ignore: ["**.md", "spikes/**"]
   workflow_dispatch:
+permissions:
+  contents: read
+  # Deletes superseded dependency caches so the repository's 10 GB cache
+  # allowance holds one entry per platform instead of evicting the live one.
+  actions: write
+env:
+  # No debug info in CI builds: smaller dependency caches and faster builds.
+  # release.yml sets the same value so its jobs reuse these caches.
+  CARGO_PROFILE_DEV_DEBUG: '0'
 jobs:
   v2-core:
     # Phase 1 gate: the v2 protocol, media engine, and test kit build and
@@ -19,12 +28,21 @@ jobs:
         with:
           toolchain: 1.94.1
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: v2-core
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: v2 crate layering
         run: python3 scripts/check_layers.py
       - name: v2 crates lint and test
         run: |
           cargo clippy -p frames-proto -p frames-media -p frames-testkit --all-targets --locked -- -D warnings
           cargo test --release -p frames-proto -p frames-media -p frames-testkit --locked
+      - name: Delete superseded dependency caches
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/prune_caches.sh v0-rust-v2-core
   windows:
     timeout-minutes: 60
     runs-on: windows-latest
@@ -34,6 +52,10 @@ jobs:
         with:
           toolchain: 1.94.1
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Prepare bundled media SDK
         run: python scripts/prepare_media.py
       - run: cargo fmt --all --check
@@ -72,13 +94,21 @@ jobs:
           cargo test -p frames-native window_selection::tests::selected_windows_reject --locked -- --include-ignored --nocapture
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo test -p frames-native window_selection::tests::one_window_picker --locked -- --include-ignored --nocapture
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # --all-features as in release.yml, which skips its copy of this check
+      # when this workflow passed for the commit being released.
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Real software codec roundtrip
         run: cargo test -p frames-core --test media_roundtrip --locked -- --nocapture
       - name: Generated Opus audio roundtrip
         run: cargo test -p frames-core --test audio_roundtrip --locked -- --nocapture
       - run: ./scripts/build.ps1 -Target x86_64-pc-windows-msvc
       - run: ./scripts/test_windows_installer.ps1
+      - name: Delete superseded dependency caches
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/prune_caches.sh v0-rust-windows
   macos:
     timeout-minutes: 60
     runs-on: macos-15
@@ -88,11 +118,31 @@ jobs:
         with:
           toolchain: 1.94.1
           targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Restore bundled media SDK
+        id: media-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .media-runtime/macos
+            .media-runtime/macos-deps
+          key: media-macos-${{ hashFiles('scripts/prepare_media_macos.sh', 'scripts/prepare_media_macos_deps.py') }}
       - name: Codec source download regression checks
         run: python scripts/test_prepare_media_macos_deps.py
       - run: python3 scripts/test_media_network_fixture.py
       - name: Prepare bundled media SDK
         run: bash scripts/prepare_media_macos.sh
+      - name: Save bundled media SDK
+        if: github.ref == 'refs/heads/main' && steps.media-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .media-runtime/macos
+            .media-runtime/macos-deps
+          key: ${{ steps.media-cache.outputs.cache-primary-key }}
       - run: cargo test --workspace --locked -- --nocapture
         timeout-minutes: 20
       - name: Signing identity regression checks
@@ -148,3 +198,8 @@ jobs:
         run: |
           swiftc native/macos/Sources/SessionState.swift native/macos/Tests/SessionStateTests.swift -o /tmp/frames-session-state-tests
           /tmp/frames-session-state-tests
+      - name: Delete superseded dependency caches
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/prune_caches.sh v0-rust-macos
