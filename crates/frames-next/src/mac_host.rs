@@ -1,13 +1,14 @@
 //! macOS host: ScreenCaptureKit → VideoToolbox → v2 host engine → frames-net.
 //!
 //! `--source qa` uses the generated source; screen capture falls back to it
-//! too when this binary lacks Screen Recording permission. Input from the
-//! viewer is received and counted but not applied yet (macOS injection needs
-//! Accessibility permission and lands with the macOS input backend).
+//! too when this binary lacks Screen Recording permission. A viewer trusted
+//! for control drives the real cursor and keyboard (Quartz events, which need
+//! the Accessibility permission); QA runs only count its input, so they never
+//! move the real cursor.
 
 use crate::{Options, StreamInfo, send_info};
 use anyhow::{Context, Result, bail};
-use frames_input::{EventReader, Pointer};
+use frames_input::{Event, EventReader, Pointer};
 use frames_media::api::{
     CaptureConfig, CaptureEvent, CaptureSource, EncodeParams, Gop, MediaClock, MediaTransport,
     PathKind, VideoFrame,
@@ -17,6 +18,7 @@ use frames_media::host::{HostConfig, HostSession};
 use frames_media::rate::RateConfig;
 use frames_platform_macos::capture::MacCapture;
 use frames_platform_macos::encoder::MacEncoder;
+use frames_platform_macos::input::MacInjector;
 use frames_platform_macos::system;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,6 +27,7 @@ use std::time::{Duration, Instant};
 pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     let handle = tokio::runtime::Handle::current();
     let events = Arc::new(AtomicU64::new(0));
+    let (events_tx, events_rx) = std::sync::mpsc::channel::<Event>();
     let reader = {
         let (session, events) = (session.clone(), events.clone());
         tokio::spawn(async move {
@@ -34,13 +37,18 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
             let mut decoder = EventReader::default();
             let mut buffer = [0u8; 1024];
             while let Ok(Some(n)) = recv.read(&mut buffer).await {
-                let count = decoder.push(&buffer[..n]).len() as u64;
-                events.fetch_add(count, Ordering::Relaxed);
+                for event in decoder.push(&buffer[..n]) {
+                    events.fetch_add(1, Ordering::Relaxed);
+                    if events_tx.send(event).is_err() {
+                        return;
+                    }
+                }
             }
         })
     };
     let result =
-        tokio::task::spawn_blocking(move || stream(&handle, &session, &o, &events)).await?;
+        tokio::task::spawn_blocking(move || stream(&handle, &session, &o, &events, events_rx))
+            .await?;
     reader.abort();
     result
 }
@@ -63,10 +71,18 @@ fn stream(
     session: &frames_net::Session,
     o: &Options,
     events: &AtomicU64,
+    inputs: std::sync::mpsc::Receiver<Event>,
 ) -> Result<()> {
     let frame_time = Duration::from_micros(1_000_000 / u64::from(o.fps.max(1)));
     let _ = system::set_realtime_thread(frame_time, frame_time / 4, frame_time / 2);
     let clock = SystemClock::new();
+    // QA runs never touch the real cursor or keyboard.
+    let mut injector = (o.control && !o.qa_source).then(MacInjector::new);
+    if injector.is_some() && !MacInjector::trusted() {
+        println!(
+            "input: this program lacks the Accessibility permission; macOS will ignore the viewer's input"
+        );
+    }
     let mut capture = MacCapture::start(o.fps, o.qa_source)?;
     capture.configure(CaptureConfig {
         fps: o.fps,
@@ -200,10 +216,18 @@ fn stream(
         let rtt = path.rtt_us;
         while let Some((datagram, arrived)) = media.try_recv_timed() {
             let arrived = arrived.unwrap_or_else(|| clock.now_us());
-            if Pointer::decode(&datagram).is_some() {
+            if let Some(pointer) = Pointer::decode(&datagram) {
                 pointers += 1;
+                if let Some(injector) = &mut injector {
+                    injector.pointer(&pointer);
+                }
             } else {
                 host.on_datagram(arrived, &datagram, rtt);
+            }
+        }
+        while let Ok(event) = inputs.try_recv() {
+            if let Some(injector) = &mut injector {
+                injector.event(event);
             }
         }
         if started.elapsed() >= next_report {
@@ -219,13 +243,18 @@ fn stream(
             let stats = host.stats();
             let p50 = crate::stats::percentile_ms(&mut encode_us, 50);
             println!(
-                "host t={:>3}s frames {frames:>5} encode p50 {p50:.2} ms target {:>5.1} Mbps keyframes {} long-term {} retx {} | input pointers {pointers} events {} (not applied on macOS yet) | {:?} rtt {:.1} ms",
+                "host t={:>3}s frames {frames:>5} encode p50 {p50:.2} ms target {:>5.1} Mbps keyframes {} long-term {} retx {} | input pointers {pointers} events {} ({}) | {:?} rtt {:.1} ms",
                 next_report.as_secs(),
                 f64::from(host.target_bps()) / 1e6,
                 stats.keyframes,
                 stats.long_term_recoveries,
                 stats.retransmissions,
                 events.load(Ordering::Relaxed),
+                if injector.is_some() {
+                    "applied"
+                } else {
+                    "counted only"
+                },
                 path.kind,
                 path.rtt_us as f64 / 1e3,
             );

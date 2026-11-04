@@ -2370,6 +2370,7 @@ name = "frames-platform-macos"
 version = "0.3.3"
 dependencies = [
  "bytes",
+ "frames-input",
  "frames-media",
  "frames-testkit",
 ]

@@ -5,6 +5,8 @@
 //!   references through VideoToolbox's acknowledgement tokens.
 //! - [`decoder::MacDecoder`]: hardware VideoToolbox to IOSurface BGRA.
 //! - [`presenter::MacPresenter`]: Metal, immediate or vsync presentation.
+//! - [`input::MacInjector`]: applies viewer input with Quartz events
+//!   (needs the Accessibility permission).
 //! - [`system`]: the AppKit run loop for headless hosts, real-time threads,
 //!   and Wi-Fi video traffic marking.
 //!
@@ -19,6 +21,7 @@ pub mod capture;
 pub mod decoder;
 pub mod encoder;
 mod ffi;
+pub mod input;
 pub mod pixel;
 pub mod presenter;
 pub mod system;
