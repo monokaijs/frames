@@ -115,6 +115,17 @@ fn confirmed_long_term_slot_recovers_without_a_keyframe() {
             }
             decode(&mut decoder, unit, &source);
         }
+        if !encoder
+            .caps()
+            .features
+            .contains(frames_media::api::EncoderFeatures::LONG_TERM_REFERENCES)
+        {
+            // This VideoToolbox (e.g. a paravirtualized CI Mac) produced no
+            // long-term tokens; the encoder stopped advertising them.
+            assert!(marked.is_none());
+            eprintln!("skipped for {codec:?}: no long-term tokens on this Mac");
+            continue;
+        }
         let marked = marked.expect("a token arrived after the mark");
         assert!(marked <= 20, "{codec:?}: mark landed on frame {marked}");
         for index in 40..45 {

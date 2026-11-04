@@ -85,6 +85,10 @@ pub struct MacEncoder {
     first: bool,
     force_keyframe: bool,
     mark: Option<u8>,
+    /// Frames encoded since a mark was requested without a token arriving.
+    mark_waiting: u32,
+    /// VideoToolbox has produced at least one long-term token.
+    tokens_seen: bool,
     use_long_term: Option<u8>,
     slots: [Option<Slot>; SLOTS],
     acknowledge: Vec<i64>,
@@ -101,6 +105,10 @@ fn codec_id(codec: Codec) -> Result<u32, MediaError> {
         Codec::Av1 => Err(MediaError::Unsupported("AV1 encoding on macOS")),
     }
 }
+
+/// Frames to wait for a first long-term token before concluding this
+/// VideoToolbox does not produce them.
+const NO_TOKEN_FRAMES: u32 = 30;
 
 impl MacEncoder {
     pub fn new(codec: Codec, params: EncodeParams) -> Result<Self, MediaError> {
@@ -127,6 +135,8 @@ impl MacEncoder {
             first: true,
             force_keyframe: true,
             mark: None,
+            mark_waiting: 0,
+            tokens_seen: false,
             use_long_term: None,
             slots: [None; SLOTS],
             acknowledge: Vec::new(),
@@ -300,10 +310,32 @@ impl VideoEncoder for MacEncoder {
             ))?;
             (FrameKind::Predicted, FrameReference::Frame(previous))
         };
+        if output.token >= 0 {
+            self.tokens_seen = true;
+        }
+        if self.mark.is_some() && output.token < 0 && !self.tokens_seen {
+            self.mark_waiting += 1;
+            // Some VideoToolbox implementations (paravirtualized Macs, such
+            // as CI runners) accept long-term references but never hand out
+            // a token. Stop advertising them so the engine recovers with
+            // keyframes instead of waiting for a slot that never comes.
+            if self.mark_waiting >= NO_TOKEN_FRAMES
+                && self
+                    .caps
+                    .features
+                    .contains(EncoderFeatures::LONG_TERM_REFERENCES)
+            {
+                self.caps.features =
+                    EncoderFeatures::DYNAMIC_BITRATE.with(EncoderFeatures::ZERO_COPY);
+                self.caps.long_term_slots = 0;
+                self.mark = None;
+            }
+        }
         let mut mark = None;
         if output.token >= 0
             && let Some(slot) = self.mark.take()
         {
+            self.mark_waiting = 0;
             self.slots[usize::from(slot)] = Some(Slot {
                 token: output.token,
                 confirmed: false,
