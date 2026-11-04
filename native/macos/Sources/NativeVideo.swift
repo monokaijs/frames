@@ -62,8 +62,8 @@ final class NativeVideoEncoder: @unchecked Sendable {
             let changed = self.scale != scale
             let rateChanged=self.bitrate != bitrate || self.fps != fps
             // Same rule as refresh_after_increase in streaming.rs: only a real
-            // budget recovery (+50%), at most every 10 s, refreshes a static picture.
-            let improvePicture = Int64(bitrate) * 2 >= Int64(self.bitrate) * 3 && Date().timeIntervalSince(self.lastImprove) >= 10
+            // budget recovery (+25%), at most every 10 s, refreshes a static picture.
+            let improvePicture = Int64(bitrate) * 4 >= Int64(self.bitrate) * 5 && Date().timeIntervalSince(self.lastImprove) >= 10
             if improvePicture { self.lastImprove = Date() }
             self.bitrate = max(128_000,min(100_000_000,bitrate));self.fps = Int32(max(1,min(60,fps)));self.scale = max(50,min(100,scale))
             if let session,rateChanged {

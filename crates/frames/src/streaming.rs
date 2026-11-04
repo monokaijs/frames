@@ -1949,12 +1949,12 @@ async fn run_native_host(
 }
 
 /// A static picture keeps the quality it was encoded at, so a recovered
-/// budget needs a fresh independent picture. Only a real recovery (+50%) does,
-/// at most every 10 s: small rescales (FEC level changes, focus shares) once
+/// budget needs a fresh independent picture. Only a real recovery (+25%) does,
+/// at most every 10 s: FEC level rescales (+6-18%) and the +5%/s ramp once
 /// forced a keyframe every couple of seconds per window, and each keyframe
 /// burst on a lossy path froze the window.
 fn refresh_after_increase(previous: u32, target: u32, last: &mut std::time::Instant) -> bool {
-    if u64::from(target) * 2 < u64::from(previous) * 3 || last.elapsed() < Duration::from_secs(10) {
+    if u64::from(target) * 4 < u64::from(previous) * 5 || last.elapsed() < Duration::from_secs(10) {
         return false;
     }
     *last = std::time::Instant::now();
@@ -1972,11 +1972,15 @@ mod refresh_tests {
             "FEC rescale"
         );
         assert!(
-            refresh_after_increase(20_000_000, 50_000_000, &mut last),
+            !refresh_after_increase(34_000_000, 40_000_000, &mut last),
+            "FEC parity 8 to 2"
+        );
+        assert!(
+            refresh_after_increase(12_000_000, 16_000_000, &mut last),
             "real recovery"
         );
         assert!(
-            !refresh_after_increase(20_000_000, 50_000_000, &mut last),
+            !refresh_after_increase(12_000_000, 16_000_000, &mut last),
             "rate limited"
         );
     }
