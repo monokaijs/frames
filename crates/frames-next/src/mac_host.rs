@@ -8,7 +8,7 @@
 
 use crate::{Options, StreamInfo, send_info};
 use anyhow::{Context, Result, bail};
-use frames_input::{Event, EventReader, Pointer};
+use frames_input::Pointer;
 use frames_media::api::{
     CaptureConfig, CaptureEvent, CaptureSource, EncodeParams, Gop, MediaClock, MediaTransport,
     PathKind, VideoFrame,
@@ -20,51 +20,14 @@ use frames_platform_macos::capture::MacCapture;
 use frames_platform_macos::encoder::MacEncoder;
 use frames_platform_macos::input::MacInjector;
 use frames_platform_macos::system;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-
-type ClipStreams = (iroh::endpoint::SendStream, iroh::endpoint::RecvStream);
 
 pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     let handle = tokio::runtime::Handle::current();
-    let events = Arc::new(AtomicU64::new(0));
-    let (events_tx, events_rx) = std::sync::mpsc::channel::<Event>();
-    let clipboard_on = o.clipboard != crate::clip::Mode::Off;
-    let (clip_tx, clip_rx) = std::sync::mpsc::channel::<ClipStreams>();
-    let reader = {
-        let (session, events) = (session.clone(), events.clone());
-        tokio::spawn(async move {
-            let Ok((_send, mut recv)) = session.accept_channel().await else {
-                return;
-            };
-            // The viewer opens its clipboard stream right after this one.
-            if clipboard_on {
-                let session = session.clone();
-                tokio::spawn(async move {
-                    if let Ok(streams) = session.accept_channel().await {
-                        let _ = clip_tx.send(streams);
-                    }
-                });
-            }
-            let mut decoder = EventReader::default();
-            let mut buffer = [0u8; 1024];
-            while let Ok(Some(n)) = recv.read(&mut buffer).await {
-                for event in decoder.push(&buffer[..n]) {
-                    events.fetch_add(1, Ordering::Relaxed);
-                    if events_tx.send(event).is_err() {
-                        return;
-                    }
-                }
-            }
-        })
-    };
-    let result = tokio::task::spawn_blocking(move || {
-        stream(&handle, &session, &o, &events, events_rx, clip_rx)
-    })
-    .await?;
-    reader.abort();
-    result
+    // Input, clipboard, and files arrive on the viewer's tagged streams.
+    let services = crate::services::HostServices::start(&session, &o);
+    tokio::task::spawn_blocking(move || stream(&handle, &session, &o, &services)).await?
 }
 
 fn first_frame(capture: &mut MacCapture, clock: &SystemClock) -> Result<VideoFrame> {
@@ -84,10 +47,13 @@ fn stream(
     handle: &tokio::runtime::Handle,
     session: &frames_net::Session,
     o: &Options,
-    events: &AtomicU64,
-    inputs: std::sync::mpsc::Receiver<Event>,
-    clipboard_streams: std::sync::mpsc::Receiver<ClipStreams>,
+    services: &crate::services::HostServices,
 ) -> Result<()> {
+    let (events, inputs, clipboard_streams) = (
+        &*services.event_count,
+        &services.events,
+        &services.clipboard,
+    );
     let frame_time = Duration::from_micros(1_000_000 / u64::from(o.fps.max(1)));
     let _ = system::set_realtime_thread(frame_time, frame_time / 4, frame_time / 2);
     let clock = SystemClock::new();

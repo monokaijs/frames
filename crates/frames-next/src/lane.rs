@@ -30,7 +30,7 @@ impl InputLane {
     pub async fn open(
         session: &frames_net::Session,
     ) -> anyhow::Result<(Self, tokio::task::JoinHandle<()>)> {
-        let (mut stream, _) = session.open_channel().await?;
+        let (mut stream, _) = crate::streams::open(session, crate::streams::INPUT).await?;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let writer = tokio::spawn(async move {
             while let Some(bytes) = rx.recv().await {

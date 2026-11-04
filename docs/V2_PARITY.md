@@ -54,7 +54,7 @@ launcher, installer, updater, and service still run v1.
 | v1 feature | v2 status |
 |---|---|
 | Clipboard (text and PNG) | **Partial**: `frames-clipboard` sync (no echo, the pre-session clipboard stays local), Windows and macOS clipboards, `frames-next --clipboard on|qa` (off by default). QA run PC host ↔ Mac viewer: 4 of 4 copies arrived. The real clipboards were not exercised automatically (tests must not overwrite the user's clipboard). |
-| File drop, fetch, resume, checksums | **Not started**. |
+| File drop, fetch, resume, checksums | **Partial**: viewer → host sending (`frames-next connect --send FILE`, host `--receive-dir`, default ~/Downloads/Frames, only from a device trusted for control): SHA-256 checked, resumed from the partial file after an interruption, never overwrites (`name (2).ext`). Mac → PC: 50 MB in 1.1 s; a 300 MB transfer killed at 4 s resumed at 197 MB and verified. Not yet: host → viewer fetch, drag and drop. |
 | Android ADB bridge | **Not started**. |
 | Gamepad forwarding | **Not started**. |
 | USB/IP passthrough | **Not started**. |

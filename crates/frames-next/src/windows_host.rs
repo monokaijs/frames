@@ -5,8 +5,8 @@ use anyhow::{Context, Result, bail};
 use frames_codec::d3d11::{AMD, INTEL, nvidia_device, vendor_device};
 use frames_codec::ffmpeg::{FfmpegEncoder, encoder_name};
 use frames_codec::nvenc::NvencEncoder;
+use frames_input::Pointer;
 use frames_input::cursor::CursorMessage;
-use frames_input::{Event, EventReader, Pointer};
 use frames_media::api::{
     CaptureConfig, CaptureEvent, CaptureSource, EncodeParams, Gop, MediaClock, MediaTransport,
     PathKind, VideoEncoder, VideoFrame,
@@ -20,46 +20,11 @@ use frames_platform_windows::system::{GpuClockHold, Mmcss, TimerResolution, rais
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-type ClipStreams = (iroh::endpoint::SendStream, iroh::endpoint::RecvStream);
-
 pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     let handle = tokio::runtime::Handle::current();
-    // The viewer's reliable input stream, decoded here and applied on the
-    // streaming thread with the pointer datagrams.
-    let (events_tx, events_rx) = std::sync::mpsc::channel::<Event>();
-    let clipboard_on = o.clipboard != crate::clip::Mode::Off;
-    let (clip_tx, clip_rx) = std::sync::mpsc::channel::<ClipStreams>();
-    let reader = {
-        let session = session.clone();
-        tokio::spawn(async move {
-            let Ok((_send, mut recv)) = session.accept_channel().await else {
-                return;
-            };
-            // The viewer opens its clipboard stream right after this one.
-            if clipboard_on {
-                let session = session.clone();
-                tokio::spawn(async move {
-                    if let Ok(streams) = session.accept_channel().await {
-                        let _ = clip_tx.send(streams);
-                    }
-                });
-            }
-            let mut decoder = EventReader::default();
-            let mut buffer = [0u8; 1024];
-            while let Ok(Some(n)) = recv.read(&mut buffer).await {
-                for event in decoder.push(&buffer[..n]) {
-                    if events_tx.send(event).is_err() {
-                        return;
-                    }
-                }
-            }
-        })
-    };
-    let result =
-        tokio::task::spawn_blocking(move || stream(&handle, &session, &o, events_rx, clip_rx))
-            .await?;
-    reader.abort();
-    result
+    // Input, clipboard, and files arrive on the viewer's tagged streams.
+    let services = crate::services::HostServices::start(&session, &o);
+    tokio::task::spawn_blocking(move || stream(&handle, &session, &o, &services)).await?
 }
 
 fn primary_monitor_rect() -> windows::Win32::Foundation::RECT {
@@ -90,9 +55,9 @@ fn stream(
     handle: &tokio::runtime::Handle,
     session: &frames_net::Session,
     o: &Options,
-    events: std::sync::mpsc::Receiver<Event>,
-    clipboard_streams: std::sync::mpsc::Receiver<ClipStreams>,
+    services: &crate::services::HostServices,
 ) -> Result<()> {
+    let (events, clipboard_streams) = (&services.events, &services.clipboard);
     win::dpi_aware();
     let _mmcss = Mmcss::games();
     let _timer = TimerResolution::one_millisecond();

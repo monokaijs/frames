@@ -52,7 +52,7 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     let clipboard = if o.clipboard == crate::clip::Mode::Off {
         None
     } else {
-        let streams = session.open_channel().await?;
+        let streams = crate::streams::open(&session, crate::streams::CLIPBOARD).await?;
         Some(crate::clip::ClipboardLink::start(
             &tokio::runtime::Handle::current(),
             streams,

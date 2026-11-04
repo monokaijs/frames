@@ -26,7 +26,10 @@ mod lane;
 mod mac_client;
 #[cfg(target_os = "macos")]
 mod mac_host;
+mod services;
 mod stats;
+mod streams;
+mod transfer;
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
@@ -82,6 +85,10 @@ pub struct Options {
     pub pacing: Option<f64>,
     /// Clipboard sharing (both ends must turn it on).
     pub clipboard: clip::Mode,
+    /// Viewer: files to send to the host once connected.
+    pub send_files: Vec<std::path::PathBuf>,
+    /// Host: where received files go (default ~/Downloads/Frames).
+    pub receive_dir: Option<std::path::PathBuf>,
     /// Viewer: post generated mouse and key messages to its own window.
     pub synthetic_input: bool,
     /// Host: `nvenc` (direct), or an FFmpeg backend: `amf`, `qsv`, `mf`,
@@ -115,6 +122,8 @@ impl Options {
             migrate_v1: false,
             pacing: None,
             clipboard: clip::Mode::Off,
+            send_files: Vec::new(),
+            receive_dir: None,
             synthetic_input: false,
             encoder: "nvenc".into(),
             config_dir: None,
@@ -151,6 +160,8 @@ impl Options {
                 "--relay" => o.relays.push(value()?.to_string()),
                 "--migrate-v1" => o.migrate_v1 = true,
                 "--pacing" => o.pacing = Some(value()?.parse()?),
+                "--send" => o.send_files.push(value()?.into()),
+                "--receive-dir" => o.receive_dir = Some(value()?.into()),
                 "--clipboard" => {
                     o.clipboard = match value()? {
                         "on" => clip::Mode::On,
@@ -242,6 +253,20 @@ async fn connect(id: &str, o: Options) -> Result<()> {
     let started = std::time::Instant::now();
     let session = node.connect(id.parse::<iroh::EndpointId>()?).await?;
     admit::send_hello(&session, &node.id(), o.migrate_v1, viewer_decoders()).await?;
+    for path in o.send_files.clone() {
+        let session = session.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            match transfer::send(&session, &path).await {
+                Ok(saved) => println!(
+                    "FILE sent {} in {:.1} s (saved as {saved})",
+                    path.display(),
+                    started.elapsed().as_secs_f64()
+                ),
+                Err(error) => println!("FILE sending {} failed: {error:#}", path.display()),
+            }
+        });
+    }
     println!(
         "connected in {:.0} ms, pairing code {} (a new host shows the same code)",
         started.elapsed().as_secs_f64() * 1e3,
@@ -357,7 +382,7 @@ async fn run(args: Vec<String>) -> Result<()> {
             connect(id, Options::parse(&args[2..])?).await
         }
         _ => bail!(
-            "usage: frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software] [--fps N] [--mbps N] [--hold N] [--seconds N] [--approve view|control] [--config-dir DIR] [--relay URL] [--relay-only]\n       frames-next connect <endpoint-id> [--vsync] [--seconds N]"
+            "usage: frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software] [--fps N] [--mbps N] [--hold N] [--seconds N] [--approve view|control] [--config-dir DIR] [--relay URL] [--relay-only] [--receive-dir DIR] [--clipboard on|off|qa]\n       frames-next connect <endpoint-id> [--vsync] [--seconds N]"
         ),
     }
 }
