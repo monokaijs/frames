@@ -244,7 +244,7 @@ Gate additions:
 
 ### Phase 2: Media engine on testkit
 
-**Status (2026-11-04): engine and gates done, in virtual time.** The engine is in `frames-media` (`host`, `client`, `fec`, `rate`); scenarios are in `frames-testkit::netsim`, with gates in `crates/frames-testkit/tests/netsim.rs`.
+**Status (2026-11-05): engine and gates done in virtual time; checked against 0.2.x on real codecs and QUIC (below).** The engine is in `frames-media` (`host`, `client`, `fec`, `rate`); scenarios are in `frames-testkit::netsim`, with gates in `crates/frames-testkit/tests/netsim.rs`.
 
 Measured results (60 fps, 1080p synthetic):
 
@@ -259,7 +259,16 @@ Measured results (60 fps, 1080p synthetic):
 
 - Seeded runs replay exactly.
 - Intra refresh is supported by the API and the synthetic codec but not yet used by the host's recovery ladder. Spike 0-C showed HEVC needs invalidation first.
-- The comparison with 0.2.x netsim waits until the v2 engine drives real codecs (Phase 3).
+- Comparison with 0.2.x on real codecs and real QUIC (2026-11-05): `frames-next impair` runs v1 netsim's scenarios as a UDP proxy; PC host (NVENC HEVC, QA window 1922x1112, bound to loopback so the stream must cross the proxy) → Mac viewer over the LAN, 15 s each. Frames delivered per second and capture → present:
+
+  | Scenario | v2 fps | v2 p50 / p95 | v1 (Windows netsim, 2026-11-04) |
+  |---|---|---|---|
+  | lan | 58.6 | 11.2 / 14.7 ms | p50 7.6 ms |
+  | wifi (4 ms, ±3 ms, 1% bursty loss) | 58.4 | 19.7 / 31.2 ms | p50 14.4 ms |
+  | lossy (10 ms, ±2 ms, 3% bursty loss) | 53.9 | 38.3 / 72.3 ms | 3.0-7.3 fps |
+  | constrained (15 ms, 4 Mbps cap) | 54.0 | 41.8 / 50.5 ms | — |
+
+  Frames delivered: no regression, and on the lossy path about 7-18x more. Latency is not like for like: v1 ran in-process on one machine at 1280x720; v2 crossed the LAN between two machines through a userspace proxy at a larger size, and its figure includes clock-offset error up to RTT/2. The host's IPv6 socket was still bound, so a direct IPv6 path could not be ruled out entirely; latencies tracking each scenario's delay suggest the proxy carried the stream.
 
 Host pipeline: capture → encode (slices) → packetize/FEC → pacer. Client pipeline: recv → reassemble → NACK/FEC → decode → present → feedback.
 

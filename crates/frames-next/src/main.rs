@@ -22,6 +22,7 @@ use std::time::Duration;
 mod admit;
 mod audio;
 mod clip;
+mod impair;
 mod lane;
 #[cfg(target_os = "macos")]
 mod mac_client;
@@ -94,6 +95,14 @@ pub struct Options {
     pub relay_only: bool,
     /// Self-hosted relays to use instead of n0's (repeatable).
     pub relays: Vec<String>,
+    /// No relays and no internet discovery: only addresses given or found
+    /// on the LAN (impairment tests, isolated networks).
+    pub direct_only: bool,
+    /// Viewer: dial this address for the device id (e.g. an impair proxy).
+    pub addr: Option<std::net::SocketAddr>,
+    /// Bind this address only (e.g. 127.0.0.1:0 behind an impair proxy, so
+    /// no direct path bypasses it).
+    pub bind: Option<std::net::SocketAddr>,
     /// Viewer: offer this device's v1 identity so a host that trusted it in
     /// v1 trusts it now.
     pub migrate_v1: bool,
@@ -154,6 +163,9 @@ impl Options {
             seconds: 0,
             relay_only: false,
             relays: Vec::new(),
+            direct_only: false,
+            addr: None,
+            bind: None,
             migrate_v1: false,
             pacing: None,
             clipboard: clip::Mode::Off,
@@ -202,6 +214,9 @@ impl Options {
                 "--vsync" => o.vsync = true,
                 "--relay-only" => o.relay_only = true,
                 "--relay" => o.relays.push(value()?.to_string()),
+                "--direct-only" => o.direct_only = true,
+                "--addr" => o.addr = Some(value()?.parse()?),
+                "--bind" => o.bind = Some(value()?.parse()?),
                 "--migrate-v1" => o.migrate_v1 = true,
                 "--pacing" => o.pacing = Some(value()?.parse()?),
                 "--audio" => o.audio = audio::parse_mode(value()?)?,
@@ -267,7 +282,13 @@ fn node_config(o: &Options) -> Result<frames_net::NodeConfig> {
     };
     Ok(frames_net::NodeConfig {
         relay_only: o.relay_only,
-        relays,
+        relays: if o.direct_only {
+            frames_net::Relays::Disabled
+        } else {
+            relays
+        },
+        discovery: !o.direct_only,
+        bind: o.bind,
         ..frames_net::NodeConfig::default()
     })
 }
@@ -282,6 +303,9 @@ async fn host(o: Options) -> Result<()> {
         println!("no relay reachable ({error:#}); reachable on this network only");
     }
     println!("endpoint id: {}", node.id());
+    for socket in node.bound_sockets() {
+        println!("listening on {socket}");
+    }
     let _advertised = frames_net::local::advertise(&node, &device_name(&o))
         .map_err(|error| println!("not advertised on the local network: {error:#}"))
         .ok();
@@ -383,12 +407,17 @@ async fn connect(id: &str, o: Options) -> Result<()> {
     let nearby = frames_net::local::find(id, Duration::from_millis(1500))
         .await
         .unwrap_or_default();
-    let target: iroh::EndpointAddr = match &nearby {
-        Some(host) => {
+    let target: iroh::EndpointAddr = match (&nearby, o.addr) {
+        (_, Some(addr)) => iroh::EndpointAddr::from_parts(
+            id.parse::<iroh::EndpointId>()
+                .context("--addr needs the full device id")?,
+            [iroh::TransportAddr::Ip(addr)],
+        ),
+        (Some(host), None) => {
             println!("found {} on this network", host.name);
             host.addr.clone()
         }
-        None => id
+        (None, None) => id
             .parse::<iroh::EndpointId>()
             .context("not a device id, and no single nearby device starts with it")?
             .into(),
@@ -593,6 +622,7 @@ async fn run(args: Vec<String>) -> Result<()> {
             }
             Ok(())
         }
+        Some("impair") => impair::run(&args[1..]).await,
         Some("discover") => {
             for device in frames_net::local::browse(Duration::from_secs(3)).await? {
                 let addrs: Vec<String> = device.addr.ip_addrs().map(ToString::to_string).collect();
