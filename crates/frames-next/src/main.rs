@@ -101,6 +101,12 @@ pub struct Options {
     pub pacing: Option<f64>,
     /// Clipboard sharing (both ends must turn it on).
     pub clipboard: clip::Mode,
+    /// ADB bridge: the viewer forwards its ADB server to the host.
+    pub adb: bool,
+    /// Viewer: the ADB server to forward (default 127.0.0.1:5037).
+    pub adb_server: std::net::SocketAddr,
+    /// Host: where the bridge listens (default 127.0.0.1:15037).
+    pub adb_listen: std::net::SocketAddr,
     /// Name shown to nearby devices (default: the computer's name).
     pub name: Option<String>,
     /// Host audio (both ends must turn it on).
@@ -144,6 +150,9 @@ impl Options {
             migrate_v1: false,
             pacing: None,
             clipboard: clip::Mode::Off,
+            adb: false,
+            adb_server: ([127, 0, 0, 1], 5037).into(),
+            adb_listen: ([127, 0, 0, 1], 15037).into(),
             name: None,
             audio: audio::Mode::Off,
             send_files: Vec::new(),
@@ -187,6 +196,16 @@ impl Options {
                 "--pacing" => o.pacing = Some(value()?.parse()?),
                 "--audio" => o.audio = audio::parse_mode(value()?)?,
                 "--name" => o.name = Some(value()?.to_string()),
+                "--adb" => o.adb = true,
+                "--adb-server" => o.adb_server = value()?.parse()?,
+                "--adb-listen" => {
+                    let address: std::net::SocketAddr = value()?.parse()?;
+                    anyhow::ensure!(
+                        address.ip().is_loopback(),
+                        "the ADB bridge listens on loopback only"
+                    );
+                    o.adb_listen = address;
+                }
                 "--send" => o.send_files.push(value()?.into()),
                 "--get" => o.get_files.push(value()?.to_string()),
                 "--receive-dir" => o.receive_dir = Some(value()?.into()),

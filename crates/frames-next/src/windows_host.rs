@@ -133,7 +133,11 @@ fn stream(
         .context("sending the stream description")?;
     // Cursor shape and visibility, opened after the description so the
     // viewer accepts the two streams in that order.
-    let (mut cursor_stream, _) = handle.block_on(session.open_channel())?;
+    let (mut cursor_stream, _) =
+        handle.block_on(crate::streams::open(session, crate::streams::CURSOR))?;
+    if o.adb && o.control {
+        handle.spawn(crate::streams::adb_listener(session.clone(), o.adb_listen));
+    }
     let (cursor_tx, mut cursor_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     handle.spawn(async move {
         while let Some(bytes) = cursor_rx.recv().await {

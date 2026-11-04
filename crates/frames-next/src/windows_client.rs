@@ -28,8 +28,14 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     let (cursor_tx, cursor_rx) = std::sync::mpsc::channel();
     let cursor_reader = {
         let session = session.clone();
+        let (cursor_streams, mut cursor_incoming) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(crate::streams::route_viewer(
+            session.clone(),
+            cursor_streams,
+            o.adb.then_some(o.adb_server),
+        ));
         tokio::spawn(async move {
-            let Ok((_send, mut recv)) = session.accept_channel().await else {
+            let Some(mut recv) = cursor_incoming.recv().await else {
                 return;
             };
             let mut reader = frames_input::cursor::CursorReader::default();

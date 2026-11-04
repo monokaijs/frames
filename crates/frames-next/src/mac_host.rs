@@ -97,7 +97,11 @@ fn stream(
         .block_on(send_info(session, info))
         .context("sending the stream description")?;
     // The viewer accepts a cursor stream after the description.
-    let (mut cursor_stream, _) = handle.block_on(session.open_channel())?;
+    let (mut cursor_stream, _) =
+        handle.block_on(crate::streams::open(session, crate::streams::CURSOR))?;
+    if o.adb && o.control {
+        handle.spawn(crate::streams::adb_listener(session.clone(), o.adb_listen));
+    }
     handle.spawn(async move {
         let mut bytes = Vec::new();
         frames_input::cursor::CursorMessage::Visible(true).encode(&mut bytes);
