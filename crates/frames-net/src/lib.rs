@@ -2,6 +2,8 @@
 //!
 //! - [`identity`]: the device key, derived from the v1 identity so existing
 //!   installations keep one stable identity without storing a new secret.
+//! - [`local`]: nearby devices on the local network (mDNS), for direct
+//!   connections without internet discovery.
 //! - [`migration`]: proof that a v2 device key belongs to a v1 identity, so
 //!   v1 trust entries carry over (docs/V2_PLAN.md, Phase 4).
 //! - [`congestion`]: QUIC congestion control that follows the media engine's
@@ -18,6 +20,7 @@
 
 pub mod congestion;
 pub mod identity;
+pub mod local;
 pub mod migration;
 pub mod node;
 pub mod trust;

@@ -2346,6 +2346,7 @@ dependencies = [
  "frames-testkit",
  "hex",
  "iroh",
+ "mdns-sd",
  "noq-proto",
  "rcgen",
  "ring",

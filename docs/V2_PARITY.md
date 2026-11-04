@@ -14,7 +14,7 @@ launcher, installer, updater, and service still run v1.
 |---|---|
 | Direct LAN/VPN connections | **Done**: iroh, direct paths found automatically (PC ↔ Mac on the LAN). |
 | Internet connections (new in v2) | **Partial**: n0 relays and self-hosted relays work; NAT matrix not run. |
-| Nearby discovery | **Not started** in the launcher; iroh dials by device id. |
+| Nearby discovery | **Partial**: hosts advertise `_frames2._udp` (device id and name); `frames-next discover` lists nearby hosts; `connect` dials a nearby host's LAN addresses directly (works without internet; 129 ms to connect PC ← Mac) and accepts an unambiguous id prefix. No launcher cards yet. |
 | Pairing code confirmation | **Partial**: both ends show the code; the host approves on its terminal (no dialog yet). |
 | Accept and trust / this session only / decline | **Partial**: view only or view and control, always remembered; no "this session only" yet. |
 | Trusted devices reconnect without a prompt | **Done** (`trusted-v2.json`). |

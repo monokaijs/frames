@@ -4,7 +4,7 @@
 //! frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software]
 //!                  [--fps 60] [--mbps 30]
 //!                  [--hold N] [--seconds N] [--relay-only]
-//! frames-next peers | revoke <device-id> [--config-dir DIR]\n       frames-next connect <endpoint-id> [--vsync] [--synthetic-input] [--seconds N] [--relay-only]
+//! frames-next discover | peers | revoke <device-id> [--config-dir DIR]\n       frames-next connect <endpoint-id> [--vsync] [--synthetic-input] [--seconds N] [--relay-only]
 //! ```
 //!
 //! The host prints its endpoint id; the client dials it by id (iroh finds a
@@ -101,6 +101,8 @@ pub struct Options {
     pub pacing: Option<f64>,
     /// Clipboard sharing (both ends must turn it on).
     pub clipboard: clip::Mode,
+    /// Name shown to nearby devices (default: the computer's name).
+    pub name: Option<String>,
     /// Host audio (both ends must turn it on).
     pub audio: audio::Mode,
     /// Viewer: files to send to the host once connected.
@@ -140,6 +142,7 @@ impl Options {
             migrate_v1: false,
             pacing: None,
             clipboard: clip::Mode::Off,
+            name: None,
             audio: audio::Mode::Off,
             send_files: Vec::new(),
             receive_dir: None,
@@ -180,6 +183,7 @@ impl Options {
                 "--migrate-v1" => o.migrate_v1 = true,
                 "--pacing" => o.pacing = Some(value()?.parse()?),
                 "--audio" => o.audio = audio::parse_mode(value()?)?,
+                "--name" => o.name = Some(value()?.to_string()),
                 "--send" => o.send_files.push(value()?.into()),
                 "--receive-dir" => o.receive_dir = Some(value()?.into()),
                 "--clipboard" => {
@@ -237,8 +241,15 @@ async fn host(mut o: Options) -> Result<()> {
     let config = admit::config_dir(o.config_dir.as_ref())?;
     let key = admit::device_key(&config)?;
     let node = frames_net::Node::bind(&key, node_config(&o)?).await?;
-    node.online(Duration::from_secs(10)).await?;
+    // Without internet, relays are unreachable; LAN viewers still find this
+    // host through the local advertisement.
+    if let Err(error) = node.online(Duration::from_secs(10)).await {
+        println!("no relay reachable ({error:#}); reachable on this network only");
+    }
     println!("endpoint id: {}", node.id());
+    let _advertised = frames_net::local::advertise(&node, &device_name(&o))
+        .map_err(|error| println!("not advertised on the local network: {error:#}"))
+        .ok();
     loop {
         let session = node.accept().await.context("node closed")??;
         match admit::decide(&config, &session, o.approve).await? {
@@ -282,7 +293,27 @@ async fn connect(id: &str, o: Options) -> Result<()> {
     let config = admit::config_dir(o.config_dir.as_ref())?;
     let node = frames_net::Node::bind(&admit::device_key(&config)?, node_config(&o)?).await?;
     let started = std::time::Instant::now();
-    let session = node.connect(id.parse::<iroh::EndpointId>()?).await?;
+    // A host on this network answers its local advertisement: dial its
+    // addresses directly (works without internet). Otherwise iroh's
+    // discovery finds it.
+    // A full id stops browsing as soon as that host answers; a prefix
+    // waits the whole window to be sure it is unambiguous.
+    let nearby = frames_net::local::find(id, Duration::from_millis(1500))
+        .await
+        .unwrap_or_default();
+    let session = match &nearby {
+        Some(host) => {
+            println!("found {} on this network", host.name);
+            node.connect(host.addr.clone()).await?
+        }
+        _ => {
+            node.connect(
+                id.parse::<iroh::EndpointId>()
+                    .context("not a device id, and no single nearby device starts with it")?,
+            )
+            .await?
+        }
+    };
     admit::send_hello(&session, &node.id(), o.migrate_v1, viewer_decoders()).await?;
     for path in o.send_files.clone() {
         let session = session.clone();
@@ -325,6 +356,22 @@ async fn run_client(session: frames_net::Session, o: Options) -> Result<()> {
 #[cfg(not(any(windows, target_os = "macos")))]
 async fn run_client(_: frames_net::Session, _: Options) -> Result<()> {
     bail!("viewing needs the Windows or macOS backends")
+}
+
+/// The name nearby devices see.
+fn device_name(o: &Options) -> String {
+    o.name
+        .clone()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .or_else(|| {
+            std::process::Command::new("scutil")
+                .args(["--get", "ComputerName"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        })
+        .unwrap_or_else(|| "Frames device".into())
 }
 
 /// What this viewer can decode, best first. Windows decodes AV1 in
@@ -408,6 +455,13 @@ fn main() -> Result<()> {
 async fn run(args: Vec<String>) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("host") => host(Options::parse(&args[1..])?).await,
+        Some("discover") => {
+            for device in frames_net::local::browse(Duration::from_secs(3)).await? {
+                let addrs: Vec<String> = device.addr.ip_addrs().map(ToString::to_string).collect();
+                println!("{}  {}  {}", device.id, device.name, addrs.join(" "));
+            }
+            Ok(())
+        }
         Some("peers") => {
             let o = Options::parse(&args[1..])?;
             let config = admit::config_dir(o.config_dir.as_ref())?;
