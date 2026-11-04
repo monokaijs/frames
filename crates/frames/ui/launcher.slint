@@ -1,5 +1,5 @@
 import { LineEdit, ScrollView, ComboBox, SpinBox } from "std-widgets.slint";
-import { ConnectionButton } from "connection-button.slint";
+import { ConnectionButton, SharingButton } from "connection-button.slint";
 import { Theme, Glyph, AppButton, AppSwitch, AppCheckBox, NavItem, TabItem, Badge, Card, SectionTitle, MutedText, ModalFocus } from "components.slint";
 
 export struct DeviceRow { name: string, address: string, detail: string, fingerprint: string, trusted: bool, online: bool, can-trust: bool, preview: image, preview-live: bool, connection-audio: bool, connection-desktop: bool }
@@ -110,6 +110,7 @@ component DeviceGrid inherits Rectangle {
                 x: 12px; y: 12px; width: parent.width - 24px; height: 32px;
                 spacing: 8px;
                 ConnectionButton {
+                    primary: true;
                     enabled: device.address != "";
                     audio: device.connection-audio; desktop: device.connection-desktop;
                     connect => { root.connect(device.address, device.fingerprint, self.audio, self.desktop); }
@@ -353,10 +354,17 @@ export component Launcher inherits Window {
                                                 Text { text: root.device-name; font-size: 15px; font-weight: 500; color: Theme.ink; overflow: elide; }
                                                 TextInput { text: root.local-address; read-only: true; single-line: true; font-size: 11px; color: Theme.muted; accessible-label: "This device's address. Other devices connect to it."; }
                                             }
+                                            // Controls sit on the card's bottom edge in both columns so they line up.
+                                            Rectangle { vertical-stretch: 1; }
                                             HorizontalLayout {
                                                 spacing: 8px;
-                                                AppButton { label: root.background-sharing-running ? "Manage sharing" : root.sharing ? "Stop sharing" : "Start sharing"; danger: root.sharing && !root.background-sharing-running; clicked => { if root.background-sharing-running { root.login-settings(); } else { root.toggle-sharing(); } } }
-                                                ComboBox { width: 154px; height: 32px; model: ["Everything", "Selected windows", "One window"]; current-index <=> root.share-mode; enabled: !root.sharing && !root.background-sharing-running; accessible-label: "What to share"; }
+                                                SharingButton {
+                                                    label: root.background-sharing-running ? "Manage sharing" : root.sharing ? "Stop sharing" : "Start sharing";
+                                                    danger: root.sharing && !root.background-sharing-running;
+                                                    options-enabled: !root.sharing && !root.background-sharing-running;
+                                                    mode <=> root.share-mode;
+                                                    activate => { if root.background-sharing-running { root.login-settings(); } else { root.toggle-sharing(); } }
+                                                }
                                                 Rectangle { horizontal-stretch: 1; }
                                             }
                                         }
@@ -365,6 +373,7 @@ export component Launcher inherits Window {
                                             min-width: 290px; horizontal-stretch: 1.1; spacing: 10px;
                                             SectionTitle { text: "Connect to a device"; }
                                             MutedText { text: "Enter the address shown on the other device."; font-size: 11px; }
+                                            Rectangle { vertical-stretch: 1; }
                                             HorizontalLayout {
                                                 spacing: 8px;
                                                 LineEdit { height: 32px; horizontal-stretch: 1; text <=> root.address; placeholder-text: "192.168.1.10 or 192.168.1.10:47990"; accessible-label: "Address of the other device"; edited => { root.connection-address-edited(); } accepted => { if root.address != "" { root.connect(root.address); } } }
@@ -379,7 +388,6 @@ export component Launcher inherits Window {
                                                     }
                                                 }
                                             }
-                                            Rectangle { vertical-stretch: 1; }
                                         }
                                     }
                                 }

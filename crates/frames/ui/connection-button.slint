@@ -109,3 +109,81 @@ export component ConnectionButton inherits Rectangle {
         }
     }
 }
+
+// Same split surface as ConnectionButton: the label starts or stops sharing,
+// the chevron chooses what is shared. The scope is fixed while sharing.
+export component SharingButton inherits Rectangle {
+    in property <string> label: "Start sharing";
+    in property <bool> danger: false;
+    in property <bool> options-enabled: true;
+    in-out property <int> mode: 0;
+    callback activate();
+    width: 138px; height: 32px;
+    horizontal-stretch: 0;
+    border-radius: 5px;
+    border-width: root.danger ? 1px : 0px;
+    border-color: #ac444c;
+    private property <bool> hot: action.has-hover || dropdown.has-hover || action-focus.has-focus || options-focus.has-focus;
+    background: root.danger ? (root.hot ? #fff2f2 : white) : action.pressed || dropdown.pressed ? Theme.accent-pressed : root.hot ? Theme.accent-hover : Theme.accent;
+    forward-focus: action-focus;
+    Text {
+        width: parent.width - 30px; height: parent.height;
+        text: root.label; font-size: 12px; font-weight: 500;
+        color: root.danger ? #b34e54 : white;
+        horizontal-alignment: center; vertical-alignment: center;
+    }
+    Glyph {
+        x: parent.width - 24px; y: 10px; width: 12px; height: 12px;
+        source: @image-url("icons/chevron-down.svg");
+        colorize: !root.options-enabled ? (root.danger ? #e2b8bb : #7c7c7c) : root.danger ? #b34e54 : white;
+    }
+    action-focus := FocusScope {
+        key-pressed(event) => {
+            if event.text == Key.DownArrow && root.options-enabled { options.show(); return accept; }
+            if event.text == " " || event.text == Key.Return { root.activate(); return accept; }
+            return reject;
+        }
+    }
+    action := TouchArea {
+        width: parent.width - 30px; mouse-cursor: pointer;
+        clicked => { action-focus.focus(); root.activate(); }
+        accessible-role: button; accessible-label: root.label;
+        accessible-action-default => { root.activate(); }
+    }
+    options-focus := FocusScope {
+        enabled: root.options-enabled;
+        key-pressed(event) => {
+            if event.text == " " || event.text == Key.Return || event.text == Key.DownArrow { options.show(); return accept; }
+            return reject;
+        }
+    }
+    dropdown := TouchArea {
+        x: parent.width - 30px; width: 30px; enabled: root.options-enabled; mouse-cursor: root.options-enabled ? pointer : default;
+        clicked => { options-focus.focus(); options.show(); }
+        accessible-role: button; accessible-label: "What to share"; accessible-enabled: root.options-enabled;
+        accessible-action-default => { if root.options-enabled { options.show(); } }
+    }
+    options := PopupWindow {
+        x: 0px; y: root.height + 6px;
+        width: 232px; height: 166px;
+        close-policy: close-on-click-outside;
+        forward-focus: menu-focus;
+        menu-focus := FocusScope {
+            key-pressed(event) => {
+                if event.text == Key.Escape { options.close(); options-focus.focus(); return accept; }
+                return reject;
+            }
+            Rectangle {
+                background: white; border-radius: 8px; border-width: 1px; border-color: #d6d9e0;
+                VerticalLayout {
+                    padding: 12px; spacing: 5px;
+                    Text { text: "What to share"; color: Theme.muted; font-size: 11px; height: 20px; }
+                    ConnectionModeOption { label: "Everything"; selected: root.mode == 0; clicked => { root.mode = 0; options.close(); } }
+                    ConnectionModeOption { label: "Selected windows"; selected: root.mode == 1; clicked => { root.mode = 1; options.close(); } }
+                    ConnectionModeOption { label: "One window"; selected: root.mode == 2; clicked => { root.mode = 2; options.close(); } }
+                    Text { text: "Window choices open when you start"; color: Theme.muted; font-size: 10px; height: 15px; }
+                }
+            }
+        }
+    }
+}
