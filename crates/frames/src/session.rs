@@ -100,6 +100,7 @@ async fn handshake(
         peer.name.len() <= 256 && peer.codecs.len() <= 32 && peer.platform.len() <= 32,
         "invalid peer capabilities"
     );
+    anyhow::ensure!(displayable_peer_name(&peer.name), "invalid peer name");
     let id = transport::peer_id(connection)?;
     anyhow::ensure!(
         peer.device_id == id,
@@ -1711,4 +1712,40 @@ pub async fn fetch_file(address: SocketAddr, path: String) -> anyhow::Result<()>
     drop(io);
     endpoint.wait_idle().await;
     Ok(())
+}
+
+/// A peer chooses its own name and it is shown in the approval dialog, so it
+/// must not contain characters that could fake dialog lines or reorder text:
+/// controls, line/paragraph separators, and bidirectional overrides.
+fn displayable_peer_name(name: &str) -> bool {
+    name.chars().all(|c| {
+        !c.is_control()
+            && !matches!(c, '\u{2028}' | '\u{2029}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    })
+}
+
+#[cfg(test)]
+mod peer_name_tests {
+    #[test]
+    fn approval_dialog_names_reject_fake_lines_and_reordering() {
+        for ok in [
+            "Studio Mac",
+            "Edward\u{2019}s MacBook Pro",
+            "PC-01",
+            "--permissions",
+            "Bäckerei 東京",
+        ] {
+            assert!(super::displayable_peer_name(ok), "{ok}");
+        }
+        for bad in [
+            "a\nVerification code: 1",
+            "a\u{2028}b",
+            "a\u{202E}cba",
+            "a\u{2066}b",
+            "a\tb",
+            "a\u{200F}",
+        ] {
+            assert!(!super::displayable_peer_name(bad), "{bad:?}");
+        }
+    }
 }

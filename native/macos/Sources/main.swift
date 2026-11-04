@@ -8,24 +8,29 @@ import ScreenCaptureKit
 @MainActor func runFrames(){
 guard frames_abi_version() == FRAMES_ABI_VERSION else { fatalError("Frames native ABI mismatch") }
 let args = CommandLine.arguments
+// The mode is always the first argument. Later arguments carry data a remote
+// peer can choose (device names, app names, error text), so they must never
+// select a mode: `--approve "--permissions" ...` once skipped the approval
+// dialog entirely and exited 0.
+let mode = args.count > 1 ? args[1] : ""
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 
-if args.contains("--network-settings"){
+if mode == "--network-settings"{
     Task { @MainActor in
         Wire.send(["opened":await SettingsNavigation.openLocalNetwork()])
         app.terminate(nil)
     }
     app.run()
-}else if args.contains("--pause-sharing-for-update"){
+}else if mode == "--pause-sharing-for-update"{
     let service=SMAppService.agent(plistName:"dev.creaton.frames.agent.plist")
     do{
         if service.status == .enabled{try service.unregister();print("resume")}else{print("off")}
     }catch{FileHandle.standardError.write(Data(error.localizedDescription.utf8));exit(1)}
-}else if args.contains("--resume-sharing-after-update"){
+}else if mode == "--resume-sharing-after-update"{
     do{try SMAppService.agent(plistName:"dev.creaton.frames.agent.plist").register()}
     catch{FileHandle.standardError.write(Data(error.localizedDescription.utf8));exit(1)}
-}else if args.contains("--login-item"){
+}else if mode == "--login-item"{
     app.setActivationPolicy(.regular);app.activate(ignoringOtherApps:true)
     let service=SMAppService.agent(plistName:"dev.creaton.frames.agent.plist")
     let enabled=service.status == .enabled || service.status == .requiresApproval
@@ -40,7 +45,7 @@ if args.contains("--network-settings"){
     }catch{
         let failure=NSAlert();failure.messageText="Couldn't update the login item";failure.informativeText=error.localizedDescription;_ = runFramesAlert(failure);exit(1)
     }
-}else if args.contains("--permissions"){
+}else if mode == "--permissions"{
     let wantsScreen=args.contains("--request") || args.contains("--request-screen")
     let wantsControl=args.contains("--request") || args.contains("--request-control")
     let needsScreen=wantsScreen && !CGPreflightScreenCaptureAccess()
@@ -70,19 +75,20 @@ if args.contains("--network-settings"){
         if needsControl{RunLoop.current.run(until:Date(timeIntervalSinceNow:1))}
         Wire.send(Wire.permissions())
     }
-}else if args.contains("--error"){
+}else if mode == "--error"{
     app.setActivationPolicy(.regular);let alert=NSAlert();alert.messageText=args.count>2 ? args[2]:"Frames";alert.informativeText=args.count>3 ? args[3]:"Unknown error";alert.alertStyle = .critical;_ = runFramesAlert(alert)
-}else if args.contains("--approve"){
+}else if mode == "--approve"{
     app.setActivationPolicy(.regular);app.activate(ignoringOtherApps:true)
     let alert=NSAlert();alert.messageText=args.count>4 ? args[4]:"Approve pairing"
     let name=args.count>2 ? args[2].components(separatedBy:.controlCharacters).joined():"Remote device"
     alert.informativeText="Verification code: \(args.count>3 ? args[3]:"")\n\nDevice: \(name)\n\nApprove only if the other device shows the same code."
     alert.informativeText += "\n\nAccept allows this session only. Accept and trust also saves the device for future connections."
     alert.addButton(withTitle:"Decline connection");alert.addButton(withTitle:"Accept and trust");alert.addButton(withTitle:"Accept")
-    let decision=runFramesAlert(alert);exit(decision == .alertSecondButtonReturn ? 0 : decision == .alertThirdButtonReturn ? 2 : 1)
-} else if args.contains("--launcher"){
+    // Dedicated codes: a normal exit 0 (any other mode, or no answer) must never read as consent.
+    let decision=runFramesAlert(alert);exit(decision == .alertSecondButtonReturn ? 10 : decision == .alertThirdButtonReturn ? 11 : 1)
+} else if mode == "--launcher"{
     app.setActivationPolicy(.regular);let launcher=FramesLauncher();app.delegate=launcher;withExtendedLifetime(launcher){app.run()}
-} else if args.contains("--host") {
+} else if mode == "--host" {
     let host = NativeHost()
     DispatchQueue.global(qos: .userInteractive).async {
         while let line = readLine() {
@@ -99,7 +105,7 @@ if args.contains("--network-settings"){
         DispatchQueue.main.async { app.terminate(nil) }
     }
     withExtendedLifetime(host){app.run()}
-} else if args.contains("--client") {
+} else if mode == "--client" {
     // Accessory apps do not own the system menu bar. The client must activate
     // normally so focused remote application menus are visible and actionable.
     app.setActivationPolicy(.regular)
@@ -133,7 +139,7 @@ if args.contains("--network-settings"){
         exit(0)
     }
     withExtendedLifetime(client){app.run()}
-} else if args.contains("--dock") {
+} else if mode == "--dock" {
     let dock = DockProxy(name: args.count > 2 ? args[2] : "Remote app", icon: args.count > 3 ? args[3] : "")
     app.setActivationPolicy(.regular); app.delegate = dock
     // stdin is a pipe held by the client helper: EOF means the helper is gone

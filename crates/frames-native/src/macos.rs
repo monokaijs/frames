@@ -45,11 +45,17 @@ pub fn confirm_pairing(
     let status = Command::new(helper_path()?)
         .args(["--approve", name, code, reason])
         .status()?;
-    Ok(match status.code() {
-        Some(0) => crate::ConnectionDecision::Trust,
-        Some(2) => crate::ConnectionDecision::Accept,
+    Ok(approval_decision(status.code()))
+}
+/// Only the approval dialog's dedicated exit codes grant access. Exit 0 is what
+/// any other helper mode returns, so reading it as consent let a peer named
+/// like a helper flag skip the dialog. Crashes, kills and unknown codes decline.
+fn approval_decision(code: Option<i32>) -> crate::ConnectionDecision {
+    match code {
+        Some(10) => crate::ConnectionDecision::Trust,
+        Some(11) => crate::ConnectionDecision::Accept,
         _ => crate::ConnectionDecision::Decline,
-    })
+    }
 }
 pub fn launcher() -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -979,5 +985,22 @@ mod launch_agent_tests {
             !launch_agent_loaded(&label).unwrap(),
             "An unloaded service must not block Restart to update"
         );
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use crate::ConnectionDecision::*;
+    #[test]
+    fn only_the_dialogs_dedicated_exit_codes_grant_access() {
+        assert!(matches!(super::approval_decision(Some(10)), Trust));
+        assert!(matches!(super::approval_decision(Some(11)), Accept));
+        // Exit 0 is what every other helper mode returns; it must not be consent.
+        for code in [Some(0), Some(1), Some(2), Some(-1), None] {
+            assert!(
+                matches!(super::approval_decision(code), Decline),
+                "{code:?}"
+            );
+        }
     }
 }
