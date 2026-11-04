@@ -648,6 +648,7 @@ async fn host_mode(
     let result = loop {
         tokio::select! {
             _=tokio::signal::ctrl_c()=>break Ok(()),
+            _=crate::lifetime::gone()=>break Ok(()),
             _=health.tick()=>{
                 if let Err(error)=desktop.check_health(){break Err(error);}
                 let name=frames_native::device_name();

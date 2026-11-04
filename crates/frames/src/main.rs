@@ -8,6 +8,7 @@ mod device_setup;
 mod file_worker;
 mod launcher;
 mod launcher_status;
+mod lifetime;
 mod media_debug;
 mod media_sender;
 #[cfg(windows)]
@@ -287,9 +288,10 @@ fn run() -> anyhow::Result<()> {
         #[cfg(target_os="macos")] Command::Permissions{request}=>{println!("{}",serde_json::to_string_pretty(&frames_native::permission_status(request)?)?);Ok(())},
         #[cfg(windows)] Command::Service{action:ServiceCommand::Agent}=>runtime.block_on(session::host("0.0.0.0:47990".parse()?,false,true,vec![],None,8,true)),
         #[cfg(windows)] Command::Service{..}=>unreachable!(),
-        Command::Host{listen,pair,unattended,exclude,receive_dir,max_streams,no_clipboard,shared_game,shared_window,share_windows}=>{if !share_windows.is_empty(){runtime.block_on(session::selected_host(listen,pair,unattended,exclude,share_windows,shared_game,max_streams))}else if shared_game{runtime.block_on(session::shared_host(listen,pair,unattended,exclude,shared_window))}else{runtime.block_on(session::host(listen,pair,unattended,exclude,receive_dir,max_streams,!no_clipboard))}},
+        Command::Host{listen,pair,unattended,exclude,receive_dir,max_streams,no_clipboard,shared_game,shared_window,share_windows}=>{lifetime::watch(||{});if !share_windows.is_empty(){runtime.block_on(session::selected_host(listen,pair,unattended,exclude,share_windows,shared_game,max_streams))}else if shared_game{runtime.block_on(session::shared_host(listen,pair,unattended,exclude,shared_window))}else{runtime.block_on(session::host(listen,pair,unattended,exclude,receive_dir,max_streams,!no_clipboard))}},
         Command::Connect{address,codec,no_clipboard,audio,view,bandwidth_mbps,quality}=>{
             let (updates_tx,updates_rx)=frames_native::client_channel(16);let(events_tx,events_rx)=tokio::sync::mpsc::unbounded_channel();
+            lifetime::watch({let events=events_tx.clone();move||{let _=events.send(frames_native::ClientEvent::Disconnected);}});
             let shutdown=updates_tx.clone();let task=runtime.spawn(async move{let result=session::client(address,codec.codec(),updates_tx,events_rx,!no_clipboard,session::MediaOptions{audio,bandwidth_mbps,quality},match view{ViewChoice::Windows=>frames_core::model::ViewMode::Windows,ViewChoice::Desktop=>frames_core::model::ViewMode::Desktop}).await;if let Err(e)=&result{tracing::error!(error=%e,"connection ended");}let _=shutdown.send(frames_native::ClientUpdate::Shutdown);result});
             let ui=frames_native::run_client(address.to_string(),updates_rx,events_tx);let network=runtime.block_on(task)?;ui?;network
         },

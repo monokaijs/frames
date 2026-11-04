@@ -521,7 +521,10 @@ impl Worker {
             .args(args)
             .env_remove("FRAMES_GUI_CHILD")
             .env("FRAMES_LAUNCHER_PID", std::process::id().to_string())
-            .stdin(Stdio::null())
+            // Only this process holds the write end: the session ends when the
+            // launcher does, even when it exits without running shutdown code.
+            .env(crate::lifetime::ENV, "1")
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(fs::File::create(&log)?);
         command.env_remove("FRAMES_EXPECTED_DEVICE_ID");
