@@ -90,6 +90,10 @@ pub struct Options {
     pub approve: Option<admit::Approve>,
     /// Host, set at admission: this viewer may send input.
     pub control: bool,
+    /// `--codec` was given; otherwise the host picks (see [`choose_codec`]).
+    pub codec_explicit: bool,
+    /// Host, set at admission: what the viewer decodes, best first.
+    pub viewer_decoders: Vec<Codec>,
 }
 
 impl Options {
@@ -112,6 +116,8 @@ impl Options {
             config_dir: None,
             approve: None,
             control: false,
+            codec_explicit: false,
+            viewer_decoders: Vec::new(),
         };
         let mut args = args.iter();
         while let Some(arg) = args.next() {
@@ -123,6 +129,7 @@ impl Options {
             match arg.as_str() {
                 "--source" => o.qa_source = value()? == "qa",
                 "--codec" => {
+                    o.codec_explicit = true;
                     o.codec = match value()? {
                         "h264" => Codec::H264,
                         "hevc" => Codec::Hevc,
@@ -192,8 +199,9 @@ async fn host(mut o: Options) -> Result<()> {
     loop {
         let session = node.accept().await.context("node closed")??;
         match admit::decide(&config, &session, o.approve).await? {
-            Some(control) => {
-                o.control = control;
+            Some(admitted) => {
+                o.control = admitted.control;
+                o.viewer_decoders = admitted.decoders;
                 return run_host(session, o).await;
             }
             None => session.close("not approved"),
@@ -221,7 +229,7 @@ async fn connect(id: &str, o: Options) -> Result<()> {
     let node = frames_net::Node::bind(&admit::device_key(&config)?, node_config(&o)?).await?;
     let started = std::time::Instant::now();
     let session = node.connect(id.parse::<iroh::EndpointId>()?).await?;
-    admit::send_hello(&session, &node.id(), o.migrate_v1).await?;
+    admit::send_hello(&session, &node.id(), o.migrate_v1, viewer_decoders()).await?;
     println!(
         "connected in {:.0} ms, pairing code {} (a new host shows the same code)",
         started.elapsed().as_secs_f64() * 1e3,
@@ -249,6 +257,37 @@ async fn run_client(session: frames_net::Session, o: Options) -> Result<()> {
 #[cfg(not(any(windows, target_os = "macos")))]
 async fn run_client(_: frames_net::Session, _: Options) -> Result<()> {
     bail!("viewing needs the Windows or macOS backends")
+}
+
+/// What this viewer can decode, best first. Windows decodes AV1 in
+/// hardware on recent GPUs and with dav1d otherwise; VideoToolbox on the
+/// Macs Frames supports has no AV1 decoder.
+fn viewer_decoders() -> Vec<Codec> {
+    if cfg!(target_os = "macos") {
+        vec![Codec::Hevc, Codec::H264]
+    } else {
+        vec![Codec::Hevc, Codec::Av1, Codec::H264]
+    }
+}
+
+/// The codec for a stream: `--codec` if given; otherwise the most
+/// efficient one both ends support. HEVC needs about 30-40% less bitrate
+/// than H.264 at the same quality; on a relayed path, where bitrate is
+/// scarce, AV1 comes first when both ends have it.
+pub fn choose_codec(o: &Options, encoders: &[Codec], relayed: bool) -> Codec {
+    if o.codec_explicit || o.viewer_decoders.is_empty() {
+        return o.codec;
+    }
+    let order: &[Codec] = if relayed {
+        &[Codec::Av1, Codec::Hevc, Codec::H264]
+    } else {
+        &[Codec::Hevc, Codec::Av1, Codec::H264]
+    };
+    order
+        .iter()
+        .copied()
+        .find(|codec| encoders.contains(codec) && o.viewer_decoders.contains(codec))
+        .unwrap_or(o.codec)
 }
 
 /// Writes one JSON line on a fresh channel.
@@ -308,5 +347,38 @@ async fn run(args: Vec<String>) -> Result<()> {
         _ => bail!(
             "usage: frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software] [--fps N] [--mbps N] [--hold N] [--seconds N] [--approve view|control] [--config-dir DIR] [--relay URL] [--relay-only]\n       frames-next connect <endpoint-id> [--vsync] [--seconds N]"
         ),
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+
+    fn options(decoders: Vec<Codec>) -> Options {
+        let mut o = Options::parse(&[]).unwrap();
+        o.viewer_decoders = decoders;
+        o
+    }
+
+    #[test]
+    fn the_best_shared_codec_wins_and_an_explicit_one_is_kept() {
+        let all = [Codec::Hevc, Codec::H264, Codec::Av1];
+        let mac_viewer = options(vec![Codec::Hevc, Codec::H264]);
+        assert_eq!(choose_codec(&mac_viewer, &all, true), Codec::Hevc);
+        let pc_viewer = options(vec![Codec::Hevc, Codec::Av1, Codec::H264]);
+        assert_eq!(choose_codec(&pc_viewer, &all, true), Codec::Av1, "relayed");
+        assert_eq!(choose_codec(&pc_viewer, &all, false), Codec::Hevc, "direct");
+        let h264_host = [Codec::H264];
+        assert_eq!(choose_codec(&pc_viewer, &h264_host, false), Codec::H264);
+        let mut explicit = options(vec![Codec::Hevc]);
+        explicit.codec = Codec::H264;
+        explicit.codec_explicit = true;
+        assert_eq!(choose_codec(&explicit, &all, false), Codec::H264);
+        let silent = options(Vec::new());
+        assert_eq!(
+            choose_codec(&silent, &all, true),
+            silent.codec,
+            "old viewer"
+        );
     }
 }

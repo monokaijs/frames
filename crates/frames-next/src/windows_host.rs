@@ -133,8 +133,16 @@ fn stream(
     let first = first_frame(&mut capture, &clock)?;
     let (width, height) = first.surface.size();
     println!("capturing {width}x{height} at up to {} fps", o.fps);
+    // NVENC on this generation (RTX 30) has no AV1; the FFmpeg backends
+    // encode what their names say.
+    let encoders: Vec<crate::Codec> = match o.encoder.as_str() {
+        "software" => vec![crate::Codec::Av1],
+        _ => vec![crate::Codec::Hevc, crate::Codec::H264],
+    };
+    let codec = crate::choose_codec(o, &encoders, session.media().path().kind == PathKind::Relay);
+    println!("codec: {codec:?}");
     let info = StreamInfo {
-        codec: o.codec,
+        codec,
         width,
         height,
         fps: o.fps,
@@ -178,18 +186,18 @@ fn stream(
     let mut encoder: Box<dyn VideoEncoder> = if nvenc {
         Box::new(NvencEncoder::new(
             &device,
-            o.codec.into(),
+            codec.into(),
             params,
             shared.clone(),
         )?)
     } else {
-        let name = encoder_name(o.codec.into(), &o.encoder).with_context(|| {
+        let name = encoder_name(codec.into(), &o.encoder).with_context(|| {
             format!(
                 "no {} encoder for {:?} (software encodes AV1 only)",
-                o.encoder, o.codec
+                o.encoder, codec
             )
         })?;
-        let encoder = FfmpegEncoder::new(&name, o.codec.into(), params, shared.clone())?;
+        let encoder = FfmpegEncoder::new(&name, codec.into(), params, shared.clone())?;
         println!("encoder: FFmpeg {}", encoder.name());
         Box::new(encoder)
     };

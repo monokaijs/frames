@@ -44,6 +44,9 @@ pub enum Approve {
 /// host already trusted in v1 (docs/V2_PLAN.md, Phase 4 identity migration).
 #[derive(Default, Serialize, Deserialize)]
 struct Hello {
+    /// Codecs the viewer can decode, best first.
+    #[serde(default)]
+    decoders: Vec<crate::Codec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     v1_certificate: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,8 +62,12 @@ pub async fn send_hello(
     session: &frames_net::Session,
     own_id: &iroh::EndpointId,
     migrate: bool,
+    decoders: Vec<crate::Codec>,
 ) -> Result<()> {
-    let mut hello = Hello::default();
+    let mut hello = Hello {
+        decoders,
+        ..Hello::default()
+    };
     if migrate {
         match v1_proof(session, own_id) {
             Ok(proof) => {
@@ -86,20 +93,31 @@ fn v1_proof(session: &frames_net::Session, own_id: &iroh::EndpointId) -> Result<
     migration::prove(&identity.certificate, pkcs8, own_id, &exporter)
 }
 
-async fn receive_hello(session: &frames_net::Session) -> Option<LegacyProof> {
+async fn receive_hello(session: &frames_net::Session) -> Hello {
     let read = async {
         let (_send, mut recv) = session.accept_channel().await.ok()?;
         let bytes = recv.read_to_end(64 * 1024).await.ok()?;
         serde_json::from_slice::<Hello>(&bytes).ok()
     };
-    let hello = tokio::time::timeout(Duration::from_secs(5), read)
+    tokio::time::timeout(Duration::from_secs(5), read)
         .await
         .ok()
-        .flatten()?;
+        .flatten()
+        .unwrap_or_default()
+}
+
+fn proof(hello: &Hello) -> Option<LegacyProof> {
     Some(LegacyProof {
-        certificate: B64.decode(hello.v1_certificate?).ok()?,
-        signature: B64.decode(hello.v1_signature?).ok()?,
+        certificate: B64.decode(hello.v1_certificate.as_ref()?).ok()?,
+        signature: B64.decode(hello.v1_signature.as_ref()?).ok()?,
     })
+}
+
+/// A device the host lets in.
+pub struct Admitted {
+    pub control: bool,
+    /// What the viewer can decode, best first (empty if it did not say).
+    pub decoders: Vec<crate::Codec>,
 }
 
 /// Host: a device that proves it is a v1-trusted device gets that trust
@@ -146,16 +164,33 @@ fn migrate(
     Ok(Some(peer.allow_control))
 }
 
-/// `Some(control)` to stream (with input when `control`), `None` to refuse.
+/// Whether to stream to this device, and how.
 pub async fn decide(
     config: &std::path::Path,
     session: &frames_net::Session,
     preset: Option<Approve>,
+) -> Result<Option<Admitted>> {
+    let hello = receive_hello(session).await;
+    let decoders = hello.decoders.clone();
+    let admit = |control| Admitted {
+        control,
+        decoders: decoders.clone(),
+    };
+    Ok(admit_device(config, session, preset, &hello)
+        .await?
+        .map(admit))
+}
+
+async fn admit_device(
+    config: &std::path::Path,
+    session: &frames_net::Session,
+    preset: Option<Approve>,
+    hello: &Hello,
 ) -> Result<Option<bool>> {
     let path = TrustList::path_in(config);
     let mut list = TrustList::load(&path)?;
     let device = session.remote();
-    let proof = receive_hello(session).await;
+    let proof = proof(hello);
     if let Admission::Trusted { control } = admission(&list, &device) {
         let name = list
             .get(&device)

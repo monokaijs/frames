@@ -83,8 +83,14 @@ fn stream(
         "capturing {width}x{height} ({source}) at up to {} fps",
         o.fps
     );
+    let codec = crate::choose_codec(
+        o,
+        &[crate::Codec::Hevc, crate::Codec::H264],
+        session.media().path().kind == PathKind::Relay,
+    );
+    println!("codec: {codec:?}");
     let info = StreamInfo {
-        codec: o.codec,
+        codec,
         width,
         height,
         fps: o.fps,
@@ -111,7 +117,7 @@ fn stream(
         intra_refresh_frames: None,
         slices: 1,
     };
-    let mut encoder = MacEncoder::new(o.codec.into(), params)?;
+    let mut encoder = MacEncoder::new(codec.into(), params)?;
     let media = session.media();
     let rate = RateConfig {
         min_bps: 2_000_000,
