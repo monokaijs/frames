@@ -64,7 +64,10 @@ pub struct Options {
     pub codec: Codec,
     pub fps: u32,
     pub mbps: u32,
+    /// GPU clock hold by dummy load (clears per ms); 0 = off.
     pub hold: u32,
+    /// NVIDIA driver profile "prefer maximum performance" for this program.
+    pub gpu_profile: bool,
     pub vsync: bool,
     pub seconds: u64,
     pub relay_only: bool,
@@ -88,7 +91,8 @@ impl Options {
             codec: Codec::Hevc,
             fps: 60,
             mbps: 30,
-            hold: 48,
+            hold: 0,
+            gpu_profile: true,
             vsync: false,
             seconds: 0,
             relay_only: false,
@@ -118,6 +122,7 @@ impl Options {
                 "--fps" => o.fps = value()?.parse()?,
                 "--mbps" => o.mbps = value()?.parse()?,
                 "--hold" => o.hold = value()?.parse()?,
+                "--no-gpu-profile" => o.gpu_profile = false,
                 "--seconds" => o.seconds = value()?.parse()?,
                 "--vsync" => o.vsync = true,
                 "--relay-only" => o.relay_only = true,

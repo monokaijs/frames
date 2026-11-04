@@ -5,6 +5,8 @@
 //!   frame rate.
 //! - [`input`]: applies v2 input events with `SendInput`, or by message to
 //!   one window for QA runs.
+//! - [`nvprofile`]: the NVIDIA driver profile that holds the GPU in its
+//!   high-performance state for this program while a session runs.
 //! - [`present`]: a flip-model `Presenter` that blits decoded D3D11 surfaces
 //!   with the video processor and presents with tearing when allowed.
 //! - [`system`]: MMCSS, GPU scheduling priority, WLAN media-streaming mode,
@@ -14,6 +16,8 @@
 pub mod capture;
 #[cfg(windows)]
 pub mod input;
+#[cfg(windows)]
+pub mod nvprofile;
 #[cfg(windows)]
 pub mod present;
 #[cfg(windows)]
