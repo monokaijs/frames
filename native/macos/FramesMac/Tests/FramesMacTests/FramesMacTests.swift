@@ -229,4 +229,25 @@ final class FramesMacTests: XCTestCase {
         XCTAssertEqual(box.events.first?.1, 65535, "right edge")
         XCTAssertEqual(box.events.first?.2, 0, "top edge")
     }
+
+    @MainActor
+    func testControlOptionF12ReleasesInputInsteadOfSendingTheKey() {
+        final class Box: @unchecked Sendable { var kinds: [UInt32] = [] }
+        let box = Box()
+        let relay = InputRelay()
+        let callback: FramesMacInputCallback = { context, kind, _, _, _, _, _ in
+            Unmanaged<Box>.fromOpaque(context!).takeUnretainedValue().kinds.append(kind)
+        }
+        relay.set(context: Unmanaged.passUnretained(box).toOpaque(), callback: callback)
+        let view = InputView(frame: NSRect(x: 0, y: 0, width: 100, height: 100), relay: relay)
+        func key(_ code: UInt16, _ flags: NSEvent.ModifierFlags) -> NSEvent {
+            NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 1, windowNumber: 0,
+                context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: code)!
+        }
+        view.keyDown(with: key(111, [.control, .option]))
+        view.keyDown(with: key(111, []))
+        relay.set(context: nil, callback: nil)
+        XCTAssertEqual(box.kinds, [UInt32(FRAMES_MAC_INPUT_FOCUS_LOST), UInt32(FRAMES_MAC_INPUT_KEY)])
+    }
 }

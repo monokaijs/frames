@@ -384,6 +384,14 @@ final class InputView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        // Control+Option+F12 (kVK_F12 = 111): release remote input and
+        // minimize, as in v1; the shortcut never reaches the host.
+        if event.keyCode == 111, event.modifierFlags.contains([.control, .option]) {
+            modifiersDown.removeAll()
+            relay.send(Int32(FRAMES_MAC_INPUT_FOCUS_LOST), 0, at: event.timestamp)
+            window?.miniaturize(nil)
+            return
+        }
         relay.send(Int32(FRAMES_MAC_INPUT_KEY), Int32(event.keyCode), 1, at: event.timestamp)
     }
 

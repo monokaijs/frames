@@ -45,7 +45,7 @@ launcher, installer, updater, and service still run v1.
 | Mouse, wheel, keyboard | **Done** on both viewers and both hosts (macOS host needs Accessibility; posting not exercised automatically). |
 | Release input on focus loss / exit | **Done**. |
 | Ctrl/Command swap, physical-key profile | **Partial**: the host states its OS in the stream description and a viewer on the other OS swaps Control and Command (both sides), as v1 does by default; Mac viewer of a PC host swaps, PC of PC does not. No physical-key profile switch yet. |
-| Ctrl+Alt+F12 release shortcut, menus | **Not started**. |
+| Ctrl+Alt+F12 release shortcut, menus | **Partial**: Ctrl+Alt+F12 (Control+Option+F12 on a Mac) releases remote input and minimizes the viewer, never reaching the host (Swift test on the Mac; Windows compiled, not exercised: it reads the real keyboard state). No Frames menu yet. |
 | Host cursor shown locally | **Done** on both viewers. |
 | Relative mouse (games) | **Not started**. |
 

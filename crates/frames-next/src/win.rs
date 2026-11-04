@@ -15,6 +15,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_F12;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
@@ -223,6 +224,17 @@ fn viewer_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<Captur
                 at_us,
             })
         }
+        // Ctrl+Alt+F12: release remote input and minimize (as in v1); the
+        // shortcut itself never reaches the host.
+        WM_KEYDOWN | WM_SYSKEYDOWN if w.0 == usize::from(VK_F12.0) && release_shortcut_held() => {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_MINIMIZE);
+            }
+            Some(Captured::Event {
+                event: Event::ReleaseAll,
+                at_us,
+            })
+        }
         WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
             let code = ((l.0 >> 16) & 0xff) as u16;
             let extended = (l.0 >> 24) & 1 == 1;
@@ -240,6 +252,14 @@ fn viewer_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<Captur
         }),
         _ => None,
     }
+}
+
+fn release_shortcut_held() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU};
+    let down = |key: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe {
+        GetKeyState(i32::from(key.0)) < 0
+    };
+    down(VK_CONTROL) && down(VK_MENU)
 }
 
 unsafe extern "system" fn viewer_procedure(
