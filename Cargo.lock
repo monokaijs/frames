@@ -2215,6 +2215,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "frames-core",
  "frames-native",
+ "frames-next",
  "fs2",
  "hex",
  "image",

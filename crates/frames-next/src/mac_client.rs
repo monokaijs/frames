@@ -183,6 +183,7 @@ fn view(
     let mut next_report = Duration::from_secs(1);
     let mut latency = Samples::new(30);
     let mut presented = 0u64;
+    let mut superseded = 0u64;
     let mut reported_clean = 0u64;
     loop {
         if o.deadline().is_some_and(|d| started.elapsed() >= d) {
@@ -234,7 +235,12 @@ fn view(
             }
             client.on_datagram(arrived.unwrap_or_else(|| clock.now_us()), &datagram);
         }
-        for frame in client.poll(clock.now_us(), &mut decoder) {
+        // Every ready frame is decoded (later ones reference it), but only
+        // the newest is shown: after a stall (the window opening, a slow
+        // drawable) the older ones are already late.
+        let mut decoded = client.poll(clock.now_us(), &mut decoder);
+        superseded += decoded.len().saturating_sub(1) as u64;
+        if let Some(frame) = decoded.pop() {
             let captured = frame.captured_us;
             match presenter.present(frame, mode) {
                 Ok(stamp) => {
@@ -295,7 +301,7 @@ fn view(
     let stats = client.stats();
     let (n, p50, p95, p99) = latency.summary();
     println!(
-        "SUMMARY presented={presented} measured={n} lost={} keyframes={} recoveries={} capture_to_present p50={p50:.2} p95={p95:.2} p99={p99:.2} ms (cross-machine: includes clock offset error up to rtt/2)",
+        "SUMMARY presented={presented} superseded={superseded} measured={n} lost={} keyframes={} recoveries={} capture_to_present p50={p50:.2} p95={p95:.2} p99={p99:.2} ms (cross-machine: includes clock offset error up to rtt/2)",
         stats.frames_lost, stats.keyframes, stats.recoveries
     );
     session.close("viewer closed");

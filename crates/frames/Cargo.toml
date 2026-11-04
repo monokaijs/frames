@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+frames-next = { path = "../frames-next" }
 frames-core = { path = "../frames-core" }
 frames-native = { path = "../frames-native" }
 anyhow.workspace = true

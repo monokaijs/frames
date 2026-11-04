@@ -184,6 +184,15 @@ impl CodecChoice {
 fn main() {
     #[cfg(windows)]
     attach_cli_console();
+    // The v2 stack (docs/V2_PLAN.md): `frames next host|connect|...`. Runs
+    // before anything else starts threads; it sets up its own runtime.
+    if std::env::args().nth(1).as_deref() == Some("next") {
+        if let Err(error) = frames_next::main_from(std::env::args().skip(2).collect()) {
+            eprintln!("Frames Next: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(error) = run() {
         eprintln!("Frames: {error:#}");
         if std::env::var_os("FRAMES_GUI_CHILD").is_some()

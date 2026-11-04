@@ -5,7 +5,9 @@ to work on the v2 stack before the cutover. Status as of 2026-11-05.
 **Done** means implemented on v2 and checked on real machines; **Partial**
 says what is missing; **Not started** has no v2 code yet.
 
-v2 today is the `frames-next` binary (host and viewer, command line). The
+v2 today is the `frames-next` binary (host and viewer, command line), also
+built into the regular app as `frames next ...` (same commands, so a
+release carries v2 without changing what users see). The
 launcher, installer, updater, and service still run v1.
 
 ## Connecting and trust
@@ -67,5 +69,5 @@ launcher, installer, updater, and service still run v1.
 | Installer, signed updates, update channel | **Not started** ("Frames Next" channel). |
 | Windows service, secure desktop | **Not started**. |
 | macOS menu bar item, Dock behaviour | **Not started**. |
-| `frames doctor`, `discover`, `peers`, `revoke` | **Not started**. |
+| `frames doctor`, `discover`, `peers`, `revoke` | **Partial**: `frames next discover`, `peers`, `revoke` and `windows` work from the app binary (Mac and Windows); no `doctor` yet. |
 | Single process on macOS (no helper) | **Done** for media; the launcher still uses the v1 helper. |
