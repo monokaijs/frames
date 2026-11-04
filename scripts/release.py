@@ -162,7 +162,10 @@ def disk_image(value):
         "icon_size": DMG_ICON_SIZE,
         "text_size": 13,
         "icon_locations": {"Frames.app": (DMG_APP_X, DMG_ICON_Y), "Applications": (DMG_APPLICATIONS_X, DMG_ICON_Y)},
-        "hide_extensions": ["Frames.app"],
+        # No "hide_extensions": it stores Finder info on the signed bundle, and
+        # codesign --strict then rejects the installed app ("resource fork,
+        # Finder information, or similar detritus not allowed"). Finder hides
+        # the .app extension by default anyway.
         "include_list_view_settings": False,
         "format": "UDZO",
         "filesystem": "HFS+",
