@@ -16,6 +16,7 @@ bytes.workspace = true
 directories = "6"
 frames-input = { path = "../frames-input" }
 frames-clipboard = { path = "../frames-clipboard" }
+frames-audio = { path = "../frames-audio" }
 frames-media = { path = "../frames-media" }
 # Transitional: v1 identity and trust store, for migrating trust (Phase 4).
 frames-core = { path = "../frames-core" }

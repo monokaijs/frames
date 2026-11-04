@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 mod admit;
+mod audio;
 mod clip;
 mod lane;
 #[cfg(target_os = "macos")]
@@ -85,6 +86,8 @@ pub struct Options {
     pub pacing: Option<f64>,
     /// Clipboard sharing (both ends must turn it on).
     pub clipboard: clip::Mode,
+    /// Host audio (both ends must turn it on).
+    pub audio: audio::Mode,
     /// Viewer: files to send to the host once connected.
     pub send_files: Vec<std::path::PathBuf>,
     /// Host: where received files go (default ~/Downloads/Frames).
@@ -122,6 +125,7 @@ impl Options {
             migrate_v1: false,
             pacing: None,
             clipboard: clip::Mode::Off,
+            audio: audio::Mode::Off,
             send_files: Vec::new(),
             receive_dir: None,
             synthetic_input: false,
@@ -160,6 +164,7 @@ impl Options {
                 "--relay" => o.relays.push(value()?.to_string()),
                 "--migrate-v1" => o.migrate_v1 = true,
                 "--pacing" => o.pacing = Some(value()?.parse()?),
+                "--audio" => o.audio = audio::parse_mode(value()?)?,
                 "--send" => o.send_files.push(value()?.into()),
                 "--receive-dir" => o.receive_dir = Some(value()?.into()),
                 "--clipboard" => {
@@ -225,7 +230,18 @@ async fn host(mut o: Options) -> Result<()> {
             Some(admitted) => {
                 o.control = admitted.control;
                 o.viewer_decoders = admitted.decoders;
-                return run_host(session, o).await;
+                let audio = tokio::spawn({
+                    let session = session.clone();
+                    let mode = o.audio;
+                    async move {
+                        if let Err(error) = audio::host(session, mode).await {
+                            println!("audio stopped: {error:#}");
+                        }
+                    }
+                });
+                let result = run_host(session, o).await;
+                audio.abort();
+                return result;
             }
             None => session.close("not approved"),
         }
@@ -382,7 +398,7 @@ async fn run(args: Vec<String>) -> Result<()> {
             connect(id, Options::parse(&args[2..])?).await
         }
         _ => bail!(
-            "usage: frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software] [--fps N] [--mbps N] [--hold N] [--seconds N] [--approve view|control] [--config-dir DIR] [--relay URL] [--relay-only] [--receive-dir DIR] [--clipboard on|off|qa]\n       frames-next connect <endpoint-id> [--vsync] [--seconds N]"
+            "usage: frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software] [--fps N] [--mbps N] [--hold N] [--seconds N] [--approve view|control] [--config-dir DIR] [--relay URL] [--relay-only] [--receive-dir DIR] [--clipboard on|off|qa] [--audio on|off|qa]\n       frames-next connect <endpoint-id> [--vsync] [--seconds N]"
         ),
     }
 }

@@ -24,19 +24,20 @@ ALLOWED = {
     "frames-net": {"frames-media", "frames-proto"},
     "frames-input": set(),
     "frames-clipboard": set(),
+    "frames-audio": set(),
     "frames-platform-macos": {"frames-media", "frames-proto", "frames-input", "frames-clipboard"},
     # The v2 application: every v2 crate. frames-core only through
     # frames-codec's FFmpeg runtime, until the v2 cutover moves it.
-    "frames-next": {"frames-media", "frames-proto", "frames-net", "frames-codec", "frames-platform-windows", "frames-platform-macos", "frames-input", "frames-clipboard", "frames-core"},
+    "frames-next": {"frames-media", "frames-proto", "frames-net", "frames-codec", "frames-platform-windows", "frames-platform-macos", "frames-input", "frames-clipboard", "frames-audio", "frames-core"},
     # Backends. frames-core is allowed only until the v2 cutover moves its
     # FFmpeg runtime into frames-codec.
     "frames-codec": {"frames-media", "frames-proto", "frames-core"},
-    "frames-platform-windows": {"frames-media", "frames-proto", "frames-codec", "frames-input", "frames-clipboard", "frames-core"},
+    "frames-platform-windows": {"frames-media", "frames-proto", "frames-codec", "frames-input", "frames-clipboard", "frames-audio", "frames-core"},
 }
 # Backend crates wrap native SDKs and may need a C toolchain; the engine
 # crates above them may not.
 # frames-net uses ring (QUIC crypto), which compiles C.
-NATIVE_ALLOWED = {"frames-codec", "frames-platform-windows", "frames-net", "frames-next"}
+NATIVE_ALLOWED = {"frames-codec", "frames-platform-windows", "frames-net", "frames-next", "frames-audio"}
 V1_CRATES = {"frames-core", "frames-native", "frames"}
 # Build-time C toolchain users.
 NATIVE_BUILD = {"cc", "cmake", "bindgen", "pkg-config", "vcpkg"}

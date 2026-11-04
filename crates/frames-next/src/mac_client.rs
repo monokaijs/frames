@@ -62,9 +62,11 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
             true,
         ))
     };
-    let result =
-        tokio::task::spawn_blocking(move || view(&session, info, &o, lane, cursor_rx, clipboard))
-            .await?;
+    let audio = crate::audio::Receiver::start(o.audio).await?;
+    let result = tokio::task::spawn_blocking(move || {
+        view(&session, info, &o, lane, cursor_rx, clipboard, audio)
+    })
+    .await?;
     let _ = writer.await;
     drain.abort();
     result
@@ -120,6 +122,7 @@ fn view(
     lane: InputLane,
     cursor_rx: std::sync::mpsc::Receiver<frames_input::cursor::CursorMessage>,
     mut clipboard: Option<crate::clip::ClipboardLink>,
+    audio: Option<crate::audio::Receiver>,
 ) -> Result<()> {
     let frame = Duration::from_micros(1_000_000 / u64::from(info.fps.max(1)));
     let _ = system::set_realtime_thread(frame, frame / 4, frame / 2);
@@ -209,6 +212,12 @@ fn view(
         let path = media.path();
         client.set_rtt(path.rtt_us);
         while let Some((datagram, arrived)) = media.try_recv_timed() {
+            if datagram.first() == Some(&crate::audio::TAG) {
+                if let Some(audio) = &audio {
+                    audio.push(&datagram);
+                }
+                continue;
+            }
             client.on_datagram(arrived.unwrap_or_else(|| clock.now_us()), &datagram);
         }
         for frame in client.poll(clock.now_us(), &mut decoder) {
@@ -248,6 +257,17 @@ fn view(
     let mut lane = lane.lock().unwrap();
     lane.release_all();
     lane.print_summary(cursor_updates);
+    if let Some(audio) = &audio {
+        use std::sync::atomic::Ordering::Relaxed;
+        let stats = &audio.stats;
+        println!(
+            "AUDIO packets={} concealed={} pcm_chunks={} zero_crossings_per_s={:.1}",
+            stats.packets.load(Relaxed),
+            stats.concealed.load(Relaxed),
+            stats.pcm_chunks.load(Relaxed),
+            stats.crossing_rate_x10.load(Relaxed) as f64 / 10.0
+        );
+    }
     if let Some(clipboard) = &clipboard {
         println!(
             "CLIPBOARD sent={} received={} now={:?}",

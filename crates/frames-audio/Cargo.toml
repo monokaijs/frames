@@ -1,0 +1,16 @@
+[package]
+name = "frames-audio"
+description = "Frames v2 audio devices: system-audio loopback capture and playback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Layering (scripts/check_layers.py): no Frames dependencies. cpal needs
+# ALSA (pkg-config) on Linux, so the crate is a native backend.
+[dependencies]
+anyhow.workspace = true
+cpal = "0.18"
+parking_lot = "0.12"
+tokio.workspace = true
+tracing.workspace = true

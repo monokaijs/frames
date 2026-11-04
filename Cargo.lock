@@ -2242,6 +2242,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "frames-audio"
+version = "0.3.3"
+dependencies = [
+ "anyhow",
+ "cpal",
+ "parking_lot",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "frames-clipboard"
 version = "0.3.3"
 
@@ -2355,6 +2366,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "directories",
+ "frames-audio",
  "frames-clipboard",
  "frames-codec",
  "frames-core",
