@@ -1,0 +1,189 @@
+//! `frames-next`: the v2 stack end to end (docs/V2_PLAN.md, Phase 3).
+//!
+//! ```text
+//! frames-next host [--source monitor|qa] [--codec hevc|h264] [--fps 60] [--mbps 30]
+//!                  [--hold N] [--seconds N] [--relay-only]
+//! frames-next connect <endpoint-id> [--vsync] [--seconds N] [--relay-only]
+//! ```
+//!
+//! The host prints its endpoint id; the client dials it by id (iroh finds a
+//! direct path or relays). Once a second the client prints delivery,
+//! capture-to-present latency, recovery, and the path. `--source qa` captures
+//! a generated test window instead of the screen.
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+mod stats;
+#[cfg(windows)]
+mod win;
+#[cfg(windows)]
+mod windows_client;
+#[cfg(windows)]
+mod windows_host;
+
+/// Sent by the host on the first channel before any media.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct StreamInfo {
+    pub codec: Codec,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Codec {
+    H264,
+    Hevc,
+}
+
+impl From<Codec> for frames_media::api::Codec {
+    fn from(codec: Codec) -> Self {
+        match codec {
+            Codec::H264 => Self::H264,
+            Codec::Hevc => Self::Hevc,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Options {
+    pub qa_source: bool,
+    pub codec: Codec,
+    pub fps: u32,
+    pub mbps: u32,
+    pub hold: u32,
+    pub vsync: bool,
+    pub seconds: u64,
+    pub relay_only: bool,
+}
+
+impl Options {
+    fn parse(args: &[String]) -> Result<Self> {
+        let mut o = Self {
+            qa_source: false,
+            codec: Codec::Hevc,
+            fps: 60,
+            mbps: 30,
+            hold: 48,
+            vsync: false,
+            seconds: 0,
+            relay_only: false,
+        };
+        let mut args = args.iter();
+        while let Some(arg) = args.next() {
+            let mut value = || {
+                args.next()
+                    .with_context(|| format!("{arg} needs a value"))
+                    .map(String::as_str)
+            };
+            match arg.as_str() {
+                "--source" => o.qa_source = value()? == "qa",
+                "--codec" => {
+                    o.codec = match value()? {
+                        "h264" => Codec::H264,
+                        "hevc" => Codec::Hevc,
+                        other => bail!("unknown codec {other}"),
+                    }
+                }
+                "--fps" => o.fps = value()?.parse()?,
+                "--mbps" => o.mbps = value()?.parse()?,
+                "--hold" => o.hold = value()?.parse()?,
+                "--seconds" => o.seconds = value()?.parse()?,
+                "--vsync" => o.vsync = true,
+                "--relay-only" => o.relay_only = true,
+                other => bail!("unknown option {other}"),
+            }
+        }
+        Ok(o)
+    }
+
+    /// How long to run; 0 runs until the peer leaves.
+    pub fn deadline(&self) -> Option<Duration> {
+        (self.seconds > 0).then(|| Duration::from_secs(self.seconds))
+    }
+}
+
+fn node_config(o: &Options) -> frames_net::NodeConfig {
+    frames_net::NodeConfig {
+        relay_only: o.relay_only,
+        ..frames_net::NodeConfig::default()
+    }
+}
+
+async fn host(o: Options) -> Result<()> {
+    let node = frames_net::Node::bind(&frames_net::DeviceKey::generate(), node_config(&o)).await?;
+    node.online(Duration::from_secs(10)).await?;
+    println!("endpoint id: {}", node.id());
+    let session = node.accept().await.context("node closed")??;
+    println!(
+        "connected: {} pairing code {}",
+        session.remote(),
+        session.pairing_code()?
+    );
+    run_host(session, o).await
+}
+
+#[cfg(windows)]
+async fn run_host(session: frames_net::Session, o: Options) -> Result<()> {
+    windows_host::run(session, o).await
+}
+
+#[cfg(not(windows))]
+async fn run_host(_: frames_net::Session, _: Options) -> Result<()> {
+    bail!("hosting needs the Windows backends (the macOS backends are not wired in yet)")
+}
+
+async fn connect(id: &str, o: Options) -> Result<()> {
+    let node = frames_net::Node::bind(&frames_net::DeviceKey::generate(), node_config(&o)).await?;
+    let started = std::time::Instant::now();
+    let session = node.connect(id.parse::<iroh::EndpointId>()?).await?;
+    println!(
+        "connected in {:.0} ms, pairing code {}",
+        started.elapsed().as_secs_f64() * 1e3,
+        session.pairing_code()?
+    );
+    run_client(session, o).await
+}
+
+#[cfg(windows)]
+async fn run_client(session: frames_net::Session, o: Options) -> Result<()> {
+    windows_client::run(session, o).await
+}
+
+#[cfg(not(windows))]
+async fn run_client(_: frames_net::Session, _: Options) -> Result<()> {
+    bail!("viewing needs the Windows backends (the macOS backends are not wired in yet)")
+}
+
+/// Writes one JSON line on a fresh channel.
+pub async fn send_info(session: &frames_net::Session, info: StreamInfo) -> Result<()> {
+    let (mut send, _recv) = session.open_channel().await?;
+    let mut line = serde_json::to_vec(&info)?;
+    line.push(b'\n');
+    send.write_all(&line).await?;
+    send.finish()?;
+    Ok(())
+}
+
+pub async fn receive_info(session: &frames_net::Session) -> Result<StreamInfo> {
+    let (_send, mut recv) = session.accept_channel().await?;
+    let bytes = recv.read_to_end(4096).await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("host") => host(Options::parse(&args[1..])?).await,
+        Some("connect") => {
+            let id = args.get(1).context("connect needs an endpoint id")?;
+            connect(id, Options::parse(&args[2..])?).await
+        }
+        _ => bail!(
+            "usage: frames-next host [--source monitor|qa] [--codec hevc|h264] [--fps N] [--mbps N] [--hold N] [--seconds N]\n       frames-next connect <endpoint-id> [--vsync] [--seconds N]"
+        ),
+    }
+}

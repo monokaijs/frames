@@ -28,38 +28,9 @@ impl MediaClock for VirtualClock {
     }
 }
 
-/// Real monotonic time in microseconds since the clock was created, for
-/// hardware runs of the engine. A [`VirtualClock`] can follow it with
+/// Real time, for hardware runs. A [`VirtualClock`] can follow it with
 /// `advance_to(system.now_us())`, so simulated links run in real time.
-#[derive(Clone, Copy, Debug)]
-pub struct SystemClock {
-    epoch: std::time::Instant,
-}
-
-impl SystemClock {
-    pub fn new() -> Self {
-        Self {
-            epoch: std::time::Instant::now(),
-        }
-    }
-
-    /// The `Instant` that [`MediaClock::now_us`] returns for `at`.
-    pub fn micros_at(&self, at: std::time::Instant) -> u64 {
-        at.saturating_duration_since(self.epoch).as_micros() as u64
-    }
-}
-
-impl Default for SystemClock {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl MediaClock for SystemClock {
-    fn now_us(&self) -> u64 {
-        self.epoch.elapsed().as_micros() as u64
-    }
-}
+pub use frames_media::clock::SystemClock;
 
 #[cfg(test)]
 mod tests {

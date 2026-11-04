@@ -291,6 +291,8 @@ Host pipeline: capture → encode (slices) → packetize/FEC → pacer. Client p
 | 1080p120 HEVC, window capture | 4.43 ms | 5.36 ms |
 | 1080p60, GPU clocks not held | 6.99 ms | 8.91 ms |
 
+Over real QUIC (`crates/frames-next`, host and viewer as two processes on the PC, iroh direct path, 1080p60 HEVC QA window, 20 s): capture → present p50 4.90 ms, p95 6.96 ms, p99 52 ms (one 130 ms stall at t=3 s, under investigation), 0 lost of 1,186, 1 keyframe.
+
 "Presented" is when `Present` returns, not photons. The clock hold is a dummy GPU load (about 140 W extra) and must be replaced by a per-application driver profile applied only during a session. Still open: the macOS half (`frames-platform-macos`, on a branch), AMF/QSV through FFmpeg, Desktop Duplication, the input lane and client model, and running this path inside the app over real QUIC.
 
 **Windows** (`frames-platform-windows`, `frames-codec`):
@@ -342,6 +344,9 @@ Host pipeline: capture → encode (slices) → packetize/FEC → pacer. Client p
 | Present | 0.5 ms |
 
 ### Phase 4: Internet transport and identity (frames-net)
+
+**Status (2026-11-05): crate on main, gate not run.** `crates/frames-net`: iroh endpoint with n0 relays and discovery, device key derived from the v1 identity, v1 trust migration proof, media datagram channel, and a congestion controller that follows the media target. `iroh` and `iroh-relay` are vendored without their cdylibs (Windows debug builds exceeded the DLL export limit). A node holds 1 ms timer resolution on Windows; at the default 15.6 ms, QUIC pacing fell below the media rate and a loopback stream lost 56% of frames. Still open: the dual-interface Mac path bug, the NAT matrix, self-hosted relays, pairing UX and migration against real 0.2.x data.
+
 - **iroh `Endpoint`:**
   - One endpoint per process, used for both serving and connecting, with IPv4 and IPv6.
   - Hole punching, with relay fallback.

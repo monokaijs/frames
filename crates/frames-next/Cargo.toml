@@ -1,0 +1,24 @@
+[package]
+name = "frames-next"
+description = "Frames v2 binary: the v2 media engine over frames-net with the platform backends"
+version.workspace = true
+edition.workspace = true
+# frames-net (iroh 1.4) requires 1.91.
+rust-version = "1.91"
+publish = false
+
+# Layering (scripts/check_layers.py): the application layer; it may use every
+# v2 crate. It never depends on the v1 crates directly.
+[dependencies]
+anyhow.workspace = true
+frames-media = { path = "../frames-media" }
+frames-net = { path = "../frames-net" }
+iroh = "=1.4.1"
+serde = { workspace = true }
+serde_json.workspace = true
+tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+frames-codec = { path = "../frames-codec" }
+frames-platform-windows = { path = "../frames-platform-windows" }
+windows.workspace = true

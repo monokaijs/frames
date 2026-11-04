@@ -1,0 +1,27 @@
+[package]
+name = "frames-net"
+description = "Frames v2 networking: iroh endpoint, device identity and migration, media datagram channel"
+version.workspace = true
+edition.workspace = true
+# iroh 1.4 requires 1.91.
+rust-version = "1.91"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+hex = "0.4"
+sha2.workspace = true
+tokio.workspace = true
+frames-media = { path = "../frames-media" }
+frames-proto = { path = "../frames-proto" }
+iroh = "=1.4.1"
+# Same version iroh uses, for the congestion::Controller trait.
+noq-proto = "=1.4.0"
+ring = "0.17"
+pki-types = { package = "rustls-pki-types", version = "1" }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["ring", "std"] }
+
+[dev-dependencies]
+frames-testkit = { path = "../frames-testkit" }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
