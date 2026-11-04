@@ -92,6 +92,9 @@ pub struct Controller {
     previous: Feedback,
     stable_since: Instant,
     clean_since: Instant,
+    /// Last feedback window with more than 2% shard loss or an unrecoverable
+    /// frame; parity stays at its highest level for PARITY_HOLD after it.
+    heavy_loss_at: Option<Instant>,
     overloaded_since: Option<Instant>,
     last_step: Instant,
     last_increase: Instant,
@@ -111,6 +114,11 @@ const QUEUEING_DELAY: Duration = Duration::from_millis(30);
 /// trip) that video may use while overloaded, leaving room for parity
 /// rounding, audio and control traffic.
 const TRANSPORT_SHARE: f64 = 0.8;
+/// FEC protection rises at once but steps down only after this long without
+/// the loss that raised it. Deciding per 100 ms window flipped bursty Wi-Fi
+/// between 8 and 4 parity several times a second; each flip rescaled the
+/// bitrate and each rise forced a keyframe, freezing per-window sessions.
+const PARITY_HOLD: Duration = Duration::from_secs(5);
 impl Controller {
     pub fn new(fps: u32, now: Instant) -> Self {
         Self {
@@ -123,6 +131,7 @@ impl Controller {
             previous: Feedback::default(),
             stable_since: now,
             clean_since: now,
+            heavy_loss_at: None,
             overloaded_since: None,
             last_step: now,
             last_increase: now,
@@ -260,14 +269,22 @@ impl Controller {
         } else {
             self.overloaded_since = None;
             if loss > 0.02 || failed {
-                self.quality.fec.parity_per_32 = 8;
+                self.heavy_loss_at = Some(now);
                 self.clean_since = now;
             } else if loss > 0.001 {
-                self.quality.fec.parity_per_32 = 4;
                 self.clean_since = now;
-            } else if now.saturating_duration_since(self.clean_since) >= Duration::from_secs(5) {
-                self.quality.fec.parity_per_32 = 2;
             }
+            self.quality.fec.parity_per_32 = if self
+                .heavy_loss_at
+                .is_some_and(|at| now.saturating_duration_since(at) < PARITY_HOLD)
+            {
+                8
+            } else if now.saturating_duration_since(self.clean_since) < PARITY_HOLD {
+                // Light loss within the hold, or the hold after an overload.
+                4
+            } else {
+                2
+            };
             if failed {
                 self.stable_since = now;
             }
@@ -590,6 +607,69 @@ mod tests {
         assert_eq!(after.fec.parity_per_32, 8);
         assert!(after.bitrate < before.bitrate);
         assert!((after.bitrate as u64 * 40).abs_diff(before.bitrate as u64 * 36) < 40);
+    }
+    #[test]
+    fn bursty_loss_holds_parity_instead_of_flipping_every_window() {
+        let start = Instant::now();
+        let mut c = Controller::new(60, start);
+        let mut received = 0;
+        let mut missing = 0;
+        let mut changes = 0;
+        let mut last = None;
+        // Wi-Fi bursts: heavy loss in every other 100 ms window for 3 s.
+        for step in 0..30u64 {
+            received += 100;
+            missing += if step % 2 == 0 { 10 } else { 0 };
+            let feedback = Feedback {
+                delivery: DeliveryStats {
+                    received_shards: received,
+                    missing_shards: missing,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let now = start + Duration::from_millis(100 * step);
+            let parity = c
+                .update(feedback, Duration::ZERO, Duration::ZERO, false, now)
+                .fec
+                .parity_per_32;
+            if last.is_some_and(|old| old != parity) {
+                changes += 1;
+            }
+            last = Some(parity);
+        }
+        assert_eq!(last, Some(8));
+        assert_eq!(changes, 0, "parity rose once at the start and then held");
+        let mut window = |c: &mut Controller, at_ms: u64, lost: u64| {
+            received += 1000;
+            missing += lost;
+            let feedback = Feedback {
+                delivery: DeliveryStats {
+                    received_shards: received,
+                    missing_shards: missing,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            c.update(
+                feedback,
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+                start + Duration::from_millis(at_ms),
+            )
+            .fec
+            .parity_per_32
+        };
+        assert_eq!(window(&mut c, 4_500, 0), 8, "held after the last burst");
+        // Light loss (0.5%) once heavy loss is 5 s old: one step down, not two.
+        assert_eq!(window(&mut c, 8_100, 5), 4);
+        assert_eq!(window(&mut c, 9_000, 0), 4, "light loss holds too");
+        assert_eq!(
+            window(&mut c, 13_200, 0),
+            2,
+            "clean for the hold: lowest level"
+        );
     }
     #[test]
     fn parity_responds_to_raw_loss_and_clean_link() {

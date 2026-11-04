@@ -17,6 +17,7 @@ final class NativeVideoEncoder: @unchecked Sendable {
     private var scheduled = false
     private var lastVersion: UInt64 = 0
     private var force = true
+    private var lastImprove = Date.distantPast
     private var busy = false
     private var stopped = false
     private var session: VTCompressionSession?
@@ -60,7 +61,10 @@ final class NativeVideoEncoder: @unchecked Sendable {
             guard let self else { return }
             let changed = self.scale != scale
             let rateChanged=self.bitrate != bitrate || self.fps != fps
-            let improvePicture = bitrate > self.bitrate + max(64_000,self.bitrate/25)
+            // Same rule as refresh_after_increase in streaming.rs: only a real
+            // budget recovery (+50%), at most every 10 s, refreshes a static picture.
+            let improvePicture = Int64(bitrate) * 2 >= Int64(self.bitrate) * 3 && Date().timeIntervalSince(self.lastImprove) >= 10
+            if improvePicture { self.lastImprove = Date() }
             self.bitrate = max(128_000,min(100_000_000,bitrate));self.fps = Int32(max(1,min(60,fps)));self.scale = max(50,min(100,scale))
             if let session,rateChanged {
                 let status=VTSessionSetProperty(session,key:kVTCompressionPropertyKey_AverageBitRate,value:self.bitrate as CFNumber)

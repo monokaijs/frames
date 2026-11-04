@@ -833,6 +833,7 @@ pub fn start_host(
                 let mut capture_encode = media::LatencyHistogram::default();
                 let mut last_capture = None;
                 let mut status_ticks = 0;
+                let mut last_refresh = std::time::Instant::now();
                 let mut first_packet = if first_packet.encoded_at.elapsed()>Duration::from_millis(50) {
                     // Codec initialization/readiness can outlive the picture.
                     // Do not spend the refresh burst on a stale reference.
@@ -861,7 +862,7 @@ pub fn start_host(
                             sender.set_budget(window, settings.bitrate.load(Ordering::Relaxed), settings.fec.load(Ordering::Relaxed) as u8, settings.focused.load(Ordering::Relaxed));
                             let target = sender.encoder_target(window, settings.bitrate.load(Ordering::Relaxed));
                             let previous = encoder.bitrate.swap(target, Ordering::Relaxed);
-                            if target > previous.saturating_add((previous/25).max(64_000)) { encoder.request_keyframe(); }
+                            if refresh_after_increase(previous, target, &mut last_refresh) { encoder.request_keyframe(); }
                             if settings.scale.load(Ordering::Relaxed) != scale { break; }
                         },
                         changed = capture.frames.changed() => {
@@ -1944,5 +1945,39 @@ async fn run_native_host(
         };
         out.send(Message::StreamStopped { window, generation })
             .await?;
+    }
+}
+
+/// A static picture keeps the quality it was encoded at, so a recovered
+/// budget needs a fresh independent picture. Only a real recovery (+50%) does,
+/// at most every 10 s: small rescales (FEC level changes, focus shares) once
+/// forced a keyframe every couple of seconds per window, and each keyframe
+/// burst on a lossy path froze the window.
+fn refresh_after_increase(previous: u32, target: u32, last: &mut std::time::Instant) -> bool {
+    if u64::from(target) * 2 < u64::from(previous) * 3 || last.elapsed() < Duration::from_secs(10) {
+        return false;
+    }
+    *last = std::time::Instant::now();
+    true
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    #[test]
+    fn only_a_real_bitrate_recovery_refreshes_and_at_most_every_ten_seconds() {
+        let mut last = std::time::Instant::now() - Duration::from_secs(11);
+        assert!(
+            !refresh_after_increase(45_000_000, 50_000_000, &mut last),
+            "FEC rescale"
+        );
+        assert!(
+            refresh_after_increase(20_000_000, 50_000_000, &mut last),
+            "real recovery"
+        );
+        assert!(
+            !refresh_after_increase(20_000_000, 50_000_000, &mut last),
+            "rate limited"
+        );
     }
 }
