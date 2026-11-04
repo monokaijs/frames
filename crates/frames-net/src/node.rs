@@ -292,6 +292,17 @@ impl MediaChannel {
         channel
     }
 
+    /// Identifies the selected path (its remote address), so callers can
+    /// tell when the connection moved, including between two direct paths
+    /// (Wi-Fi to Ethernet).
+    pub fn selected_path_key(&self) -> Option<String> {
+        self.connection
+            .paths()
+            .iter()
+            .find(|path| path.is_selected())
+            .map(|path| format!("{:?}", path.remote_addr()))
+    }
+
     /// Every known path, for diagnostics: `local -> remote`, selected first.
     pub fn describe_paths(&self) -> Vec<String> {
         let mut out: Vec<(bool, String)> = self

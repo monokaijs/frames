@@ -121,20 +121,27 @@ pub struct HostSession {
     probing: Probing,
 }
 
-/// Probe packets per cluster, and their size.
-const PROBE_PACKETS: u32 = 10;
+/// Probe packet size, and how long each train lasts at its rate: long
+/// enough that a few milliseconds of jitter or of the caller's polling do not
+/// dominate the measured spread (10-packet, ~1 ms trains measured 96 Mbps on
+/// a 60 Mbps link with 1 ms of jitter).
 const PROBE_BYTES: usize = 1200;
+const PROBE_TRAIN_US: f64 = 15_000.0;
+const PROBE_MIN_PACKETS: u32 = 5;
+const PROBE_MAX_PACKETS: u32 = 100;
 /// A cluster that delivered at least this share of its rate fit the path.
 const PROBE_FIT: f64 = 0.8;
 /// Feedback for a cluster later than this after its last packet: give up.
 const PROBE_TIMEOUT_US: u64 = 500_000;
+/// After a path change, wait this long before probing the new path.
+const PATH_SETTLE_US: u64 = 250_000;
 
-/// A train of probe packets offered at one rate (sent back to back, with
-/// the transport pacing at that rate); the receiver's arrival times show
-/// whether the path carried it.
+/// A train of probe packets paced at one rate; the receiver's arrival
+/// times show whether the path carried it.
 struct Cluster {
     id: u16,
     rate_bps: f64,
+    packets: u32,
     sent: u32,
     next_us: u64,
     last_send_us: u64,
@@ -156,6 +163,11 @@ impl Cluster {
 
 #[derive(Default)]
 struct Probing {
+    /// After a path change: probe only once feedback has kept coming for
+    /// this long after the first (µs), so packets still in flight on the old
+    /// path do not compress the trains. `None` at session start.
+    settle_us: Option<u64>,
+    first_feedback_us: Option<u64>,
     started: bool,
     clusters: Vec<Cluster>,
     current: usize,
@@ -218,16 +230,20 @@ impl HostSession {
             return;
         }
         let rate = self.config.rate;
-        let start = f64::from(rate.start_bps);
+        // At session start the target is the start rate; after a path
+        // change, probing builds on the current rate.
+        let start = f64::from(self.rate.target_bps());
         let max = f64::from(rate.max_bps);
         for (id, factor) in [2.0, 4.0, 8.0].into_iter().enumerate() {
             let rate_bps = (start * factor).min(max);
             if rate_bps <= self.probing.clusters.last().map_or(start, |c| c.rate_bps) {
                 break;
             }
+            let packets = (rate_bps * PROBE_TRAIN_US / 1e6 / (PROBE_BYTES as f64 * 8.0)) as u32;
             self.probing.clusters.push(Cluster {
                 id: id as u16,
                 rate_bps,
+                packets: packets.clamp(PROBE_MIN_PACKETS, PROBE_MAX_PACKETS),
                 sent: 0,
                 next_us: now_us,
                 last_send_us: now_us,
@@ -248,16 +264,16 @@ impl HostSession {
         }
         let seq = self.next_seq;
         let cluster = self.probing.clusters.get_mut(self.probing.current)?;
-        if cluster.sent >= PROBE_PACKETS || now_us < cluster.next_us {
+        if cluster.sent >= cluster.packets || now_us < cluster.next_us {
             return None;
         }
         let id = cluster.id;
-        // The whole train goes out back to back: the bottleneck (or the
-        // transport's pacer, at a multiple of the cluster rate) spreads it,
-        // and the spread on arrival measures the path. Pacing it here would
-        // measure only how often the caller polls.
+        // Paced at the train's rate. A caller that polls only every few
+        // milliseconds sends the due packets together, which still averages
+        // to the rate over the train.
         cluster.sent += 1;
         cluster.last_send_us = now_us;
+        cluster.next_us += (PROBE_BYTES as f64 * 8.0 * 1e6 / cluster.rate_bps) as u64;
         let probe = wire::Probe {
             seq: seq as u32,
             send_us: now_us as u32,
@@ -318,8 +334,9 @@ impl HostSession {
             self.probing.finished = true;
             return;
         };
-        let all_sent = cluster.sent >= PROBE_PACKETS;
-        let answered = cluster.received >= PROBE_PACKETS - 1;
+        let all_sent = cluster.sent >= cluster.packets;
+        // Most of the train answered; a lost packet or two is fine.
+        let answered = cluster.received * 10 >= cluster.packets * 9;
         let timed_out = all_sent && now_us.saturating_sub(cluster.last_send_us) > PROBE_TIMEOUT_US;
         if !(all_sent && (answered || timed_out)) {
             return;
@@ -355,8 +372,17 @@ impl HostSession {
     }
 
     /// Call when the transport's selected path changes.
+    /// The transport moved to another path (relay ↔ direct, or another
+    /// network): the delay baseline belongs to the old path, and the new
+    /// path's capacity is unknown, so probe it again from the current rate.
     pub fn path_changed(&mut self) {
         self.rate.path_changed();
+        if self.config.probe_at_start {
+            self.probing = Probing {
+                settle_us: Some(PATH_SETTLE_US),
+                ..Probing::default()
+            };
+        }
     }
 
     /// Bitrate for the encoder: the target minus FEC and header overhead.
@@ -674,7 +700,10 @@ impl HostSession {
         }
         self.last_feedback_seq = Some(feedback.feedback_seq);
         if !self.probing.started {
-            self.start_probing(now_us);
+            let first = *self.probing.first_feedback_us.get_or_insert(now_us);
+            if now_us.saturating_sub(first) >= self.probing.settle_us.unwrap_or(0) {
+                self.start_probing(now_us);
+            }
         }
         if self.next_seq > 0 {
             self.feedback_unwrap = Unwrapper::starting_at(self.next_seq - 1);

@@ -42,6 +42,7 @@ fn scenario(link: LinkConfig, seconds: f64) -> Scenario {
         model: EncoderModel::default(),
         features: None,
         seed: 7,
+        changes_are_new_paths: false,
     }
 }
 
@@ -435,4 +436,40 @@ fn internet_path_meets_the_phase_5_gate() {
         report.target_at(9_000_000)
     );
     assert_no_broken_submissions(&report);
+}
+
+/// Phase 5: moving to another network mid-session (here from a 10 Mbps
+/// Wi-Fi-like path to a 60 Mbps wired one) re-probes the new path instead of
+/// climbing slowly from the old rate, without losing frames.
+#[test]
+fn moving_to_a_faster_network_reprobes_it() {
+    let slow = LinkConfig {
+        rate_bps: Some(10_000_000),
+        ..internet(20)
+    };
+    let fast = LinkConfig {
+        rate_bps: Some(60_000_000),
+        ..internet(10)
+    };
+    let run_with = |notify: bool| {
+        let mut s = scenario(slow, 8.0);
+        s.host.rate.start_bps = 5_000_000;
+        s.encoder.bitrate_bps = 5_000_000;
+        s.changes = vec![(4_000_000, fast)];
+        s.changes_are_new_paths = notify;
+        run(&s)
+    };
+    let moved = run_with(true);
+    let plain = run_with(false);
+    summary("moved", &moved);
+    let (with, without) = (moved.target_at(5_000_000), plain.target_at(5_000_000));
+    println!("target 1 s after the move: re-probed {with} not told {without}");
+    assert!(moved.target_at(3_900_000) <= 10_000_000, "before the move");
+    assert!(
+        with >= 30_000_000,
+        "re-probed target 1 s after the move: {with}"
+    );
+    assert!(with > without, "{with} vs {without}");
+    assert_eq!(moved.client.frames_lost, 0);
+    assert_eq!(moved.host.keyframes, 1);
 }

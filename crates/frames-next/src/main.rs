@@ -77,6 +77,8 @@ pub struct Options {
     /// Viewer: offer this device's v1 identity so a host that trusted it in
     /// v1 trusts it now.
     pub migrate_v1: bool,
+    /// Host: pacing rate as a multiple of the target (experiments).
+    pub pacing: Option<f64>,
     /// Viewer: post generated mouse and key messages to its own window.
     pub synthetic_input: bool,
     /// Host: `nvenc` (direct), or an FFmpeg backend: `amf`, `qsv`, `mf`,
@@ -104,6 +106,7 @@ impl Options {
             relay_only: false,
             relays: Vec::new(),
             migrate_v1: false,
+            pacing: None,
             synthetic_input: false,
             encoder: "nvenc".into(),
             config_dir: None,
@@ -136,6 +139,7 @@ impl Options {
                 "--relay-only" => o.relay_only = true,
                 "--relay" => o.relays.push(value()?.to_string()),
                 "--migrate-v1" => o.migrate_v1 = true,
+                "--pacing" => o.pacing = Some(value()?.parse()?),
                 "--synthetic-input" => o.synthetic_input = true,
                 "--encoder" => o.encoder = value()?.to_string(),
                 "--config-dir" => o.config_dir = Some(value()?.into()),

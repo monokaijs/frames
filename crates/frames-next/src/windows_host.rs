@@ -200,6 +200,9 @@ fn stream(
         start_bps: o.mbps * 1_000_000,
     };
     let mut config = HostConfig::new(1, 1, rate);
+    if let Some(pacing) = o.pacing {
+        config.pacing_factor = pacing;
+    }
     config.max_datagram = media.path().max_datagram.min(1200);
     let mut host = HostSession::new(config);
     // n0's public relays deliver about 8-10 Mbps; self-hosted ones are
@@ -210,6 +213,7 @@ fn stream(
         rate.max_bps
     };
     let mut path_kind = media.path().kind;
+    let mut path_key = media.selected_path_key();
     if path_kind == PathKind::Relay {
         host.set_max_bps(relay_max_bps);
     }
@@ -229,14 +233,20 @@ fn stream(
         }
         win::pump();
         let path = media.path();
-        if path.kind != path_kind {
+        let key = media.selected_path_key();
+        if path.kind != path_kind || (key.is_some() && key != path_key) {
             path_kind = path.kind;
+            path_key = key;
+            // Rate control restarts on the new path and probes it.
             host.path_changed();
             host.set_max_bps(match path.kind {
                 PathKind::Relay => relay_max_bps,
                 PathKind::Direct => rate.max_bps,
             });
-            println!("path changed to {path_kind:?}");
+            println!(
+                "path changed to {path_kind:?} {}",
+                path_key.as_deref().unwrap_or("")
+            );
         }
         let frame = match pending.take() {
             Some(frame) => Some(frame),

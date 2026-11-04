@@ -34,6 +34,9 @@ pub struct Scenario {
     /// encoder implements).
     pub features: Option<EncoderFeatures>,
     pub seed: u64,
+    /// Tell the host its path changed when a `changes` entry applies, as a
+    /// transport does when it moves to another network (Wi-Fi ↔ Ethernet).
+    pub changes_are_new_paths: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -120,6 +123,9 @@ pub fn run(scenario: &Scenario) -> Report {
         }
         while let Some((_, config)) = changes.next_if(|(at, _)| *at <= now) {
             host_end.set_send_config(config);
+            if scenario.changes_are_new_paths {
+                host.path_changed();
+            }
         }
         let rtt = host_end.path().rtt_us;
         client.set_rtt(rtt);
