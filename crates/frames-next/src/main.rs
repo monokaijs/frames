@@ -19,6 +19,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+mod admit;
 #[cfg(target_os = "macos")]
 mod mac_client;
 #[cfg(target_os = "macos")]
@@ -72,6 +73,12 @@ pub struct Options {
     /// Host: `nvenc` (direct), or an FFmpeg backend: `amf`, `qsv`, `mf`,
     /// `software`.
     pub encoder: String,
+    /// Where the device key and trust list live (default: v1's directory).
+    pub config_dir: Option<std::path::PathBuf>,
+    /// Host: approve unknown devices without asking (unattended tests).
+    pub approve: Option<admit::Approve>,
+    /// Host, set at admission: this viewer may send input.
+    pub control: bool,
 }
 
 impl Options {
@@ -87,6 +94,9 @@ impl Options {
             relay_only: false,
             synthetic_input: false,
             encoder: "nvenc".into(),
+            config_dir: None,
+            approve: None,
+            control: false,
         };
         let mut args = args.iter();
         while let Some(arg) = args.next() {
@@ -113,6 +123,14 @@ impl Options {
                 "--relay-only" => o.relay_only = true,
                 "--synthetic-input" => o.synthetic_input = true,
                 "--encoder" => o.encoder = value()?.to_string(),
+                "--config-dir" => o.config_dir = Some(value()?.into()),
+                "--approve" => {
+                    o.approve = Some(match value()? {
+                        "view" => admit::Approve::View,
+                        "control" => admit::Approve::Control,
+                        other => bail!("--approve takes view or control, not {other}"),
+                    })
+                }
                 other => bail!("unknown option {other}"),
             }
         }
@@ -132,17 +150,22 @@ fn node_config(o: &Options) -> frames_net::NodeConfig {
     }
 }
 
-async fn host(o: Options) -> Result<()> {
-    let node = frames_net::Node::bind(&frames_net::DeviceKey::generate(), node_config(&o)).await?;
+async fn host(mut o: Options) -> Result<()> {
+    let config = admit::config_dir(o.config_dir.as_ref())?;
+    let key = admit::device_key(&config)?;
+    let node = frames_net::Node::bind(&key, node_config(&o)).await?;
     node.online(Duration::from_secs(10)).await?;
     println!("endpoint id: {}", node.id());
-    let session = node.accept().await.context("node closed")??;
-    println!(
-        "connected: {} pairing code {}",
-        session.remote(),
-        session.pairing_code()?
-    );
-    run_host(session, o).await
+    loop {
+        let session = node.accept().await.context("node closed")??;
+        match admit::decide(&config, &session, o.approve).await? {
+            Some(control) => {
+                o.control = control;
+                return run_host(session, o).await;
+            }
+            None => session.close("not approved"),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -161,15 +184,22 @@ async fn run_host(_: frames_net::Session, _: Options) -> Result<()> {
 }
 
 async fn connect(id: &str, o: Options) -> Result<()> {
-    let node = frames_net::Node::bind(&frames_net::DeviceKey::generate(), node_config(&o)).await?;
+    let config = admit::config_dir(o.config_dir.as_ref())?;
+    let node = frames_net::Node::bind(&admit::device_key(&config)?, node_config(&o)).await?;
     let started = std::time::Instant::now();
     let session = node.connect(id.parse::<iroh::EndpointId>()?).await?;
     println!(
-        "connected in {:.0} ms, pairing code {}",
+        "connected in {:.0} ms, pairing code {} (a new host shows the same code)",
         started.elapsed().as_secs_f64() * 1e3,
         session.pairing_code()?
     );
-    run_client(session, o).await
+    let result = run_client(session.clone(), o).await;
+    match (&result, session.close_reason()) {
+        (Err(_), Some(reason)) if reason == "not approved" => {
+            anyhow::bail!("the host refused this device (not approved there)")
+        }
+        _ => result,
+    }
 }
 
 #[cfg(windows)]
@@ -232,7 +262,7 @@ async fn run(args: Vec<String>) -> Result<()> {
             connect(id, Options::parse(&args[2..])?).await
         }
         _ => bail!(
-            "usage: frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software] [--fps N] [--mbps N] [--hold N] [--seconds N]\n       frames-next connect <endpoint-id> [--vsync] [--seconds N]"
+            "usage: frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software] [--fps N] [--mbps N] [--hold N] [--seconds N] [--approve view|control] [--config-dir DIR]\n       frames-next connect <endpoint-id> [--vsync] [--seconds N]"
         ),
     }
 }

@@ -6,6 +6,8 @@
 //!   v1 trust entries carry over (docs/V2_PLAN.md, Phase 4).
 //! - [`congestion`]: QUIC congestion control that follows the media engine's
 //!   target while media flows, and plain Cubic otherwise.
+//! - [`trust`]: the devices this one trusts, by device id, and whether a
+//!   connecting device is let in or asked about.
 //! - [`node`]: binding, dialing by device id, sessions, pairing codes, and
 //!   the media datagram channel implementing
 //!   [`frames_media::api::MediaTransport`].
@@ -18,6 +20,7 @@ pub mod congestion;
 pub mod identity;
 pub mod migration;
 pub mod node;
+pub mod trust;
 
 /// Media bitrate ceiling on n0's public relays: they deliver about
 /// 8-10 Mbps per connection (spike 0-A), so leave headroom for FEC bursts.

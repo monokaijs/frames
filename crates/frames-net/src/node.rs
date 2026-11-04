@@ -240,6 +240,17 @@ impl Session {
         self.connection.close(0u32.into(), reason.as_bytes());
     }
 
+    /// Why the connection closed, once it has: the peer's reason text when
+    /// it closed deliberately (for example "not approved").
+    pub fn close_reason(&self) -> Option<String> {
+        self.connection.close_reason().map(|reason| match reason {
+            iroh::endpoint::ConnectionError::ApplicationClosed(close) => {
+                String::from_utf8_lossy(&close.reason).into_owned()
+            }
+            other => other.to_string(),
+        })
+    }
+
     /// True once the connection closed, from either side.
     pub fn is_closed(&self) -> bool {
         self.connection.close_reason().is_some()

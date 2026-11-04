@@ -260,14 +260,18 @@ fn stream(
         let rtt = path.rtt_us;
         while let Some(datagram) = media.try_recv() {
             match Pointer::decode(&datagram) {
-                Some(pointer) => {
+                // A view-only device's input is dropped here, on the host.
+                Some(pointer) if o.control => {
                     injector.pointer(&pointer);
                 }
+                Some(_) => {}
                 None => host.on_datagram(clock.now_us(), &datagram, rtt),
             }
         }
         while let Ok(event) = events.try_recv() {
-            injector.event(event);
+            if o.control {
+                injector.event(event);
+            }
         }
         if started.elapsed() >= next_report {
             let stats = host.stats();

@@ -2336,7 +2336,10 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "rustls-webpki",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
 ]
 
@@ -2346,6 +2349,7 @@ version = "0.3.3"
 dependencies = [
  "anyhow",
  "bytes",
+ "directories",
  "frames-codec",
  "frames-input",
  "frames-media",

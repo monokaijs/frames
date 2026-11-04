@@ -12,6 +12,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
+directories = "6"
 frames-input = { path = "../frames-input" }
 frames-media = { path = "../frames-media" }
 frames-net = { path = "../frames-net" }

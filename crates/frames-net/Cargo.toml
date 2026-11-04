@@ -19,9 +19,12 @@ iroh = "=1.4.1"
 # Same version iroh uses, for the congestion::Controller trait.
 noq-proto = "=1.4.0"
 ring = "0.17"
+serde.workspace = true
+serde_json.workspace = true
 pki-types = { package = "rustls-pki-types", version = "1" }
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["ring", "std"] }
 
 [dev-dependencies]
+tempfile = "3"
 frames-testkit = { path = "../frames-testkit" }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
