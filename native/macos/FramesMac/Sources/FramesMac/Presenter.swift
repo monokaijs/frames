@@ -108,6 +108,16 @@ final class Presenter: @unchecked Sendable {
         }
     }
 
+    func setTitle(_ title: String) {
+        guard let window else { return }
+        let apply = { @MainActor in window.title = title }
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { apply() }
+        } else {
+            DispatchQueue.main.async { MainActor.assumeIsolated { apply() } }
+        }
+    }
+
     /// Generated events for unattended tests, through `InputView`'s handlers.
     func postSyntheticInput(step: UInt64) {
         guard let inputView else { return }
@@ -479,4 +489,11 @@ public func framesMacPresenterSetCursor(
 public func framesMacPresenterSetCursorVisible(_ handle: UnsafeMutableRawPointer?, _ visible: Bool) {
     guard let handle else { return }
     borrowed(handle, as: Presenter.self).setCursor(nil, visible: visible)
+}
+
+@_cdecl("frames_mac_presenter_set_title")
+public func framesMacPresenterSetTitle(_ handle: UnsafeMutableRawPointer?, _ utf8: UnsafePointer<UInt8>?, _ length: Int) {
+    guard let handle, let utf8 else { return }
+    let title = String(decoding: UnsafeBufferPointer(start: utf8, count: length), as: UTF8.self)
+    borrowed(handle, as: Presenter.self).setTitle(title)
 }

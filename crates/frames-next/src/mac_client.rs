@@ -250,6 +250,8 @@ fn view(
         if started.elapsed() >= next_report {
             let stats = client.stats();
             let (n, p50, p95) = latency.take_window();
+            let title = crate::stats::window_title(n, p50, p95, &path, stats.frames_lost);
+            presenter.set_title(&title);
             println!(
                 "client t={:>3}s presented {n:>3}/s clean {:>3} lost {} | capture to present p50 {p50:>5.2} p95 {p95:>5.2} ms | recoveries {} nacks {} | {:?} rtt {:.1} ms offset {:.1} ms",
                 next_report.as_secs(),

@@ -115,6 +115,7 @@ unsafe extern "C" {
         hotspot_y: u32,
     );
     pub fn frames_mac_presenter_set_cursor_visible(presenter: *mut c_void, visible: bool);
+    pub fn frames_mac_presenter_set_title(presenter: *mut c_void, utf8: *const u8, length: usize);
     pub fn frames_mac_clipboard_change_count() -> u64;
     pub fn frames_mac_clipboard_text(out: *mut *mut u8) -> i64;
     pub fn frames_mac_clipboard_png(out: *mut *mut u8) -> i64;

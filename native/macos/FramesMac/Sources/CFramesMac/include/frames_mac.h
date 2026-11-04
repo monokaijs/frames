@@ -133,6 +133,8 @@ void frames_mac_presenter_set_input(void *presenter, void *context, FramesMacInp
 void frames_mac_presenter_set_cursor(void *presenter, const uint8_t *bgra, uint32_t width,
                                      uint32_t height, uint32_t hotspot_x, uint32_t hotspot_y);
 void frames_mac_presenter_set_cursor_visible(void *presenter, bool visible);
+// The presenter window's title (UTF-8, borrowed), e.g. live statistics.
+void frames_mac_presenter_set_title(void *presenter, const uint8_t *utf8, size_t length);
 // Feeds generated mouse, wheel and key events for `step` through the same
 // conversion as real ones (unattended tests). Runs on the main thread.
 void frames_mac_presenter_post_synthetic_input(void *presenter, uint64_t step);

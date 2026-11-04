@@ -35,7 +35,7 @@ launcher, installer, updater, and service still run v1.
 | Codec choice and automatic selection | **Done**: NVENC (H.264/HEVC), AMF/QSV/MF and software AV1 through FFmpeg, VideoToolbox; host picks the best shared codec. VP9 dropped. |
 | Host audio | **Partial**: 10 ms Opus datagrams with the previous packet repeated, v1's jitter buffer and drift-corrected playback (`frames-audio`, cpal on both platforms), `frames-next --audio on|qa` on both ends. QA run PC host → Mac viewer (generated 440 Hz tone, silent sink): 800 of 800 packets in 8 s, none concealed, the tone's 880 zero crossings per second recovered. Windows loopback capture and real playback are ported but not exercised automatically (they would capture and play the user's audio); macOS host capture (ScreenCaptureKit audio) is not wired yet. |
 | Image quality settings, live change | **Partial**: bitrate ceiling from the command line; adaptive rate, probing. |
-| Debug overlay | **Partial**: per-second statistics printed; no overlay. |
+| Debug overlay | **Partial**: per-second statistics printed, and the viewer window's title shows frame rate, capture → present p50/p95, path (direct or relayed) with RTT, and frames lost, refreshed each second (not read back automatically). No graphs or panel. |
 | Low latency | **Done**: PC capture → present p50 3-5 ms; PC ↔ Mac 8-12 ms; photodiode check pending. |
 
 ## Input

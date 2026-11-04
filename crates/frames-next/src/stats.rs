@@ -1,5 +1,24 @@
 //! Per-second latency summaries.
 
+/// The viewer window's title: the session's live state, refreshed once a
+/// second (the v2 stand-in for v1's debug overlay).
+pub fn window_title(
+    fps: usize,
+    p50_ms: f64,
+    p95_ms: f64,
+    path: &frames_media::api::PathInfo,
+    lost: u64,
+) -> String {
+    let kind = match path.kind {
+        frames_media::api::PathKind::Direct => "direct",
+        frames_media::api::PathKind::Relay => "relayed",
+    };
+    format!(
+        "Frames Next — {fps} fps · {p50_ms:.1} ms (p95 {p95_ms:.1}) · {kind} {:.1} ms RTT · {lost} lost",
+        path.rtt_us as f64 / 1e3
+    )
+}
+
 /// The `p`th percentile (0-100) in milliseconds; 0 when empty.
 pub fn percentile_ms(values: &mut [u64], p: usize) -> f64 {
     if values.is_empty() {

@@ -175,6 +175,12 @@ impl MacPresenter {
         };
     }
 
+    /// The window's title (live statistics, for example).
+    pub fn set_title(&self, title: &str) {
+        // SAFETY: live presenter; Swift copies the text.
+        unsafe { ffi::frames_mac_presenter_set_title(self.handle, title.as_ptr(), title.len()) };
+    }
+
     pub fn set_cursor_visible(&self, visible: bool) {
         // SAFETY: live presenter.
         unsafe { ffi::frames_mac_presenter_set_cursor_visible(self.handle, visible) };

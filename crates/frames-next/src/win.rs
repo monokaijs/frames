@@ -499,3 +499,11 @@ pub fn find_window(needle: &str) -> Option<(HWND, String)> {
         .into_iter()
         .find(|(_, title)| title.to_lowercase().contains(&needle))
 }
+
+/// Sets a window's title.
+pub fn set_title(hwnd: HWND, title: &str) {
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
+    }
+}
