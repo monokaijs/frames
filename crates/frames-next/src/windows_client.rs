@@ -1,11 +1,10 @@
 //! Windows viewer: frames-net → v2 client engine → D3D11VA → flip presenter.
 
+use crate::lane::InputLane;
 use crate::stats::Samples;
 use crate::{Options, receive_info, win};
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use frames_codec::ffmpeg::FfmpegDecoder;
-use frames_input::{Event, Pointer};
 use frames_media::api::{MediaClock, MediaTransport, PresentMode, Presenter};
 use frames_media::client::{ClientConfig, ClientSession};
 use frames_media::clock::SystemClock;
@@ -45,19 +44,10 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
             }
         })
     };
-    // Buttons, keys, and wheel: one reliable stream, written by this task.
-    let (mut input_stream, _) = session.open_channel().await?;
-    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    let writer = tokio::spawn(async move {
-        while let Some(bytes) = input_rx.recv().await {
-            if input_stream.write_all(&bytes).await.is_err() {
-                break;
-            }
-        }
-        let _ = input_stream.finish();
-    });
+    // Buttons, keys, and wheel: one reliable stream, written by a task.
+    let (lane, writer) = InputLane::open(&session).await?;
     let result =
-        tokio::task::spawn_blocking(move || view(&session, info, &o, input_tx, cursor_rx)).await?;
+        tokio::task::spawn_blocking(move || view(&session, info, &o, lane, cursor_rx)).await?;
     let _ = writer.await;
     cursor_reader.abort();
     result
@@ -109,7 +99,7 @@ fn view(
     session: &frames_net::Session,
     info: crate::StreamInfo,
     o: &Options,
-    input_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    mut lane: InputLane,
     cursor_rx: std::sync::mpsc::Receiver<frames_input::cursor::CursorMessage>,
 ) -> Result<()> {
     win::dpi_aware();
@@ -161,10 +151,7 @@ fn view(
         moves: 0,
         seconds: 0,
     });
-    let mut pointer_seq = 0u32;
     let mut cursor_shapes = 0u64;
-    let mut input_wire = Samples::new(0);
-    let (mut sent_moves, mut sent_events) = (0u64, 0u64);
     let mut next_report = Duration::from_secs(1);
     let mut latency = Samples::new(30);
     let mut presented = 0u64;
@@ -191,14 +178,7 @@ fn view(
         }
         cursor_shapes += cursor_updates;
         win::pump();
-        send_input(
-            &media,
-            &input_tx,
-            &clock,
-            &mut pointer_seq,
-            &mut input_wire,
-            (&mut sent_moves, &mut sent_events),
-        );
+        lane.send(&media, &clock, win::take_input());
         let path = media.path();
         client.set_rtt(path.rtt_us);
         while let Some(datagram) = media.try_recv() {
@@ -236,29 +216,13 @@ fn view(
                 path.rtt_us as f64 / 1e3,
             );
             reported_clean = stats.frames_clean;
-            let (inputs, input_p50, input_p95) = input_wire.take_window();
-            if inputs > 0 {
-                println!(
-                    "client input: {inputs} sent, input to wire p50 {:.0} p95 {:.0} µs",
-                    input_p50 * 1e3,
-                    input_p95 * 1e3
-                );
-            }
+            lane.report_window();
             next_report += Duration::from_secs(1);
         }
         std::thread::sleep(Duration::from_micros(200));
     }
-    let _ = input_tx.send({
-        let mut release = Vec::new();
-        Event::ReleaseAll.encode(&mut release);
-        release
-    });
-    let (inputs, input_p50, input_p95, _) = input_wire.summary();
-    println!(
-        "INPUT moves={sent_moves} events={sent_events} cursor_updates={cursor_shapes} measured={inputs} input_to_wire p50={:.0} p95={:.0} us",
-        input_p50 * 1e3,
-        input_p95 * 1e3
-    );
+    lane.release_all();
+    lane.print_summary(cursor_shapes);
     let stats = client.stats();
     let (n, p50, p95, p99) = latency.summary();
     println!(
@@ -267,55 +231,4 @@ fn view(
     );
     session.close("viewer closed");
     Ok(())
-}
-
-/// Sends what the viewer window captured: the newest pointer position as one
-/// datagram, everything else on the reliable stream, in order.
-fn send_input(
-    media: &frames_net::MediaChannel,
-    input_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    clock: &SystemClock,
-    pointer_seq: &mut u32,
-    input_wire: &mut Samples,
-    (sent_moves, sent_events): (&mut u64, &mut u64),
-) {
-    let captured = win::take_input();
-    if captured.is_empty() {
-        return;
-    }
-    let mut latest = None;
-    let mut records = Vec::new();
-    let mut stamps = Vec::new();
-    for item in captured {
-        match item {
-            win::Captured::Move { x, y, at_us } => latest = Some((x, y, at_us)),
-            win::Captured::Event { event, at_us } => {
-                event.encode(&mut records);
-                stamps.push(at_us);
-                *sent_events += 1;
-            }
-        }
-    }
-    if !records.is_empty() && input_tx.send(records).is_ok() {
-        let now = clock.now_us();
-        for at in stamps {
-            input_wire.push(now.saturating_sub(at));
-        }
-    }
-    if let Some((x, y, at_us)) = latest {
-        *pointer_seq = pointer_seq.wrapping_add(1);
-        let pointer = Pointer {
-            seq: *pointer_seq,
-            time_us: at_us as u32,
-            x,
-            y,
-        };
-        if media
-            .try_send(Bytes::copy_from_slice(&pointer.encode()))
-            .is_ok()
-        {
-            input_wire.push(clock.now_us().saturating_sub(at_us));
-            *sent_moves += 1;
-        }
-    }
 }

@@ -1,4 +1,5 @@
-//! USB HID keyboard usages (page 7) and Windows Scan Set 1 codes.
+//! USB HID keyboard usages (page 7), Windows Scan Set 1 codes, and macOS
+//! virtual key codes.
 //!
 //! Keys travel as HID usages so the viewer's and host's keyboard conventions
 //! never meet; each platform maps at its edge. Copied from v1
@@ -39,6 +40,110 @@ pub fn scan_to_usage(scan: u16) -> Option<u16> {
     (4..=0xe7).find(|&usage| usage_to_scan(usage) == Some(scan))
 }
 
+/// USB HID usage → macOS virtual key code (`kVK_*`), from v1's
+/// `native/macos/Sources/Host.swift`.
+const MAC_KEYS: &[(u16, u16)] = &[
+    (0x04, 0),
+    (0x05, 11),
+    (0x06, 8),
+    (0x07, 2),
+    (0x08, 14),
+    (0x09, 3),
+    (0x0a, 5),
+    (0x0b, 4),
+    (0x0c, 34),
+    (0x0d, 38),
+    (0x0e, 40),
+    (0x0f, 37),
+    (0x10, 46),
+    (0x11, 45),
+    (0x12, 31),
+    (0x13, 35),
+    (0x14, 12),
+    (0x15, 15),
+    (0x16, 1),
+    (0x17, 17),
+    (0x18, 32),
+    (0x19, 9),
+    (0x1a, 13),
+    (0x1b, 7),
+    (0x1c, 16),
+    (0x1d, 6),
+    (0x1e, 18),
+    (0x1f, 19),
+    (0x20, 20),
+    (0x21, 21),
+    (0x22, 23),
+    (0x23, 22),
+    (0x24, 26),
+    (0x25, 28),
+    (0x26, 25),
+    (0x27, 29),
+    (0x28, 36),
+    (0x29, 53),
+    (0x2a, 51),
+    (0x2b, 48),
+    (0x2c, 49),
+    (0x2d, 27),
+    (0x2e, 24),
+    (0x2f, 33),
+    (0x30, 30),
+    (0x31, 42),
+    (0x33, 41),
+    (0x34, 39),
+    (0x35, 50),
+    (0x36, 43),
+    (0x37, 47),
+    (0x38, 44),
+    (0x39, 57),
+    (0x3a, 122),
+    (0x3b, 120),
+    (0x3c, 99),
+    (0x3d, 118),
+    (0x3e, 96),
+    (0x3f, 97),
+    (0x40, 98),
+    (0x41, 100),
+    (0x42, 101),
+    (0x43, 109),
+    (0x44, 103),
+    (0x45, 111),
+    (0x49, 114),
+    (0x4a, 115),
+    (0x4b, 116),
+    (0x4c, 117),
+    (0x4d, 119),
+    (0x4e, 121),
+    (0x4f, 124),
+    (0x50, 123),
+    (0x51, 125),
+    (0x52, 126),
+    (0xe0, 59),
+    (0xe1, 56),
+    (0xe2, 58),
+    (0xe3, 55),
+    (0xe4, 62),
+    (0xe5, 60),
+    (0xe6, 61),
+    (0xe7, 54),
+];
+
+/// The macOS virtual key code for a HID usage.
+pub fn usage_to_mac(usage: u16) -> Option<u16> {
+    MAC_KEYS
+        .iter()
+        .find(|&&(u, _)| u == usage)
+        .map(|&(_, code)| code)
+}
+
+/// The HID usage for a macOS virtual key code.
+pub fn mac_to_usage(code: u16) -> Option<u16> {
+    MAC_KEYS
+        .iter()
+        .find(|&&(_, c)| c == code)
+        .map(|&(usage, _)| usage)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,5 +163,19 @@ mod tests {
         assert_eq!(usage_to_scan(0x04), Some(0x1e), "A");
         assert_eq!(usage_to_scan(0x50), Some(0xe04b), "left arrow is extended");
         assert_eq!(scan_to_usage(0xe045), Some(0x53), "Num Lock alias");
+    }
+
+    #[test]
+    fn mac_key_codes_round_trip_and_agree_with_the_windows_table() {
+        assert_eq!(MAC_KEYS.len(), 83, "v1's table");
+        for &(usage, code) in MAC_KEYS {
+            assert_eq!(mac_to_usage(code), Some(usage), "{usage:#x}");
+            assert!(
+                usage_to_scan(usage).is_some(),
+                "{usage:#x} has no Windows scan code"
+            );
+        }
+        assert_eq!(usage_to_mac(0x04), Some(0), "A is kVK_ANSI_A");
+        assert_eq!(usage_to_mac(0xe3), Some(55), "left GUI is Command");
     }
 }

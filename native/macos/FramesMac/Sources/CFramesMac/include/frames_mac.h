@@ -11,7 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define FRAMES_MAC_ABI_VERSION 1u
+#define FRAMES_MAC_ABI_VERSION 2u
 
 typedef struct FramesMacCallbacks {
     void *context;
@@ -111,6 +111,25 @@ int32_t frames_mac_presenter_present(void *presenter, void *pixel_buffer, bool v
 // if not known yet (windowed presenters only). Reported asynchronously, so it
 // usually describes the frame before the one just presented.
 uint64_t frames_mac_presenter_last_on_glass_ns(void *presenter);
+
+// Viewer input from a windowed presenter's view (ABI 2). Positions are
+// normalized to 0-65535 over the view, origin top left. `event_ns` is the
+// event's own timestamp (CLOCK_UPTIME_RAW ns).
+enum {
+    FRAMES_MAC_INPUT_MOVE = 1,       // a = x, b = y
+    FRAMES_MAC_INPUT_BUTTON = 2,     // a = button (0 left, 1 right, 2 middle, 3 back, 4 forward), b = down, c = x, d = y
+    FRAMES_MAC_INPUT_WHEEL = 3,      // a = dx, b = dy, in 1/120 notches, positive = right / up
+    FRAMES_MAC_INPUT_KEY = 4,        // a = macOS virtual key code, b = down
+    FRAMES_MAC_INPUT_FOCUS_LOST = 5, // the window stopped being key
+};
+typedef void (*FramesMacInputCallback)(void *context, uint32_t kind, int32_t a, int32_t b,
+                                       int32_t c, int32_t d, uint64_t event_ns);
+// Installs (or with NULL, removes) the input callback. Removing waits for a
+// callback in progress, so the context may be freed once this returns.
+void frames_mac_presenter_set_input(void *presenter, void *context, FramesMacInputCallback callback);
+// Feeds generated mouse, wheel and key events for `step` through the same
+// conversion as real ones (unattended tests). Runs on the main thread.
+void frames_mac_presenter_post_synthetic_input(void *presenter, uint64_t step);
 double frames_mac_presenter_refresh_hz(void *presenter);
 void frames_mac_presenter_free(void *presenter);
 

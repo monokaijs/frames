@@ -20,6 +20,9 @@ final class Presenter: @unchecked Sendable {
     let refreshHz: Double
     /// Host time (ns) the newest drawable reached the glass, when known.
     let presentedAt = PresentedTime()
+    /// Where the window's input goes (set by the Rust viewer).
+    let input = InputRelay()
+    private var inputView: InputView?
 
     init?(width: Int, height: Int, windowed: Bool) {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { return nil }
@@ -63,7 +66,8 @@ final class Presenter: @unchecked Sendable {
             return
         }
         var refresh = 60.0
-        let makeWindow = { @MainActor () -> (NSWindow?, Double) in
+        let input = self.input
+        let makeWindow = { @MainActor () -> (NSWindow?, Double, InputView) in
             let hz = Double(NSScreen.main?.maximumFramesPerSecond ?? 60)
             let scale = NSScreen.main?.backingScaleFactor ?? 2
             let frame = NSRect(x: 80, y: 80, width: CGFloat(width) / scale, height: CGFloat(height) / scale)
@@ -71,22 +75,38 @@ final class Presenter: @unchecked Sendable {
                 contentRect: frame, styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
             window.title = "Frames presenter"
             window.isReleasedWhenClosed = false
-            let view = NSView(frame: frame)
+            let view = InputView(frame: frame, relay: input)
             view.wantsLayer = true
             view.layer = layer
             window.contentView = view
+            window.acceptsMouseMovedEvents = true
             window.makeKeyAndOrderFront(nil)
-            return (window, hz)
+            window.makeFirstResponder(view)
+            return (window, hz, view)
         }
+        let made: (NSWindow?, Double, InputView)
         if Thread.isMainThread {
-            (window, refresh) = MainActor.assumeIsolated { makeWindow() }
+            made = MainActor.assumeIsolated { makeWindow() }
         } else {
-            (window, refresh) = DispatchQueue.main.sync { MainActor.assumeIsolated { makeWindow() } }
+            made = DispatchQueue.main.sync { MainActor.assumeIsolated { makeWindow() } }
         }
+        (window, refresh, inputView) = (made.0, made.1, made.2)
         refreshHz = refresh
     }
 
+    /// Generated events for unattended tests, through `InputView`'s handlers.
+    func postSyntheticInput(step: UInt64) {
+        guard let inputView else { return }
+        let post = { @MainActor in inputView.synthetic(step: step) }
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { post() }
+        } else {
+            DispatchQueue.main.async { MainActor.assumeIsolated { post() } }
+        }
+    }
+
     func close() {
+        input.set(context: nil, callback: nil)
         guard let window else { return }
         self.window = nil
         let close = { @MainActor in window.close() }
@@ -197,4 +217,175 @@ public func framesMacPresenterRefreshHz(_ handle: UnsafeMutableRawPointer?) -> D
 public func framesMacPresenterFree(_ handle: UnsafeMutableRawPointer?) {
     guard let handle else { return }
     released(handle, as: Presenter.self).close()
+}
+
+
+/// The Rust viewer's input callback, behind a lock so removing it waits for
+/// a call in progress (the context can then be freed safely).
+final class InputRelay: @unchecked Sendable {
+    private let lock = NSLock()
+    private var context: UnsafeMutableRawPointer?
+    private var callback: FramesMacInputCallback?
+
+    func set(context: UnsafeMutableRawPointer?, callback: FramesMacInputCallback?) {
+        lock.lock()
+        self.context = context
+        self.callback = callback
+        lock.unlock()
+    }
+
+    func send(_ kind: Int32, _ a: Int32, _ b: Int32 = 0, _ c: Int32 = 0, _ d: Int32 = 0, at seconds: TimeInterval) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let callback else { return }
+        // NSEvent timestamps are seconds of system uptime.
+        let nanos = seconds > 0 ? UInt64(seconds * 1_000_000_000) : uptimeNanos()
+        callback(context, UInt32(kind), a, b, c, d, nanos)
+    }
+}
+
+/// The presenter window's content: forwards mouse, wheel, and key events.
+final class InputView: NSView {
+    private let relay: InputRelay
+    private var tracking: NSTrackingArea?
+    /// Modifier keys currently down, by key code (flagsChanged reports one
+    /// key at a time).
+    private var modifiersDown: Set<UInt16> = []
+
+    init(frame: NSRect, relay: InputRelay) {
+        self.relay = relay
+        super.init(frame: frame)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(
+            rect: bounds, options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect], owner: self, userInfo: nil)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    /// Normalized position, origin top left.
+    private func position(_ event: NSEvent) -> (Int32, Int32) {
+        let point = convert(event.locationInWindow, from: nil)
+        let width = max(bounds.width, 1), height = max(bounds.height, 1)
+        let x = min(max(point.x / width, 0), 1), y = min(max(1 - point.y / height, 0), 1)
+        return (Int32((x * 65535).rounded()), Int32((y * 65535).rounded()))
+    }
+
+    private func move(_ event: NSEvent) {
+        let (x, y) = position(event)
+        relay.send(Int32(FRAMES_MAC_INPUT_MOVE), x, y, at: event.timestamp)
+    }
+
+    private func button(_ event: NSEvent, _ button: Int32, down: Bool) {
+        let (x, y) = position(event)
+        relay.send(Int32(FRAMES_MAC_INPUT_BUTTON), button, down ? 1 : 0, x, y, at: event.timestamp)
+    }
+
+    private func otherButton(_ event: NSEvent) -> Int32 {
+        switch event.buttonNumber {
+        case 3: return 3
+        case 4: return 4
+        default: return 2
+        }
+    }
+
+    override func mouseMoved(with event: NSEvent) { move(event) }
+    override func mouseDragged(with event: NSEvent) { move(event) }
+    override func rightMouseDragged(with event: NSEvent) { move(event) }
+    override func otherMouseDragged(with event: NSEvent) { move(event) }
+    override func mouseDown(with event: NSEvent) { button(event, 0, down: true) }
+    override func mouseUp(with event: NSEvent) { button(event, 0, down: false) }
+    override func rightMouseDown(with event: NSEvent) { button(event, 1, down: true) }
+    override func rightMouseUp(with event: NSEvent) { button(event, 1, down: false) }
+    override func otherMouseDown(with event: NSEvent) { button(event, otherButton(event), down: true) }
+    override func otherMouseUp(with event: NSEvent) { button(event, otherButton(event), down: false) }
+
+    override func scrollWheel(with event: NSEvent) {
+        // Lines (wheel mice) are notches; trackpad deltas are points, about a
+        // tenth of a notch each.
+        let scale: CGFloat = event.hasPreciseScrollingDeltas ? 12 : 120
+        let dx = Int32((event.scrollingDeltaX * scale).rounded())
+        let dy = Int32((event.scrollingDeltaY * scale).rounded())
+        if dx != 0 || dy != 0 {
+            relay.send(Int32(FRAMES_MAC_INPUT_WHEEL), dx, dy, at: event.timestamp)
+        }
+    }
+
+    override func keyDown(with event: NSEvent) {
+        relay.send(Int32(FRAMES_MAC_INPUT_KEY), Int32(event.keyCode), 1, at: event.timestamp)
+    }
+
+    override func keyUp(with event: NSEvent) {
+        relay.send(Int32(FRAMES_MAC_INPUT_KEY), Int32(event.keyCode), 0, at: event.timestamp)
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        let code = event.keyCode
+        let down = !modifiersDown.contains(code)
+        if down { modifiersDown.insert(code) } else { modifiersDown.remove(code) }
+        relay.send(Int32(FRAMES_MAC_INPUT_KEY), Int32(code), down ? 1 : 0, at: event.timestamp)
+    }
+
+    override func resignFirstResponder() -> Bool {
+        modifiersDown.removeAll()
+        relay.send(Int32(FRAMES_MAC_INPUT_FOCUS_LOST), 0, at: 0)
+        return super.resignFirstResponder()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification, object: window, queue: .main
+        ) { [relay] _ in relay.send(Int32(FRAMES_MAC_INPUT_FOCUS_LOST), 0, at: 0) }
+    }
+
+    /// One step of generated input: a circling pointer every step, and a
+    /// click, a wheel notch, and an "A" key press every 125th.
+    func synthetic(step: UInt64) {
+        let angle = Double(step) * 0.05
+        let point = NSPoint(
+            x: bounds.midX + bounds.width * 0.3 * cos(angle), y: bounds.midY + bounds.height * 0.3 * sin(angle))
+        let location = convert(point, to: nil)
+        let number = window?.windowNumber ?? 0
+        let now = ProcessInfo.processInfo.systemUptime
+        func mouse(_ type: NSEvent.EventType) -> NSEvent? {
+            NSEvent.mouseEvent(
+                with: type, location: location, modifierFlags: [], timestamp: now, windowNumber: number,
+                context: nil, eventNumber: 0, clickCount: 1, pressure: type == .leftMouseDown ? 1 : 0)
+        }
+        func key(_ type: NSEvent.EventType) -> NSEvent? {
+            NSEvent.keyEvent(
+                with: type, location: location, modifierFlags: [], timestamp: now, windowNumber: number,
+                context: nil, characters: "a", charactersIgnoringModifiers: "a", isARepeat: false, keyCode: 0)
+        }
+        if let event = mouse(.mouseMoved) { mouseMoved(with: event) }
+        guard step % 125 == 0 else { return }
+        if let event = mouse(.leftMouseDown) { mouseDown(with: event) }
+        if let event = mouse(.leftMouseUp) { mouseUp(with: event) }
+        relay.send(Int32(FRAMES_MAC_INPUT_WHEEL), 0, 120, at: now)
+        if let event = key(.keyDown) { keyDown(with: event) }
+        if let event = key(.keyUp) { keyUp(with: event) }
+    }
+}
+
+@_cdecl("frames_mac_presenter_set_input")
+public func framesMacPresenterSetInput(
+    _ handle: UnsafeMutableRawPointer?, _ context: UnsafeMutableRawPointer?, _ callback: FramesMacInputCallback?
+) {
+    guard let handle else { return }
+    borrowed(handle, as: Presenter.self).input.set(context: context, callback: callback)
+}
+
+@_cdecl("frames_mac_presenter_post_synthetic_input")
+public func framesMacPresenterPostSyntheticInput(_ handle: UnsafeMutableRawPointer?, _ step: UInt64) {
+    guard let handle else { return }
+    borrowed(handle, as: Presenter.self).postSyntheticInput(step: step)
 }

@@ -39,13 +39,7 @@ fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe { DefWindowProcW(hwnd, message, w, l) }
 }
 
-/// Input the viewer window received, stamped with the engine clock when its
-/// message was handled.
-#[derive(Clone, Copy, Debug)]
-pub enum Captured {
-    Move { x: u16, y: u16, at_us: u64 },
-    Event { event: Event, at_us: u64 },
-}
+pub use crate::lane::Captured;
 
 thread_local! {
     static CAPTURED: RefCell<Vec<Captured>> = const { RefCell::new(Vec::new()) };

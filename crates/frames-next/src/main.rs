@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 mod admit;
+mod lane;
 #[cfg(target_os = "macos")]
 mod mac_client;
 #[cfg(target_os = "macos")]

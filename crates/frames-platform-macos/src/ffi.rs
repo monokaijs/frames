@@ -3,7 +3,7 @@
 
 use std::ffi::c_void;
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 pub const CODEC_H264: u32 = 0;
 pub const CODEC_HEVC: u32 = 1;
@@ -24,6 +24,13 @@ pub type OnFrame = unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u32, u64,
 pub type OnEncoded = unsafe extern "C" fn(*mut c_void, *const u8, usize, u32, i64, u64, u64, i32);
 pub type OnCursor = unsafe extern "C" fn(*mut c_void, f64, f64, bool);
 pub type OnEvent = unsafe extern "C" fn(*mut c_void, u32, *const u8, usize);
+pub type OnInput = unsafe extern "C" fn(*mut c_void, u32, i32, i32, i32, i32, u64);
+
+pub const INPUT_MOVE: u32 = 1;
+pub const INPUT_BUTTON: u32 = 2;
+pub const INPUT_WHEEL: u32 = 3;
+pub const INPUT_KEY: u32 = 4;
+pub const INPUT_FOCUS_LOST: u32 = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -93,6 +100,12 @@ unsafe extern "C" {
     pub fn frames_mac_presenter_last_on_glass_ns(presenter: *mut c_void) -> u64;
     pub fn frames_mac_presenter_refresh_hz(presenter: *mut c_void) -> f64;
     pub fn frames_mac_presenter_free(presenter: *mut c_void);
+    pub fn frames_mac_presenter_set_input(
+        presenter: *mut c_void,
+        context: *mut c_void,
+        callback: Option<OnInput>,
+    );
+    pub fn frames_mac_presenter_post_synthetic_input(presenter: *mut c_void, step: u64);
     pub fn frames_mac_run_app(seconds: f64);
     pub fn frames_mac_stop_app();
 }
