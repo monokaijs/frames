@@ -722,6 +722,15 @@ async fn host_session(
     clipboard: bool,
 ) -> anyhow::Result<()> {
     let _update_lease = crate::update::session_lease()?;
+    // Access comes either from the trust store (checked again every second, so
+    // Remove/revoke cuts the session) or from an "Accept" for this session only,
+    // which is never stored and so has nothing to revoke. Checking the store for
+    // a session-only grant ended every such session about a second after it
+    // was approved.
+    let stored_access = TrustStore::load()?
+        .peers
+        .get(&peer.device_id)
+        .is_some_and(|p| p.allow_control);
     anyhow::ensure!(
         desktop.shared_session().is_none()
             || peer.shared_game == Some(frames_core::shared_game::Capabilities::V1),
@@ -884,7 +893,7 @@ async fn host_session(
                     }
                     if let Some(state)=desktop.shared_session() && last_shared_phase!=Some(state.phase){last_shared_phase=Some(state.phase);io.send.send(Message::SharedState(state)).await?;}
                 }
-                if scan.is_multiple_of(10){anyhow::ensure!(TrustStore::load()?.peers.get(&peer.device_id).is_some_and(|p|p.allow_control),"device access revoked");}
+                if stored_access && scan.is_multiple_of(10){anyhow::ensure!(TrustStore::load()?.peers.get(&peer.device_id).is_some_and(|p|p.allow_control),"device access revoked");}
                 if peer.purpose==SessionPurpose::Transfer{continue;}
                 if window_scan.is_none(){
                     let d=desktop.clone();scan_mode=view_mode;
