@@ -89,7 +89,7 @@ pub fn connection(name: &str, text: &str) -> anyhow::Result<crate::ConnectionDec
     let labels = [
         super::wide("Decline connection\nDo not allow this session."),
         super::wide(
-            "Accept and trust\nAllow this session and save the device for future connections.",
+            "Accept and trust\nAllow this session, and let this device connect without asking while you share.",
         ),
         super::wide("Accept\nAllow this session only. You can trust the device later."),
     ];

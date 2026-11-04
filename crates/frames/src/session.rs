@@ -121,7 +121,7 @@ async fn handshake(
     let needs_approval = if preview {
         false
     } else if server {
-        frames_core::trust::incoming_needs_approval(known, unattended)
+        frames_core::trust::incoming_needs_approval(known, unattended, allow_pair)
     } else {
         known.is_none()
     };

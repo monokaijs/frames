@@ -189,7 +189,27 @@ pub struct TrustedPeer {
     #[serde(default)]
     pub allow_control: bool,
 }
-pub fn incoming_needs_approval(peer: Option<&TrustedPeer>, unattended: bool) -> bool {
+/// Whether an incoming control connection needs the host's approval.
+///
+/// - `attended`: the host was started where someone can answer a prompt
+///   (the launcher or `frames host --pair`). There, a device trusted for
+///   control ("Accept and trust") reconnects without asking; "trust" that
+///   still asked every time was indistinguishable from "accept once".
+/// - Otherwise (sharing at login, the Windows service) nobody may be watching:
+///   the host must run with `unattended` and the device must also have been
+///   approved for unattended access.
+///
+/// A peer stored without `allow_control` is a host this device connects to,
+/// not a device allowed to control it, and is always asked.
+pub fn incoming_needs_approval(
+    peer: Option<&TrustedPeer>,
+    unattended: bool,
+    attended: bool,
+) -> bool {
+    let trusted = peer.is_some_and(|p| p.allow_control);
+    if attended && trusted {
+        return false;
+    }
     !unattended || !peer.is_some_and(|p| p.allow_control && p.unattended)
 }
 pub fn allows_preview(peer: Option<&TrustedPeer>) -> bool {
@@ -271,14 +291,33 @@ mod tests {
             unattended: true,
             allow_control: false,
         };
-        assert!(incoming_needs_approval(Some(&pin), true));
+        for attended in [false, true] {
+            assert!(incoming_needs_approval(Some(&pin), true, attended));
+            assert!(incoming_needs_approval(None, true, attended));
+            assert!(incoming_needs_approval(None, false, attended));
+        }
         let allowed = TrustedPeer {
             allow_control: true,
             ..pin.clone()
         };
-        assert!(!incoming_needs_approval(Some(&allowed), true));
-        assert!(incoming_needs_approval(Some(&allowed), false));
-        assert!(incoming_needs_approval(None, true));
+        assert!(!incoming_needs_approval(Some(&allowed), true, false));
+        assert!(incoming_needs_approval(Some(&allowed), false, false));
+        // "Accept and trust" while someone shares interactively: no prompt next time,
+        // even when the device was never approved for unattended access.
+        let trusted_attended = TrustedPeer {
+            unattended: false,
+            ..allowed.clone()
+        };
+        assert!(!incoming_needs_approval(
+            Some(&trusted_attended),
+            false,
+            true
+        ));
+        assert!(incoming_needs_approval(
+            Some(&trusted_attended),
+            true,
+            false
+        ));
         assert!(!allows_preview(None));
         assert!(!allows_preview(Some(&pin)));
         assert!(allows_preview(Some(&allowed)));

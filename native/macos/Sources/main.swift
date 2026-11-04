@@ -82,7 +82,7 @@ if mode == "--network-settings"{
     let alert=NSAlert();alert.messageText=args.count>4 ? args[4]:"Approve pairing"
     let name=args.count>2 ? args[2].components(separatedBy:.controlCharacters).joined():"Remote device"
     alert.informativeText="Verification code: \(args.count>3 ? args[3]:"")\n\nDevice: \(name)\n\nApprove only if the other device shows the same code."
-    alert.informativeText += "\n\nAccept allows this session only. Accept and trust also saves the device for future connections."
+    alert.informativeText += "\n\nAccept allows this session only. Accept and trust also saves the device, and it then connects without asking while you share."
     alert.addButton(withTitle:"Decline connection");alert.addButton(withTitle:"Accept and trust");alert.addButton(withTitle:"Accept")
     // Dedicated codes: a normal exit 0 (any other mode, or no answer) must never read as consent.
     let decision=runFramesAlert(alert);exit(decision == .alertSecondButtonReturn ? 10 : decision == .alertThirdButtonReturn ? 11 : 1)
