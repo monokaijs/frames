@@ -44,7 +44,7 @@ launcher, installer, updater, and service still run v1.
 |---|---|
 | Mouse, wheel, keyboard | **Done** on both viewers and both hosts (macOS host needs Accessibility; posting not exercised automatically). |
 | Release input on focus loss / exit | **Done**. |
-| Ctrl/Command swap, physical-key profile | **Not started** (keys travel as HID usages; no remapping yet). |
+| Ctrl/Command swap, physical-key profile | **Partial**: the host states its OS in the stream description and a viewer on the other OS swaps Control and Command (both sides), as v1 does by default; Mac viewer of a PC host swaps, PC of PC does not. No physical-key profile switch yet. |
 | Ctrl+Alt+F12 release shortcut, menus | **Not started**. |
 | Host cursor shown locally | **Done** on both viewers. |
 | Relative mouse (games) | **Not started**. |

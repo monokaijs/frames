@@ -39,12 +39,27 @@ mod windows_client;
 mod windows_host;
 
 /// Sent by the host on the first channel before any media.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamInfo {
     pub codec: Codec,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// The host's OS ("windows", "macos"); viewers swap Control and Command
+    /// when it differs from theirs.
+    #[serde(default)]
+    pub platform: String,
+}
+
+/// This machine's OS, as [`StreamInfo::platform`] names it.
+pub fn platform() -> &'static str {
+    if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "other"
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

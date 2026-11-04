@@ -91,6 +91,7 @@ fn stream(
         width,
         height,
         fps: o.fps,
+        platform: crate::platform().into(),
     };
     handle
         .block_on(send_info(session, info))

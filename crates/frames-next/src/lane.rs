@@ -18,6 +18,8 @@ pub enum Captured {
 
 pub struct InputLane {
     tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    /// Swap Control and Command (the host runs another OS).
+    pub swap_modifiers: bool,
     pointer_seq: u32,
     /// Event time → handed to the transport, µs.
     pub wire: Samples,
@@ -43,6 +45,7 @@ impl InputLane {
         Ok((
             Self {
                 tx,
+                swap_modifiers: false,
                 pointer_seq: 0,
                 wire: Samples::new(0),
                 sent_moves: 0,
@@ -67,7 +70,12 @@ impl InputLane {
         for item in captured {
             match item {
                 Captured::Move { x, y, at_us } => latest = Some((x, y, at_us)),
-                Captured::Event { event, at_us } => {
+                Captured::Event { mut event, at_us } => {
+                    if self.swap_modifiers
+                        && let Event::Key { usage, .. } = &mut event
+                    {
+                        *usage = frames_input::keys::swap_control_and_command(*usage);
+                    }
                     event.encode(&mut records);
                     stamps.push(at_us);
                     self.sent_events += 1;

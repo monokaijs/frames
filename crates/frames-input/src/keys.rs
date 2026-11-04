@@ -40,6 +40,19 @@ pub fn scan_to_usage(scan: u16) -> Option<u16> {
     (4..=0xe7).find(|&usage| usage_to_scan(usage) == Some(scan))
 }
 
+/// Swaps Control and GUI (Windows / Command) keys, left and right, for
+/// sessions between a Mac and a PC: Command+C on the Mac is Ctrl+C on the
+/// PC, and the reverse. Other keys pass through. (v1's `remap_modifier`.)
+pub fn swap_control_and_command(usage: u16) -> u16 {
+    match usage {
+        0xe0 => 0xe3,
+        0xe3 => 0xe0,
+        0xe4 => 0xe7,
+        0xe7 => 0xe4,
+        other => other,
+    }
+}
+
 /// USB HID usage → macOS virtual key code (`kVK_*`), from v1's
 /// `native/macos/Sources/Host.swift`.
 const MAC_KEYS: &[(u16, u16)] = &[
@@ -163,6 +176,24 @@ mod tests {
         assert_eq!(usage_to_scan(0x04), Some(0x1e), "A");
         assert_eq!(usage_to_scan(0x50), Some(0xe04b), "left arrow is extended");
         assert_eq!(scan_to_usage(0xe045), Some(0x53), "Num Lock alias");
+    }
+
+    #[test]
+    fn control_and_command_swap_both_sides_and_nothing_else() {
+        assert_eq!(swap_control_and_command(0xe0), 0xe3, "left Ctrl → left GUI");
+        assert_eq!(
+            swap_control_and_command(0xe7),
+            0xe4,
+            "right GUI → right Ctrl"
+        );
+        assert_eq!(swap_control_and_command(0x04), 0x04, "A");
+        assert_eq!(swap_control_and_command(0xe1), 0xe1, "Shift");
+        for usage in 0..=0xffu16 {
+            assert_eq!(
+                swap_control_and_command(swap_control_and_command(usage)),
+                usage
+            );
+        }
     }
 
     #[test]

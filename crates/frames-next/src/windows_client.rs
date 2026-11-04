@@ -47,7 +47,12 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
         })
     };
     // Buttons, keys, and wheel: one reliable stream, written by a task.
-    let (lane, writer) = InputLane::open(&session).await?;
+    let (mut lane, writer) = InputLane::open(&session).await?;
+    // Cross-platform sessions swap Control and Command, as v1 does.
+    lane.swap_modifiers = !info.platform.is_empty() && info.platform != crate::platform();
+    if lane.swap_modifiers {
+        println!("keys: Control and Command swapped ({} host)", info.platform);
+    }
     // Clipboard sharing: one two-way stream, opened after the input stream.
     let clipboard = if o.clipboard == crate::clip::Mode::Off {
         None
