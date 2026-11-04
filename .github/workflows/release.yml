@@ -370,8 +370,10 @@ jobs:
           mkdir -p dist/release
           gh release download "$RELEASE_TAG" --dir dist/release
           # Checksums from the jobs that built the packages, not from the draft.
-          printf '%s;%s' "$WINDOWS_CHECKSUMS" "$MACOS_CHECKSUMS" | tr ';' '\n' | sed '/^$/d' > SHA256SUMS
-          test "$(wc -l < SHA256SUMS)" -eq 4
+          # One "checksum  name" line per package; the trailing \n keeps the
+          # last line newline-terminated for line counting.
+          printf '%s;%s\n' "$WINDOWS_CHECKSUMS" "$MACOS_CHECKSUMS" | tr ';' '\n' | sed '/^$/d' > SHA256SUMS
+          test "$(grep -c . SHA256SUMS)" -eq 4
           (cd dist/release && sha256sum --check ../../SHA256SUMS)
           printf '%s' "$UPDATE_PRIVATE_KEY" > "$RUNNER_TEMP/update-key.pem"
           trap 'rm -f "$RUNNER_TEMP/update-key.pem"' EXIT
