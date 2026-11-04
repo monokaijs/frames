@@ -5,6 +5,10 @@ pub struct DeviceProbe {
     pub name: String,
     pub device_id: String,
     pub png: Option<Vec<u8>>,
+    /// QUIC round-trip time measured during the probe. A host reachable on
+    /// several addresses (Wi-Fi and Ethernet on one network) is used through
+    /// the fastest one.
+    pub rtt: Duration,
 }
 
 pub async fn probe_device(
@@ -54,11 +58,13 @@ pub async fn probe_device(
             _ => anyhow::bail!("invalid device preview reply"),
         };
         send.finish()?;
+        let rtt = connection.rtt();
         connection.close(0u32.into(), b"device preview complete");
         Ok(DeviceProbe {
             name: peer.name,
             device_id: peer.device_id,
             png,
+            rtt,
         })
     })
     .await

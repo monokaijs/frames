@@ -154,26 +154,25 @@ pub(super) fn scan() -> Result<Vec<Device>> {
                     trusted,
                     ..Default::default()
                 };
-                for address in addresses.into_iter().take(2) {
-                    if let Ok(probe) = crate::session::probe_device(address, &id, trusted).await {
-                        device.name = probe.name;
-                        device.fingerprint = probe.device_id;
-                        device.address = address.to_string();
-                        device.online = true;
-                        let _ = crate::connection_history::update_discovered(
-                            &id,
-                            &device.name,
-                            address,
-                        );
-                        if let Some(bytes) = probe.png {
-                            // Discovery refreshes the clear preview only. The blurred copy
-                            // always comes from the last accepted interactive session.
-                            if let Ok(path) = crate::connection_history::preview_path(&id, false) {
-                                device.preview_live =
-                                    crate::connection_history::write_atomic(path, &bytes).is_ok();
-                            }
+                // Probe every advertised address at once and keep the fastest.
+                // Picking the first that answers chose by address order: a Mac
+                // with Wi-Fi and Ethernet on one network was used over Wi-Fi,
+                // where video bursts lost a quarter or more of their packets.
+                let probes = futures_probe(&addresses, &id, trusted).await;
+                if let Some((address, probe)) = fastest(probes) {
+                    device.name = probe.name;
+                    device.fingerprint = probe.device_id;
+                    device.address = address.to_string();
+                    device.online = true;
+                    let _ =
+                        crate::connection_history::update_discovered(&id, &device.name, address);
+                    if let Some(bytes) = probe.png {
+                        // Discovery refreshes the clear preview only. The blurred copy
+                        // always comes from the last accepted interactive session.
+                        if let Ok(path) = crate::connection_history::preview_path(&id, false) {
+                            device.preview_live =
+                                crate::connection_history::write_atomic(path, &bytes).is_ok();
                         }
-                        break;
                     }
                 }
                 device
@@ -191,3 +190,85 @@ pub(super) fn scan() -> Result<Vec<Device>> {
 }
 
 use std::sync::Arc;
+
+/// Probes up to four addresses of one device concurrently.
+async fn futures_probe(
+    addresses: &[SocketAddr],
+    id: &str,
+    trusted: bool,
+) -> Vec<(SocketAddr, crate::session::DeviceProbe)> {
+    let mut probes = tokio::task::JoinSet::new();
+    for (order, &address) in addresses.iter().take(4).enumerate() {
+        let id = id.to_string();
+        probes.spawn(async move {
+            (
+                order,
+                address,
+                crate::session::probe_device(address, &id, trusted).await,
+            )
+        });
+    }
+    let mut answered = Vec::new();
+    while let Some(result) = probes.join_next().await {
+        if let Ok((order, address, Ok(probe))) = result {
+            answered.push((order, address, probe));
+        }
+    }
+    answered.sort_by_key(|(order, ..)| *order);
+    answered
+        .into_iter()
+        .map(|(_, address, probe)| (address, probe))
+        .collect()
+}
+
+/// The answering address with the lowest round-trip time. Differences under
+/// half a millisecond are noise, so the earlier address (IPv4 first) wins them.
+fn fastest<T: HasRtt>(answered: Vec<(SocketAddr, T)>) -> Option<(SocketAddr, T)> {
+    const NOISE: std::time::Duration = std::time::Duration::from_micros(500);
+    let mut best: Option<(SocketAddr, T)> = None;
+    for (address, probe) in answered {
+        match &best {
+            Some((_, current)) if probe.rtt() + NOISE >= current.rtt() => {}
+            _ => best = Some((address, probe)),
+        }
+    }
+    best
+}
+
+trait HasRtt {
+    fn rtt(&self) -> std::time::Duration;
+}
+impl HasRtt for crate::session::DeviceProbe {
+    fn rtt(&self) -> std::time::Duration {
+        self.rtt
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+    use std::time::Duration;
+    struct Probe(Duration);
+    impl HasRtt for Probe {
+        fn rtt(&self) -> Duration {
+            self.0
+        }
+    }
+    fn at(ip: &str) -> SocketAddr {
+        SocketAddr::new(ip.parse().unwrap(), 47990)
+    }
+    #[test]
+    fn a_dual_homed_host_is_used_through_its_fastest_address() {
+        // Wi-Fi sorts first by address but answers slower than Ethernet.
+        let wifi = (at("192.168.0.131"), Probe(Duration::from_millis(5)));
+        let wired = (at("192.168.0.169"), Probe(Duration::from_micros(400)));
+        assert_eq!(fastest(vec![wifi, wired]).unwrap().0, at("192.168.0.169"));
+    }
+    #[test]
+    fn near_equal_round_trips_keep_the_earlier_address() {
+        let first = (at("192.168.0.20"), Probe(Duration::from_micros(700)));
+        let second = (at("192.168.0.30"), Probe(Duration::from_micros(500)));
+        assert_eq!(fastest(vec![first, second]).unwrap().0, at("192.168.0.20"));
+        assert!(fastest::<Probe>(vec![]).is_none());
+    }
+}

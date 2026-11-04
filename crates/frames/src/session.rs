@@ -4,8 +4,8 @@ mod device_probe;
 mod ui_delivery;
 use anyhow::Context;
 use base64::Engine;
-pub use device_probe::probe_device;
 use device_probe::serve_preview;
+pub use device_probe::{DeviceProbe, probe_device};
 use frames_core::{
     codec::{self, Codec, CodecCapability},
     model::*,
