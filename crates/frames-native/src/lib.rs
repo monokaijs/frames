@@ -14,8 +14,16 @@ pub use client_updates::{ClientReceiver, ClientSendError, ClientSender, client_c
 pub use device_name::{device_name, device_name_override, set_device_name, system_device_name};
 #[cfg(all(windows, feature = "media-diagnostics"))]
 pub use windows::diagnostic_capture_window;
+#[cfg(target_os = "macos")]
+mod macos_tray;
+#[cfg(any(windows, target_os = "macos"))]
+mod tray_model;
+#[cfg(target_os = "macos")]
+pub use macos_tray::Tray;
+#[cfg(any(windows, target_os = "macos"))]
+pub use tray_model::{TrayGlyph, TrayItem};
 #[cfg(windows)]
-pub use windows::tray::{Tray, TrayGlyph, TrayItem};
+pub use windows::tray::Tray;
 
 #[cfg(target_os = "macos")]
 pub fn permission_status(request: bool) -> anyhow::Result<serde_json::Value> {

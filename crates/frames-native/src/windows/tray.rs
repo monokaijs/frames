@@ -1,6 +1,7 @@
 //! Notification icons and icon-bearing menus shared by the launcher and sessions.
 #![allow(unsafe_op_in_unsafe_fn)]
 use super::wide;
+pub use crate::tray_model::{TrayGlyph, TrayItem};
 use std::{collections::HashMap, sync::mpsc, thread};
 use windows::{
     Win32::{
@@ -17,23 +18,6 @@ const UPDATE: u32 = WM_APP + 75;
 const OPEN: u32 = WM_APP + 78;
 const RECOVERY: u32 = WM_APP + 79;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TrayGlyph {
-    App,
-    Window,
-    Show,
-    Hide,
-    Settings,
-    Display,
-    Cursor,
-    Keyboard,
-    Refresh,
-    Folder,
-    Devices,
-    Network,
-    Power,
-    Info,
-}
 impl TrayGlyph {
     fn character(self) -> char {
         match self {
@@ -52,42 +36,6 @@ impl TrayGlyph {
             Self::Power => '\u{e7e8}',
             Self::Info => '\u{e946}',
         }
-    }
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TrayItem {
-    pub id: u32,
-    pub title: String,
-    pub glyph: TrayGlyph,
-    pub checked: bool,
-    pub enabled: bool,
-    pub children: Vec<TrayItem>,
-}
-impl TrayItem {
-    pub fn new(id: u32, title: impl Into<String>, glyph: TrayGlyph) -> Self {
-        Self {
-            id,
-            title: title.into(),
-            glyph,
-            checked: false,
-            enabled: true,
-            children: vec![],
-        }
-    }
-    pub fn checked(mut self, checked: bool) -> Self {
-        self.checked = checked;
-        self
-    }
-    pub fn enabled(mut self, enabled: bool) -> Self {
-        self.enabled = enabled;
-        self
-    }
-    pub fn children(mut self, children: Vec<Self>) -> Self {
-        self.children = children;
-        self
-    }
-    pub fn separator() -> Self {
-        Self::new(0, "", TrayGlyph::App)
     }
 }
 #[derive(Clone, PartialEq, Eq)]

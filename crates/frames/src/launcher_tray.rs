@@ -1,4 +1,5 @@
-//! Windows launcher controls remain available after its window is hidden.
+//! Launcher controls in the Windows notification area and the macOS menu bar,
+//! available whether or not the launcher window is shown.
 use super::{Action, Launcher};
 use frames_native::{Tray, TrayGlyph as G, TrayItem as Item};
 use slint::{ComponentHandle, Model};
@@ -90,6 +91,8 @@ impl LauncherTray {
             count > 0,
             if count > 0 {
                 format!("Frames · {count} active sessions")
+            } else if cfg!(target_os = "macos") {
+                "Frames · Ready".into()
             } else {
                 "Frames · Ready · Open from the tray".into()
             },

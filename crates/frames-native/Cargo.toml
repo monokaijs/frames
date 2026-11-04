@@ -28,6 +28,10 @@ required-features = ["media-diagnostics"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+# Menu bar item (macos_tray.rs). Same versions Slint's winit backend already uses.
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSData", "NSGeometry", "NSObject"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView", "NSResponder", "NSMenu", "NSMenuItem", "NSImage", "NSCell", "NSGraphics"] }
 
 [target.'cfg(windows)'.dependencies]
 resvg = { version = "=0.45.1", default-features = false }

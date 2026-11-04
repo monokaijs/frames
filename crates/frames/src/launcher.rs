@@ -22,7 +22,7 @@ use std::{
 mod device_catalog;
 #[path = "launcher_close.rs"]
 mod launcher_close;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[path = "launcher_tray.rs"]
 mod launcher_tray;
 #[path = "sharing_picker.rs"]
@@ -1019,7 +1019,7 @@ fn local_address() -> String {
 pub fn run() -> Result<()> {
     window_style::initialize()?;
     let ui = Launcher::new()?;
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     let mut tray = launcher_tray::LauncherTray::new()?;
     ui.set_app_version(env!("CARGO_PKG_VERSION").into());
     ui.on_filter_devices(|rows, query| {
@@ -1254,7 +1254,7 @@ pub fn run() -> Result<()> {
     });
     let weak = ui.as_weak();
     let timer = slint::Timer::default();
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     let tray_actions = actions.clone();
     let mut permission_notice = false;
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(100), move || {
@@ -1357,7 +1357,7 @@ pub fn run() -> Result<()> {
                 }
             }
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         tray.poll(&ui, &tray_actions);
     });
     #[cfg(windows)]
