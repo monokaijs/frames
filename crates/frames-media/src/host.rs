@@ -372,6 +372,21 @@ impl HostSession {
     }
 
     /// Call when the transport's selected path changes.
+    /// A recovery (keyframe, invalidation, long-term reference) waits for
+    /// the next encode. A still picture produces no new frames, so the
+    /// caller should encode its last frame again.
+    pub fn wants_frame(&self) -> bool {
+        self.controls.iter().any(|control| {
+            matches!(
+                control,
+                EncoderControl::ForceKeyframe
+                    | EncoderControl::Invalidate { .. }
+                    | EncoderControl::UseLongTerm(_)
+                    | EncoderControl::Refresh
+            )
+        })
+    }
+
     /// The transport moved to another path (relay ↔ direct, or another
     /// network): the delay baseline belongs to the old path, and the new
     /// path's capacity is unknown, so probe it again from the current rate.

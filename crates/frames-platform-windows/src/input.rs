@@ -24,6 +24,9 @@ pub enum InputTarget {
     Desktop(RECT),
     /// A window's client area, by message (no global side effects).
     Window(HWND),
+    /// Real input (`SendInput`) onto wherever this window is on screen now,
+    /// for sharing one window; follows the window when it moves.
+    WindowArea(HWND),
 }
 
 pub struct InputInjector {
@@ -113,13 +116,27 @@ impl InputInjector {
         ((y as u16 as isize) << 16) | (x as u16 as isize)
     }
 
+    /// The screen rectangle that normalized positions cover.
+    fn area(&self) -> RECT {
+        match self.target {
+            InputTarget::Desktop(rect) => rect,
+            InputTarget::WindowArea(hwnd) => {
+                let mut rect = RECT::default();
+                let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
+                rect
+            }
+            InputTarget::Window(_) => RECT::default(),
+        }
+    }
+
     fn move_to(&self, x: u16, y: u16) {
         match self.target {
             InputTarget::Window(hwnd) => {
                 let (px, py) = Self::client_point(hwnd, x, y);
                 Self::post(hwnd, WM_MOUSEMOVE, 0, Self::pack(px, py));
             }
-            InputTarget::Desktop(monitor) => {
+            InputTarget::Desktop(_) | InputTarget::WindowArea(_) => {
+                let monitor = self.area();
                 let px = monitor.left + denormalize(x, (monitor.right - monitor.left) as u32);
                 let py = monitor.top + denormalize(y, (monitor.bottom - monitor.top) as u32);
                 let (vx, vy, vw, vh) = unsafe {
@@ -160,7 +177,7 @@ impl InputInjector {
                 };
                 Self::post(hwnd, message, wparam, Self::pack(x, y));
             }
-            InputTarget::Desktop(_) => {
+            InputTarget::Desktop(_) | InputTarget::WindowArea(_) => {
                 let (flags, data) = match (button, down) {
                     (Button::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
                     (Button::Left, false) => (MOUSEEVENTF_LEFTUP, 0),
@@ -195,7 +212,7 @@ impl InputInjector {
                     }
                 }
             }
-            InputTarget::Desktop(_) => {
+            InputTarget::Desktop(_) | InputTarget::WindowArea(_) => {
                 if dy != 0 {
                     send(&[mouse(MOUSEEVENTF_WHEEL, 0, 0, i32::from(dy))]);
                 }
@@ -221,7 +238,7 @@ impl InputInjector {
                 let vk = unsafe { MapVirtualKeyW(u32::from(scan), MAPVK_VSC_TO_VK_EX) } as usize;
                 Self::post(hwnd, if down { WM_KEYDOWN } else { WM_KEYUP }, vk, lparam);
             }
-            InputTarget::Desktop(_) => {
+            InputTarget::Desktop(_) | InputTarget::WindowArea(_) => {
                 let mut flags = KEYEVENTF_SCANCODE;
                 if extended {
                     flags |= KEYEVENTF_EXTENDEDKEY;

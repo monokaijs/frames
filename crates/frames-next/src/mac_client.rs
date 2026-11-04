@@ -174,6 +174,9 @@ fn view(
     if stale > 0 {
         println!("dropped {stale} datagrams queued during start-up");
     }
+    // Whatever keyframe came first was just discarded (or is still to come);
+    // ask for one, since a still picture would never send another.
+    client.request_keyframe();
     let started = Instant::now();
     let mut synthetic_step = 0u64;
     let mut cursor_updates = 0u64;

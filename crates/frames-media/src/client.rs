@@ -161,6 +161,8 @@ pub struct ClientSession {
     feedback_seq: u32,
     last_feedback_us: Option<u64>,
     last_request: RecoveryRequest,
+    /// Asked for a keyframe (see [`ClientSession::request_keyframe`]).
+    need_keyframe: bool,
     stats: ClientStats,
 }
 
@@ -187,6 +189,7 @@ impl ClientSession {
             feedback_seq: 0,
             last_feedback_us: None,
             last_request: RecoveryRequest::None,
+            need_keyframe: false,
             stats: ClientStats::default(),
         }
     }
@@ -428,6 +431,7 @@ impl ClientSession {
             match decoder.decode(unit) {
                 Ok(Decoded::Frame(decoded)) => {
                     if kind == FrameKind::Keyframe {
+                        self.need_keyframe = false;
                         self.decoded.clear();
                         self.long_term = [None; MAX_LTR_SLOTS as usize];
                         self.stats.keyframes += 1;
@@ -463,8 +467,17 @@ impl ClientSession {
         out
     }
 
+    /// Asks the host for a keyframe until one is decoded: for a viewer
+    /// that joins mid-stream or discarded what arrived while it started.
+    /// A static picture sends no further frames, so nothing else would make
+    /// the viewer ask.
+    pub fn request_keyframe(&mut self) {
+        self.need_keyframe = true;
+    }
+
     fn request(&self) -> RecoveryRequest {
         match self.broken_since {
+            None if self.need_keyframe => RecoveryRequest::Keyframe,
             None => RecoveryRequest::None,
             Some((first, _)) if self.config.invalidate => RecoveryRequest::Invalidate {
                 first: first as u32,

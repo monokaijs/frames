@@ -1,10 +1,10 @@
 //! `frames-next`: the v2 stack end to end (docs/V2_PLAN.md, Phase 3).
 //!
 //! ```text
-//! frames-next host [--source monitor|qa] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software]
+//! frames-next host [--source monitor|qa] [--window TITLE] [--codec hevc|h264|av1] [--encoder nvenc|amf|qsv|mf|software]
 //!                  [--fps 60] [--mbps 30]
 //!                  [--hold N] [--seconds N] [--relay-only]
-//! frames-next discover | peers | revoke <device-id> [--config-dir DIR]\n       frames-next connect <endpoint-id> [--vsync] [--synthetic-input] [--seconds N] [--relay-only]
+//! frames-next discover | peers | revoke | windows <device-id> [--config-dir DIR]\n       frames-next connect <endpoint-id> [--vsync] [--synthetic-input] [--seconds N] [--relay-only]
 //! ```
 //!
 //! The host prints its endpoint id; the client dials it by id (iroh finds a
@@ -101,6 +101,9 @@ pub struct Options {
     pub pacing: Option<f64>,
     /// Clipboard sharing (both ends must turn it on).
     pub clipboard: clip::Mode,
+    /// Host: share one window (first whose title contains this) instead of
+    /// the screen.
+    pub window: Option<String>,
     /// ADB bridge: the viewer forwards its ADB server to the host.
     pub adb: bool,
     /// Viewer: the ADB server to forward (default 127.0.0.1:5037).
@@ -150,6 +153,7 @@ impl Options {
             migrate_v1: false,
             pacing: None,
             clipboard: clip::Mode::Off,
+            window: None,
             adb: false,
             adb_server: ([127, 0, 0, 1], 5037).into(),
             adb_listen: ([127, 0, 0, 1], 15037).into(),
@@ -197,6 +201,7 @@ impl Options {
                 "--audio" => o.audio = audio::parse_mode(value()?)?,
                 "--name" => o.name = Some(value()?.to_string()),
                 "--adb" => o.adb = true,
+                "--window" => o.window = Some(value()?.to_string()),
                 "--adb-server" => o.adb_server = value()?.parse()?,
                 "--adb-listen" => {
                     let address: std::net::SocketAddr = value()?.parse()?;
@@ -496,6 +501,13 @@ fn main() -> Result<()> {
 async fn run(args: Vec<String>) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("host") => host(Options::parse(&args[1..])?).await,
+        #[cfg(windows)]
+        Some("windows") => {
+            for (_, title) in win::shareable_windows() {
+                println!("{title}");
+            }
+            Ok(())
+        }
         Some("discover") => {
             for device in frames_net::local::browse(Duration::from_secs(3)).await? {
                 let addrs: Vec<String> = device.addr.ip_addrs().map(ToString::to_string).collect();

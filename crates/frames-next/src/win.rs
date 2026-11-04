@@ -470,3 +470,32 @@ fn paint(hwnd: HWND, n: u64, width: u32, height: u32) {
         ReleaseDC(Some(hwnd), dc);
     }
 }
+
+/// Visible top-level windows with a title, in z order: `(handle, title)`.
+pub fn shareable_windows() -> Vec<(HWND, String)> {
+    unsafe extern "system" fn each(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
+        let found = unsafe { &mut *(found.0 as *mut Vec<(HWND, String)>) };
+        let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+        let style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+        let tool = style & WS_EX_TOOLWINDOW.0 != 0;
+        let mut title = [0u16; 512];
+        let len = unsafe { GetWindowTextW(hwnd, &mut title) } as usize;
+        if visible && !tool && len > 0 {
+            found.push((hwnd, String::from_utf16_lossy(&title[..len])));
+        }
+        true.into()
+    }
+    let mut found: Vec<(HWND, String)> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(each), LPARAM(&mut found as *mut _ as isize));
+    }
+    found
+}
+
+/// The first shareable window whose title contains `needle` (any case).
+pub fn find_window(needle: &str) -> Option<(HWND, String)> {
+    let needle = needle.to_lowercase();
+    shareable_windows()
+        .into_iter()
+        .find(|(_, title)| title.to_lowercase().contains(&needle))
+}

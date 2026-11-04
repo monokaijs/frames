@@ -30,7 +30,7 @@ launcher, installer, updater, and service still run v1.
 |---|---|
 | Full desktop view | **Done** on Windows (WGC monitor capture); macOS uses ScreenCaptureKit but was only run with the generated source (Screen Recording grant needed). |
 | Individual remote application windows | **Not started** (window catalog, per-window capture, local windows). |
-| Selected windows / One window sharing scopes | **Not started**. |
+| Selected windows / One window sharing scopes | **Partial**: One window on a Windows host (`frames-next host --window TITLE`; `frames-next windows` lists them): captures that window only, real input lands on wherever the window is. Checked with a throwaway test window. No Selected windows, no macOS window capture, no picker UI. |
 | Isolated input for games (One window) | **Not started**. |
 | Codec choice and automatic selection | **Done**: NVENC (H.264/HEVC), AMF/QSV/MF and software AV1 through FFmpeg, VideoToolbox; host picks the best shared codec. VP9 dropped. |
 | Host audio | **Partial**: 10 ms Opus datagrams with the previous packet repeated, v1's jitter buffer and drift-corrected playback (`frames-audio`, cpal on both platforms), `frames-next --audio on|qa` on both ends. QA run PC host → Mac viewer (generated 440 Hz tone, silent sink): 800 of 800 packets in 8 s, none concealed, the tone's 880 zero crossings per second recovered. Windows loopback capture and real playback are ported but not exercised automatically (they would capture and play the user's audio); macOS host capture (ScreenCaptureKit audio) is not wired yet. |

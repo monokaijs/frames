@@ -98,13 +98,25 @@ fn stream(
     } else {
         None
     };
-    let mut capture = match &qa {
-        Some(source) => WgcCapture::window(source.hwnd(), &device, shared.clone())?,
-        None => WgcCapture::primary_monitor(&device, shared.clone())?,
+    // One window (--window), the QA source, or the whole primary monitor.
+    let shared_window = match &o.window {
+        Some(needle) => {
+            let (hwnd, title) = win::find_window(needle)
+                .with_context(|| format!("no window whose title contains {needle:?}"))?;
+            println!("sharing one window: {title}");
+            Some(hwnd)
+        }
+        None => None,
     };
-    let mut injector = InputInjector::new(match &qa {
-        Some(source) => InputTarget::Window(source.hwnd()),
-        None => InputTarget::Desktop(primary_monitor_rect()),
+    let mut capture = match (&qa, shared_window) {
+        (Some(source), _) => WgcCapture::window(source.hwnd(), &device, shared.clone())?,
+        (None, Some(hwnd)) => WgcCapture::window(hwnd, &device, shared.clone())?,
+        (None, None) => WgcCapture::primary_monitor(&device, shared.clone())?,
+    };
+    let mut injector = InputInjector::new(match (&qa, shared_window) {
+        (Some(source), _) => InputTarget::Window(source.hwnd()),
+        (None, Some(hwnd)) => InputTarget::WindowArea(hwnd),
+        (None, None) => InputTarget::Desktop(primary_monitor_rect()),
     });
     capture.configure(CaptureConfig {
         fps: o.fps,
@@ -214,6 +226,9 @@ fn stream(
     let mut clipboard: Option<crate::clip::ClipboardLink> = None;
     let started = Instant::now();
     let mut next_report = Duration::from_secs(1);
+    let mut last_frame: Option<VideoFrame> = None;
+    let mut last_encode_us = 0u64;
+    let frame_interval_us = 1_000_000 / u64::from(o.fps.max(1));
     let mut pending = Some(first);
     let mut frames = 0u64;
     let mut encode_us = Vec::new();
@@ -271,8 +286,26 @@ fn stream(
                 send_cursor(CursorMessage::Visible(update.visible));
             }
         }
+        // A still picture sends no new frames; when the viewer needs a
+        // recovery, encode the last one again.
+        let frame = match frame {
+            Some(frame) => {
+                last_frame = Some(frame.clone());
+                Some(frame)
+            }
+            None if host.wants_frame()
+                && clock.now_us().saturating_sub(last_encode_us) >= frame_interval_us =>
+            {
+                last_frame.clone().map(|mut frame| {
+                    frame.captured_us = clock.now_us();
+                    frame
+                })
+            }
+            None => None,
+        };
         if let Some(frame) = frame {
             let before = clock.now_us();
+            last_encode_us = before;
             host.encode(before, encoder.as_mut(), &frame)?;
             encode_us.push(clock.now_us().saturating_sub(before));
             frames += 1;
