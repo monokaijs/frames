@@ -405,6 +405,9 @@ Still open: the NAT matrix (needs other networks), production relays, a graphica
   - on relay: a stable stream at the relay's cap.
 
 ### Phase 6: Services, parity and cutover
+
+**Status (2026-11-05): parity checklist written** (`docs/V2_PARITY.md`): connecting, trust, streaming, codecs, input and the host cursor are done or partial on v2; windows mode, audio, clipboard, files, device forwarding, the launcher, installer, updater and service are not started.
+
 - Port these as `services/*` on the new session: transfer, clipboard, devices (USB/IP, gamepad, ADB bridge), shared game, the window graph and menus, updater, installer, the Windows service, and the secure desktop through a Desktop Duplication SYSTEM helper.
 - **Parity checklist** against the README features. Ship as a "Frames Next" updater channel. It reads the shared config directory, and writes migrated trust entries alongside the old ones, never in place of them.
 - Two-week beta.
