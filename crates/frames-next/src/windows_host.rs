@@ -58,7 +58,7 @@ fn first_frame(capture: &mut WgcCapture, clock: &SystemClock) -> Result<VideoFra
 /// Encoders to try, best first: `--encoder` alone when given; otherwise
 /// each hardware encoder whose GPU is present (discrete first), then Media
 /// Foundation and software AV1, so a missing or outdated driver (NVENC
-/// needs API 13, driver 570+) falls back instead of failing.
+/// needs API 12.2, driver 551+) falls back instead of failing.
 pub fn backends(o: &Options) -> Vec<&'static str> {
     if o.encoder_explicit {
         return vec![match o.encoder.as_str() {
@@ -396,8 +396,14 @@ fn stream(
         .then(|| GpuClockHold::start(&device, Duration::from_millis(1), o.hold))
         .transpose()?;
     println!("adapter: {adapter}");
+    let api = match backend {
+        "nvenc" => frames_codec::nvenc::api_version()
+            .map(|v| format!(", API {v}"))
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
     println!(
-        "encoder: {backend} ({})",
+        "encoder: {backend} ({}{api})",
         codecs
             .iter()
             .map(|c| format!("{c:?}"))

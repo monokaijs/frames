@@ -220,13 +220,19 @@ fn windows(report: &mut Report, o: &Options) {
         match result {
             Ok((adapter, codecs)) => {
                 let codecs: Vec<String> = codecs.iter().map(|c| format!("{c:?}")).collect();
-                report.line(true, &format!("encoder {backend}"), format!("{} on {adapter}", codecs.join(", ")));
+                let api = match backend {
+                    "nvenc" => frames_codec::nvenc::api_version()
+                        .map(|v| format!(" (NVENC API {v})"))
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                report.line(true, &format!("encoder {backend}"), format!("{} on {adapter}{api}", codecs.join(", ")));
                 usable.get_or_insert(backend);
             }
             Err(error) if backend == "nvenc" => report.line(
                 false,
                 "encoder nvenc",
-                format!("{error:#}. Hosting falls back to the next encoder; an NVIDIA driver 570 or newer gives the lowest latency"),
+                format!("{error:#}. Hosting falls back to the next encoder; an NVIDIA driver 551 or newer gives the lowest latency"),
             ),
             Err(error) => report.info(&format!("encoder {backend}"), format!("unavailable: {error:#}")),
         }
