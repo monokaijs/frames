@@ -13,7 +13,7 @@ iroh-relay = { path = "vendor/iroh-relay" }
 iroh = { path = "vendor/iroh" }
 
 [workspace.package]
-version = "0.3.3"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 
