@@ -2206,7 +2206,7 @@ dependencies = [
 
 [[package]]
 name = "frames"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2246,7 +2246,7 @@ dependencies = [
 
 [[package]]
 name = "frames-audio"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "cpal",
@@ -2257,11 +2257,11 @@ dependencies = [
 
 [[package]]
 name = "frames-clipboard"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "frames-codec"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2272,7 +2272,7 @@ dependencies = [
 
 [[package]]
 name = "frames-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2300,7 +2300,7 @@ dependencies = [
 
 [[package]]
 name = "frames-devices"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "sdl3",
@@ -2314,11 +2314,11 @@ dependencies = [
 
 [[package]]
 name = "frames-input"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "frames-media"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "reed-solomon-simd",
@@ -2326,7 +2326,7 @@ dependencies = [
 
 [[package]]
 name = "frames-native"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2352,7 +2352,7 @@ dependencies = [
 
 [[package]]
 name = "frames-net"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2376,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "frames-next"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2408,7 +2408,7 @@ dependencies = [
 
 [[package]]
 name = "frames-platform-macos"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "frames-clipboard",
@@ -2419,7 +2419,7 @@ dependencies = [
 
 [[package]]
 name = "frames-platform-windows"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2435,7 +2435,7 @@ dependencies = [
 
 [[package]]
 name = "frames-proto"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "frames-testkit"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "frames-media",
