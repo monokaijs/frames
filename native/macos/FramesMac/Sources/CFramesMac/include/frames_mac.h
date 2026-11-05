@@ -131,6 +131,9 @@ enum {
     FRAMES_MAC_INPUT_FOCUS_LOST = 5, // the window stopped being key
     FRAMES_MAC_INPUT_MOTION = 6,     // relative mouse (ABI 3): a = dx, b = dy in points, positive = right / down
     FRAMES_MAC_INPUT_MODE = 7,       // relative mouse turned on (a = 1) or off (a = 0) (ABI 3)
+    FRAMES_MAC_INPUT_STATS = 8,      // Control+Option+F10: show or hide live statistics (ABI 4)
+    FRAMES_MAC_INPUT_MENU = 10,      // an item of the host application's menus, a = id (ABI 4)
+    FRAMES_MAC_INPUT_COMMAND = 9,    // a Frames menu command, a = 1-3 quality high/medium/low, 4 statistics, 6 disconnect (ABI 4)
 };
 typedef void (*FramesMacInputCallback)(void *context, uint32_t kind, int32_t a, int32_t b,
                                        int32_t c, int32_t d, uint64_t event_ns);
@@ -153,8 +156,35 @@ void frames_mac_presenter_post_synthetic_input(void *presenter, uint64_t step);
 void frames_mac_presenter_set_relative(void *presenter, bool relative, bool lock_pointer);
 double frames_mac_presenter_refresh_hz(void *presenter);
 void frames_mac_presenter_free(void *presenter);
+// Makes the process a regular app (Dock icon) with the viewer's menu bar,
+// whose commands reach the front window as FRAMES_MAC_INPUT_COMMAND (ABI 4).
+void frames_mac_viewer_app(void);
 // Whether the user closed a windowed presenter's window (ABI 4).
 bool frames_mac_presenter_closed(void *presenter);
+// With `on`, the window's first close is only recorded (a request the
+// caller acts on) and a second one closes it (ABI 4).
+void frames_mac_presenter_intercept_close(void *presenter, bool on);
+// Files dropped on the window since the last call (ABI 4): a UTF-8 JSON
+// array of paths, written to `buffer` when it fits in `capacity`; returns
+// its length either way (files that did not fit are kept). 0: none.
+size_t frames_mac_presenter_take_dropped(void *presenter, uint8_t *buffer, size_t capacity);
+// The shared application's menus for this window's menu bar (ABI 4), as
+// frames_mac_app_menus makes them; chosen items arrive as
+// FRAMES_MAC_INPUT_MENU.
+void frames_mac_presenter_set_menus(void *presenter, const uint8_t *utf8, size_t length);
+// Whether a close was requested since the last call (ABI 4).
+bool frames_mac_presenter_take_close_request(void *presenter);
+// Asks another application's window (CGWindowID) to close as its close
+// button would, through Accessibility (ABI 4). False when it cannot.
+bool frames_mac_close_window(uint32_t window_id);
+// The menus of the application owning `window_id` (ABI 4), through
+// Accessibility: a UTF-8 JSON tree of {"id", "title", "enabled",
+// "checked", "separator", "children"}, enabled leaf items numbered from 1
+// in order. Written to `buffer` when it fits; returns its length either
+// way (0: none).
+size_t frames_mac_app_menus(uint32_t window_id, uint8_t *buffer, size_t capacity);
+// Presses leaf item `id` of that tree (ABI 4). False when it is not there.
+bool frames_mac_press_menu(uint32_t window_id, uint32_t id);
 // The stream's new size (ABI 4): the drawable follows it and the window
 // takes its shape at its current scale, within the screen.
 void frames_mac_presenter_resize(void *presenter, uint32_t width, uint32_t height);

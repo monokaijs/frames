@@ -17,7 +17,6 @@ uuid.workspace = true
 parking_lot = "0.12"
 image = { version = "0.25", default-features = false, features = ["png"] }
 cpal = "0.18"
-sdl3 = { version = "=0.20.0", features = ["build-from-source-static"] }
 
 [features]
 media-diagnostics = []
@@ -35,7 +34,6 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"
 
 [target.'cfg(windows)'.dependencies]
 resvg = { version = "=0.45.1", default-features = false }
-vigem-client = { version = "=0.1.4", features = ["unstable_xtarget_notification"] }
 windows-core = "0.62.2"
 windows = { workspace = true, features = ["Win32_System_StationsAndDesktops", "Win32_System_Console", "Win32_System_SystemInformation", "Win32_Graphics_Dwm", "Win32_Graphics_Direct3D_Fxc", "Win32_System_Ole", "Win32_System_SystemServices", "Win32_UI_Shell_Common", "Win32_UI_Controls"] }
 

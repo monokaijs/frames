@@ -96,6 +96,13 @@ struct Hello {
     /// The host window this session streams, by catalog id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window_id: Option<u64>,
+    /// Proof that the viewer knows the host's access password
+    /// (`crate::password`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
+    /// Asks for a preview image only (`crate::preview`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    preview: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     v1_certificate: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,6 +127,10 @@ pub struct Asks {
     pub catalog: bool,
     /// The host window to stream, by catalog id.
     pub window_id: Option<u64>,
+    /// The host's access password, when the viewer was given one.
+    pub password: Option<String>,
+    /// Asks for a preview image only (`crate::preview`).
+    pub preview: bool,
 }
 
 /// Viewer: always opens the hello stream first (it fixes the order of the
@@ -139,8 +150,12 @@ pub async fn send_hello(
         max_mbps: asks.max_mbps,
         catalog: asks.catalog,
         window_id: asks.window_id,
+        preview: asks.preview,
         ..Hello::default()
     };
+    if let Some(password) = &asks.password {
+        hello.password = Some(crate::password::proof(session, password)?);
+    }
     if migrate {
         match v1_proof(session, own_id) {
             Ok(proof) => {
@@ -201,6 +216,8 @@ pub struct Admitted {
     pub catalog: bool,
     /// The host window the viewer asks for.
     pub window_id: Option<u64>,
+    /// The viewer asks for a preview image only.
+    pub preview: bool,
 }
 
 /// Host: a device that proves it is a v1-trusted device gets that trust
@@ -248,44 +265,77 @@ fn migrate(
 }
 
 /// Whether to stream to this device, and how.
+/// What a host remembers between admissions while it runs.
+#[derive(Default)]
+pub struct HostState {
+    /// Devices let in for this session only, with whether they may
+    /// control; they are not asked again (a viewer of several windows opens
+    /// a session for each). Trusted devices are checked against the trust
+    /// list every time, so removing one takes effect at once.
+    approved: std::collections::HashMap<iroh::EndpointId, bool>,
+    /// Recent wrong access passwords.
+    attempts: crate::password::Attempts,
+    /// The last device was let in by the access password: not remembered,
+    /// so every session proves it again (and changing the password takes
+    /// effect at once).
+    by_password: bool,
+}
+
+/// Why a device was not let in, for its close reason.
+pub const NOT_APPROVED: &str = "not approved";
+pub const WRONG_PASSWORD: &str = "wrong password";
+
 /// `launcher`: the Frames launcher started this host and asks its user.
-/// `approved`: devices let in for this session only, earlier while this
-/// host runs, with whether they may control; they are not asked again (a
-/// viewer of several windows opens a session for each). Trusted devices
-/// are checked against the trust list every time, so removing one takes
-/// effect at once.
+/// `Err` (inside `Ok`) is the reason a device was refused.
 pub async fn decide(
     config: &std::path::Path,
     session: &frames_net::Session,
     preset: Option<Approve>,
     launcher: bool,
-    approved: &mut std::collections::HashMap<iroh::EndpointId, bool>,
-) -> Result<Option<Admitted>> {
+    state: &mut HostState,
+) -> Result<std::result::Result<Admitted, &'static str>> {
     let hello = receive_hello(session).await;
-    let control = match approved.get(&session.remote()) {
+    // Previews go to trusted devices only, and nobody is asked for them.
+    if hello.preview
+        && !matches!(
+            admission(
+                &TrustList::load(&TrustList::path_in(config))?,
+                &session.remote()
+            ),
+            Admission::Trusted { .. }
+        )
+    {
+        return Ok(Err(NOT_APPROVED));
+    }
+    let control = match state.approved.get(&session.remote()) {
         Some(&control) => control,
         None => {
-            let Some(control) = admit_device(config, session, preset, launcher, &hello).await?
-            else {
-                return Ok(None);
-            };
+            state.by_password = false;
+            let control =
+                match admit_device(config, session, preset, launcher, &hello, state).await? {
+                    Ok(control) => control,
+                    Err(reason) => return Ok(Err(reason)),
+                };
             let list = TrustList::load(&TrustList::path_in(config))?;
-            if list.get(&session.remote()).is_none() {
-                approved.insert(session.remote(), control);
+            if list.get(&session.remote()).is_none() && !state.by_password {
+                state.approved.insert(session.remote(), control);
             }
             control
         }
     };
     let name = hello.name.clone().unwrap_or_default();
-    crate::launcher::report(
-        "viewer",
-        &serde_json::json!({
-            "device": session.remote().to_string(),
-            "name": name,
-            "control": control,
-        }),
-    );
-    Ok(Some(Admitted {
+    // A preview is not a connection to announce.
+    if !hello.preview {
+        crate::launcher::report(
+            "viewer",
+            &serde_json::json!({
+                "device": session.remote().to_string(),
+                "name": name,
+                "control": control,
+            }),
+        );
+    }
+    Ok(Ok(Admitted {
         control,
         decoders: hello.decoders,
         window: hello.window,
@@ -293,6 +343,7 @@ pub async fn decide(
         max_mbps: hello.max_mbps.map(|cap| cap.max(1)),
         catalog: hello.catalog,
         window_id: hello.window_id,
+        preview: hello.preview,
     }))
 }
 
@@ -313,7 +364,8 @@ async fn admit_device(
     preset: Option<Approve>,
     launcher: bool,
     hello: &Hello,
-) -> Result<Option<bool>> {
+    state: &mut HostState,
+) -> Result<std::result::Result<bool, &'static str>> {
     let path = TrustList::path_in(config);
     let mut list = TrustList::load(&path)?;
     let device = session.remote();
@@ -343,12 +395,35 @@ async fn admit_device(
                 "view only"
             }
         );
-        return Ok(Some(control));
+        return Ok(Ok(control));
     }
     if let Some(proof) = &proof
         && let Some(control) = migrate(session, proof, &mut list, &path)?
     {
-        return Ok(Some(control));
+        return Ok(Ok(control));
+    }
+    // A viewer that knows the access password needs nobody here.
+    let mut wrong_password = false;
+    if let Some(proof) = &hello.password
+        && crate::password::is_set(config)
+    {
+        let now = std::time::Instant::now();
+        if !state.attempts.allowed(now) {
+            println!("access password not checked: too many wrong ones in the last minute");
+            wrong_password = true;
+        } else if crate::password::verify(config, session, proof)? {
+            println!(
+                "{} ({}) gave the access password: view and control",
+                saved_name(hello, &device),
+                short(&device)
+            );
+            state.by_password = true;
+            return Ok(Ok(true));
+        } else {
+            state.attempts.failed(now);
+            println!("wrong access password from {}", short(&device));
+            wrong_password = true;
+        }
     }
     let code = session.pairing_code()?;
     let name = saved_name(hello, &device);
@@ -374,12 +449,16 @@ async fn admit_device(
         }
     };
     let Some(choice) = choice else {
-        return Ok(None);
+        return Ok(Err(if wrong_password {
+            WRONG_PASSWORD
+        } else {
+            NOT_APPROVED
+        }));
     };
     let control = choice.control;
     if !choice.remember {
         println!("not saved: this device will be asked about again next time");
-        return Ok(Some(control));
+        return Ok(Ok(control));
     }
     list.insert(
         &device,
@@ -391,7 +470,7 @@ async fn admit_device(
     );
     list.save(&path)?;
     println!("saved to {}", path.display());
-    Ok(Some(control))
+    Ok(Ok(control))
 }
 
 async fn ask() -> Option<Approve> {

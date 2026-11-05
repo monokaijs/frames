@@ -44,6 +44,18 @@ pub(super) fn connect_args(options: &SessionOptions, target: &str) -> Vec<String
         "--max-mbps".into(),
         max_mbps(options).to_string(),
     ];
+    if options.physical_keys {
+        args.push("--physical-keys".into());
+    }
+    if options.adb {
+        args.push("--adb".into());
+    }
+    if options.gamepads {
+        args.push("--gamepads".into());
+    }
+    for bus in &options.usb {
+        args.extend(["--usb".into(), bus.clone()]);
+    }
     // "Application windows": each host window in its own window.
     if !options.desktop {
         args.push("--apps".into());
@@ -70,6 +82,9 @@ pub(super) fn sharing_args(options: &SessionOptions) -> Vec<String> {
         on_off(options.clipboard),
         "--max-windows".into(),
         options.max_streams.to_string(),
+        // The ADB bridge listens on loopback, for viewers trusted for
+        // control that turn it on.
+        "--adb".into(),
     ];
     if options.encoder != "auto" {
         args.extend(["--prefer-encoder".into(), options.encoder.clone()]);

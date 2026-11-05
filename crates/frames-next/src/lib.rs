@@ -27,17 +27,24 @@ mod clip;
 pub mod directory;
 mod doctor;
 mod impair;
+#[cfg(windows)]
+mod isolated;
 mod lane;
 pub mod launcher;
 #[cfg(target_os = "macos")]
 mod mac_client;
 #[cfg(target_os = "macos")]
 mod mac_host;
+mod menus;
+mod pads;
+pub mod password;
+mod preview;
 mod resize;
 mod services;
 mod stats;
 mod streams;
 mod transfer;
+mod usb;
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
@@ -185,6 +192,21 @@ pub struct Options {
     pub title: Option<String>,
     /// Viewer: show live statistics in the window title (diagnostics).
     pub stats_title: bool,
+    /// Viewer: send keys as the same physical keys on the host (Control as
+    /// Control) instead of swapping Control and Command across platforms.
+    pub physical_keys: bool,
+    /// Viewer: forward this device's gamepads to the host (`crate::pads`).
+    pub gamepads: bool,
+    /// Viewer: USB devices (bus ids) to pass through to a Windows host
+    /// (`crate::usb`; Windows viewers).
+    pub usb: Vec<String>,
+    /// Windows host sharing one window: the viewer's input goes into that
+    /// window's process only (`crate::isolated`), not the host's mouse and
+    /// keyboard.
+    pub isolated: bool,
+    /// Viewer: the host's access password, from `FRAMES_ACCESS_PASSWORD`
+    /// (an environment variable, so it never shows in process lists).
+    pub password: Option<String>,
 }
 
 impl Options {
@@ -235,6 +257,13 @@ impl Options {
             max_mbps_cap: None,
             title: None,
             stats_title: false,
+            physical_keys: false,
+            gamepads: false,
+            usb: Vec::new(),
+            isolated: false,
+            password: std::env::var("FRAMES_ACCESS_PASSWORD")
+                .ok()
+                .filter(|p| !p.is_empty()),
         };
         let mut args = args.iter();
         while let Some(arg) = args.next() {
@@ -304,6 +333,17 @@ impl Options {
                 "--apps" => o.apps = true,
                 "--max-windows" => o.max_windows = value()?.parse::<usize>()?.clamp(1, 32),
                 "--stats-title" => o.stats_title = true,
+                "--physical-keys" => o.physical_keys = true,
+                "--gamepads" => o.gamepads = true,
+                "--usb" => {
+                    let bus = value()?;
+                    anyhow::ensure!(
+                        frames_devices::protocol::valid_bus_id(bus),
+                        "--usb takes a USB bus id (such as 1-4), not {bus}"
+                    );
+                    o.usb.push(bus.to_string());
+                }
+                "--isolated" => o.isolated = true,
                 "--prefer-encoder" => {
                     let name = value()?;
                     anyhow::ensure!(
@@ -410,7 +450,7 @@ async fn host(o: Options) -> Result<()> {
     // One session at a time carries host audio; it is free again when that
     // session ends.
     let audio_free = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let mut approved = std::collections::HashMap::new();
+    let mut admission = admit::HostState::default();
     loop {
         let session = tokio::select! {
             () = launcher::gone() => {
@@ -430,30 +470,28 @@ async fn host(o: Options) -> Result<()> {
         };
         // One device's admission failing (say, the trust list cannot be
         // written) refuses that device, not every later one.
-        let admitted = match admit::decide(
-            &config,
-            &session,
-            o.approve,
-            o.ask_launcher,
-            &mut approved,
-        )
-        .await
-        {
-            Ok(Some(admitted)) => admitted,
-            Ok(None) => {
-                session.close("not approved");
-                continue;
-            }
-            Err(error) => {
-                println!("could not admit {}: {error:#}", session.remote());
-                session.close("not approved");
-                continue;
-            }
-        };
+        let admitted =
+            match admit::decide(&config, &session, o.approve, o.ask_launcher, &mut admission).await
+            {
+                Ok(Ok(admitted)) => admitted,
+                Ok(Err(reason)) => {
+                    session.close(reason);
+                    continue;
+                }
+                Err(error) => {
+                    println!("could not admit {}: {error:#}", session.remote());
+                    session.close(admit::NOT_APPROVED);
+                    continue;
+                }
+            };
         let mut session_options = o.clone();
         session_options.control = admitted.control;
         session_options.viewer_decoders = admitted.decoders;
         session_options.max_mbps_cap = admitted.max_mbps;
+        if admitted.preview {
+            sessions.spawn(preview::serve(session));
+            continue;
+        }
         if admitted.catalog {
             sessions.spawn(catalog::serve(session, o.windows.clone(), o.max_windows));
             continue;
@@ -571,11 +609,13 @@ async fn connect(id: &str, o: Options) -> Result<()> {
                 max_mbps: o.max_mbps_cap,
                 catalog: false,
                 window_id: o.window_id,
+                password: o.password.clone(),
+                preview: false,
             },
         )
         .await?;
         if index == 0 {
-            start_transfers(&session, &o);
+            start_services(&session, &o);
         }
         let code = session.pairing_code()?;
         println!(
@@ -589,8 +629,11 @@ async fn connect(id: &str, o: Options) -> Result<()> {
         viewers.spawn(async move {
             let result = run_client(session.clone(), session_options).await;
             match (&result, session.close_reason()) {
-                (Err(_), Some(reason)) if reason == "not approved" => {
+                (Err(_), Some(reason)) if reason == admit::NOT_APPROVED => {
                     anyhow::bail!("the host refused this device (not approved there)")
+                }
+                (Err(_), Some(reason)) if reason == admit::WRONG_PASSWORD => {
+                    anyhow::bail!("the host refused this device: wrong access password")
                 }
                 (Err(_), Some(reason)) if reason == "no such window" => {
                     anyhow::bail!("the host shares fewer windows than asked for")
@@ -607,6 +650,20 @@ async fn connect(id: &str, o: Options) -> Result<()> {
         }
     }
     outcome
+}
+
+/// Viewer: the session's extras, on its first streaming session: files
+/// given with --get and --send, and gamepads (`--gamepads`).
+fn start_services(session: &frames_net::Session, o: &Options) {
+    start_transfers(session, o);
+    if o.gamepads || !o.usb.is_empty() {
+        let (session, gamepads, usb) = (session.clone(), o.gamepads, o.usb.clone());
+        tokio::spawn(async move {
+            if let Err(error) = pads::viewer(session, gamepads, usb).await {
+                println!("gamepads stopped: {error:#}");
+            }
+        });
+    }
 }
 
 /// The files given with --get and --send, on the first session.
@@ -728,6 +785,20 @@ pub async fn send_info(session: &frames_net::Session, info: StreamInfo) -> Resul
     Ok(())
 }
 
+/// Viewer: set by Disconnect in a Frames menu; every window of this viewer
+/// ends.
+pub static DISCONNECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The most a viewer receives for an image quality (0 high, 1 medium, 2
+/// low), in Mbps, as the launcher's Settings describe them.
+pub fn quality_mbps(quality: u8) -> u16 {
+    match quality {
+        0 => 50,
+        1 => 12,
+        _ => 4,
+    }
+}
+
 /// Viewer: its window's title, `--title` or else the host's name.
 pub fn viewer_title(o: &Options, info: &StreamInfo) -> String {
     o.title.clone().unwrap_or_else(|| {
@@ -770,6 +841,11 @@ pub async fn receive_info(session: &frames_net::Session) -> Result<StreamInfo> {
 /// name). The `frames-next` binary and `frames next` both call this, before
 /// starting any other threads.
 pub fn main_from(args: Vec<String>) -> Result<()> {
+    // The viewer's controller reader (`frames_devices::gamepad::Capture`):
+    // SDL needs this process's main thread.
+    if args.first().map(String::as_str) == Some("gamepad-worker") {
+        return frames_devices::gamepad::capture_worker();
+    }
     // v1's identity and trust store read FRAMES_CONFIG_DIR; point them at
     // --config-dir before any other thread exists.
     if let Some(dir) = args
@@ -822,6 +898,39 @@ async fn run(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         Some("impair") => impair::run(&args[1..]).await,
+        Some("preview") => {
+            let id = args.get(1).context("preview needs a device id")?;
+            let out = args.get(2).context("preview needs a file to write")?;
+            let png = directory::preview(id, Duration::from_secs(15)).await?;
+            std::fs::write(out, &png)?;
+            println!("preview saved to {out} ({} bytes)", png.len());
+            Ok(())
+        }
+        Some("password") => {
+            let o = Options::parse(args.get(2..).unwrap_or_default())?;
+            let config = admit::config_dir(o.config_dir.as_ref())?;
+            match args.get(1).map(String::as_str) {
+                Some("set") => {
+                    // From stdin, so it stays out of shell history.
+                    println!("type the access password and press Enter:");
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    let id = admit::device_key(&config)?.id();
+                    password::set(&config, &id, line.trim_end_matches(['\r', '\n']))?;
+                    println!("access password set: devices that give it connect without asking");
+                }
+                Some("clear") => {
+                    password::clear(&config)?;
+                    println!("access password removed");
+                }
+                Some("status") => println!(
+                    "access password {}",
+                    if password::is_set(&config) { "set" } else { "not set" }
+                ),
+                _ => bail!("password takes set, clear or status"),
+            }
+            Ok(())
+        }
         Some("doctor") => doctor::run(Options::parse(&args[1..])?).await,
         Some("discover") => {
             for device in frames_net::local::browse(Duration::from_secs(3)).await? {

@@ -33,6 +33,9 @@ pub const INPUT_KEY: u32 = 4;
 pub const INPUT_FOCUS_LOST: u32 = 5;
 pub const INPUT_MOTION: u32 = 6;
 pub const INPUT_MODE: u32 = 7;
+pub const INPUT_STATS: u32 = 8;
+pub const INPUT_COMMAND: u32 = 9;
+pub const INPUT_MENU: u32 = 10;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -109,6 +112,17 @@ unsafe extern "C" {
     pub fn frames_mac_presenter_refresh_hz(presenter: *mut c_void) -> f64;
     pub fn frames_mac_presenter_free(presenter: *mut c_void);
     pub fn frames_mac_presenter_closed(presenter: *mut c_void) -> bool;
+    pub fn frames_mac_presenter_intercept_close(presenter: *mut c_void, on: bool);
+    pub fn frames_mac_presenter_take_close_request(presenter: *mut c_void) -> bool;
+    pub fn frames_mac_presenter_set_menus(presenter: *mut c_void, utf8: *const u8, length: usize);
+    pub fn frames_mac_presenter_take_dropped(
+        presenter: *mut c_void,
+        buffer: *mut u8,
+        capacity: usize,
+    ) -> usize;
+    pub fn frames_mac_close_window(window_id: u32) -> bool;
+    pub fn frames_mac_app_menus(window_id: u32, buffer: *mut u8, capacity: usize) -> usize;
+    pub fn frames_mac_press_menu(window_id: u32, id: u32) -> bool;
     pub fn frames_mac_presenter_resize(presenter: *mut c_void, width: u32, height: u32);
     pub fn frames_mac_presenter_set_input(
         presenter: *mut c_void,
@@ -139,6 +153,7 @@ unsafe extern "C" {
     pub fn frames_mac_free(pointer: *mut c_void);
     pub fn frames_mac_run_app(seconds: f64);
     pub fn frames_mac_stop_app();
+    pub fn frames_mac_viewer_app();
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -151,7 +166,13 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn CVPixelBufferGetWidth(buffer: *mut c_void) -> usize;
     pub fn CVPixelBufferGetHeight(buffer: *mut c_void) -> usize;
+    pub fn CVPixelBufferLockBaseAddress(buffer: *mut c_void, flags: u64) -> i32;
+    pub fn CVPixelBufferUnlockBaseAddress(buffer: *mut c_void, flags: u64) -> i32;
+    pub fn CVPixelBufferGetBaseAddress(buffer: *mut c_void) -> *mut c_void;
+    pub fn CVPixelBufferGetBytesPerRow(buffer: *mut c_void) -> usize;
 }
+/// kCVPixelBufferLock_ReadOnly.
+pub const PIXEL_BUFFER_LOCK_READ_ONLY: u64 = 1;
 
 unsafe extern "C" {
     pub fn clock_gettime_nsec_np(clock: u32) -> u64;

@@ -25,4 +25,13 @@ pub mod nvprofile;
 #[cfg(windows)]
 pub mod present;
 #[cfg(windows)]
+pub mod secure;
+#[cfg(windows)]
 pub mod system;
+// Isolated input needs the adapter, built for x64 MSVC only (build.rs);
+// other Windows builds get a stand-in that cannot attach.
+#[cfg(all(windows, frames_shared_input))]
+pub mod shared_input;
+#[cfg(all(windows, not(frames_shared_input)))]
+#[path = "shared_input_unavailable.rs"]
+pub mod shared_input;

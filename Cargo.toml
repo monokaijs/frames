@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/frames-core", "crates/frames-native", "crates/frames", "crates/frames-proto", "crates/frames-media", "crates/frames-testkit", "crates/frames-codec", "crates/frames-platform-windows", "crates/frames-net", "crates/frames-next", "crates/frames-input", "crates/frames-clipboard", "crates/frames-audio", "crates/frames-platform-macos"]
+members = ["crates/frames-core", "crates/frames-native", "crates/frames", "crates/frames-proto", "crates/frames-media", "crates/frames-testkit", "crates/frames-codec", "crates/frames-platform-windows", "crates/frames-net", "crates/frames-next", "crates/frames-input", "crates/frames-clipboard", "crates/frames-audio", "crates/frames-platform-macos", "crates/frames-devices"]
 resolver = "2"
 exclude = ["vendor/quinn-udp", "vendor/noq-udp", "vendor/iroh-relay", "vendor/iroh"]
 

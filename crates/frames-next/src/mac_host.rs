@@ -19,6 +19,7 @@ use frames_media::rate::RateConfig;
 use frames_platform_macos::capture::MacCapture;
 use frames_platform_macos::encoder::MacEncoder;
 use frames_platform_macos::input::MacInjector;
+use frames_platform_macos::pixel::PixelBuffer;
 use frames_platform_macos::system;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -28,6 +29,24 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     // Input, clipboard, and files arrive on the viewer's tagged streams.
     let services = crate::services::HostServices::start(&session, &o);
     tokio::task::spawn_blocking(move || stream(&handle, &session, &o, &services)).await?
+}
+
+/// One picture of the main display as packed BGRA (for device card
+/// previews). Refuses the generated source shown without Screen Recording.
+pub fn screenshot() -> Result<(Vec<u8>, u32, u32)> {
+    let clock = SystemClock::new();
+    let mut capture = MacCapture::start(10, false)?;
+    capture.configure(CaptureConfig {
+        fps: 10,
+        separate_cursor: true,
+    })?;
+    let frame = first_frame(&mut capture, &clock)?;
+    if capture.synthetic() == Some(true) {
+        bail!("no Screen Recording permission");
+    }
+    PixelBuffer::from_surface(&frame.surface)
+        .and_then(PixelBuffer::bgra)
+        .context("cannot read the picture")
 }
 
 /// Clears a flag when dropped, so a helper thread stops with the session.
@@ -68,6 +87,9 @@ fn stream(
     let _awake = system::KeepAwake::display();
     let clock = SystemClock::new();
     // QA runs never touch the real cursor or keyboard.
+    if o.isolated {
+        println!("isolated input is Windows-only; this Mac uses its normal input for the viewer");
+    }
     let mut injector = (o.control && !o.qa_source).then(MacInjector::new);
     if injector.is_some() && !MacInjector::trusted() {
         println!(
@@ -153,6 +175,17 @@ fn stream(
     } else {
         rate.max_bps
     };
+    // The viewer's image quality caps the rate; it can change it during the
+    // session (`Event::MaxBitrate`). Relays cap it further.
+    let ceiling_bps = (o.mbps * 2).max(20) * 1_000_000;
+    let mut viewer_cap = o.max_mbps_cap;
+    let max_bps = |kind: PathKind, cap: Option<u32>| {
+        let max = cap.map_or(ceiling_bps, |mbps| ceiling_bps.min(mbps * 1_000_000));
+        match kind {
+            PathKind::Relay => max.min(relay_max_bps),
+            PathKind::Direct => max,
+        }
+    };
     let mut path_kind = media.path().kind;
     let mut path_key = media.selected_path_key();
     if path_kind == PathKind::Relay {
@@ -167,6 +200,8 @@ fn stream(
     let frame_interval_us = 1_000_000 / u64::from(o.fps.max(1));
     let mut pending = Some(first);
     let mut follower = crate::resize::Follower::new((width, height));
+    // A shared application window's menus, for the viewer's window.
+    let mut host_menus = o.window_id.map(crate::menus::HostMenus::start);
     let mut resize_stream = None;
     let (mut frames, mut pointers) = (0u64, 0u64);
     // QA runs have no injector: relative motion is summed here instead, so
@@ -208,10 +243,7 @@ fn stream(
             path_key = key;
             // Rate control restarts on the new path and probes it.
             host.path_changed();
-            host.set_max_bps(match path.kind {
-                PathKind::Relay => relay_max_bps,
-                PathKind::Direct => rate.max_bps,
-            });
+            host.set_max_bps(max_bps(path.kind, viewer_cap));
             println!(
                 "path changed to {path_kind:?} {}",
                 path_key.as_deref().unwrap_or("")
@@ -313,7 +345,45 @@ fn stream(
                 host.on_datagram(arrived, &datagram, rtt);
             }
         }
+        if let Some(menus) = &mut host_menus
+            && let Err(error) = menus.send_changes(handle, session)
+        {
+            println!("application menus stopped: {error:#}");
+            host_menus = None;
+        }
         while let Ok(event) = inputs.try_recv() {
+            if let frames_input::Event::Menu { id } = event {
+                if o.control
+                    && let Some(menus) = &host_menus
+                {
+                    menus.invoke(id);
+                }
+                continue;
+            }
+            if let frames_input::Event::MaxBitrate { mbps } = event {
+                viewer_cap = Some(u32::from(mbps).max(1));
+                host.set_max_bps(max_bps(media.path().kind, viewer_cap));
+                println!("the viewer's image quality: at most {mbps} Mbps");
+                continue;
+            }
+            if event == frames_input::Event::CloseWindow {
+                // As the window's close button would; it may ask to save.
+                if o.control
+                    && let Some(id) = o.window_id
+                {
+                    let closed =
+                        u32::try_from(id).is_ok_and(frames_platform_macos::capture::close_window);
+                    println!(
+                        "the viewer asked to close the window: {}",
+                        if closed {
+                            "closing"
+                        } else {
+                            "it has no close button here"
+                        }
+                    );
+                }
+                continue;
+            }
             if let frames_input::Event::Mode { relative } = event {
                 println!(
                     "input: relative mouse {}",

@@ -1,7 +1,7 @@
 //! SDL runs on a helper process's main thread, independently of either renderer.
 #[cfg(windows)]
-use frames_core::devices::DeviceMessage;
-use frames_core::devices::{DeviceInfo, GamepadState, MAX_GAMEPADS};
+use crate::protocol::DeviceMessage;
+use crate::protocol::{DeviceInfo, GamepadState, MAX_GAMEPADS};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -542,7 +542,7 @@ pub fn host_available() -> Result<(), String> {
 }
 
 pub struct Host {
-    pub input: frames_core::devices::Sender,
+    pub input: crate::protocol::Sender,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl Drop for Host {
@@ -551,9 +551,9 @@ impl Drop for Host {
     }
 }
 impl Host {
-    pub fn start(output: frames_core::devices::Sender) -> anyhow::Result<Self> {
+    pub fn start(output: crate::protocol::Sender) -> anyhow::Result<Self> {
         host_available().map_err(anyhow::Error::msg)?;
-        let (input, receiver) = frames_core::devices::channel();
+        let (input, receiver) = crate::protocol::channel();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         #[cfg(windows)]
         {
@@ -576,7 +576,7 @@ impl Host {
 
 #[cfg(windows)]
 struct PadWorker {
-    input: frames_core::devices::Sender,
+    input: crate::protocol::Sender,
     generation: u64,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -588,13 +588,13 @@ impl Drop for PadWorker {
 }
 #[cfg(windows)]
 fn windows_host(
-    mut input: frames_core::devices::Receiver,
-    output: frames_core::devices::Sender,
+    mut input: crate::protocol::Receiver,
+    output: crate::protocol::Sender,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     use std::sync::{Arc, Mutex, atomic::Ordering};
     let client = Arc::new(vigem_client::Client::connect()?);
-    let clock = Arc::new(Mutex::new(frames_core::devices::InputClock::default()));
+    let clock = Arc::new(Mutex::new(crate::protocol::InputClock::default()));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()?;
@@ -611,7 +611,7 @@ fn windows_host(
                         DeviceMessage::Clock { elapsed_ms }=>clock.lock().unwrap().observe(elapsed_ms,Instant::now()),
                         DeviceMessage::GamepadAttach { slot,generation,.. }=>{
                             targets.remove(&slot);
-                            let (tx,rx)=frames_core::devices::channel();
+                            let (tx,rx)=crate::protocol::channel();
                             let stopping=Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let flag=stopping.clone(); let client=client.clone(); let clock=clock.clone(); let feedback=output.clone();
                             match std::thread::Builder::new().name(format!("frames-gamepad-{slot}")).spawn(move || {
@@ -642,9 +642,9 @@ fn windows_host(
 #[cfg(windows)]
 fn windows_pad(
     client: std::sync::Arc<vigem_client::Client>,
-    mut input: frames_core::devices::Receiver,
-    output: frames_core::devices::Sender,
-    clock: std::sync::Arc<std::sync::Mutex<frames_core::devices::InputClock>>,
+    mut input: crate::protocol::Receiver,
+    output: crate::protocol::Sender,
+    clock: std::sync::Arc<std::sync::Mutex<crate::protocol::InputClock>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     slot: u8,
     generation: u64,
@@ -707,7 +707,7 @@ fn windows_pad(
             if stop.load(Ordering::Acquire) { break; }
             tokio::select! {
                 _=timer.tick()=>{
-                    if !neutral && (last.elapsed()>=frames_core::devices::REPORT_TTL || !clock.lock().unwrap().fresh(client_ms,Instant::now())) {
+                    if !neutral && (last.elapsed()>=crate::protocol::REPORT_TTL || !clock.lock().unwrap().fresh(client_ms,Instant::now())) {
                         target.pad.update(&XGamepad::default())?; neutral=true;
                     }
                     if feedback_at.elapsed()>=Duration::from_millis(20) {

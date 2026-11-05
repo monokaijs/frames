@@ -7,6 +7,10 @@ pub const CLIPBOARD: u8 = 2;
 pub const FILE: u8 = 3;
 /// The viewer asks for a file from the host's home folder.
 pub const FETCH: u8 = 4;
+/// Gamepad and USB forwarding (`crate::pads`).
+pub const DEVICES: u8 = 5;
+/// One USB/IP connection, opened by the host (`crate::usb`).
+pub const USB: u8 = 6;
 
 /// Streams the host opens after the stream description, also tagged.
 pub const CURSOR: u8 = 10;
@@ -17,6 +21,11 @@ pub const ADB: u8 = 11;
 pub const CATALOG: u8 = 12;
 /// The stream's new size when the shared window resizes (`crate::resize`).
 pub const RESIZE: u8 = 13;
+/// A PNG preview of the host's screen, for a trusted launcher
+/// (`crate::preview`).
+pub const PREVIEW: u8 = 14;
+/// The shared window's application menus (`crate::menus`).
+pub const MENU: u8 = 15;
 
 pub type Streams = (iroh::endpoint::SendStream, iroh::endpoint::RecvStream);
 
@@ -33,6 +42,7 @@ pub struct Routes {
     pub clipboard: Option<std::sync::mpsc::Sender<Streams>>,
     pub file: Option<tokio::sync::mpsc::UnboundedSender<Streams>>,
     pub fetch: Option<tokio::sync::mpsc::UnboundedSender<Streams>>,
+    pub devices: Option<tokio::sync::mpsc::UnboundedSender<Streams>>,
 }
 
 /// Host: accepts the viewer's streams until the session ends and hands each
@@ -68,6 +78,11 @@ pub async fn route(session: frames_net::Session, routes: Routes) {
                     let _ = route.send(streams);
                 }
             }
+            DEVICES => {
+                if let Some(route) = &routes.devices {
+                    let _ = route.send(streams);
+                }
+            }
             _ => {}
         }
     }
@@ -81,6 +96,7 @@ pub async fn route_viewer(
     session: frames_net::Session,
     cursor: tokio::sync::mpsc::UnboundedSender<iroh::endpoint::RecvStream>,
     sizes: std::sync::mpsc::Sender<(u32, u32)>,
+    menus: std::sync::mpsc::Sender<Vec<crate::menus::Item>>,
     adb: Option<std::net::SocketAddr>,
 ) {
     loop {
@@ -97,6 +113,14 @@ pub async fn route_viewer(
             }
             (RESIZE, _) => {
                 tokio::spawn(crate::resize::receive(recv, sizes.clone()));
+            }
+            (MENU, _) => {
+                tokio::spawn(crate::menus::receive(recv, menus.clone()));
+            }
+            (USB, _) => {
+                if let Some(route) = crate::pads::USB_STREAMS.lock().unwrap().as_ref() {
+                    let _ = route.send((send, recv));
+                }
             }
             (ADB, Some(server)) => {
                 tokio::spawn(async move {
@@ -116,6 +140,8 @@ pub struct HostUpdates {
     pub cursor: std::sync::mpsc::Receiver<frames_input::cursor::CursorMessage>,
     /// The stream's new size when the host window resizes.
     pub sizes: std::sync::mpsc::Receiver<(u32, u32)>,
+    /// The shared window's application menus, when they change.
+    pub menus: std::sync::mpsc::Receiver<Vec<crate::menus::Item>>,
 }
 
 /// Copies both ways between a TCP connection and a stream until either

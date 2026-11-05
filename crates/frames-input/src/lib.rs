@@ -255,6 +255,15 @@ pub enum Event {
     /// Relative mouse (games) turned on or off. While on, motion arrives as
     /// [`Motion`] datagrams and button presses do not move the pointer.
     Mode { relative: bool },
+    /// The viewer closed its window of a shared application window: the
+    /// host asks that window to close (as its close button would).
+    CloseWindow,
+    /// The most the viewer wants to receive now, in Mbps (its image
+    /// quality, changed during the session).
+    MaxBitrate { mbps: u16 },
+    /// The viewer chose an item of the shared window's application menu,
+    /// by the id the host gave it.
+    Menu { id: u32 },
 }
 
 const KIND_BUTTON: u8 = 1;
@@ -262,6 +271,9 @@ const KIND_WHEEL: u8 = 2;
 const KIND_KEY: u8 = 3;
 const KIND_RELEASE_ALL: u8 = 4;
 const KIND_MODE: u8 = 5;
+const KIND_CLOSE_WINDOW: u8 = 6;
+const KIND_MAX_BITRATE: u8 = 7;
+const KIND_MENU: u8 = 8;
 
 impl Event {
     /// Appends the length-prefixed record to `out`.
@@ -286,6 +298,15 @@ impl Event {
             }
             Self::ReleaseAll => out.push(KIND_RELEASE_ALL),
             Self::Mode { relative } => out.extend([KIND_MODE, u8::from(relative)]),
+            Self::CloseWindow => out.push(KIND_CLOSE_WINDOW),
+            Self::MaxBitrate { mbps } => {
+                out.push(KIND_MAX_BITRATE);
+                out.extend(mbps.to_le_bytes());
+            }
+            Self::Menu { id } => {
+                out.push(KIND_MENU);
+                out.extend(id.to_le_bytes());
+            }
         }
         out[start] = (out.len() - start - 1) as u8;
     }
@@ -343,6 +364,11 @@ fn decode_record(record: &[u8]) -> Option<Event> {
         },
         KIND_RELEASE_ALL if body.is_empty() => Event::ReleaseAll,
         KIND_MODE if body.len() == 1 => Event::Mode { relative: flag(0)? },
+        KIND_CLOSE_WINDOW if body.is_empty() => Event::CloseWindow,
+        KIND_MAX_BITRATE if body.len() == 2 => Event::MaxBitrate { mbps: u16_at(0)? },
+        KIND_MENU if body.len() == 4 => Event::Menu {
+            id: u32::from_le_bytes(body.try_into().ok()?),
+        },
         _ => return None,
     };
     Some(event)
@@ -371,7 +397,12 @@ impl Held {
                     self.buttons.push(button);
                 }
             }
-            Event::Wheel { .. } | Event::ReleaseAll | Event::Mode { .. } => {}
+            Event::Wheel { .. }
+            | Event::ReleaseAll
+            | Event::Mode { .. }
+            | Event::CloseWindow
+            | Event::MaxBitrate { .. }
+            | Event::Menu { .. } => {}
         }
     }
 
@@ -494,11 +525,17 @@ mod tests {
         let mut bytes = Vec::new();
         Event::Mode { relative: true }.encode(&mut bytes);
         Event::Mode { relative: false }.encode(&mut bytes);
+        Event::CloseWindow.encode(&mut bytes);
+        Event::MaxBitrate { mbps: 12 }.encode(&mut bytes);
+        Event::Menu { id: 70_000 }.encode(&mut bytes);
         assert_eq!(
             EventReader::default().push(&bytes),
             vec![
                 Event::Mode { relative: true },
-                Event::Mode { relative: false }
+                Event::Mode { relative: false },
+                Event::CloseWindow,
+                Event::MaxBitrate { mbps: 12 },
+                Event::Menu { id: 70_000 }
             ]
         );
     }

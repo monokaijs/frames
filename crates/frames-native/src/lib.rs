@@ -5,13 +5,11 @@ pub mod audio;
 mod client_updates;
 mod device_name;
 mod window_selection;
+pub use client_updates::{ClientReceiver, ClientSendError, ClientSender, client_channel};
+pub use device_name::{device_name, device_name_override, set_device_name, system_device_name};
 pub use window_selection::{
     SharingWindow, WindowSelection, parse_selection, selected_desktop, sharing_windows,
 };
-pub mod gamepad;
-pub mod usb;
-pub use client_updates::{ClientReceiver, ClientSendError, ClientSender, client_channel};
-pub use device_name::{device_name, device_name_override, set_device_name, system_device_name};
 #[cfg(all(windows, feature = "media-diagnostics"))]
 pub use windows::diagnostic_capture_window;
 #[cfg(target_os = "macos")]

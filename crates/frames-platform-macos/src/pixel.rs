@@ -44,6 +44,32 @@ impl PixelBuffer {
         (difference >= 0.0).then_some(difference)
     }
 
+    /// The pixels as tightly packed BGRA rows, with the width and height
+    /// (a CPU copy, for thumbnails).
+    pub fn bgra(&self) -> Option<(Vec<u8>, u32, u32)> {
+        // SAFETY: the buffer is alive; it is locked read-only around the
+        // copy, which stays within its rows.
+        unsafe {
+            if ffi::CVPixelBufferLockBaseAddress(self.0, ffi::PIXEL_BUFFER_LOCK_READ_ONLY) != 0 {
+                return None;
+            }
+            let width = ffi::CVPixelBufferGetWidth(self.0);
+            let height = ffi::CVPixelBufferGetHeight(self.0);
+            let stride = ffi::CVPixelBufferGetBytesPerRow(self.0);
+            let base = ffi::CVPixelBufferGetBaseAddress(self.0) as *const u8;
+            let copied = (!base.is_null() && stride >= width * 4).then(|| {
+                let mut out = Vec::with_capacity(width * height * 4);
+                for row in 0..height {
+                    let start = base.add(row * stride);
+                    out.extend_from_slice(std::slice::from_raw_parts(start, width * 4));
+                }
+                out
+            });
+            ffi::CVPixelBufferUnlockBaseAddress(self.0, ffi::PIXEL_BUFFER_LOCK_READ_ONLY);
+            copied.map(|bytes| (bytes, width as u32, height as u32))
+        }
+    }
+
     pub fn into_surface(self) -> Surface {
         Surface::Platform(Arc::new(self))
     }

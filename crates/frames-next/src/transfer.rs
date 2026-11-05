@@ -82,6 +82,23 @@ pub async fn send(session: &frames_net::Session, path: &Path) -> Result<String> 
     send_on(streams, path).await
 }
 
+/// Viewer: sends a file dropped on its window to the host's receive
+/// folder, in the background (from a viewer thread inside the runtime).
+pub fn send_dropped(session: &frames_net::Session, path: std::path::PathBuf) {
+    let session = session.clone();
+    tokio::runtime::Handle::current().spawn(async move {
+        let started = std::time::Instant::now();
+        match send(&session, &path).await {
+            Ok(saved) => println!(
+                "FILE sent {} in {:.1} s (saved as {saved})",
+                path.display(),
+                started.elapsed().as_secs_f64()
+            ),
+            Err(error) => println!("FILE sending {} failed: {error:#}", path.display()),
+        }
+    });
+}
+
 /// Sends `path` over a file stream (either direction).
 pub async fn send_on((mut send, mut recv): crate::streams::Streams, path: &Path) -> Result<String> {
     let name = path

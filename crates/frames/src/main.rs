@@ -323,7 +323,7 @@ fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     if matches!(args.command, Some(Command::GamepadWorker)) {
         let _lease = update::runtime_lease()?;
-        return frames_native::gamepad::capture_worker();
+        return frames_devices::gamepad::capture_worker();
     }
     if let Some(Command::DeviceLease {
         bus_id,
@@ -332,7 +332,7 @@ fn run() -> anyhow::Result<()> {
     }) = &args.command
     {
         let _lease = update::runtime_lease()?;
-        return frames_native::usb::lease_worker(bus_id, *port, token);
+        return frames_devices::usb::lease_worker(bus_id, *port, token);
     }
     if let Some(Command::ApplyUpdate {
         plan,

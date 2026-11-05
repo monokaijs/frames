@@ -39,8 +39,9 @@ pub fn install() -> anyhow::Result<()> {
     // The service cannot ask anyone: only devices already trusted for
     // control (with Accept and trust) can connect to it.
     anyhow::ensure!(
-        frames_next::directory::trusted()?.iter().any(|d| d.control),
-        "trust at least one device for control (share, and choose Accept and trust) before installing the service"
+        frames_next::directory::trusted()?.iter().any(|d| d.control)
+            || frames_next::directory::access_password_set(),
+        "set an access password, or trust a device for control (share, and choose Accept and trust), before installing the service"
     );
     let user_config = frames_core::trust::config_dir()?;
     let dir = installation();
@@ -82,6 +83,14 @@ pub fn install() -> anyhow::Result<()> {
     for file in ["device-v2.key", "trusted-v2.json"] {
         std::fs::copy(user_config.join(file), data.join(file))
             .with_context(|| format!("copying {file} for the service"))?;
+    }
+    // The access password, when one is set, lets devices in unattended.
+    if user_config.join("access-password.json").exists() {
+        std::fs::copy(
+            user_config.join("access-password.json"),
+            data.join("access-password.json"),
+        )
+        .context("copying the access password for the service")?;
     }
     let info = ServiceInfo {
         name: NAME.into(),

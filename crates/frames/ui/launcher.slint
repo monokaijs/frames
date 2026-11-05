@@ -1,9 +1,10 @@
-import { LineEdit, ScrollView, ComboBox, SpinBox } from "std-widgets.slint";
+import { LineEdit, ListView, ScrollView, ComboBox, SpinBox } from "std-widgets.slint";
 import { ConnectionButton, SharingButton } from "connection-button.slint";
 import { Theme, Glyph, AppButton, AppSwitch, AppCheckBox, NavItem, TabItem, Badge, Card, SectionTitle, MutedText, ModalFocus } from "components.slint";
 
 export struct DeviceRow { name: string, address: string, detail: string, fingerprint: string, trusted: bool, online: bool, can-trust: bool, preview: image, preview-live: bool, connection-audio: bool, connection-desktop: bool }
 export struct SessionRow { id: int, name: string, detail: string, hosting: bool }
+export struct UsbRow { id: string, name: string, detail: string, selected: bool }
 export struct ShareWindowRow { id: string, title: string, app: string, detail: string, preview: image, selected: bool, available: bool }
 
 component ShareWindowGrid inherits Rectangle {
@@ -222,6 +223,16 @@ export component Launcher inherits Window {
     in-out property <bool> clipboard: true;
     in-out property <int> codec: 0;
     in-out property <int> encoder: 0;
+    in-out property <bool> physical-keys: false;
+    in-out property <bool> adb: false;
+    in-out property <bool> gamepads: false;
+    // USB passthrough (Windows): this PC's devices, and the chosen ones.
+    in-out property <bool> usb-open: false;
+    in property <[UsbRow]> usb-devices;
+    in property <string> usb-status;
+    in property <int> usb-chosen: 0;
+    callback load-usb();
+    callback usb-toggled(string, bool);
     in-out property <int> quality: 0;
     in-out property <bool> bandwidth-auto: true;
     in-out property <int> bandwidth-mbps: 50;
@@ -274,6 +285,17 @@ export component Launcher inherits Window {
     in property <bool> update-ready: false;
     in property <bool> update-error: false;
     in-out property <bool> update-prompt-open: false;
+    // A host refused this device: its access password may let it in.
+    in-out property <bool> password-prompt-open: false;
+    in property <string> password-prompt-name;
+    in property <string> password-prompt-target;
+    in property <bool> password-prompt-wrong;
+    in-out property <string> password-prompt-text;
+    callback connect-with-password(string, string);
+    // This device's access password (Settings > Sharing).
+    in property <bool> access-password-set;
+    in-out property <string> access-password-edit;
+    callback set-access-password(string);
     // A device asks to connect while this device shares.
     in-out property <bool> pairing-open: false;
     in property <string> pairing-name;
@@ -310,7 +332,7 @@ export component Launcher inherits Window {
     callback confirm-restart-update();
 
     FocusScope {
-        enabled: root.revoke-id == "" && !root.permissions-open && !root.close-prompt-open && !root.window-picker-open && !root.pairing-open;
+        enabled: root.revoke-id == "" && !root.permissions-open && !root.close-prompt-open && !root.window-picker-open && !root.pairing-open && !root.password-prompt-open && !root.usb-open;
         HorizontalLayout {
             spacing: 0px;
             Rectangle { width: 56px; }
@@ -497,12 +519,31 @@ export component Launcher inherits Window {
                                 SettingRow { title: "Video codec"; detail: "Automatic selects a working codec for both devices.";
                                     ComboBox { width: 180px; model: ["Automatic", "H.264", "HEVC", "AV1", "VP9"]; current-index <=> root.codec; selected(value) => { root.settings-edited(); } accessible-label: "Video codec"; }
                                 }
+                                SettingRow { title: "Keyboard"; detail: root.physical-keys ? "Keys stay in place between Mac and PC (Control is Control), for terminals and games." : "Between Mac and PC, Control and Command trade places, so shortcuts work as on this device.";
+                                    ComboBox { width: 180px; model: ["Swap Control and Command", "Physical keys"]; current-index: root.physical-keys ? 1 : 0; selected(value) => { root.physical-keys = self.current-index == 1; root.settings-edited(); } accessible-label: "Keyboard"; }
+                                }
+                                SettingRow { title: "Forward gamepads"; detail: "Controllers connected here become Xbox controllers on Windows hosts you control (the host needs the ViGEmBus driver).";
+                                    AppSwitch { checked <=> root.gamepads; toggled => { root.settings-edited(); } accessible-label: "Forward gamepads"; }
+                                }
+                                if !root.mac: SettingRow { title: "USB passthrough"; detail: root.usb-chosen == 0 ? "Pass USB devices of this PC to Windows hosts you control (USB/IP; asks for administrator rights)." : root.usb-chosen + " device(s) go to Windows hosts you connect to.";
+                                    AppButton { label: "Choose..."; quiet: true; clicked => { root.usb-open = true; root.load-usb(); } }
+                                }
+                                SettingRow { title: "Android ADB bridge"; detail: "Hosts you control reach this device's ADB server at adb -H 127.0.0.1 -P 15037 (start adb here first).";
+                                    AppSwitch { checked <=> root.adb; toggled => { root.settings-edited(); } accessible-label: "Android ADB bridge"; }
+                                }
                                 SettingRow { title: "Clipboard sync"; detail: "Share text and images in both directions."; divider: false;
                                     AppSwitch { checked <=> root.clipboard; toggled => { root.settings-edited(); } accessible-label: "Clipboard sync"; }
                                 }
                             }
                             SettingsSection {
                                 title: "Sharing";
+                                SettingRow { title: "Access password"; detail: root.access-password-set ? "Set. Devices that enter it connect without anyone approving them here." : "Lets devices that know it connect without anyone approving them here (unattended access). At least 8 characters.";
+                                    HorizontalLayout { spacing: 8px; alignment: end;
+                                        LineEdit { width: 160px; input-type: password; text <=> root.access-password-edit; placeholder-text: root.access-password-set ? "New password" : "Password"; accessible-label: "Access password"; accepted => { if root.access-password-edit != "" { root.set-access-password(root.access-password-edit); } } }
+                                        AppButton { label: "Set"; quiet: true; enabled: root.access-password-edit != ""; clicked => { root.set-access-password(root.access-password-edit); } }
+                                        if root.access-password-set: AppButton { label: "Remove"; quiet: true; clicked => { root.set-access-password(""); } }
+                                    }
+                                }
                                 SettingRow { title: "Shared window limit"; detail: "Maximum windows streamed at the same time, per connection.";
                                     SpinBox { width: 140px; minimum: 1; maximum: 32; value <=> root.max-streams; edited => { root.settings-edited(); } accessible-label: "Shared window limit"; }
                                 }
@@ -670,6 +711,60 @@ export component Launcher inherits Window {
                     alignment: end; spacing: 8px;
                     AppButton { label: "Cancel"; enabled: !root.update-restart-busy; clicked => { root.update-prompt-open = false; } }
                     AppButton { label: root.update-restart-busy ? "Preparing update..." : "Disconnect and update"; primary: true; enabled: !root.update-restart-busy; clicked => { root.confirm-restart-update(); } }
+                }
+            }
+        }
+    }
+    if root.usb-open: ModalFocus {
+        key-pressed(event) => { if event.text == Key.Escape { root.usb-open = false; return accept; } return reject; }
+        Rectangle { background: #00000066; }
+        TouchArea { }
+        Card {
+            width: min(520px, parent.width - 48px); height: min(440px, parent.height - 48px);
+            x: round((parent.width - self.width) / (2 * 1phx)) * 1phx;
+            y: round((parent.height - self.height) / (2 * 1phx)) * 1phx;
+            VerticalLayout {
+                padding: 24px; spacing: 12px;
+                SectionTitle { text: "USB passthrough"; font-size: 18px; }
+                MutedText { text: root.usb-status != "" ? root.usb-status : "Chosen devices go to the Windows host when you connect, and come back when you disconnect."; }
+                ListView {
+                    vertical-stretch: 1;
+                    for device in root.usb-devices: HorizontalLayout {
+                        padding: 6px; spacing: 10px;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            Text { text: device.name; color: Theme.ink; overflow: elide; }
+                            MutedText { text: device.detail; font-size: 11px; }
+                        }
+                        AppSwitch { checked: device.selected; toggled => { root.usb-toggled(device.id, self.checked); } accessible-label: device.name; }
+                    }
+                }
+                HorizontalLayout {
+                    alignment: end; spacing: 8px;
+                    AppButton { label: "Refresh"; quiet: true; clicked => { root.load-usb(); } }
+                    AppButton { label: "Done"; primary: true; clicked => { root.usb-open = false; } }
+                }
+            }
+        }
+    }
+    if root.password-prompt-open: ModalFocus {
+        key-pressed(event) => { if event.text == Key.Escape { root.password-prompt-open = false; root.password-prompt-text = ""; return accept; } return reject; }
+        Rectangle { background: #00000066; }
+        TouchArea { }
+        Card {
+            width: min(460px, parent.width - 48px); height: 236px;
+            x: round((parent.width - self.width) / (2 * 1phx)) * 1phx;
+            y: round((parent.height - self.height) / (2 * 1phx)) * 1phx;
+            VerticalLayout {
+                padding: 24px; spacing: 12px;
+                SectionTitle { text: root.password-prompt-wrong ? "Wrong password" : "Connect with a password?"; font-size: 18px; }
+                MutedText { text: (root.password-prompt-name == "" ? "The device" : root.password-prompt-name) + (root.password-prompt-wrong ? " did not accept that password. Check it and try again." : " did not let this device in. If you know its access password, enter it to connect."); }
+                LineEdit { input-type: password; text <=> root.password-prompt-text; placeholder-text: "Access password"; accessible-label: "Access password"; accepted => { if root.password-prompt-text != "" { root.connect-with-password(root.password-prompt-target, root.password-prompt-text); } } }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    alignment: end; spacing: 8px;
+                    AppButton { label: "Cancel"; clicked => { root.password-prompt-open = false; root.password-prompt-text = ""; } }
+                    AppButton { label: "Connect"; primary: true; enabled: root.password-prompt-text != ""; clicked => { root.connect-with-password(root.password-prompt-target, root.password-prompt-text); } }
                 }
             }
         }

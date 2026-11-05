@@ -32,6 +32,13 @@ pub fn run_app(seconds: f64) {
     unsafe { ffi::frames_mac_run_app(seconds) }
 }
 
+/// A regular app with a Dock icon and the viewer's Frames menu, whose
+/// commands arrive as [`crate::presenter::MacInput::Command`].
+pub fn viewer_app() {
+    // SAFETY: posts to the main queue.
+    unsafe { ffi::frames_mac_viewer_app() }
+}
+
 pub fn stop_app() {
     // SAFETY: posts to the main queue.
     unsafe { ffi::frames_mac_stop_app() }

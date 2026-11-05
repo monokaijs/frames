@@ -20,11 +20,17 @@ frames-audio = { path = "../frames-audio" }
 frames-media = { path = "../frames-media" }
 # Transitional: v1 identity and trust store, for migrating trust (Phase 4).
 frames-core = { path = "../frames-core" }
+frames-devices = { path = "../frames-devices" }
 frames-net = { path = "../frames-net" }
 iroh = "=1.4.1"
 serde = { workspace = true }
 serde_json.workspace = true
 sha2.workspace = true
+# Access password: PBKDF2-derived key, HMAC proof bound to the session.
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+# Device card previews (PNG thumbnails).
+image = { version = "0.25", default-features = false, features = ["png"] }
 tokio.workspace = true
 
 [dev-dependencies]

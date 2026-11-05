@@ -80,6 +80,15 @@ struct SessionOptions {
     codec: String,
     /// Encoder for sharing: "auto" or one of `frames_core::codec::ENCODERS`.
     encoder: String,
+    /// Keys keep their physical place on another platform (Control stays
+    /// Control) instead of swapping Control and Command.
+    physical_keys: bool,
+    /// Forward this device's ADB server to hosts it controls.
+    adb: bool,
+    /// Forward this device's gamepads to Windows hosts it controls.
+    gamepads: bool,
+    /// USB devices (bus ids) passed to Windows hosts this PC connects to.
+    usb: Vec<String>,
     bandwidth_mbps: u32,
     quality: frames_core::adaptive::QualityPreset,
     max_streams: usize,
@@ -96,6 +105,10 @@ impl Default for SessionOptions {
             unattended: false,
             codec: "auto".into(),
             encoder: "auto".into(),
+            physical_keys: false,
+            adb: false,
+            gamepads: false,
+            usb: Vec::new(),
             bandwidth_mbps: 0,
             quality: Default::default(),
             max_streams: 8,
@@ -150,6 +163,11 @@ impl SessionOptions {
                 .get(ui.get_encoder() as usize)
                 .unwrap_or(&"auto")
                 .to_string(),
+            physical_keys: ui.get_physical_keys(),
+            adb: ui.get_adb(),
+            gamepads: ui.get_gamepads(),
+            // Chosen in the USB passthrough dialog, saved by its action.
+            usb: Vec::new(),
             max_streams: ui.get_max_streams() as usize,
         }
     }
@@ -334,6 +352,14 @@ enum Action {
     Stop(i32),
     /// The answer to the open pairing prompt (`frames_next::launcher`).
     AnswerPairing(String),
+    /// Connect again to a device with its access password.
+    ConnectWithPassword(String, String),
+    /// This device's access password; empty removes it.
+    SetAccessPassword(String),
+    /// List this PC's USB devices for the passthrough dialog.
+    LoadUsb,
+    /// Pass a USB device (bus id) through, or stop.
+    ToggleUsb(String, bool),
     Discover,
     Refresh,
     Permission(String),
@@ -361,6 +387,14 @@ enum Event {
     Sessions(Vec<(i32, String, String, bool)>),
     /// A device asks to connect to this host: its name and pairing code.
     Pairing(Option<(String, String)>),
+    /// A host refused this device: offer its access password (the device
+    /// id, its name, whether a password was already given and wrong).
+    PasswordPrompt(String, String, bool),
+    /// Whether this device has an access password, and the outcome of
+    /// changing it.
+    AccessPassword(bool, Result<(), String>),
+    /// This PC's USB devices (id, name, detail, chosen), or why not.
+    UsbDevices(Result<Vec<(String, String, String, bool)>, String>, usize),
 }
 
 fn bind_settings_autosave(ui: &Launcher, actions: mpsc::Sender<Action>) {
@@ -484,6 +518,8 @@ struct Worker {
     discovery_tx: mpsc::Sender<Result<Vec<Device>, String>>,
     /// The device whose pairing prompt is open.
     pairing: Option<String>,
+    /// The access password for the next connection started (never saved).
+    next_password: Option<String>,
 }
 impl Worker {
     fn close_pairing(&mut self) {
@@ -623,6 +659,12 @@ impl Worker {
             .stdout(log_file.try_clone()?)
             .stderr(log_file);
         command.env_remove("FRAMES_EXPECTED_DEVICE_ID");
+        // The access password goes in the environment, never on the
+        // command line (process lists show arguments).
+        command.env_remove("FRAMES_ACCESS_PASSWORD");
+        if let Some(password) = self.next_password.take() {
+            command.env("FRAMES_ACCESS_PASSWORD", password);
+        }
         if !expected_id.is_empty() {
             command.env("FRAMES_EXPECTED_DEVICE_ID", expected_id);
         }
@@ -704,7 +746,12 @@ impl Worker {
                     "Refresh the window selection before sharing"
                 );
                 // v2 shares windows by title (each viewer window shows one).
+                // One window: isolated input on Windows (the host keeps its
+                // own mouse and keyboard).
                 let mut args = self.preferences.options.sharing_args();
+                if mode == 2 {
+                    args.push("--isolated".into());
+                }
                 for argument in windows {
                     if let Some(choice) = self.sharing_choices.iter().find(|choice| {
                         choice
@@ -810,7 +857,11 @@ impl Worker {
                 let result = (|| -> Result<()> {
                     options.validate()?;
                     let mut preferences = self.preferences.clone();
+                    // The USB choice is the passthrough dialog's, not the
+                    // settings page's.
+                    let usb = preferences.options.usb.clone();
                     preferences.options = options.clone();
+                    preferences.options.usb = usb;
                     preferences.save()?;
                     self.preferences = preferences;
                     Ok(())
@@ -902,6 +953,61 @@ impl Worker {
                         .and_then(|()| stdin.flush())
                         .context("couldn't answer the pairing request")?;
                 }
+            }
+            Action::ConnectWithPassword(target, password) => {
+                self.next_password = Some(password);
+                let (audio, desktop) = (
+                    self.preferences.options.audio,
+                    self.preferences.options.desktop,
+                );
+                let result = self.handle(Action::Connect(target.clone(), target, audio, desktop));
+                self.next_password = None;
+                result?;
+            }
+            Action::LoadUsb => {
+                let events = self.events.clone();
+                let chosen = self.preferences.options.usb.clone();
+                std::thread::spawn(move || {
+                    let result = frames_devices::usb::inventory()
+                        .map(|devices| {
+                            devices
+                                .into_iter()
+                                .map(|d| {
+                                    let detail = d
+                                        .error
+                                        .clone()
+                                        .or(d.status.clone())
+                                        .unwrap_or_else(|| d.id.clone());
+                                    let selected = chosen.contains(&d.id);
+                                    (d.id, d.name, detail, selected)
+                                })
+                                .collect()
+                        })
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = events.send(Event::UsbDevices(result, chosen.len()));
+                });
+            }
+            Action::ToggleUsb(id, on) => {
+                let mut preferences = self.preferences.clone();
+                preferences.options.usb.retain(|bus| *bus != id);
+                if on {
+                    preferences.options.usb.push(id);
+                }
+                preferences.save()?;
+                self.preferences = preferences;
+                self.handle(Action::LoadUsb)?;
+            }
+            Action::SetAccessPassword(password) => {
+                let result = if password.is_empty() {
+                    frames_next::directory::clear_access_password()
+                } else {
+                    frames_next::directory::set_access_password(&password)
+                }
+                .map_err(|error| format!("{error:#}"));
+                let _ = self.events.send(Event::AccessPassword(
+                    frames_next::directory::access_password_set(),
+                    result,
+                ));
             }
             Action::Discover => {
                 if self.discovering {
@@ -1021,6 +1127,13 @@ impl Worker {
                         let log = crate::launcher_status::read_tail(&session.log);
                         let phase =
                             crate::launcher_status::latest_phase(&log).unwrap_or(session.phase);
+                        if !session.host && log.contains("refused this device") {
+                            let _ = self.events.send(Event::PasswordPrompt(
+                                session.address.clone(),
+                                session.name.clone(),
+                                log.contains("wrong access password"),
+                            ));
+                        }
                         self.notice(
                             crate::launcher_status::explain_failure(&session.name, &log, phase),
                             true,
@@ -1201,6 +1314,10 @@ pub fn run() -> Result<()> {
             .unwrap_or(0) as i32,
     );
     ui.set_max_streams(preferences.options.max_streams as i32);
+    ui.set_physical_keys(preferences.options.physical_keys);
+    ui.set_adb(preferences.options.adb);
+    ui.set_gamepads(preferences.options.gamepads);
+    ui.set_usb_chosen(preferences.options.usb.len() as i32);
     ui.set_quality(preferences.options.quality.index());
     ui.set_bandwidth_auto(preferences.options.bandwidth_mbps == 0);
     ui.set_bandwidth_mbps(if preferences.options.bandwidth_mbps == 0 {
@@ -1246,6 +1363,7 @@ pub fn run() -> Result<()> {
             discovery_tx,
             discovery_done,
             pairing: None,
+            next_password: None,
         };
         worker.refresh();
         loop {
@@ -1380,6 +1498,31 @@ pub fn run() -> Result<()> {
     });
     let tx = actions.clone();
     let weak = ui.as_weak();
+    ui.on_connect_with_password(move |target, password| {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_password_prompt_open(false);
+            ui.set_password_prompt_text("".into());
+        }
+        let _ = tx.send(Action::ConnectWithPassword(
+            target.to_string(),
+            password.to_string(),
+        ));
+    });
+    let tx = actions.clone();
+    ui.on_load_usb(move || {
+        let _ = tx.send(Action::LoadUsb);
+    });
+    let tx = actions.clone();
+    ui.on_usb_toggled(move |id, on| {
+        let _ = tx.send(Action::ToggleUsb(id.to_string(), on));
+    });
+    let tx = actions.clone();
+    ui.on_set_access_password(move |password| {
+        let _ = tx.send(Action::SetAccessPassword(password.to_string()));
+    });
+    ui.set_access_password_set(frames_next::directory::access_password_set());
+    let tx = actions.clone();
+    let weak = ui.as_weak();
     ui.on_pairing_answer(move |answer| {
         if let Some(ui) = weak.upgrade() {
             ui.set_pairing_open(false);
@@ -1498,6 +1641,40 @@ pub fn run() -> Result<()> {
                         ui.set_notice(format!("Couldn't check macOS permissions: {error}").into()); ui.set_notice_error(true);
                     }
                 },
+                Event::UsbDevices(result, chosen) => {
+                    ui.set_usb_chosen(chosen as i32);
+                    match result {
+                        Ok(devices) => {
+                            ui.set_usb_status(if devices.is_empty() { "No USB devices found." } else { "" }.into());
+                            ui.set_usb_devices(model(devices.into_iter().map(|(id, name, detail, selected)| UsbRow { id: id.into(), name: name.into(), detail: detail.into(), selected }).collect()));
+                        }
+                        Err(error) => {
+                            ui.set_usb_status(error.into());
+                            ui.set_usb_devices(model(Vec::new()));
+                        }
+                    }
+                }
+                Event::PasswordPrompt(target, name, wrong) => {
+                    ui.set_password_prompt_target(target.into());
+                    ui.set_password_prompt_name(name.into());
+                    ui.set_password_prompt_wrong(wrong);
+                    ui.set_password_prompt_text("".into());
+                    ui.set_password_prompt_open(true);
+                }
+                Event::AccessPassword(set, result) => {
+                    ui.set_access_password_set(set);
+                    match result {
+                        Ok(()) => {
+                            ui.set_access_password_edit("".into());
+                            ui.set_settings_error(false);
+                            ui.set_settings_status(if set { "Access password set." } else { "Access password removed." }.into());
+                        }
+                        Err(error) => {
+                            ui.set_settings_error(true);
+                            ui.set_settings_status(format!("Couldn't change the access password: {error}").into());
+                        }
+                    }
+                }
                 Event::Pairing(prompt) => match prompt {
                     Some((name, code)) => {
                         ui.set_pairing_name(name.into());
@@ -1712,6 +1889,10 @@ mod tests {
             unattended: true,
             codec: "hevc".into(),
             encoder: "qsv".into(),
+            physical_keys: true,
+            adb: true,
+            gamepads: true,
+            usb: vec!["1-4".into()],
             bandwidth_mbps: 8,
             quality: frames_core::adaptive::QualityPreset::High,
             max_streams: 12,
@@ -1725,6 +1906,11 @@ mod tests {
         assert!(has(&connect, ["--codec", "hevc"]));
         // The bandwidth limit caps the quality preset's 50 Mbps.
         assert!(has(&connect, ["--max-mbps", "8"]));
+        assert!(connect.iter().any(|a| a == "--physical-keys"));
+        assert!(connect.iter().any(|a| a == "--adb"));
+        assert!(connect.iter().any(|a| a == "--gamepads"));
+        assert!(has(&connect, ["--usb", "1-4"]));
+        assert!(options.sharing_args().iter().any(|a| a == "--adb"));
         let host = options.sharing_args();
         assert!(frames_next::valid_command(&host[1..]), "{host:?}");
         assert!(has(&host, ["--prefer-encoder", "qsv"]));

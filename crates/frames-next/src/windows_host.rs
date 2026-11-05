@@ -55,6 +55,153 @@ fn first_frame(capture: &mut WgcCapture, clock: &SystemClock) -> Result<VideoFra
     bail!("no frame captured within 5 s")
 }
 
+/// The secure desktop, for the service agent
+/// (`frames_platform_windows::secure`).
+struct Secure {
+    privileged: bool,
+    next_check: Instant,
+    capture: Option<frames_platform_windows::secure::SecureCapture>,
+    input: Option<frames_platform_windows::secure::SecureInput>,
+    last: u64,
+    id: u64,
+}
+
+impl Secure {
+    fn new() -> Self {
+        Self {
+            privileged: frames_platform_windows::secure::privileged(),
+            next_check: Instant::now(),
+            capture: None,
+            input: None,
+            last: 0,
+            id: 1 << 48,
+        }
+    }
+
+    /// Starts or stops following the secure desktop (four times a second).
+    fn check(&mut self) {
+        self.next_check = Instant::now() + Duration::from_millis(250);
+        let active = frames_platform_windows::secure::secure_desktop_active();
+        if active && self.capture.is_none() {
+            match frames_platform_windows::secure::SecureCapture::start() {
+                Ok(capture) => {
+                    println!("showing the secure desktop");
+                    self.capture = Some(capture);
+                    self.input = frames_platform_windows::secure::SecureInput::start()
+                        .map_err(|error| println!("secure desktop input unavailable: {error:#}"))
+                        .ok();
+                }
+                Err(error) => println!("secure desktop unavailable: {error:#}"),
+            }
+        } else if !active && self.capture.is_some() {
+            println!("back to the user's desktop");
+            self.capture = None;
+            self.input = None;
+        }
+    }
+
+    /// The newest secure-desktop picture, uploaded for the encoder.
+    fn frame(
+        &mut self,
+        device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        clock: &SystemClock,
+    ) -> Option<VideoFrame> {
+        let (bgra, width, height, number) = self.capture.as_ref()?.latest()?;
+        if number == self.last {
+            std::thread::sleep(Duration::from_millis(2));
+            return None;
+        }
+        self.last = number;
+        let texture = frames_platform_windows::secure::upload(device, &bgra, width, height).ok()?;
+        self.id += 1;
+        Some(VideoFrame {
+            id: self.id,
+            captured_us: clock.now_us(),
+            surface: frames_media::api::Surface::Platform(Arc::new(
+                frames_codec::d3d11::D3D11Surface {
+                    texture,
+                    subresource: 0,
+                    width: width & !1,
+                    height: height & !1,
+                    matrix_709: true,
+                    full_range: true,
+                    keepalive: None,
+                },
+            )),
+            dirty: None,
+        })
+    }
+}
+
+/// One picture of the primary monitor as packed BGRA (for device card
+/// previews), read back from the GPU through a staging texture.
+pub fn screenshot() -> Result<(Vec<u8>, u32, u32)> {
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
+        D3D11_USAGE_STAGING, ID3D11Texture2D,
+    };
+    win::dpi_aware();
+    let (device, context, _) = backend_device("mf")?;
+    let clock = SystemClock::new();
+    let shared: Arc<dyn MediaClock> = Arc::new(clock);
+    let mut capture = WgcCapture::primary_monitor(&device, shared).context(CaptureFailed)?;
+    capture.configure(CaptureConfig {
+        fps: 10,
+        separate_cursor: true,
+    })?;
+    let frame = first_frame(&mut capture, &clock)?;
+    let frames_media::api::Surface::Platform(surface) = &frame.surface else {
+        bail!("not a GPU picture");
+    };
+    let surface = surface
+        .as_any()
+        .downcast_ref::<frames_codec::d3d11::D3D11Surface>()
+        .context("not a D3D11 picture")?;
+    unsafe {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        surface.texture.GetDesc(&mut desc);
+        desc.Width = surface.width;
+        desc.Height = surface.height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        desc.MiscFlags = 0;
+        let mut staging: Option<ID3D11Texture2D> = None;
+        device.CreateTexture2D(&desc, None, Some(&mut staging))?;
+        let staging = staging.context("no staging texture")?;
+        let region = windows::Win32::Graphics::Direct3D11::D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: surface.width,
+            bottom: surface.height,
+            back: 1,
+        };
+        context.CopySubresourceRegion(
+            &staging,
+            0,
+            0,
+            0,
+            0,
+            &surface.texture,
+            surface.subresource,
+            Some(&region),
+        );
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+        let (width, height) = (surface.width as usize, surface.height as usize);
+        let mut bgra = Vec::with_capacity(width * height * 4);
+        for row in 0..height {
+            let start = (mapped.pData as *const u8).add(row * mapped.RowPitch as usize);
+            bgra.extend_from_slice(std::slice::from_raw_parts(start, width * 4));
+        }
+        context.Unmap(&staging, 0);
+        Ok((bgra, surface.width, surface.height))
+    }
+}
+
 /// Encoders to try, best first: `--encoder` alone when given; otherwise
 /// each hardware encoder whose GPU is present (discrete first), then Media
 /// Foundation and software AV1, so a missing or outdated driver (NVENC
@@ -432,6 +579,27 @@ fn stream(
         (None, Some(hwnd)) => InputTarget::WindowArea(hwnd),
         (None, None) => InputTarget::Desktop(primary_monitor_rect()),
     });
+    // One window with isolated input: into that window's process only. If
+    // the adapter cannot attach, the viewer gets no input at all rather
+    // than the host's own mouse and keyboard.
+    let mut isolated = match (o.isolated, shared_window) {
+        (true, Some(hwnd)) if o.control => {
+            let config = crate::admit::config_dir(o.config_dir.as_ref())?;
+            match crate::isolated::Isolated::attach(hwnd, &config) {
+                Ok(isolated) => {
+                    println!("isolated input attached: the host keeps its own mouse and keyboard");
+                    Some(isolated)
+                }
+                Err(error) => {
+                    println!("isolated input unavailable, viewing only: {error:#}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let global_input = o.control && !o.isolated;
+    let mut secure = Secure::new();
     let (width, height) = first.surface.size();
     println!("capturing {width}x{height} at up to {} fps", o.fps);
     let chosen = crate::choose_codec(o, &codecs, session.media().path().kind == PathKind::Relay);
@@ -503,6 +671,17 @@ fn stream(
     } else {
         rate.max_bps
     };
+    // The viewer's image quality caps the rate; it can change it during the
+    // session (`Event::MaxBitrate`). Relays cap it further.
+    let ceiling_bps = (o.mbps * 2).max(20) * 1_000_000;
+    let mut viewer_cap = o.max_mbps_cap;
+    let max_bps = |kind: PathKind, cap: Option<u32>| {
+        let max = cap.map_or(ceiling_bps, |mbps| ceiling_bps.min(mbps * 1_000_000));
+        match kind {
+            PathKind::Relay => max.min(relay_max_bps),
+            PathKind::Direct => max,
+        }
+    };
     let mut path_kind = media.path().kind;
     let mut path_key = media.selected_path_key();
     if path_kind == PathKind::Relay {
@@ -517,6 +696,8 @@ fn stream(
     let frame_interval_us = 1_000_000 / u64::from(o.fps.max(1));
     let mut pending = Some(first);
     let mut follower = crate::resize::Follower::new((width, height));
+    // A shared application window's menus, for the viewer's window.
+    let mut host_menus = o.window_id.map(crate::menus::HostMenus::start);
     let mut resize_stream = None;
     let mut frames = 0u64;
     let mut encode_us = Vec::new();
@@ -536,17 +717,24 @@ fn stream(
             path_key = key;
             // Rate control restarts on the new path and probes it.
             host.path_changed();
-            host.set_max_bps(match path.kind {
-                PathKind::Relay => relay_max_bps,
-                PathKind::Direct => rate.max_bps,
-            });
+            host.set_max_bps(max_bps(path.kind, viewer_cap));
             println!(
                 "path changed to {path_kind:?} {}",
                 path_key.as_deref().unwrap_or("")
             );
         }
+        // The service agent shows and drives the secure desktop (UAC, sign
+        // in) while it is up, through Desktop Duplication.
+        if secure.privileged && secure.next_check <= Instant::now() {
+            secure.check();
+        }
         let frame = match pending.take() {
             Some(frame) => Some(frame),
+            None if secure.capture.is_some() => {
+                // Drain WGC so it does not queue frames meanwhile.
+                let _ = capture.next(clock.now_us());
+                secure.frame(&device, &clock)
+            }
             None => match capture.next(clock.now_us() + 500) {
                 Ok(CaptureEvent::Frame(frame)) => Some(frame),
                 Ok(CaptureEvent::Lost) => bail!("the capture source went away"),
@@ -556,7 +744,15 @@ fn stream(
                 Err(error) => bail!("capture failed: {error}"),
             },
         };
+        // With isolated input the game's own cursor is the one to show.
+        if let Some(input) = &mut isolated
+            && let Err(error) = input.tick(&send_cursor)
+        {
+            println!("isolated input stopped, viewing only: {error:#}");
+            isolated = None;
+        }
         if qa.is_none()
+            && isolated.is_none()
             && let Some(update) = capture.cursor()
         {
             if let Some(shape) = update.shape {
@@ -634,21 +830,75 @@ fn stream(
             let arrived = arrived.unwrap_or_else(|| clock.now_us());
             match Pointer::decode(&datagram) {
                 // A view-only device's input is dropped here, on the host.
-                Some(pointer) if o.control => {
-                    injector.pointer(&pointer);
-                }
-                Some(_) => {}
-                None => match Motion::decode(&datagram) {
-                    Some(motion) if o.control => {
-                        injector.motion(&motion);
+                Some(pointer) => {
+                    if let Some(input) = secure.input.as_ref().filter(|_| o.control) {
+                        input.pointer(pointer);
+                    } else if let Some(input) = &mut isolated {
+                        let _ = input.pointer(&pointer);
+                    } else if global_input {
+                        injector.pointer(&pointer);
                     }
-                    Some(_) => {}
+                }
+                None => match Motion::decode(&datagram) {
+                    Some(motion) => {
+                        if let Some(input) = secure.input.as_ref().filter(|_| o.control) {
+                            input.motion(motion);
+                        } else if let Some(input) = &mut isolated {
+                            let _ = input.motion(&motion);
+                        } else if global_input {
+                            injector.motion(&motion);
+                        }
+                    }
                     None => host.on_datagram(arrived, &datagram, rtt),
                 },
             }
         }
+        if let Some(menus) = &mut host_menus
+            && let Err(error) = menus.send_changes(handle, session)
+        {
+            println!("application menus stopped: {error:#}");
+            host_menus = None;
+        }
         while let Ok(event) = events.try_recv() {
-            if o.control {
+            if let frames_input::Event::Menu { id } = event {
+                if o.control
+                    && let Some(menus) = &host_menus
+                {
+                    menus.invoke(id);
+                }
+                continue;
+            }
+            if let frames_input::Event::MaxBitrate { mbps } = event {
+                viewer_cap = Some(u32::from(mbps).max(1));
+                host.set_max_bps(max_bps(media.path().kind, viewer_cap));
+                println!("the viewer's image quality: at most {mbps} Mbps");
+                continue;
+            }
+            if event == frames_input::Event::CloseWindow {
+                // As the window's close button would; it may ask to save.
+                if o.control
+                    && let Some(hwnd) = shared_window
+                {
+                    println!("the viewer asked to close the window");
+                    unsafe {
+                        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                            Some(hwnd),
+                            windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                            windows::Win32::Foundation::WPARAM(0),
+                            windows::Win32::Foundation::LPARAM(0),
+                        );
+                    }
+                }
+                continue;
+            }
+            if let Some(input) = secure.input.as_ref().filter(|_| o.control) {
+                input.event(event);
+            } else if let Some(input) = &mut isolated {
+                if let Err(error) = input.event(event) {
+                    println!("isolated input stopped, viewing only: {error:#}");
+                    isolated = None;
+                }
+            } else if global_input {
                 injector.event(event);
             }
         }

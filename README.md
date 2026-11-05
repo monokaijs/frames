@@ -12,21 +12,25 @@ Launch Frames and choose **Start sharing** under **Share this device** on the ho
 
 The first time a device connects, the host shows its name and a pairing code: allow it only if the other device shows the same code. **Accept and trust** lets it connect again without asking, **Accept this time** lets it in for this sharing session, and **Decline** refuses it. Devices trusted with Frames 0.4 or earlier are trusted again automatically on their first connection. Open the chevron on Connect to choose the view (application windows or full desktop) and host audio; Frames remembers these per device, along with the image quality.
 
+**Settings > Sharing > Access password** lets a device that knows it connect without anyone approving it at the host, for unattended access (sharing at login, the Windows service). When a host turns a device away, Frames offers to connect with its password. The password itself never leaves either device: both derive a key from it, the host stores only that key, and the viewer proves it knows the key for that connection only. Five wrong passwords within a minute pause password attempts for a minute. From a terminal: `frames next password set|clear|status` on the host, and `FRAMES_ACCESS_PASSWORD=... frames connect DEVICE_ID` on the viewer.
+
 Connections are end-to-end encrypted. Frames finds a direct path across networks and NATs where it can and otherwise relays through public relay servers (n0's, at about 8-10 Mbps); a relayed connection is marked as such. No ports need opening.
 
 On macOS, open the Frames DMG, drag Frames.app to Applications, and open it in the logged-in desktop session. Allow Local Network, Screen Recording, and Accessibility in System Settings > Privacy & Security. Accessibility is named Device Control and Data Access on newer macOS versions. A locked Mac must be unlocked locally before application control can continue.
 
 ## Remote windows
 
-**Application windows** (the default view) opens each of the host's application windows in its own local window, titled like the remote one; windows appear and close as they do on the host. When a remote window is resized, the local one follows in the same shape, and resizing a local window keeps the picture's shape, so no bars appear around it. **Full desktop** shows the whole remote screen. Closing a local window stops showing that remote window; the session ends when all are closed.
+**Application windows** (the default view) opens each of the host's application windows in its own local window, titled like the remote one, with the application's menus in that window (the menu bar on Mac while it is in front); windows appear and close as they do on the host. Closing a local window closes the remote one, as its close button would (a second close closes it here only). When a remote window is resized, the local one follows in the same shape, and resizing a local window keeps the picture's shape, so no bars appear around it. **Full desktop** shows the whole remote screen.
 
-**Control+Option+F11** (Ctrl+Alt+F11 on Windows) holds the pointer for games (relative mouse); **Ctrl+Alt+F12** gives it back. Cross-platform sessions swap Control and Command. Text and PNG clipboard sync is on by default.
+The **Frames menu** (the window menu on Windows, the menu bar on Mac) changes image quality during the session, sends files (or drop them on a window), shows live statistics (**Ctrl+Alt+F10** / Control+Option+F10) and disconnects. **Control+Option+F11** (Ctrl+Alt+F11 on Windows) holds the pointer for games (relative mouse); **Ctrl+Alt+F12** gives it back. Cross-platform sessions swap Control and Command; **Settings > Keyboard > Physical keys** keeps them in place. Text and PNG clipboard sync is on by default.
 
-Not yet on the current engine (they were in Frames 0.4): the host's application menus and the Frames menu in remote windows, closing a host window from its local window, the debug overlay, dropping files into remote windows (`frames next connect ID --send FILE` sends one), device preview images on device cards, gamepad and USB forwarding, and isolated input for One window sharing. See [docs/V2_PARITY.md](docs/V2_PARITY.md).
+Received files go to `~/Downloads/Frames` on the host, are checksum verified, resume after an interruption and never overwrite existing files. Only devices trusted for control can send them.
+
+**Settings > Forward gamepads** turns controllers connected to this device into Xbox controllers on Windows hosts you control (the host needs the ViGEmBus driver: `frames devices setup gamepad`). **Settings > USB passthrough** (Windows) passes chosen USB devices to Windows hosts over USB/IP. **Settings > Android ADB bridge** forwards this device's ADB server; on the host use `adb -H 127.0.0.1 -P 15037 devices`. See [device forwarding and setup](docs/DEVICE_FORWARDING.md).
 
 ## Sharing scopes
 
-Use **Start sharing** with **Everything** (default), **Selected windows**, or **One window**. The window modes open a searchable preview grid; select windows and press **Share**. Viewers then see only those windows.
+Use **Start sharing** with **Everything** (default), **Selected windows**, or **One window**. The window modes open a searchable preview grid; select windows and press **Share**. Viewers then see only those windows. On Windows, **One window** uses isolated input: the viewer's input goes into that application's process only, so the host's own mouse and keyboard stay free (eligible x64 applications in the same user session; see [isolated input](docs/SHARED_GAME.md)). If it cannot attach, the viewer can watch but not control.
 
 ## Command line
 
@@ -63,7 +67,7 @@ open dist/macos/Frames.app
 
 Mac builds reuse the previous signing identity or select a unique Developer ID/Apple Development certificate. Set `FRAMES_SIGN_IDENTITY` to choose one explicitly. Ad-hoc signing (`-`) can reset privacy grants after rebuilds. `FRAMES_MAC_HELPER` selects a development helper; Mac builds prepare a minimal LGPL codec runtime with Homebrew build dependencies. Windows builds fetch a checksum-pinned LGPL SDK. Run `python scripts/prepare_media.py` before direct Cargo commands on Windows, or `bash scripts/prepare_media_macos.sh` on Mac.
 
-An optional Windows service installs with `frames service install` from an Administrator terminal. It shares the signed-in desktop with this device's ID and trusted devices (copied when it is installed; new devices cannot be approved there). Uninstall with `frames service uninstall`. The service, secure desktop and Mac prelogin/FileVault access need further validation; see [validation](docs/VALIDATION.md).
+An optional Windows service installs with `frames service install` from an Administrator terminal. It shares the signed-in desktop with this device's ID, trusted devices and access password (copied when it is installed; new devices cannot be approved there, but one that knows the access password can connect). Uninstall with `frames service uninstall`. The service, secure desktop and Mac prelogin/FileVault access need further validation; see [validation](docs/VALIDATION.md).
 
 [Transport and latency](docs/LATENCY_REVIEW.md) ? [Launcher development](docs/LAUNCHER.md) ? [Validation](docs/VALIDATION.md)
 

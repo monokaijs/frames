@@ -157,10 +157,11 @@ pub async fn view(
         max_mbps: o.max_mbps_cap,
         catalog,
         window_id,
+        password: o.password.clone(),
+        preview: false,
     };
     let catalog = node.connect(target.clone()).await?;
     crate::admit::send_hello(&catalog, &node.id(), o.migrate_v1, asks(true, None, false)).await?;
-    crate::start_transfers(&catalog, o);
     let code = catalog.pairing_code()?;
     println!(
         "connected in {:.0} ms, pairing code {code} (a new host shows the same code)",
@@ -179,6 +180,7 @@ pub async fn view(
     let mut dismissed: HashSet<u64> = HashSet::new();
     let mut viewers = tokio::task::JoinSet::new();
     let mut audio_given = false;
+    let mut services_started = false;
     let mut listed = false;
     // A host seeing this device for the first time asks its user first.
     let first_list = tokio::time::sleep(std::time::Duration::from_secs(150));
@@ -220,6 +222,12 @@ pub async fn view(
                         asks(false, Some(window.id), audio),
                     )
                     .await?;
+                    // Files and gamepads go with the first window's session
+                    // (the host serves them on streaming sessions).
+                    if !audio_given && !services_started {
+                        crate::start_services(&session, o);
+                        services_started = true;
+                    }
                     audio_given |= audio;
                     println!("opening window {}: {}", window.id, window.title);
                     let mut options = o.clone();
@@ -255,12 +263,16 @@ pub async fn view(
     }
     viewers.shutdown().await;
     receiver.abort();
-    let refused = catalog
-        .close_reason()
-        .is_some_and(|reason| reason == "not approved");
+    let reason = catalog.close_reason();
     catalog.close("viewer left");
-    if refused {
-        anyhow::bail!("the host refused this device (not approved there)");
+    match reason.as_deref() {
+        Some(crate::admit::NOT_APPROVED) => {
+            anyhow::bail!("the host refused this device (not approved there)")
+        }
+        Some(crate::admit::WRONG_PASSWORD) => {
+            anyhow::bail!("the host refused this device: wrong access password")
+        }
+        _ => {}
     }
     Ok(())
 }

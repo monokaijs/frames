@@ -334,7 +334,12 @@ impl MacInjector {
                     Self::post(unsafe { CGEventCreateKeyboardEvent(self.source, code, down) });
                 }
             }
-            Event::ReleaseAll | Event::Mode { .. } => {}
+            // Window actions are the host session's, not the injector's.
+            Event::ReleaseAll
+            | Event::Mode { .. }
+            | Event::CloseWindow
+            | Event::MaxBitrate { .. }
+            | Event::Menu { .. } => {}
         }
     }
 }

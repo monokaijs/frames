@@ -1,6 +1,6 @@
 //! Windows viewer: frames-net → v2 client engine → D3D11VA → flip presenter.
 
-use crate::lane::InputLane;
+use crate::lane::{Captured, InputLane};
 use crate::stats::Samples;
 use crate::{Options, win};
 use anyhow::Result;
@@ -19,6 +19,7 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     // The host's cursor shape and visibility, applied on the viewer thread.
     let (cursor_tx, cursor_rx) = std::sync::mpsc::channel();
     let (sizes_tx, sizes) = std::sync::mpsc::channel();
+    let (menus_tx, menus) = std::sync::mpsc::channel();
     let cursor_reader = {
         let session = session.clone();
         let (cursor_streams, mut cursor_incoming) = tokio::sync::mpsc::unbounded_channel();
@@ -26,6 +27,7 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
             session.clone(),
             cursor_streams,
             sizes_tx,
+            menus_tx,
             o.adb.then_some(o.adb_server),
         ));
         tokio::spawn(async move {
@@ -49,7 +51,10 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     // Buttons, keys, and wheel: one reliable stream, written by a task.
     let (mut lane, writer) = InputLane::open(&session).await?;
     // Cross-platform sessions swap Control and Command, as v1 does.
-    lane.swap_modifiers = !info.platform.is_empty() && info.platform != crate::platform();
+    // Control and Command trade places across platforms, unless the user
+    // wants the same physical keys (`--physical-keys`, for terminals).
+    lane.swap_modifiers =
+        !o.physical_keys && !info.platform.is_empty() && info.platform != crate::platform();
     if lane.swap_modifiers {
         println!("keys: Control and Command swapped ({} host)", info.platform);
     }
@@ -70,6 +75,7 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
         let updates = crate::streams::HostUpdates {
             cursor: cursor_rx,
             sizes,
+            menus,
         };
         view(&session, info, &o, lane, updates, clipboard, audio)
     })
@@ -209,9 +215,36 @@ fn view(
     let mut superseded = 0u64;
     let mut errors = 0u64;
     let mut reported_clean = 0u64;
+    let mut close_asked = false;
+    let mut showing_stats = false;
     loop {
-        if o.deadline().is_some_and(|d| started.elapsed() >= d) || win::close_requested() {
+        if o.deadline().is_some_and(|d| started.elapsed() >= d)
+            || crate::DISCONNECT.load(std::sync::atomic::Ordering::Relaxed)
+        {
             break;
+        }
+        // A window of a host application: the first close asks the host
+        // window to close (its going away ends this session); a second one
+        // closes here.
+        for path in win::take_dropped(viewer) {
+            crate::transfer::send_dropped(session, path);
+        }
+        if win::close_requested() {
+            if o.window_id.is_none() || close_asked {
+                break;
+            }
+            close_asked = true;
+            win::clear_close();
+            println!("asking the host to close its window");
+            let at_us = clock.now_us();
+            lane.send(
+                &media,
+                &clock,
+                vec![Captured::Event {
+                    event: frames_input::Event::CloseWindow,
+                    at_us,
+                }],
+            );
         }
         if session.is_closed() {
             println!("the host left");
@@ -223,6 +256,10 @@ fn view(
         let mut cursor_updates = 0u64;
         // The host window resized: a decoder for the new size, and this
         // window in the new shape at its current scale.
+        while let Ok(items) = updates.menus.try_recv() {
+            println!("host menus: {}", crate::menus::summary(&items));
+            win::set_host_menu(viewer, &items);
+        }
         while let Ok(size) = updates.sizes.try_recv() {
             println!("stream resized to {}x{}", size.0, size.1);
             decoder = open_decoder(size)?;
@@ -285,9 +322,13 @@ fn view(
         if started.elapsed() >= next_report {
             let stats = client.stats();
             let (n, p50, p95) = latency.take_window();
-            if o.stats_title {
+            if o.stats_title ^ win::stats_toggled() {
                 let title = crate::stats::window_title(n, p50, p95, &path, stats.frames_lost);
                 win::set_title(viewer, &title);
+                showing_stats = true;
+            } else if showing_stats {
+                win::set_title(viewer, &crate::viewer_title(o, &info));
+                showing_stats = false;
             }
             println!(
                 "client t={:>3}s presented {n:>3}/s clean {:>3} lost {} | capture to present p50 {p50:>5.2} p95 {p95:>5.2} ms | recoveries {} nacks {} | {:?} rtt {:.1} ms",

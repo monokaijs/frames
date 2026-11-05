@@ -15,9 +15,12 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F11, VK_F12};
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F10, VK_F11, VK_F12};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
+
+#[path = "win_menus.rs"]
+pub mod menus;
 
 pub fn dpi_aware() {
     unsafe {
@@ -29,6 +32,10 @@ thread_local! {
     /// The picture's size: the viewer window keeps its shape when resized,
     /// so the picture fills it (no bars).
     static ASPECT: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
+    /// Live statistics in the title, flipped by Ctrl+Alt+F10.
+    static STATS: Cell<bool> = const { Cell::new(false) };
+    /// Files dropped on the viewer, for the host.
+    static DROPPED: RefCell<Vec<std::path::PathBuf>> = const { RefCell::new(Vec::new()) };
     /// Set when the user closes a window this thread created (each viewer
     /// window runs on its own thread, so closing one ends only its session).
     static CLOSED: Cell<bool> = const { Cell::new(false) };
@@ -36,6 +43,11 @@ thread_local! {
 
 pub fn close_requested() -> bool {
     CLOSED.with(Cell::get)
+}
+
+/// Forgets a close request (it was turned into a request to the host).
+pub fn clear_close() {
+    CLOSED.with(|closed| closed.set(false));
 }
 
 fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -353,6 +365,12 @@ fn viewer_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<Captur
         // Ctrl+Alt+F12: release remote input and minimize (as in v1); the
         // shortcut itself never reaches the host.
         // Ctrl+Alt+F11: relative mouse on or off (as in v1); never sent.
+        // Ctrl+Alt+F10: live statistics on or off (v1's debug overlay
+        // shortcut); never sent.
+        WM_KEYDOWN | WM_SYSKEYDOWN if w.0 == usize::from(VK_F10.0) && release_shortcut_held() => {
+            STATS.with(|stats| stats.set(!stats.get()));
+            None
+        }
         WM_KEYDOWN | WM_SYSKEYDOWN if w.0 == usize::from(VK_F11.0) && release_shortcut_held() => {
             set_relative(hwnd, !relative(), true);
             None
@@ -415,12 +433,72 @@ unsafe extern "system" fn viewer_procedure(
             return LRESULT(1);
         }
     }
+    // An item of the host application's menus (`set_host_menu`).
+    if message == WM_COMMAND && (w.0 & 0xffff) >= HOST_MENU_BASE && (l.0 == 0) {
+        let id = ((w.0 & 0xffff) - HOST_MENU_BASE) as u32;
+        let at_us = SystemClock::new().now_us();
+        CAPTURED.with(|c| {
+            c.borrow_mut().push(Captured::Event {
+                event: Event::Menu { id },
+                at_us,
+            })
+        });
+        return LRESULT(0);
+    }
+    if message == WM_SYSCOMMAND {
+        let at_us = SystemClock::new().now_us();
+        let quality = |quality: u8| Captured::Event {
+            event: Event::MaxBitrate {
+                mbps: crate::quality_mbps(quality),
+            },
+            at_us,
+        };
+        let handled = match w.0 & 0xfff0 {
+            MENU_HIGH => Some(Some(quality(0))),
+            MENU_MEDIUM => Some(Some(quality(1))),
+            MENU_LOW => Some(Some(quality(2))),
+            MENU_SEND => {
+                choose_files(hwnd);
+                Some(None)
+            }
+            MENU_STATS => {
+                STATS.with(|stats| stats.set(!stats.get()));
+                Some(None)
+            }
+            MENU_RELEASE => {
+                set_relative(hwnd, false, true);
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                }
+                Some(Some(Captured::Event {
+                    event: Event::ReleaseAll,
+                    at_us,
+                }))
+            }
+            MENU_DISCONNECT => {
+                crate::DISCONNECT.store(true, Ordering::Relaxed);
+                Some(None)
+            }
+            _ => None,
+        };
+        if let Some(captured) = handled {
+            if let Some(captured) = captured {
+                CAPTURED.with(|c| c.borrow_mut().push(captured));
+            }
+            return LRESULT(0);
+        }
+    }
+    if message == WM_DROPFILES {
+        let files = dropped_files(windows::Win32::UI::Shell::HDROP(w.0 as *mut _));
+        DROPPED.with(|dropped| dropped.borrow_mut().extend(files));
+        return LRESULT(0);
+    }
     if message == WM_SIZING
         && let Some(aspect) = ASPECT.with(Cell::get)
     {
         // SAFETY: WM_SIZING carries the proposed window rectangle.
         let rect = unsafe { &mut *(l.0 as *mut RECT) };
-        keep_aspect(rect, w.0 as u32, aspect);
+        keep_aspect(hwnd, rect, w.0 as u32, aspect);
         return LRESULT(1);
     }
     if let Some(captured) = viewer_input(hwnd, message, w, l) {
@@ -493,7 +571,7 @@ pub fn window(title: PCWSTR, kind: Kind, x: i32, width: u32, height: u32) -> Res
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
-        Ok(CreateWindowExW(
+        let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             class,
             title,
@@ -506,23 +584,224 @@ pub fn window(title: PCWSTR, kind: Kind, x: i32, width: u32, height: u32) -> Res
             None,
             Some(instance.into()),
             None,
-        )?)
+        )?;
+        // Files dropped on the viewer go to the host; the window menu has
+        // the Frames commands.
+        if matches!(kind, Kind::Viewer) {
+            windows::Win32::UI::Shell::DragAcceptFiles(hwnd, true);
+            add_frames_menu(hwnd);
+        }
+        Ok(hwnd)
     }
 }
 
-/// Border and title bar sizes of a viewer window (left+right, top+bottom).
-fn frame_extra() -> (i32, i32) {
+// Frames commands in the viewer's window menu (title bar icon, Alt+Space).
+// WM_SYSCOMMAND reserves the low four bits, so ids step by 16.
+const MENU_HIGH: usize = 0x100;
+const MENU_MEDIUM: usize = 0x110;
+const MENU_LOW: usize = 0x120;
+const MENU_SEND: usize = 0x130;
+const MENU_STATS: usize = 0x140;
+const MENU_RELEASE: usize = 0x150;
+const MENU_DISCONNECT: usize = 0x160;
+
+fn add_frames_menu(hwnd: HWND) {
+    unsafe {
+        let menu = GetSystemMenu(hwnd, false);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        for (id, label) in [
+            (MENU_HIGH, w!("High quality")),
+            (MENU_MEDIUM, w!("Medium quality")),
+            (MENU_LOW, w!("Low quality")),
+            (MENU_SEND, w!("Send file...")),
+            (MENU_STATS, w!("Show statistics\tCtrl+Alt+F10")),
+            (MENU_RELEASE, w!("Release input\tCtrl+Alt+F12")),
+            (MENU_DISCONNECT, w!("Disconnect")),
+        ] {
+            let _ = AppendMenuW(menu, MF_STRING, id, label);
+        }
+    }
+}
+
+/// Files chosen with Send file..., by viewer window (the dialog runs on its
+/// own thread so the video keeps playing).
+static CHOSEN: std::sync::Mutex<Vec<(usize, std::path::PathBuf)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Shows the file dialog for `hwnd` on a new thread.
+fn choose_files(hwnd: HWND) {
+    let owner = hwnd.0 as usize;
+    std::thread::spawn(move || {
+        use windows::Win32::System::Com::{
+            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+            CoTaskMemFree,
+        };
+        use windows::Win32::UI::Shell::{
+            FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FileOpenDialog, IFileOpenDialog,
+            SIGDN_FILESYSPATH,
+        };
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let Ok(dialog) =
+                CoCreateInstance::<_, IFileOpenDialog>(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
+            else {
+                return;
+            };
+            if let Ok(options) = dialog.GetOptions() {
+                let _ = dialog.SetOptions(options | FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST);
+            }
+            let _ = dialog.SetTitle(w!("Send files to the remote computer"));
+            // Err when cancelled.
+            if dialog.Show(Some(HWND(owner as *mut _))).is_err() {
+                return;
+            }
+            let Ok(items) = dialog.GetResults() else {
+                return;
+            };
+            let mut chosen = Vec::new();
+            for index in 0..items.GetCount().unwrap_or(0) {
+                if let Ok(item) = items.GetItemAt(index)
+                    && let Ok(name) = item.GetDisplayName(SIGDN_FILESYSPATH)
+                {
+                    if let Ok(path) = name.to_string() {
+                        chosen.push((owner, std::path::PathBuf::from(path)));
+                    }
+                    CoTaskMemFree(Some(name.0 as *const _));
+                }
+            }
+            CHOSEN.lock().unwrap().extend(chosen);
+        }
+    });
+}
+
+/// Whether Ctrl+Alt+F10 turned live statistics on for this thread's viewer.
+pub fn stats_toggled() -> bool {
+    STATS.with(Cell::get)
+}
+
+/// Files dropped on (or chosen for) this viewer window since the last call.
+pub fn take_dropped(viewer: HWND) -> Vec<std::path::PathBuf> {
+    let mut files = DROPPED.with(|dropped| std::mem::take(&mut *dropped.borrow_mut()));
+    let mut chosen = CHOSEN.lock().unwrap();
+    let owner = viewer.0 as usize;
+    files.extend(
+        chosen
+            .iter()
+            .filter(|(o, _)| *o == owner)
+            .map(|(_, p)| p.clone()),
+    );
+    chosen.retain(|(o, _)| *o != owner);
+    files
+}
+
+/// The files of a WM_DROPFILES message.
+fn dropped_files(drop: windows::Win32::UI::Shell::HDROP) -> Vec<std::path::PathBuf> {
+    use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW};
+    let mut files = Vec::new();
+    unsafe {
+        let count = DragQueryFileW(drop, u32::MAX, None);
+        for index in 0..count {
+            let length = DragQueryFileW(drop, index, None) as usize;
+            let mut name = vec![0u16; length + 1];
+            let copied = DragQueryFileW(drop, index, Some(&mut name)) as usize;
+            files.push(std::path::PathBuf::from(String::from_utf16_lossy(
+                &name[..copied],
+            )));
+        }
+        DragFinish(drop);
+    }
+    files
+}
+
+/// Border, title bar and menu bar sizes of a viewer window (left+right,
+/// top+bottom).
+fn frame_extra(hwnd: HWND) -> (i32, i32) {
     let mut rect = RECT::default();
     unsafe {
-        let _ = AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false);
+        let has_menu = !GetMenu(hwnd).is_invalid();
+        let _ = AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, has_menu);
     }
     (rect.right - rect.left, rect.bottom - rect.top)
 }
 
+/// Menu bar command ids of the host application's items (`Event::Menu`).
+const HOST_MENU_BASE: usize = 0x8000;
+
+/// Shows the host application's menus as this viewer window's menu bar,
+/// keeping its client size.
+pub fn set_host_menu(hwnd: HWND, items: &[crate::menus::Item]) {
+    fn build(items: &[crate::menus::Item]) -> HMENU {
+        unsafe {
+            let menu = CreatePopupMenu().unwrap_or_default();
+            for item in items {
+                if item.separator {
+                    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+                    continue;
+                }
+                let title: Vec<u16> = item
+                    .title
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let mut flags = MF_STRING;
+                if !item.enabled {
+                    flags |= MF_GRAYED;
+                }
+                if item.checked {
+                    flags |= MF_CHECKED;
+                }
+                if item.children.is_empty() {
+                    let id = if item.id > 0 && (item.id as usize) < 0x7fff {
+                        HOST_MENU_BASE + item.id as usize
+                    } else {
+                        0
+                    };
+                    let _ = AppendMenuW(menu, flags, id, PCWSTR(title.as_ptr()));
+                } else {
+                    let submenu = build(&item.children);
+                    let _ = AppendMenuW(
+                        menu,
+                        flags | MF_POPUP,
+                        submenu.0 as usize,
+                        PCWSTR(title.as_ptr()),
+                    );
+                }
+            }
+            menu
+        }
+    }
+    let client = client_size(hwnd);
+    unsafe {
+        let old = GetMenu(hwnd);
+        let bar = if items.is_empty() {
+            HMENU::default()
+        } else {
+            let bar = CreateMenu().unwrap_or_default();
+            for top in items {
+                let title: Vec<u16> = top.title.encode_utf16().chain(std::iter::once(0)).collect();
+                let submenu = build(&top.children);
+                let _ = AppendMenuW(
+                    bar,
+                    MF_STRING | MF_POPUP,
+                    submenu.0 as usize,
+                    PCWSTR(title.as_ptr()),
+                );
+            }
+            bar
+        };
+        let _ = SetMenu(hwnd, Some(bar));
+        if !old.is_invalid() {
+            let _ = DestroyMenu(old);
+        }
+    }
+    // The menu bar sits outside the client area: keep the picture's size.
+    set_client_size(hwnd, client.0, client.1);
+}
+
 /// Adjusts a window rectangle being dragged so its client area has the
 /// picture's shape: the dragged edge decides, the opposite one follows.
-fn keep_aspect(rect: &mut RECT, edge: u32, (width, height): (u32, u32)) {
-    let (extra_w, extra_h) = frame_extra();
+fn keep_aspect(hwnd: HWND, rect: &mut RECT, edge: u32, (width, height): (u32, u32)) {
+    let (extra_w, extra_h) = frame_extra(hwnd);
     let client_w = (rect.right - rect.left - extra_w).max(1);
     let client_h = (rect.bottom - rect.top - extra_h).max(1);
     let ratio = f64::from(width.max(1)) / f64::from(height.max(1));
@@ -578,7 +857,7 @@ pub fn work_area() -> (u32, u32) {
 
 /// Gives a window this client size, keeping its position.
 pub fn set_client_size(hwnd: HWND, width: u32, height: u32) {
-    let (extra_w, extra_h) = frame_extra();
+    let (extra_w, extra_h) = frame_extra(hwnd);
     unsafe {
         let _ = SetWindowPos(
             hwnd,

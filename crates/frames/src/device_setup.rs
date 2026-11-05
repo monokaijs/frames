@@ -17,7 +17,7 @@ fn launch(target: &str) -> anyhow::Result<()> {
         ["gamepad", "usb-export", "usb-host"].contains(&target),
         "Unknown device setup target"
     );
-    frames_native::usb::elevate(&format!("devices setup {target}"))
+    frames_devices::usb::elevate(&format!("devices setup {target}"))
 }
 
 pub async fn install(target: &str) -> anyhow::Result<()> {
@@ -33,14 +33,14 @@ pub async fn install(target: &str) -> anyhow::Result<()> {
         }
     }
     let present = match target {
-        "gamepad" => frames_native::gamepad::host_available().is_ok(),
-        "usb-host" => frames_native::usb::host_available().is_ok(),
-        "usb-export" => frames_native::usb::inventory().is_ok(),
+        "gamepad" => frames_devices::gamepad::host_available().is_ok(),
+        "usb-host" => frames_devices::usb::host_available().is_ok(),
+        "usb-export" => frames_devices::usb::inventory().is_ok(),
         _ => false,
     };
     if !present {
         anyhow::ensure!(
-            !frames_native::usb::package_installed(target)?,
+            !frames_devices::usb::package_installed(target)?,
             "Device support is already installed but unavailable. Repair it through Windows Installed Apps, then refresh devices. Frames will not downgrade an existing package."
         );
         use sha2::{Digest, Sha256};
@@ -75,7 +75,7 @@ pub async fn install(target: &str) -> anyhow::Result<()> {
         tokio::task::spawn_blocking(move || run_installer(&path)).await??;
     }
     if target == "usb-export" {
-        tokio::task::spawn_blocking(frames_native::usb::configure_isolation).await??;
+        tokio::task::spawn_blocking(frames_devices::usb::configure_isolation).await??;
     }
     Ok(())
 }
@@ -84,7 +84,7 @@ fn run_installer(path: &std::path::Path) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        let verified = std::process::Command::new(frames_native::usb::system_tool("WindowsPowerShell/v1.0/powershell.exe")?).args(["-NoProfile", "-NonInteractive", "-Command",
+        let verified = std::process::Command::new(frames_devices::usb::system_tool("WindowsPowerShell/v1.0/powershell.exe")?).args(["-NoProfile", "-NonInteractive", "-Command",
             "if ((Get-AuthenticodeSignature -LiteralPath $env:FRAMES_DEVICE_INSTALLER).Status -ne 'Valid') { throw 'Device installer signature is invalid' }"])
             .env("FRAMES_DEVICE_INSTALLER", path).creation_flags(0x08000000).output()?;
         anyhow::ensure!(
@@ -92,7 +92,7 @@ fn run_installer(path: &std::path::Path) -> anyhow::Result<()> {
             "Device installer signature verification failed"
         );
         let status = if path.extension().is_some_and(|e| e == "msi") {
-            std::process::Command::new(frames_native::usb::system_tool("msiexec.exe")?)
+            std::process::Command::new(frames_devices::usb::system_tool("msiexec.exe")?)
                 .arg("/i")
                 .arg(path)
                 .status()?

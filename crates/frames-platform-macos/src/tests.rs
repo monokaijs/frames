@@ -192,3 +192,12 @@ fn real_time_threads_and_video_service_type() {
     use std::os::fd::AsRawFd;
     system::set_video_service_type(socket.as_raw_fd()).expect("SO_NET_SERVICE_TYPE");
 }
+
+#[test]
+fn pixel_buffers_read_back_as_packed_bgra() {
+    let buffer = PixelBuffer::synthetic(64, 36, 3).expect("synthetic frame");
+    let (bytes, width, height) = buffer.bgra().expect("readable");
+    assert_eq!((width, height), (64, 36));
+    assert_eq!(bytes.len(), 64 * 36 * 4);
+    assert!(bytes.chunks_exact(4).all(|p| p[3] == 255), "opaque BGRA");
+}

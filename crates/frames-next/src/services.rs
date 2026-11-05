@@ -28,12 +28,15 @@ impl HostServices {
         let (clipboard_tx, clipboard) = std::sync::mpsc::channel();
         let (file_tx, mut file_rx) = tokio::sync::mpsc::unbounded_channel::<Streams>();
         let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::unbounded_channel::<Streams>();
+        let (devices_tx, mut devices_rx) = tokio::sync::mpsc::unbounded_channel::<Streams>();
         let routes = Routes {
             input: Some(input_tx),
             clipboard: (o.clipboard != clip::Mode::Off).then_some(clipboard_tx),
             file: o.control.then_some(file_tx),
             // Reading this user's files also needs control trust.
             fetch: o.control.then_some(fetch_tx),
+            // Virtual controllers are input: control trust only.
+            devices: o.control.then_some(devices_tx),
         };
         let mut tasks = vec![tokio::spawn(route(session.clone(), routes))];
         let count = event_count.clone();
@@ -62,6 +65,17 @@ impl HostServices {
                     match transfer::receive(streams, dir).await {
                         Ok(path) => println!("received {}", path.display()),
                         Err(error) => println!("file transfer failed: {error:#}"),
+                    }
+                });
+            }
+        }));
+        let device_session = session.clone();
+        tasks.push(tokio::spawn(async move {
+            while let Some(streams) = devices_rx.recv().await {
+                let session = device_session.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = crate::pads::host(session, streams).await {
+                        println!("gamepads stopped: {error:#}");
                     }
                 });
             }

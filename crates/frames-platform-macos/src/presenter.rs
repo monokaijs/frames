@@ -61,6 +61,13 @@ pub enum MacInput {
         relative: bool,
         at_us: u64,
     },
+    /// Live statistics shown or hidden (Control+Option+F10).
+    ToggleStats,
+    /// A Frames menu command: 1-3 image quality high/medium/low, 4 live
+    /// statistics, 6 disconnect.
+    Command(i32),
+    /// An item of the host application's menus, by its id.
+    Menu(u32),
 }
 
 type InputHandler = Box<dyn FnMut(MacInput) + Send>;
@@ -105,6 +112,9 @@ unsafe extern "C" fn on_input(
             dy: b,
             at_us,
         },
+        ffi::INPUT_STATS => MacInput::ToggleStats,
+        ffi::INPUT_COMMAND => MacInput::Command(a),
+        ffi::INPUT_MENU => MacInput::Menu(a.max(0) as u32),
         ffi::INPUT_MODE => MacInput::Mode {
             relative: a != 0,
             at_us,
@@ -201,6 +211,50 @@ impl MacPresenter {
     pub fn resize(&self, width: u32, height: u32) {
         // SAFETY: live presenter.
         unsafe { ffi::frames_mac_presenter_resize(self.handle, width, height) };
+    }
+
+    /// With `on`, the window's first close is only a request
+    /// ([`Self::take_close_request`]); a second one closes it.
+    pub fn intercept_close(&self, on: bool) {
+        // SAFETY: live presenter.
+        unsafe { ffi::frames_mac_presenter_intercept_close(self.handle, on) };
+    }
+
+    /// Files dropped on the window since the last call, as a JSON array of
+    /// paths; `None` when there were none.
+    pub fn take_dropped_json(&self) -> Option<String> {
+        let mut buffer = vec![0u8; 16 * 1024];
+        loop {
+            // SAFETY: live presenter; Swift writes at most `capacity` bytes.
+            let length = unsafe {
+                ffi::frames_mac_presenter_take_dropped(
+                    self.handle,
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                )
+            };
+            if length == 0 {
+                return None;
+            }
+            if length <= buffer.len() {
+                buffer.truncate(length);
+                return Some(String::from_utf8_lossy(&buffer).into_owned());
+            }
+            buffer.resize(length, 0);
+        }
+    }
+
+    /// The host application's menus (JSON, `frames_mac_app_menus`'s form)
+    /// for the menu bar while this window is in front.
+    pub fn set_menus(&self, json: &str) {
+        // SAFETY: live presenter; Swift copies the text.
+        unsafe { ffi::frames_mac_presenter_set_menus(self.handle, json.as_ptr(), json.len()) };
+    }
+
+    /// Whether the user asked to close the window since the last call.
+    pub fn take_close_request(&self) -> bool {
+        // SAFETY: live presenter.
+        unsafe { ffi::frames_mac_presenter_take_close_request(self.handle) }
     }
 
     /// Whether the user closed the window.

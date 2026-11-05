@@ -93,6 +93,66 @@ pub fn revoke(id: &str) -> Result<bool> {
     Ok(removed)
 }
 
+/// Sets this device's access password: devices that give it connect
+/// without anyone approving them here (`crate::password`).
+pub fn set_access_password(password: &str) -> Result<()> {
+    let config = admit::config_dir(None)?;
+    let id = admit::device_key(&config)?.id();
+    crate::password::set(&config, &id, password)
+}
+
+pub fn clear_access_password() -> Result<()> {
+    crate::password::clear(&admit::config_dir(None)?)
+}
+
+pub fn access_password_set() -> bool {
+    admit::config_dir(None).is_ok_and(|config| crate::password::is_set(&config))
+}
+
+/// A PNG preview of a trusted host's screen (`crate::preview`); the host
+/// refuses devices it does not trust. Gives up after `wait`.
+pub async fn preview(id: &str, wait: Duration) -> Result<Vec<u8>> {
+    let config = admit::config_dir(None)?;
+    let key = admit::device_key(&config)?;
+    let fetch = async {
+        let node = frames_net::Node::bind(&key, frames_net::NodeConfig::default()).await?;
+        let target: iroh::EndpointAddr =
+            match frames_net::local::find(id, Duration::from_millis(1500))
+                .await
+                .ok()
+                .flatten()
+            {
+                Some(nearby) => nearby.addr,
+                None => endpoint(id)?.into(),
+            };
+        let session = node.connect(target).await?;
+        admit::send_hello(
+            &session,
+            &node.id(),
+            false,
+            admit::Asks {
+                decoders: Vec::new(),
+                window: None,
+                name: String::new(),
+                audio: false,
+                max_mbps: None,
+                catalog: false,
+                window_id: None,
+                password: None,
+                preview: true,
+            },
+        )
+        .await?;
+        let png = crate::preview::receive(&session).await;
+        session.close("preview received");
+        node.close().await;
+        png
+    };
+    tokio::time::timeout(wait, fetch)
+        .await
+        .context("no preview in time")?
+}
+
 /// Whether `text` is a full device id (64 hex digits).
 pub fn is_device_id(text: &str) -> bool {
     text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit())

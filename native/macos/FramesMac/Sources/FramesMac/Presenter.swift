@@ -23,8 +23,12 @@ final class Presenter: @unchecked Sendable {
     /// Where the window's input goes (set by the Rust viewer).
     let input = InputRelay()
     private var inputView: InputView?
+    /// The window's view (windowed presenters).
+    var view: InputView? { inputView }
     /// Set once the user closes the window (ABI 4).
     let closed = CloseWatcher()
+    /// Files dropped on the window, for the host (ABI 4).
+    let drops = DroppedFiles()
 
     init?(width: Int, height: Int, windowed: Bool) {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { return nil }
@@ -70,6 +74,7 @@ final class Presenter: @unchecked Sendable {
         var refresh = 60.0
         let input = self.input
         let closed = self.closed
+        let drops = self.drops
         let makeWindow = { @MainActor () -> (NSWindow?, Double, InputView) in
             let hz = Double(NSScreen.main?.maximumFramesPerSecond ?? 60)
             let scale = NSScreen.main?.backingScaleFactor ?? 2
@@ -88,6 +93,8 @@ final class Presenter: @unchecked Sendable {
             // Resizing keeps the picture's shape: no bars around it.
             window.contentAspectRatio = NSSize(width: CGFloat(width), height: CGFloat(height))
             let view = InputView(frame: frame, relay: input)
+            view.drops = drops
+            view.registerForDraggedTypes([.fileURL])
             view.wantsLayer = true
             view.layer = layer
             window.contentView = view
@@ -292,14 +299,46 @@ final class PresentedTime: @unchecked Sendable {
 }
 
 /// Notices the user closing a presenter window; read from any thread.
+/// With `intercept`, the first close only records a request (the viewer
+/// asks the host window to close; its going away ends the session) and a
+/// second one closes the window.
 final class CloseWatcher: NSObject, NSWindowDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private var value = false
+    private var intercept = false
+    private var requested = false
+    private var asked = false
+
+    @MainActor func windowShouldClose(_ sender: NSWindow) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if intercept && !asked {
+            asked = true
+            requested = true
+            return false
+        }
+        return true
+    }
 
     @MainActor func windowWillClose(_ notification: Notification) {
         lock.lock()
         value = true
         lock.unlock()
+    }
+
+    func setIntercept(_ on: Bool) {
+        lock.lock()
+        intercept = on
+        lock.unlock()
+    }
+
+    /// Whether a close was requested since the last call.
+    func takeRequest() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let was = requested
+        requested = false
+        return was
     }
 
     var isClosed: Bool {
@@ -313,6 +352,74 @@ final class CloseWatcher: NSObject, NSWindowDelegate, @unchecked Sendable {
 public func framesMacPresenterResize(_ handle: UnsafeMutableRawPointer?, _ width: UInt32, _ height: UInt32) {
     guard let handle else { return }
     borrowed(handle, as: Presenter.self).resize(width: Int(width), height: Int(height))
+}
+
+/// Paths of files dropped on a presenter window, until taken.
+final class DroppedFiles: @unchecked Sendable {
+    private let lock = NSLock()
+    private var paths: [String] = []
+
+    func add(_ new: [String]) {
+        lock.lock()
+        paths.append(contentsOf: new)
+        lock.unlock()
+    }
+
+    func take() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        let taken = paths
+        paths = []
+        return taken
+    }
+}
+
+/// Files dropped on the window since the last call, as a UTF-8 JSON array
+/// of paths (ABI 4). Written to `buffer` when it fits in `capacity`; the
+/// length is returned either way, and the files are kept until they fit.
+@_cdecl("frames_mac_presenter_take_dropped")
+public func framesMacPresenterTakeDropped(
+    _ handle: UnsafeMutableRawPointer?, _ buffer: UnsafeMutablePointer<UInt8>?, _ capacity: Int
+) -> Int {
+    guard let handle else { return 0 }
+    let drops = borrowed(handle, as: Presenter.self).drops
+    let paths = drops.take()
+    guard !paths.isEmpty, let json = try? JSONSerialization.data(withJSONObject: paths) else { return 0 }
+    guard let buffer, json.count <= capacity else {
+        drops.add(paths)
+        return json.count
+    }
+    json.copyBytes(to: buffer, count: json.count)
+    return json.count
+}
+
+/// The shared application's menus for this window's menu bar (ABI 4):
+/// UTF-8 JSON as `frames_mac_app_menus` makes it; items are chosen as
+/// FRAMES_MAC_INPUT_MENU (a = id).
+@_cdecl("frames_mac_presenter_set_menus")
+public func framesMacPresenterSetMenus(_ handle: UnsafeMutableRawPointer?, _ utf8: UnsafePointer<UInt8>?, _ length: Int) {
+    guard let handle, let utf8 else { return }
+    let data = Data(bytes: utf8, count: length)
+    let presenter = borrowed(handle, as: Presenter.self)
+    DispatchQueue.main.async {
+        MainActor.assumeIsolated {
+            guard let view = presenter.view else { return }
+            view.hostMenus = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] ?? []
+            refreshViewerMenu(for: view)
+        }
+    }
+}
+
+@_cdecl("frames_mac_presenter_intercept_close")
+public func framesMacPresenterInterceptClose(_ handle: UnsafeMutableRawPointer?, _ on: Bool) {
+    guard let handle else { return }
+    borrowed(handle, as: Presenter.self).closed.setIntercept(on)
+}
+
+@_cdecl("frames_mac_presenter_take_close_request")
+public func framesMacPresenterTakeCloseRequest(_ handle: UnsafeMutableRawPointer?) -> Bool {
+    guard let handle else { return false }
+    return borrowed(handle, as: Presenter.self).closed.takeRequest()
 }
 
 @_cdecl("frames_mac_presenter_closed")
@@ -416,7 +523,7 @@ private final class WeakInputView: @unchecked Sendable {
 
 /// The presenter window's content: forwards mouse, wheel, and key events.
 final class InputView: NSView {
-    private let relay: InputRelay
+    let relay: InputRelay
     /// What Control+Option+F11 locks; tests replace it.
     var pointerLock: any PointerLock = SystemPointerLock()
     private var heldLock: (any PointerLock)?
@@ -449,9 +556,30 @@ final class InputView: NSView {
         if let cursor = shownCursor { addCursorRect(bounds, cursor: cursor) }
     }
 
+    /// Where dropped files go.
+    var drops: DroppedFiles?
+    /// The shared application's menus (from the host), for the menu bar.
+    var hostMenus: [[String: Any]] = []
+
     init(frame: NSRect, relay: InputRelay) {
         self.relay = relay
         super.init(frame: frame)
+    }
+
+    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        fileURLs(sender).isEmpty ? [] : .copy
+    }
+
+    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        let files = fileURLs(sender)
+        guard !files.isEmpty else { return false }
+        drops?.add(files.map(\.path))
+        return true
+    }
+
+    private func fileURLs(_ sender: any NSDraggingInfo) -> [URL] {
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        return sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL] ?? []
     }
 
     required init?(coder: NSCoder) { nil }
@@ -546,14 +674,34 @@ final class InputView: NSView {
         }
     }
 
+    /// A Frames menu command for this window's session.
+    func command(_ command: ViewerCommand) {
+        if command == .releaseInput {
+            releaseInput(at: ProcessInfo.processInfo.systemUptime)
+            return
+        }
+        relay.send(Int32(FRAMES_MAC_INPUT_COMMAND), command.rawValue, at: ProcessInfo.processInfo.systemUptime)
+    }
+
+    /// Gives the pointer and keys back and minimizes the window.
+    private func releaseInput(at timestamp: TimeInterval) {
+        setRelative(false, at: timestamp)
+        modifiersDown.removeAll()
+        relay.send(Int32(FRAMES_MAC_INPUT_FOCUS_LOST), 0, at: timestamp)
+        window?.miniaturize(nil)
+    }
+
     override func keyDown(with event: NSEvent) {
         // Control+Option+F12 (kVK_F12 = 111): release remote input and
         // minimize, as in v1; the shortcut never reaches the host.
         if event.keyCode == 111, event.modifierFlags.contains([.control, .option]) {
-            setRelative(false, at: event.timestamp)
-            modifiersDown.removeAll()
-            relay.send(Int32(FRAMES_MAC_INPUT_FOCUS_LOST), 0, at: event.timestamp)
-            window?.miniaturize(nil)
+            releaseInput(at: event.timestamp)
+            return
+        }
+        // Control+Option+F10 (kVK_F10 = 109): live statistics on or off, as
+        // v1's debug overlay shortcut; never reaches the host.
+        if event.keyCode == 109, event.modifierFlags.contains([.control, .option]) {
+            relay.send(Int32(FRAMES_MAC_INPUT_STATS), 0, at: event.timestamp)
             return
         }
         // Control+Option+F11 (kVK_F11 = 103): relative mouse on or off, as in

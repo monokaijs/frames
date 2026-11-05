@@ -1,5 +1,5 @@
 //! Native Windows USB/IP tooling. Device leases run elevated and revoke on EOF.
-use frames_core::devices::DeviceInfo;
+use crate::protocol::DeviceInfo;
 use std::net::TcpStream;
 #[cfg(windows)]
 use std::{
@@ -111,10 +111,7 @@ pub struct ExportLease {
     _socket: TcpStream,
 }
 pub fn prepare_export(bus: &str) -> anyhow::Result<ExportLease> {
-    anyhow::ensure!(
-        frames_core::devices::valid_bus_id(bus),
-        "Invalid USB device ID"
-    );
+    anyhow::ensure!(crate::protocol::valid_bus_id(bus), "Invalid USB device ID");
     #[cfg(not(windows))]
     {
         anyhow::bail!("USB forwarding requires Windows.")
@@ -178,7 +175,7 @@ fn uuid_token() -> String {
 }
 pub fn lease_worker(bus: &str, port: u16, token: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
-        frames_core::devices::valid_bus_id(bus)
+        crate::protocol::valid_bus_id(bus)
             && port >= 1024
             && token.len() == 64
             && token.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -244,7 +241,7 @@ fn importer() -> anyhow::Result<std::path::PathBuf> {
 }
 pub fn attach(bus: &str, port: u16) -> anyhow::Result<u16> {
     anyhow::ensure!(
-        frames_core::devices::valid_bus_id(bus) && port >= 1024,
+        crate::protocol::valid_bus_id(bus) && port >= 1024,
         "Invalid USB attachment"
     );
     #[cfg(windows)]

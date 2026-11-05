@@ -22,6 +22,7 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     // The host's cursor shape and visibility, applied on the viewer thread.
     let (cursor_tx, cursor_rx) = std::sync::mpsc::channel();
     let (sizes_tx, sizes) = std::sync::mpsc::channel();
+    let (menus_tx, menus) = std::sync::mpsc::channel();
     let drain = {
         let session = session.clone();
         let (cursor_streams, mut cursor_incoming) = tokio::sync::mpsc::unbounded_channel();
@@ -29,6 +30,7 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
             session.clone(),
             cursor_streams,
             sizes_tx,
+            menus_tx,
             o.adb.then_some(o.adb_server),
         ));
         tokio::spawn(async move {
@@ -51,7 +53,10 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     };
     let (mut lane, writer) = InputLane::open(&session).await?;
     // Cross-platform sessions swap Control and Command, as v1 does.
-    lane.swap_modifiers = !info.platform.is_empty() && info.platform != crate::platform();
+    // Control and Command trade places across platforms, unless the user
+    // wants the same physical keys (`--physical-keys`, for terminals).
+    lane.swap_modifiers =
+        !o.physical_keys && !info.platform.is_empty() && info.platform != crate::platform();
     if lane.swap_modifiers {
         println!("keys: Control and Command swapped ({} host)", info.platform);
     }
@@ -72,6 +77,7 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
         let updates = crate::streams::HostUpdates {
             cursor: cursor_rx,
             sizes,
+            menus,
         };
         view(&session, info, &o, lane, updates, clipboard, audio)
     })
@@ -80,6 +86,9 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     drain.abort();
     result
 }
+
+/// Flipped by Control+Option+F10 on any viewer window of this process.
+static STATS_TOGGLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn captured(input: MacInput) -> Option<Captured> {
     let button = |code: u8| match code {
@@ -129,6 +138,26 @@ fn captured(input: MacInput) -> Option<Captured> {
                 at_us,
             }
         }
+        MacInput::ToggleStats | MacInput::Command(4) => {
+            STATS_TOGGLED.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        // Image quality from the Frames menu: what the viewer receives at most.
+        MacInput::Command(command @ 1..=3) => Captured::Event {
+            event: Event::MaxBitrate {
+                mbps: crate::quality_mbps(command as u8 - 1),
+            },
+            at_us: frames_media::clock::SystemClock::new().now_us(),
+        },
+        MacInput::Command(6) => {
+            crate::DISCONNECT.store(true, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        MacInput::Command(_) => return None,
+        MacInput::Menu(id) => Captured::Event {
+            event: Event::Menu { id },
+            at_us: frames_media::clock::SystemClock::new().now_us(),
+        },
     })
 }
 
@@ -150,6 +179,11 @@ fn view(
     // screen), in its own shape.
     let mut presenter = MacPresenter::new(info.width, info.height, true)?;
     presenter.set_title(&crate::viewer_title(o, &info));
+    system::viewer_app();
+    // A window of a host application: closing it asks the host window to
+    // close (its going away ends this session); a second close closes here.
+    let mut showing_stats = false;
+    presenter.intercept_close(o.window_id.is_some());
     // Events are sent from the main thread as they arrive: the viewer loop
     // can wait up to a frame for a drawable, which would delay input.
     let lane = Arc::new(Mutex::new(lane));
@@ -198,8 +232,28 @@ fn view(
     let mut superseded = 0u64;
     let mut reported_clean = 0u64;
     loop {
-        if o.deadline().is_some_and(|d| started.elapsed() >= d) || presenter.closed() {
+        if o.deadline().is_some_and(|d| started.elapsed() >= d)
+            || presenter.closed()
+            || crate::DISCONNECT.load(std::sync::atomic::Ordering::Relaxed)
+        {
             break;
+        }
+        if let Some(json) = presenter.take_dropped_json() {
+            for path in serde_json::from_str::<Vec<String>>(&json).unwrap_or_default() {
+                crate::transfer::send_dropped(session, path.into());
+            }
+        }
+        if presenter.take_close_request() {
+            println!("asking the host to close its window");
+            let at_us = clock.now_us();
+            lane.lock().unwrap().send(
+                &session.media(),
+                &clock,
+                vec![Captured::Event {
+                    event: Event::CloseWindow,
+                    at_us,
+                }],
+            );
         }
         if session.is_closed() {
             println!("the host left");
@@ -216,6 +270,10 @@ fn view(
         lane.lock().unwrap().tick(&media, clock.now_us());
         // The host window resized: a decoder for the new size, and the
         // window in the new shape at its current scale.
+        while let Ok(items) = updates.menus.try_recv() {
+            println!("host menus: {}", crate::menus::summary(&items));
+            presenter.set_menus(&serde_json::to_string(&items).unwrap_or_default());
+        }
         while let Ok((width, height)) = updates.sizes.try_recv() {
             println!("stream resized to {width}x{height}");
             decoder = MacDecoder::new(info.codec.into())?;
@@ -277,9 +335,14 @@ fn view(
         if started.elapsed() >= next_report {
             let stats = client.stats();
             let (n, p50, p95) = latency.take_window();
-            if o.stats_title {
+            let show = o.stats_title ^ STATS_TOGGLED.load(std::sync::atomic::Ordering::Relaxed);
+            if show {
                 let title = crate::stats::window_title(n, p50, p95, &path, stats.frames_lost);
                 presenter.set_title(&title);
+                showing_stats = true;
+            } else if showing_stats {
+                presenter.set_title(&crate::viewer_title(o, &info));
+                showing_stats = false;
             }
             println!(
                 "client t={:>3}s presented {n:>3}/s clean {:>3} lost {} | capture to present p50 {p50:>5.2} p95 {p95:>5.2} ms | recoveries {} nacks {} | {:?} rtt {:.1} ms offset {:.1} ms",

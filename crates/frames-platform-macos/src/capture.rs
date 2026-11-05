@@ -94,6 +94,38 @@ pub struct MacCapture {
 // only used from the owning thread and freed once.
 unsafe impl Send for MacCapture {}
 
+/// Asks another application's window to close, as its close button would
+/// (needs Accessibility). False when it could not.
+pub fn close_window(window_id: u32) -> bool {
+    // SAFETY: plain call.
+    unsafe { ffi::frames_mac_close_window(window_id) }
+}
+
+/// The menus of the application owning `window_id`, as JSON (needs
+/// Accessibility); `None` when it has none or cannot be read.
+pub fn app_menus_json(window_id: u32) -> Option<String> {
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        // SAFETY: Swift writes at most `capacity` bytes.
+        let length =
+            unsafe { ffi::frames_mac_app_menus(window_id, buffer.as_mut_ptr(), buffer.len()) };
+        if length == 0 {
+            return None;
+        }
+        if length <= buffer.len() {
+            buffer.truncate(length);
+            return Some(String::from_utf8_lossy(&buffer).into_owned());
+        }
+        buffer.resize(length, 0);
+    }
+}
+
+/// Presses an item of [`app_menus_json`]'s tree by its id.
+pub fn press_menu(window_id: u32, id: u32) -> bool {
+    // SAFETY: plain call.
+    unsafe { ffi::frames_mac_press_menu(window_id, id) }
+}
+
 /// Other processes' on-screen application windows as JSON:
 /// `[{"id": CGWindowID, "title": "..."}]`, front to back.
 pub fn windows_json() -> String {

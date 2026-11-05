@@ -17,8 +17,9 @@ bytes.workspace = true
 frames-codec = { path = "../frames-codec", default-features = false }
 frames-input = { path = "../frames-input" }
 frames-clipboard = { path = "../frames-clipboard" }
+sha2.workspace = true
 tracing.workspace = true
-windows.workspace = true
+windows = { workspace = true, features = ["Win32_System_StationsAndDesktops"] }
 
 [dev-dependencies]
 frames-testkit = { path = "../frames-testkit" }
