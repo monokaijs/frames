@@ -143,6 +143,8 @@ pub struct Options {
     /// Host: `nvenc` (direct), or an FFmpeg backend: `amf`, `qsv`, `mf`,
     /// `software`.
     pub encoder: String,
+    /// `--encoder` was given: use that one or fail, no fallback.
+    pub encoder_explicit: bool,
     /// Where the device key and trust list live (default: v1's directory).
     pub config_dir: Option<std::path::PathBuf>,
     /// Host: approve unknown devices without asking (unattended tests).
@@ -188,6 +190,7 @@ impl Options {
             synthetic_input: false,
             relative_qa: false,
             encoder: "nvenc".into(),
+            encoder_explicit: false,
             config_dir: None,
             approve: None,
             control: false,
@@ -252,7 +255,10 @@ impl Options {
                 }
                 "--synthetic-input" => o.synthetic_input = true,
                 "--relative-qa" => o.relative_qa = true,
-                "--encoder" => o.encoder = value()?.to_string(),
+                "--encoder" => {
+                    o.encoder = value()?.to_string();
+                    o.encoder_explicit = true;
+                }
                 "--config-dir" => o.config_dir = Some(value()?.into()),
                 "--approve" => {
                     let text = value()?;

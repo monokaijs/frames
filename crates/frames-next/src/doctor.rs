@@ -203,10 +203,37 @@ fn macos(report: &mut Report) {
     }
 }
 
-/// Not run on Windows yet: the checks there only report what was chosen.
+/// Test-encodes each encoder in the fallback order (no screen capture needed).
 #[cfg(windows)]
 fn windows(report: &mut Report, o: &Options) {
     println!("this PC");
-    report.info("encoder", format!("{} (change with --encoder)", o.encoder));
+    let order = crate::windows_host::backends(o);
+    report.info(
+        "encoders to try",
+        format!(
+            "{} (the first that encodes a test frame is used; --encoder picks one)",
+            order.join(", ")
+        ),
+    );
+    let mut usable = None;
+    for (backend, result) in crate::windows_host::probe_backends(o) {
+        match result {
+            Ok((adapter, codecs)) => {
+                let codecs: Vec<String> = codecs.iter().map(|c| format!("{c:?}")).collect();
+                report.line(true, &format!("encoder {backend}"), format!("{} on {adapter}", codecs.join(", ")));
+                usable.get_or_insert(backend);
+            }
+            Err(error) if backend == "nvenc" => report.line(
+                false,
+                "encoder nvenc",
+                format!("{error:#}. Hosting falls back to the next encoder; an NVIDIA driver 570 or newer gives the lowest latency"),
+            ),
+            Err(error) => report.info(&format!("encoder {backend}"), format!("unavailable: {error:#}")),
+        }
+    }
+    match usable {
+        Some(backend) => report.info("hosting will use", backend),
+        None => report.line(false, "hosting", "no encoder works on this PC"),
+    }
     report.info("shareable windows", crate::win::shareable_windows().len());
 }

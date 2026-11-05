@@ -39,6 +39,12 @@ struct Api {
 unsafe impl Send for Api {}
 unsafe impl Sync for Api {}
 
+/// Whether this machine's NVIDIA driver can run this encoder (it needs
+/// NVENC API 13, driver 570 or newer), with the reason when it cannot.
+pub fn available() -> Result<(), MediaError> {
+    api().map(|_| ())
+}
+
 fn api() -> Result<&'static Api, MediaError> {
     static API: OnceLock<Result<Api, String>> = OnceLock::new();
     API.get_or_init(|| unsafe {
