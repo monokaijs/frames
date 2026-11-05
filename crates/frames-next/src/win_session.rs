@@ -52,12 +52,205 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// v1's menu glyphs (Segoe MDL2 Assets, `frames-native` tray_model).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Glyph {
+    Window,
+    Show,
+    Hide,
+    Settings,
+    Display,
+    Cursor,
+    Keyboard,
+    Refresh,
+    Folder,
+    Devices,
+    Network,
+    Power,
+    Info,
+}
+
+impl Glyph {
+    fn character(self) -> char {
+        match self {
+            Self::Window => '\u{e737}',
+            Self::Show => '\u{e890}',
+            Self::Hide => '\u{ed1a}',
+            Self::Settings => '\u{e713}',
+            Self::Display => '\u{e7f4}',
+            Self::Cursor => '\u{e962}',
+            Self::Keyboard => '\u{e765}',
+            Self::Refresh => '\u{e72c}',
+            Self::Folder => '\u{e8b7}',
+            Self::Devices => '\u{e772}',
+            Self::Network => '\u{e968}',
+            Self::Power => '\u{e7e8}',
+            Self::Info => '\u{e946}',
+        }
+    }
+
+    /// The glyph v1 gave the item with this label, if any.
+    fn for_label(label: &str) -> Option<Self> {
+        Some(match label {
+            "Application menu"
+            | "Show remote window header"
+            | "Windows"
+            | "Per-window view"
+            | "No remote windows available"
+            | "No remote window" => Self::Window,
+            "Show all windows" => Self::Show,
+            "Hide all windows" | "Ignore / hide this window" => Self::Hide,
+            "This window" | "Window options" => Self::Settings,
+            "Fill window" | "Resize remote app" | "Stretch locally" | "Image quality" | "View"
+            | "Full desktop view" => Self::Display,
+            "Relative mouse · Ctrl+Alt+F11" | "Show remote cursor" => Self::Cursor,
+            "Swap Control / Command" | "Physical keys" => Self::Keyboard,
+            "Refresh application menus" | "Refresh devices" => Self::Refresh,
+            "Fetch remote file…" => Self::Folder,
+            "Devices" | "Gamepads" | "USB devices" => Self::Devices,
+            "Android ADB bridge" | "Connecting" => Self::Network,
+            "Disconnect" => Self::Power,
+            "Window compatibility" | "Debug overlay · Ctrl+Alt+F10" => Self::Info,
+            _ if label.starts_with("Connected · ") => Self::Network,
+            _ if ["High (", "Medium (", "Low ("]
+                .iter()
+                .any(|p| label.starts_with(p)) =>
+            {
+                Self::Display
+            }
+            _ => return None,
+        })
+    }
+
+    /// The glyph drawn white-on-black into a 32-bit bitmap of `size` pixels,
+    /// then turned into v1's grey with the glyph as alpha.
+    unsafe fn bitmap(self, size: i32) -> Option<HBITMAP> {
+        unsafe {
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: size,
+                    biHeight: -size,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bitmap = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+            let dc = CreateCompatibleDC(None);
+            let old = SelectObject(dc, bitmap.into());
+            let font = CreateFontW(
+                size * 4 / 5,
+                0,
+                0,
+                0,
+                400,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                ANTIALIASED_QUALITY,
+                0,
+                w!("Segoe MDL2 Assets"),
+            );
+            let old_font = SelectObject(dc, font.into());
+            SetBkColor(dc, COLORREF(0));
+            SetTextColor(dc, COLORREF(0xffffff));
+            let _ = PatBlt(dc, 0, 0, size, size, BLACKNESS);
+            let mut text: Vec<u16> = self.character().to_string().encode_utf16().collect();
+            DrawTextW(
+                dc,
+                &mut text,
+                &mut RECT {
+                    left: 0,
+                    top: 0,
+                    right: size,
+                    bottom: size,
+                },
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+            let _ = GdiFlush();
+            SelectObject(dc, old_font);
+            SelectObject(dc, old);
+            let _ = DeleteObject(font.into());
+            let _ = DeleteDC(dc);
+            let pixels =
+                std::slice::from_raw_parts_mut(bits.cast::<u8>(), (size * size * 4) as usize);
+            for pixel in pixels.chunks_exact_mut(4) {
+                let alpha = pixel[0].max(pixel[1]).max(pixel[2]);
+                // Premultiplied grey (v1's 70).
+                let shade = (70 * u16::from(alpha) / 255) as u8;
+                pixel.copy_from_slice(&[shade, shade, shade, alpha]);
+            }
+            Some(bitmap)
+        }
+    }
+}
+
 /// Builds popup menus whose item ids index `choices`.
 struct Builder {
     choices: Vec<Choice>,
+    /// Glyph bitmaps made for this menu, deleted with it.
+    bitmaps: std::collections::HashMap<Glyph, HBITMAP>,
+    /// Glyph bitmaps' size in pixels (at the menu window's DPI).
+    glyph_size: i32,
+    /// The next item's glyph when its label has none of its own (a
+    /// window row's shown or hidden eye).
+    next_glyph: Option<Glyph>,
+}
+
+impl Drop for Builder {
+    fn drop(&mut self) {
+        for bitmap in self.bitmaps.values() {
+            let _ = unsafe { DeleteObject((*bitmap).into()) };
+        }
+    }
 }
 
 impl Builder {
+    fn new(owner: HWND) -> Self {
+        let dpi = unsafe { GetDpiForWindow(owner) }.max(96) as i32;
+        Self {
+            choices: Vec::new(),
+            bitmaps: std::collections::HashMap::new(),
+            glyph_size: (16 * dpi + 48) / 96,
+            next_glyph: None,
+        }
+    }
+
+    /// Gives the item just appended to `menu` its glyph (`label`'s, or the
+    /// one set for it).
+    fn glyph(&mut self, menu: HMENU, label: &str) {
+        let Some(glyph) = self.next_glyph.take().or_else(|| Glyph::for_label(label)) else {
+            return;
+        };
+        let size = self.glyph_size;
+        let bitmap = match self.bitmaps.get(&glyph) {
+            Some(bitmap) => *bitmap,
+            None => match unsafe { glyph.bitmap(size) } {
+                Some(bitmap) => *self.bitmaps.entry(glyph).or_insert(bitmap),
+                None => return,
+            },
+        };
+        unsafe {
+            let info = MENUITEMINFOW {
+                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_BITMAP,
+                hbmpItem: bitmap,
+                ..Default::default()
+            };
+            let last = GetMenuItemCount(Some(menu)) - 1;
+            if last >= 0 {
+                let _ = SetMenuItemInfoW(menu, last as u32, true, &info);
+            }
+        }
+    }
+
     fn item(&mut self, menu: HMENU, title: &str, choice: Option<Choice>, checked: bool) {
         let mut flags = MF_STRING;
         if checked {
@@ -73,10 +266,12 @@ impl Builder {
                 0
             }
         };
+        let label = title;
         let title = wide(title);
         unsafe {
             let _ = AppendMenuW(menu, flags, id, PCWSTR(title.as_ptr()));
         }
+        self.glyph(menu, label);
     }
 
     fn command(&mut self, menu: HMENU, title: &str, command: Command, checked: bool) {
@@ -84,6 +279,7 @@ impl Builder {
     }
 
     fn submenu(&mut self, menu: HMENU, title: &str, child: HMENU) {
+        let label = title;
         let title = wide(title);
         unsafe {
             let _ = AppendMenuW(
@@ -93,6 +289,7 @@ impl Builder {
                 PCWSTR(title.as_ptr()),
             );
         }
+        self.glyph(menu, label);
     }
 
     fn separator(menu: HMENU) {
@@ -267,6 +464,12 @@ impl Builder {
             } else {
                 format!("{} · {}", window.title, window.app)
             };
+            // v1: an open eye for a shown window, a closed one for a hidden.
+            self.next_glyph = Some(if window.shown {
+                Glyph::Show
+            } else {
+                Glyph::Hide
+            });
             if per_window {
                 self.command(
                     list,
@@ -445,9 +648,7 @@ impl Builder {
 /// It runs a menu loop on this thread (this window's video waits).
 pub fn show_menu(owner: HWND, at: POINT, context: &Context) -> Option<Choice> {
     let snapshot = crate::control::snapshot();
-    let mut builder = Builder {
-        choices: Vec::new(),
-    };
+    let mut builder = Builder::new(owner);
     let menu = builder.session(&snapshot, context);
     let chosen = unsafe {
         let _ = SetForegroundWindow(owner);
