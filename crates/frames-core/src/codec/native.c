@@ -628,6 +628,7 @@ Media *frames_encoder_open_gpu(const char *name,int width,int height,int fps,int
     c->colorspace=AVCOL_SPC_BT709;c->color_range=AVCOL_RANGE_MPEG;
     if(strstr(name,"_nvenc")){option(m,"rc","cbr");option(m,"preset","p1");option(m,"tune","ull");option(m,"zerolatency","1");option(m,"delay","0");option(m,"rc-lookahead","0");option(m,"forced-idr","1");}
     if(strstr(name,"_amf")){option(m,"usage","ultralowlatency");option(m,"quality","speed");option(m,"async_depth","1");option(m,"preanalysis","0");}
+    if(strstr(name,"_qsv")){option(m,"preset","veryfast");option(m,"async_depth","1");option(m,"look_ahead","0");option(m,"forced_idr","1");}
     c->hw_device_ctx=p_av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);if(!c->hw_device_ctx)goto fail;
     AVHWDeviceContext *device=(AVHWDeviceContext *)c->hw_device_ctx->data;AVD3D11VADeviceContext *hw=device->hwctx;
     ID3D11Texture2D_GetDevice((ID3D11Texture2D *)source,&hw->device);

@@ -10,15 +10,17 @@ use frames_codec::nvenc::NvencEncoder;
 use frames_input::cursor::CursorMessage;
 use frames_input::{Motion, Pointer};
 use frames_media::api::{
-    CaptureConfig, CaptureEvent, CaptureSource, EncodeParams, Gop, MediaClock, MediaTransport,
-    PathKind, VideoEncoder, VideoFrame,
+    CaptureConfig, CaptureEvent, CaptureSource, EncodeParams, EncoderControl, Gop, MediaClock,
+    MediaTransport, PathKind, VideoEncoder, VideoFrame,
 };
 use frames_media::clock::SystemClock;
 use frames_media::host::{HostConfig, HostSession};
 use frames_media::rate::RateConfig;
 use frames_platform_windows::capture::WgcCapture;
 use frames_platform_windows::input::{InputInjector, InputTarget};
-use frames_platform_windows::system::{GpuClockHold, Mmcss, TimerResolution, raise_gpu_priority};
+use frames_platform_windows::system::{
+    GpuClockHold, KeepAwake, Mmcss, TimerResolution, raise_gpu_priority,
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -186,14 +188,15 @@ fn working_codecs(
     let mut codecs = Vec::new();
     let mut failures = Vec::new();
     for &codec in backend_codecs(backend) {
-        let tried = make_encoder(
-            backend,
-            device,
-            codec,
-            encode_params(o, width, height),
-            shared.clone(),
-        )
-        .and_then(|mut encoder| Ok(encoder.encode(frame, &mut |_| {})?));
+        let params = encode_params(o, width, height);
+        let tried =
+            make_encoder(backend, device, codec, params, shared.clone()).and_then(|mut encoder| {
+                encoder.encode(frame, &mut |_| {})?;
+                // Rate control changes the bitrate within seconds, and some
+                // encoders fail only then: change it once here.
+                encoder.control(EncoderControl::Bitrate(params.bitrate_bps / 10 * 7))?;
+                Ok(encoder.encode(frame, &mut |_| {})?)
+            });
         match tried {
             Ok(()) => codecs.push(codec),
             Err(error) => failures.push(format!("{codec:?}: {error:#}")),
@@ -277,6 +280,18 @@ pub fn probe_backends(o: &Options) -> Vec<Probe> {
         .collect()
 }
 
+/// Capture failing is not the encoder's fault, so it is reported apart.
+#[derive(Debug)]
+struct CaptureFailed;
+
+impl std::fmt::Display for CaptureFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "screen capture failed (hosting needs the signed-in desktop; an SSH or service session cannot capture)",
+        )
+    }
+}
+
 fn open_backend(
     backend: &'static str,
     o: &Options,
@@ -285,15 +300,19 @@ fn open_backend(
     shared: &Arc<dyn MediaClock>,
 ) -> Result<Opened> {
     let (device, context, adapter) = backend_device(backend)?;
-    let mut capture = match source {
-        Some(hwnd) => WgcCapture::window(hwnd, &device, shared.clone())?,
-        None => WgcCapture::primary_monitor(&device, shared.clone())?,
+    let capture = || -> Result<_> {
+        let mut capture = match source {
+            Some(hwnd) => WgcCapture::window(hwnd, &device, shared.clone())?,
+            None => WgcCapture::primary_monitor(&device, shared.clone())?,
+        };
+        capture.configure(CaptureConfig {
+            fps: o.fps,
+            separate_cursor: true,
+        })?;
+        let first = first_frame(&mut capture, clock)?;
+        Ok((capture, first))
     };
-    capture.configure(CaptureConfig {
-        fps: o.fps,
-        separate_cursor: true,
-    })?;
-    let first = first_frame(&mut capture, clock)?;
+    let (capture, first) = capture().context(CaptureFailed)?;
     let codecs = working_codecs(backend, &device, &first, o, shared)?;
     Ok(Opened {
         backend,
@@ -316,6 +335,7 @@ fn stream(
     win::dpi_aware();
     let _mmcss = Mmcss::games();
     let _timer = TimerResolution::one_millisecond();
+    let _awake = KeepAwake::display();
     let clock = SystemClock::new();
     let shared: Arc<dyn MediaClock> = Arc::new(clock);
     let qa = if o.qa_source {
@@ -337,13 +357,20 @@ fn stream(
     // Capture on the encoder's GPU: hardware encoders only accept textures
     // from their own adapter.
     let mut opened = None;
+    let mut encoder_failed = false;
     for backend in backends(o) {
         match open_backend(backend, o, source, &clock, &shared) {
             Ok(found) => {
                 opened = Some(found);
                 break;
             }
-            Err(error) => println!("encoder {backend} unavailable: {error:#}"),
+            Err(error) if error.downcast_ref::<CaptureFailed>().is_some() => {
+                println!("{backend}: {error:#}")
+            }
+            Err(error) => {
+                encoder_failed = true;
+                println!("encoder {backend} unavailable: {error:#}")
+            }
         }
     }
     let Opened {
@@ -354,7 +381,13 @@ fn stream(
         mut capture,
         first,
         codecs,
-    } = opened.context("no encoder works on this machine")?;
+    } = opened.with_context(|| {
+        if encoder_failed {
+            "no encoder works on this machine"
+        } else {
+            "the screen cannot be captured here"
+        }
+    })?;
     let nvenc = backend == "nvenc";
     raise_gpu_priority(&device);
     // NVENC runs 2-2.5x slower when the GPU idles in a low power state

@@ -15,7 +15,7 @@ use frames_media::api::{
     EncoderCaps, EncoderControl, EncoderFeatures, FrameKind, FrameReference, Gop, MediaClock,
     MediaError, PixelFormat, Surface, VideoDecoder, VideoEncoder, VideoFrame,
 };
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 pub struct FfmpegDecoder {
     context: Context,
@@ -116,8 +116,31 @@ pub struct FfmpegEncoder {
     clock: Arc<dyn MediaClock>,
     next_frame: u64,
     keyframe: bool,
+    /// A bitrate this encoder can only take by restarting (Media Foundation,
+    /// QSV), waiting for [`restart_due`].
+    restart_bps: Option<u32>,
+    restarted_us: Option<u64>,
+    /// The replacement opening on another thread: a restart takes QSV
+    /// 0.25-1.1 s and Media Foundation 0.1 s (Iris Xe, RTX 4050 laptop), which
+    /// would freeze the stream; this encoder keeps encoding meanwhile.
+    replacement: Option<mpsc::Receiver<Result<FfmpegEncoder, MediaError>>>,
+    /// Frames in a row QSV skipped (see `encode`).
+    skipped: u32,
     #[cfg(windows)]
     zero_copy_reported: bool,
+}
+
+/// Whether an encoder that restarts (with a keyframe) for every bitrate
+/// change should restart now, `since_us` after its last restart: soon to fall
+/// to a rate the path needs, rarely and only for a large step to climb.
+fn restart_due(running_bps: u32, wanted_bps: u32, since_us: Option<u64>) -> bool {
+    let since = since_us.unwrap_or(u64::MAX);
+    let (running, wanted) = (u64::from(running_bps), u64::from(wanted_bps));
+    if wanted < running {
+        wanted * 10 <= running * 9 && since >= 1_000_000
+    } else {
+        wanted * 4 >= running * 5 && since >= 5_000_000
+    }
 }
 
 // One thread at a time uses the context; the encoder is moved, never shared.
@@ -190,9 +213,76 @@ impl FfmpegEncoder {
             clock,
             next_frame: 0,
             keyframe: true,
+            restart_bps: None,
+            restarted_us: None,
+            replacement: None,
+            skipped: 0,
             #[cfg(windows)]
             zero_copy_reported: false,
         })
+    }
+
+    /// A new encoder with `params` that carries on this one's frame numbers.
+    fn reopen(&mut self, params: EncodeParams) -> Result<(), MediaError> {
+        let next_frame = self.next_frame;
+        *self = Self::new(
+            &self.name.clone(),
+            self.caps.codec,
+            params,
+            self.clock.clone(),
+        )?;
+        self.next_frame = next_frame;
+        self.restarted_us = Some(self.clock.now_us());
+        Ok(())
+    }
+
+    /// Opens an encoder at `bps` on another thread, warmed up with `frame`
+    /// (the D3D11 encoder opens on its first frame).
+    fn start_replacement(&mut self, bps: u32, frame: &VideoFrame) {
+        let (name, codec, clock, frame) = (
+            self.name.clone(),
+            self.caps.codec,
+            self.clock.clone(),
+            frame.clone(),
+        );
+        let params = EncodeParams {
+            bitrate_bps: bps,
+            ..self.params
+        };
+        let (done, replacement) = mpsc::channel();
+        self.replacement = Some(replacement);
+        std::thread::spawn(move || {
+            let opened = Self::new(&name, codec, params, clock).and_then(|mut encoder| {
+                encoder.encode(&frame, &mut |_| {})?;
+                Ok(encoder)
+            });
+            let _ = done.send(opened);
+        });
+    }
+
+    /// Switches to the replacement once it is open, at a keyframe (it never
+    /// sent the frames its references point to).
+    fn take_replacement(&mut self) {
+        let Some(replacement) = &self.replacement else {
+            return;
+        };
+        match replacement.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {}
+            Ok(Ok(mut encoder)) => {
+                encoder.next_frame = self.next_frame;
+                encoder.keyframe = true;
+                encoder.restart_bps = self
+                    .restart_bps
+                    .filter(|&bps| bps != encoder.params.bitrate_bps);
+                encoder.restarted_us = Some(self.clock.now_us());
+                *self = encoder;
+            }
+            // Keep this one; the next due restart tries again.
+            Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                self.replacement = None;
+                self.restarted_us = Some(self.clock.now_us());
+            }
+        }
     }
 
     /// The FFmpeg encoder in use.
@@ -250,30 +340,26 @@ impl VideoEncoder for FfmpegEncoder {
     fn control(&mut self, control: EncoderControl) -> Result<(), MediaError> {
         match control {
             EncoderControl::Bitrate(bps) => {
-                self.params.bitrate_bps = bps.max(100_000);
+                let bps = bps.max(100_000);
                 apply_shape(&self.params);
-                let update = self
-                    .context
-                    .set_rate(self.params.bitrate_bps, self.params.fps)
-                    .map_err(backend_error)?;
+                // QSV fails its reset at the first rate change (Iris Xe,
+                // driver of 2026-11), so it restarts like Media Foundation.
+                let update = if self.name.ends_with("_qsv") {
+                    frames_core::codec::RateUpdate::RestartRequired
+                } else {
+                    self.context
+                        .set_rate(bps, self.params.fps)
+                        .map_err(backend_error)?
+                };
                 if matches!(update, frames_core::codec::RateUpdate::RestartRequired) {
-                    *self = Self::new(
-                        &self.name.clone(),
-                        self.caps.codec,
-                        self.params,
-                        self.clock.clone(),
-                    )?;
+                    self.restart_bps = Some(bps);
+                } else {
+                    self.params.bitrate_bps = bps;
+                    self.restart_bps = None;
                 }
             }
             EncoderControl::ForceKeyframe => self.keyframe = true,
-            EncoderControl::Reconfigure(params) => {
-                *self = Self::new(
-                    &self.name.clone(),
-                    self.caps.codec,
-                    params,
-                    self.clock.clone(),
-                )?;
-            }
+            EncoderControl::Reconfigure(params) => self.reopen(params)?,
             // Only encoders that advertise long-term references receive it.
             EncoderControl::ConfirmLongTerm(_) => {}
             EncoderControl::Invalidate { .. }
@@ -293,13 +379,37 @@ impl VideoEncoder for FfmpegEncoder {
         frame: &VideoFrame,
         out: &mut dyn FnMut(Chunk<'_>),
     ) -> Result<(), MediaError> {
+        self.take_replacement();
+        if let (Some(bps), None) = (self.restart_bps, &self.replacement) {
+            let since = self
+                .restarted_us
+                .map(|at| self.clock.now_us().saturating_sub(at));
+            if restart_due(self.params.bitrate_bps, bps, since) {
+                self.start_replacement(bps, frame);
+            }
+        }
         let raw = self.raw_frame(frame)?;
         if std::mem::take(&mut self.keyframe) {
             self.context.request_keyframe();
         }
         // The D3D11 encoder opens on the first GPU frame, on this thread.
         apply_shape(&self.params);
-        let packets = self.context.encode(&raw).map_err(backend_error)?;
+        let packets = match self.context.encode(&raw) {
+            Ok(packets) => packets,
+            // QSV reports a frame its rate control skipped (seen right after
+            // a bitrate drop) as invalid data, "Invalid FrameType:0"; the
+            // next frame still encodes. Many in a row is a broken encoder.
+            Err(error)
+                if self.name.ends_with("_qsv")
+                    && self.skipped < 30
+                    && error.to_string().contains("Invalid data") =>
+            {
+                self.skipped += 1;
+                return Ok(());
+            }
+            Err(error) => return Err(backend_error(error)),
+        };
+        self.skipped = 0;
         #[cfg(windows)]
         if !self.zero_copy_reported && raw.gpu.is_some() {
             self.zero_copy_reported = true;
@@ -341,6 +451,20 @@ impl VideoEncoder for FfmpegEncoder {
 #[cfg(test)]
 mod encoder_tests {
     use super::*;
+
+    #[test]
+    fn restarting_encoders_fall_soon_and_climb_rarely() {
+        let second = Some(1_000_000);
+        // Falling: at most once a second, and not for a few percent.
+        assert!(restart_due(10_000_000, 8_000_000, None));
+        assert!(restart_due(10_000_000, 8_000_000, second));
+        assert!(!restart_due(10_000_000, 8_000_000, Some(500_000)));
+        assert!(!restart_due(10_000_000, 9_500_000, second));
+        // Climbing: only by a quarter or more, every five seconds.
+        assert!(!restart_due(10_000_000, 12_000_000, Some(10_000_000)));
+        assert!(!restart_due(10_000_000, 13_000_000, Some(4_000_000)));
+        assert!(restart_due(10_000_000, 13_000_000, Some(5_000_000)));
+    }
 
     #[test]
     fn backend_names_map_to_ffmpeg_encoders() {

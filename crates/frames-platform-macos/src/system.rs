@@ -127,3 +127,62 @@ pub fn set_video_service_type(socket: c_int) -> Result<(), i32> {
     };
     if result == 0 { Ok(()) } else { Err(result) }
 }
+
+#[link(name = "IOKit", kind = "framework")]
+unsafe extern "C" {
+    fn IOPMAssertionCreateWithName(
+        kind: *const std::ffi::c_void,
+        level: u32,
+        name: *const std::ffi::c_void,
+        id: *mut u32,
+    ) -> i32;
+    fn IOPMAssertionRelease(id: u32) -> i32;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFStringCreateWithCString(
+        allocator: *const std::ffi::c_void,
+        text: *const std::ffi::c_char,
+        encoding: u32,
+    ) -> *const std::ffi::c_void;
+    fn CFRelease(object: *const std::ffi::c_void);
+}
+
+/// Keeps the display awake while the guard lives: a viewer does not count
+/// as local activity, and ScreenCaptureKit has nothing to capture from a
+/// sleeping display.
+pub struct KeepAwake(u32);
+
+impl KeepAwake {
+    pub fn display() -> Option<Self> {
+        const UTF8: u32 = 0x0800_0100;
+        const ON: u32 = 255;
+        // SAFETY: NUL-terminated literals; both strings are released after
+        // the call, which copies what it keeps.
+        unsafe {
+            let kind = CFStringCreateWithCString(
+                std::ptr::null(),
+                c"PreventUserIdleDisplaySleep".as_ptr(),
+                UTF8,
+            );
+            let name = CFStringCreateWithCString(
+                std::ptr::null(),
+                c"Frames is sharing this screen".as_ptr(),
+                UTF8,
+            );
+            let mut id = 0;
+            let result = IOPMAssertionCreateWithName(kind, ON, name, &mut id);
+            CFRelease(kind);
+            CFRelease(name);
+            (result == 0).then_some(Self(id))
+        }
+    }
+}
+
+impl Drop for KeepAwake {
+    fn drop(&mut self) {
+        // SAFETY: an assertion this guard created.
+        unsafe { IOPMAssertionRelease(self.0) };
+    }
+}

@@ -56,6 +56,7 @@ fn stream(
     );
     let frame_time = Duration::from_micros(1_000_000 / u64::from(o.fps.max(1)));
     let _ = system::set_realtime_thread(frame_time, frame_time / 4, frame_time / 2);
+    let _awake = system::KeepAwake::display();
     let clock = SystemClock::new();
     // QA runs never touch the real cursor or keyboard.
     let mut injector = (o.control && !o.qa_source).then(MacInjector::new);

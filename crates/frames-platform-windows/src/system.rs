@@ -84,6 +84,34 @@ impl Drop for TimerResolution {
     }
 }
 
+/// Keeps the display (and the PC) awake while the guard lives: a viewer does
+/// not count as local input, and with the display off Windows Graphics Capture
+/// delivers a few frames a second. Per thread: hold it on the session's thread.
+pub struct KeepAwake;
+
+impl KeepAwake {
+    pub fn display() -> Option<Self> {
+        const CONTINUOUS: u32 = 0x8000_0000;
+        const SYSTEM_REQUIRED: u32 = 0x1;
+        const DISPLAY_REQUIRED: u32 = 0x2;
+        (execution_state(CONTINUOUS | SYSTEM_REQUIRED | DISPLAY_REQUIRED)? != 0).then_some(Self)
+    }
+}
+
+impl Drop for KeepAwake {
+    fn drop(&mut self) {
+        execution_state(0x8000_0000);
+    }
+}
+
+/// `SetThreadExecutionState`: the previous state, 0 on failure.
+fn execution_state(flags: u32) -> Option<u32> {
+    type SetState = unsafe extern "system" fn(u32) -> u32;
+    let set: SetState =
+        unsafe { std::mem::transmute(function(w!("kernel32.dll"), b"SetThreadExecutionState\0")?) };
+    Some(unsafe { set(flags) })
+}
+
 /// Raises GPU scheduling priority for this process (high, not realtime: no
 /// administrator rights needed) and for `device`'s submissions, so a game
 /// saturating the GPU does not starve capture, conversion, and encode.
