@@ -100,6 +100,9 @@ enum Command {
         max_streams: usize,
         #[arg(long)]
         no_clipboard: bool,
+        /// Encoder to use; automatic again when it does not work here.
+        #[arg(long, value_enum, default_value = "auto")]
+        encoder: EncoderChoice,
     },
     /// Open the host's application windows as native local windows.
     Connect {
@@ -162,6 +165,27 @@ enum CodecChoice {
     Hevc,
     Av1,
     Vp9,
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum EncoderChoice {
+    Auto,
+    Nvenc,
+    Amf,
+    Qsv,
+    Mf,
+    Software,
+}
+impl EncoderChoice {
+    fn backend(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Nvenc => Some("nvenc"),
+            Self::Amf => Some("amf"),
+            Self::Qsv => Some("qsv"),
+            Self::Mf => Some("mf"),
+            Self::Software => Some("software"),
+        }
+    }
 }
 #[derive(Clone, Copy, ValueEnum)]
 enum ViewChoice {
@@ -297,7 +321,8 @@ fn run() -> anyhow::Result<()> {
         #[cfg(target_os="macos")] Command::Permissions{request}=>{println!("{}",serde_json::to_string_pretty(&frames_native::permission_status(request)?)?);Ok(())},
         #[cfg(windows)] Command::Service{action:ServiceCommand::Agent}=>runtime.block_on(session::host("0.0.0.0:47990".parse()?,false,true,vec![],None,8,true)),
         #[cfg(windows)] Command::Service{..}=>unreachable!(),
-        Command::Host{listen,pair,unattended,exclude,receive_dir,max_streams,no_clipboard,shared_game,shared_window,share_windows}=>{lifetime::watch(||{});if !share_windows.is_empty(){runtime.block_on(session::selected_host(listen,pair,unattended,exclude,share_windows,shared_game,max_streams))}else if shared_game{runtime.block_on(session::shared_host(listen,pair,unattended,exclude,shared_window))}else{runtime.block_on(session::host(listen,pair,unattended,exclude,receive_dir,max_streams,!no_clipboard))}},
+        Command::Host{listen,pair,unattended,exclude,receive_dir,max_streams,no_clipboard,shared_game,shared_window,share_windows,encoder}=>{lifetime::watch(||{});if let Some(backend)=encoder.backend(){frames_core::codec::prefer_encoder(backend)?;}
+            if !share_windows.is_empty(){runtime.block_on(session::selected_host(listen,pair,unattended,exclude,share_windows,shared_game,max_streams))}else if shared_game{runtime.block_on(session::shared_host(listen,pair,unattended,exclude,shared_window))}else{runtime.block_on(session::host(listen,pair,unattended,exclude,receive_dir,max_streams,!no_clipboard))}},
         Command::Connect{address,codec,no_clipboard,audio,view,bandwidth_mbps,quality}=>{
             let (updates_tx,updates_rx)=frames_native::client_channel(16);let(events_tx,events_rx)=tokio::sync::mpsc::unbounded_channel();
             lifetime::watch({let events=events_tx.clone();move||{let _=events.send(frames_native::ClientEvent::Disconnected);}});

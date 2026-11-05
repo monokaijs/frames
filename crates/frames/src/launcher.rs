@@ -77,11 +77,15 @@ struct SessionOptions {
     clipboard: bool,
     unattended: bool,
     codec: String,
+    /// Encoder for sharing: "auto" or one of `frames_core::codec::ENCODERS`.
+    encoder: String,
     bandwidth_mbps: u32,
     quality: frames_core::adaptive::QualityPreset,
     max_streams: usize,
 }
 const CODECS: [&str; 5] = ["auto", "h264", "hevc", "av1", "vp9"];
+/// The Settings encoder choices, in menu order.
+const ENCODERS: [&str; 6] = ["auto", "nvenc", "amf", "qsv", "mf", "software"];
 impl Default for SessionOptions {
     fn default() -> Self {
         Self {
@@ -90,6 +94,7 @@ impl Default for SessionOptions {
             clipboard: true,
             unattended: false,
             codec: "auto".into(),
+            encoder: "auto".into(),
             bandwidth_mbps: 0,
             quality: Default::default(),
             max_streams: 8,
@@ -105,6 +110,10 @@ impl SessionOptions {
         anyhow::ensure!(
             CODECS.contains(&self.codec.as_str()),
             "Choose a supported video codec."
+        );
+        anyhow::ensure!(
+            ENCODERS.contains(&self.encoder.as_str()),
+            "Choose a supported video encoder."
         );
         anyhow::ensure!(
             (1..=32).contains(&self.max_streams),
@@ -147,6 +156,9 @@ impl SessionOptions {
         if !self.clipboard {
             args.push("--no-clipboard".into());
         }
+        if self.encoder != "auto" {
+            args.extend(["--encoder".into(), self.encoder.clone()]);
+        }
         args
     }
     fn from_ui(ui: &Launcher) -> Self {
@@ -164,6 +176,10 @@ impl SessionOptions {
             },
             codec: CODECS
                 .get(ui.get_codec() as usize)
+                .unwrap_or(&"auto")
+                .to_string(),
+            encoder: ENCODERS
+                .get(ui.get_encoder() as usize)
                 .unwrap_or(&"auto")
                 .to_string(),
             max_streams: ui.get_max_streams() as usize,
@@ -1104,6 +1120,12 @@ pub fn run() -> Result<()> {
             .position(|codec| *codec == preferences.options.codec)
             .unwrap_or(0) as i32,
     );
+    ui.set_encoder(
+        ENCODERS
+            .iter()
+            .position(|encoder| *encoder == preferences.options.encoder)
+            .unwrap_or(0) as i32,
+    );
     ui.set_max_streams(preferences.options.max_streams as i32);
     ui.set_quality(preferences.options.quality.index());
     ui.set_bandwidth_auto(preferences.options.bandwidth_mbps == 0);
@@ -1602,6 +1624,7 @@ mod tests {
             clipboard: false,
             unattended: true,
             codec: "hevc".into(),
+            encoder: "qsv".into(),
             bandwidth_mbps: 50,
             quality: frames_core::adaptive::QualityPreset::High,
             max_streams: 12,
@@ -1633,6 +1656,7 @@ mod tests {
                 unattended: true,
                 no_clipboard: true,
                 max_streams: 12,
+                encoder: crate::EncoderChoice::Qsv,
                 ..
             })
         ));
@@ -1641,7 +1665,7 @@ mod tests {
             !defaults
                 .sharing_args()
                 .iter()
-                .any(|arg| arg == "--unattended" || arg == "--no-clipboard")
+                .any(|arg| arg == "--unattended" || arg == "--no-clipboard" || arg == "--encoder")
         );
         assert!(
             !defaults
@@ -1690,6 +1714,19 @@ mod tests {
             .validate()
             .is_err()
         );
+        assert!(
+            SessionOptions {
+                encoder: "unknown".into(),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        // Every Settings choice is one the core and the host CLI accept.
+        for encoder in &ENCODERS[1..] {
+            assert!(frames_core::codec::ENCODERS.contains(encoder));
+            assert!(crate::Args::try_parse_from(["frames", "host", "--encoder", encoder]).is_ok());
+        }
     }
 
     #[test]

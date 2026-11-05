@@ -122,6 +122,29 @@ pub async fn probe_decoders() -> Vec<CodecCapability> {
     .await
     .unwrap_or_default()
 }
+/// The encoder hosts use (`nvenc`, `amf`, `qsv`, `mf`, or `software`), set
+/// before the first [`probe`]; unset selects automatically.
+static PREFERRED_ENCODER: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+pub const ENCODERS: [&str; 5] = ["nvenc", "amf", "qsv", "mf", "software"];
+/// Limits hosting to one encoder. When none of its codecs works here, the
+/// probe selects automatically instead, so sharing still starts.
+pub fn prefer_encoder(backend: &str) -> anyhow::Result<()> {
+    let backend = ENCODERS
+        .into_iter()
+        .find(|known| *known == backend)
+        .ok_or_else(|| anyhow::anyhow!("unknown encoder {backend}"))?;
+    PREFERRED_ENCODER
+        .set(backend)
+        .map_err(|_| anyhow::anyhow!("the encoder is already chosen"))
+}
+fn uses(backend: &str, name: &str, hardware: bool) -> bool {
+    match backend {
+        "software" => !hardware,
+        backend => name
+            .rsplit_once('_')
+            .is_some_and(|(_, suffix)| suffix == backend),
+    }
+}
 /// Advertise only paths that produce and decode a single picture without EOF.
 pub async fn probe() -> Vec<CodecCapability> {
     static CAPABILITIES: tokio::sync::OnceCell<Vec<CodecCapability>> =
@@ -129,52 +152,14 @@ pub async fn probe() -> Vec<CodecCapability> {
     CAPABILITIES
         .get_or_init(|| async {
             tokio::task::spawn_blocking(|| {
-                let mut result = Vec::new();
-                let frame = RawFrame {
-                    media_generation: 0,
-                    #[cfg(windows)]
-                    gpu: None,
-                    captured_at: std::time::Instant::now(),
-                    frame_number: 0,
-                    width: 128,
-                    height: 128,
-                    bgra: [220, 30, 20, 255].repeat(128 * 128).into(),
-                };
-                for codec in [Codec::H264, Codec::Hevc, Codec::Av1, Codec::Vp9] {
-                    for &(name, hardware) in candidates(codec) {
-                        let valid = (|| -> anyhow::Result<()> {
-                            let mut encoder = runtime::Context::encoder(name, 128, 128, 60)?;
-                            let mut decoder =
-                                runtime::Context::decoder(codec.decoder(), 128, 128, false)?;
-                            for _ in 0..4 {
-                                let packets = encoder.encode(&frame)?;
-                                anyhow::ensure!(
-                                    packets.len() == 1,
-                                    "Encoder buffered a picture instead of returning one complete packet"
-                                );
-                                let output = decoder
-                                    .decode(&packets[0])?
-                                    .ok_or_else(|| anyhow::anyhow!("Decoder buffers pictures"))?;
-                                anyhow::ensure!(
-                                    output.bgra[0] > 140 && output.bgra[2] < 100,
-                                    "Invalid codec pixels"
-                                );
-                            }
-                            Ok(())
-                        })();
-                        match valid {
-                            Ok(()) => {
-                                result.push(CodecCapability {
-                                    codec,
-                                    encoder: Some(name.into()),
-                                    decoder: true,
-                                    hardware,
-                                });
-                                break;
-                            }
-                            Err(e) => tracing::debug!(name,error=%e,"Codec probe unavailable"),
-                        }
-                    }
+                let preferred = PREFERRED_ENCODER.get().copied();
+                let result = probe_encoders(preferred);
+                if preferred.is_some() && result.is_empty() {
+                    tracing::warn!(
+                        encoder = preferred,
+                        "chosen encoder unavailable; selecting automatically"
+                    );
+                    return probe_encoders(None);
                 }
                 result
             })
@@ -183,6 +168,58 @@ pub async fn probe() -> Vec<CodecCapability> {
         })
         .await
         .clone()
+}
+fn probe_encoders(preferred: Option<&str>) -> Vec<CodecCapability> {
+    let mut result = Vec::new();
+    let frame = RawFrame {
+        media_generation: 0,
+        #[cfg(windows)]
+        gpu: None,
+        captured_at: std::time::Instant::now(),
+        frame_number: 0,
+        width: 128,
+        height: 128,
+        bgra: [220, 30, 20, 255].repeat(128 * 128).into(),
+    };
+    for codec in [Codec::H264, Codec::Hevc, Codec::Av1, Codec::Vp9] {
+        for &(name, hardware) in candidates(codec)
+            .iter()
+            .filter(|(name, hardware)| preferred.is_none_or(|b| uses(b, name, *hardware)))
+        {
+            let valid = (|| -> anyhow::Result<()> {
+                let mut encoder = runtime::Context::encoder(name, 128, 128, 60)?;
+                let mut decoder = runtime::Context::decoder(codec.decoder(), 128, 128, false)?;
+                for _ in 0..4 {
+                    let packets = encoder.encode(&frame)?;
+                    anyhow::ensure!(
+                        packets.len() == 1,
+                        "Encoder buffered a picture instead of returning one complete packet"
+                    );
+                    let output = decoder
+                        .decode(&packets[0])?
+                        .ok_or_else(|| anyhow::anyhow!("Decoder buffers pictures"))?;
+                    anyhow::ensure!(
+                        output.bgra[0] > 140 && output.bgra[2] < 100,
+                        "Invalid codec pixels"
+                    );
+                }
+                Ok(())
+            })();
+            match valid {
+                Ok(()) => {
+                    result.push(CodecCapability {
+                        codec,
+                        encoder: Some(name.into()),
+                        decoder: true,
+                        hardware,
+                    });
+                    break;
+                }
+                Err(e) => tracing::debug!(name,error=%e,"Codec probe unavailable"),
+            }
+        }
+    }
+    result
 }
 fn candidates(codec: Codec) -> &'static [(&'static str, bool)] {
     match codec {
@@ -875,5 +912,23 @@ mod tests {
         }];
         assert!(negotiate(&caps, &caps, Some(Codec::H264)).is_err());
         assert_eq!(negotiate(&caps, &caps, None).unwrap().codec, Codec::Vp9);
+    }
+
+    #[test]
+    fn a_chosen_encoder_keeps_only_its_own_candidates() {
+        let kept = |backend: &str| -> Vec<&str> {
+            [Codec::H264, Codec::Hevc, Codec::Av1, Codec::Vp9]
+                .into_iter()
+                .flat_map(candidates)
+                .filter(|(name, hardware)| uses(backend, name, *hardware))
+                .map(|(name, _)| *name)
+                .collect()
+        };
+        if !cfg!(target_os = "macos") {
+            assert_eq!(kept("qsv"), ["h264_qsv", "hevc_qsv", "av1_qsv"]);
+            assert_eq!(kept("mf"), ["h264_mf", "hevc_mf", "av1_mf"]);
+        }
+        assert_eq!(kept("software"), ["libaom-av1", "libvpx-vp9"]);
+        assert!(prefer_encoder("cuda").is_err());
     }
 }

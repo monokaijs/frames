@@ -606,6 +606,10 @@ async fn host_mode(
     let identity = Arc::new(Identity::load()?);
     let codecs = codec::probe().await;
     anyhow::ensure!(!codecs.is_empty(), "no working codecs; run frames doctor");
+    tracing::info!(
+        encoders = ?codecs.iter().filter_map(|c| c.encoder.as_deref()).collect::<Vec<_>>(),
+        "host encoders"
+    );
     let desktop = if let Some((windows, isolated)) = selected {
         if isolated {
             frames_native::shared_selected_desktop(exclude, windows.into_iter().next().unwrap())?

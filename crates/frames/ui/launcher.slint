@@ -221,6 +221,7 @@ export component Launcher inherits Window {
     in-out property <bool> unattended: false;
     in-out property <bool> clipboard: true;
     in-out property <int> codec: 0;
+    in-out property <int> encoder: 0;
     in-out property <int> quality: 0;
     in-out property <bool> bandwidth-auto: true;
     in-out property <int> bandwidth-mbps: 50;
@@ -501,8 +502,11 @@ export component Launcher inherits Window {
                                     if root.background-sharing-running: AppSwitch { checked: true; enabled: false; accessible-label: "Unattended access"; }
                                     if !root.background-sharing-running: AppSwitch { checked <=> root.unattended; toggled => { root.settings-edited(); } enabled: root.unattended-editable; accessible-label: "Unattended access"; }
                                 }
-                                SettingRow { title: "Shared window limit"; detail: "Maximum windows streamed at the same time, per connection."; divider: root.mac;
+                                SettingRow { title: "Shared window limit"; detail: "Maximum windows streamed at the same time, per connection.";
                                     SpinBox { width: 140px; minimum: 1; maximum: 32; value <=> root.max-streams; edited => { root.settings-edited(); } accessible-label: "Shared window limit"; }
+                                }
+                                if !root.mac: SettingRow { title: "Video encoder"; detail: root.encoder == 0 ? "Automatic uses the fastest encoder that works on this PC." : "Used when sharing starts. If it does not work on this PC, Frames picks one automatically."; divider: false;
+                                    ComboBox { width: 180px; model: ["Automatic", "NVIDIA NVENC", "AMD AMF", "Intel Quick Sync", "Windows Media Foundation", "Software"]; current-index <=> root.encoder; selected(value) => { root.settings-edited(); } accessible-label: "Video encoder"; }
                                 }
                                 if root.mac: SettingRow { title: "Sharing at login"; detail: root.background-sharing-registered ? "Enabled. Sharing starts when you sign in." : "Manage background sharing on this Mac."; divider: false;
                                     AppButton { label: "Manage"; a11y-label: "Manage sharing at login"; quiet: true; clicked => { root.login-settings(); } }
