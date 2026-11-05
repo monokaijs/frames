@@ -18,9 +18,7 @@ pub enum Captured {
         y: u16,
         at_us: u64,
     },
-    /// Relative motion, in points or pixels (positive y is down). Only the
-    /// macOS viewer captures it so far.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// Relative motion, in points or pixels (positive y is down).
     Motion {
         dx: i32,
         dy: i32,
@@ -152,7 +150,6 @@ impl InputLane {
 
     /// Sends the newest motion datagram again once it is 4 ms old (call
     /// every loop iteration; the host drops it if the first arrived).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn tick(&mut self, media: &frames_net::MediaChannel, now_us: u64) {
         if let Some((datagram, sent)) = self.repeat
             && now_us.saturating_sub(sent) >= 4_000

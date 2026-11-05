@@ -4,7 +4,7 @@ use anyhow::Result;
 use frames_input::{Button, Event, keys, normalize};
 use frames_media::api::MediaClock;
 use frames_media::clock::SystemClock;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -15,7 +15,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_F12;
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F11, VK_F12};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
@@ -47,6 +47,120 @@ thread_local! {
     /// The host's cursor as shown over the viewer; `None` hides it.
     static CURSOR: RefCell<Option<HCURSOR>> = const { RefCell::new(None) };
     static CURSOR_SHAPE: RefCell<Option<HCURSOR>> = const { RefCell::new(None) };
+    /// Relative mouse: `Some(locked)` while on; `locked` when the pointer is
+    /// confined and hidden (not in unattended tests).
+    static RELATIVE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Turns relative mouse (games) on or off, as Ctrl+Alt+F11 does, and tells
+/// the host. With `lock`, motion comes from raw input and the pointer is
+/// confined to the viewer and hidden; without it (unattended tests) the
+/// system pointer is left alone.
+pub fn set_relative(hwnd: HWND, on: bool, lock: bool) {
+    use windows::Win32::UI::Input::{RAWINPUTDEVICE, RIDEV_REMOVE, RegisterRawInputDevices};
+    let current = RELATIVE.with(Cell::get);
+    if current.is_some() == on {
+        return;
+    }
+    let device = |flags, target: Option<HWND>| RAWINPUTDEVICE {
+        usUsagePage: 0x01,
+        usUsage: 0x02,
+        dwFlags: flags,
+        hwndTarget: target.unwrap_or_default(),
+    };
+    let size = std::mem::size_of::<RAWINPUTDEVICE>() as u32;
+    if on {
+        if lock {
+            // SAFETY: plain Win32 calls on this thread's window.
+            unsafe {
+                if RegisterRawInputDevices(&[device(Default::default(), Some(hwnd))], size).is_err()
+                {
+                    return;
+                }
+                let mut rect = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rect);
+                let mut corners = [
+                    windows::Win32::Foundation::POINT {
+                        x: rect.left,
+                        y: rect.top,
+                    },
+                    windows::Win32::Foundation::POINT {
+                        x: rect.right,
+                        y: rect.bottom,
+                    },
+                ];
+                MapWindowPoints(Some(hwnd), None, &mut corners);
+                let screen = RECT {
+                    left: corners[0].x,
+                    top: corners[0].y,
+                    right: corners[1].x,
+                    bottom: corners[1].y,
+                };
+                let _ = ClipCursor(Some(&screen));
+                ShowCursor(false);
+            }
+        }
+        RELATIVE.with(|r| r.set(Some(lock)));
+    } else {
+        if current == Some(true) {
+            // SAFETY: undoes exactly what turning it on did.
+            unsafe {
+                let _ = RegisterRawInputDevices(&[device(RIDEV_REMOVE, None)], size);
+                let _ = ClipCursor(None);
+                ShowCursor(true);
+            }
+        }
+        RELATIVE.with(|r| r.set(None));
+    }
+    let at_us = SystemClock::new().now_us();
+    CAPTURED.with(|c| {
+        c.borrow_mut().push(Captured::Event {
+            event: Event::Mode { relative: on },
+            at_us,
+        })
+    });
+}
+
+pub fn relative() -> bool {
+    RELATIVE.with(Cell::get).is_some()
+}
+
+/// Generated relative motion for unattended tests (raw input cannot be
+/// posted); ignored unless relative mode is on.
+pub fn synthetic_motion(dx: i32, dy: i32) {
+    if relative() {
+        let at_us = SystemClock::new().now_us();
+        CAPTURED.with(|c| c.borrow_mut().push(Captured::Motion { dx, dy, at_us }));
+    }
+}
+
+/// The relative motion in a WM_INPUT message, if it is mouse motion.
+fn raw_motion(l: LPARAM) -> Option<(i32, i32)> {
+    use windows::Win32::UI::Input::{
+        GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTHEADER, RID_INPUT, RIM_TYPEMOUSE,
+    };
+    let mut input = RAWINPUT::default();
+    let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+    // SAFETY: `input` is large enough for one mouse report.
+    let read = unsafe {
+        GetRawInputData(
+            HRAWINPUT(l.0 as *mut _),
+            RID_INPUT,
+            Some((&mut input as *mut RAWINPUT).cast()),
+            &mut size,
+            std::mem::size_of::<RAWINPUTHEADER>() as u32,
+        )
+    };
+    if read == u32::MAX || input.header.dwType != RIM_TYPEMOUSE.0 {
+        return None;
+    }
+    // SAFETY: a mouse report, per the header.
+    let mouse = unsafe { input.data.mouse };
+    // MOUSE_MOVE_ABSOLUTE (tablets, remote desktop) carries positions.
+    if mouse.usFlags.0 & 1 != 0 || (mouse.lLastX == 0 && mouse.lLastY == 0) {
+        return None;
+    }
+    Some((mouse.lLastX, mouse.lLastY))
 }
 
 /// Applies a cursor message from the host (viewer thread only).
@@ -200,6 +314,12 @@ fn viewer_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<Captur
         button(which, down)
     };
     match message {
+        WM_INPUT if relative() => {
+            let (dx, dy) = raw_motion(l)?;
+            Some(Captured::Motion { dx, dy, at_us })
+        }
+        // Positions mean nothing while relative.
+        WM_MOUSEMOVE if relative() => None,
         WM_MOUSEMOVE => {
             let (x, y) = position(hwnd, l);
             Some(Captured::Move { x, y, at_us })
@@ -226,7 +346,13 @@ fn viewer_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<Captur
         }
         // Ctrl+Alt+F12: release remote input and minimize (as in v1); the
         // shortcut itself never reaches the host.
+        // Ctrl+Alt+F11: relative mouse on or off (as in v1); never sent.
+        WM_KEYDOWN | WM_SYSKEYDOWN if w.0 == usize::from(VK_F11.0) && release_shortcut_held() => {
+            set_relative(hwnd, !relative(), true);
+            None
+        }
         WM_KEYDOWN | WM_SYSKEYDOWN if w.0 == usize::from(VK_F12.0) && release_shortcut_held() => {
+            set_relative(hwnd, false, true);
             unsafe {
                 let _ = ShowWindow(hwnd, SW_MINIMIZE);
             }
@@ -246,10 +372,14 @@ fn viewer_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<Captur
                 at_us,
             })
         }
-        WM_KILLFOCUS => Some(Captured::Event {
-            event: Event::ReleaseAll,
-            at_us,
-        }),
+        WM_KILLFOCUS => {
+            // Leaving the window gives the pointer back.
+            set_relative(hwnd, false, true);
+            Some(Captured::Event {
+                event: Event::ReleaseAll,
+                at_us,
+            })
+        }
         _ => None,
     }
 }

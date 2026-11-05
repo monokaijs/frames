@@ -101,7 +101,14 @@ impl SyntheticInput {
         use windows::Win32::UI::WindowsAndMessaging::*;
         let elapsed = self.started.elapsed();
         let due_moves = elapsed.as_millis() as u64 / 8;
-        if due_moves > self.moves {
+        if due_moves > self.moves && win::relative() {
+            // 3 right and 1 up per step, as the Mac viewer's generated input.
+            win::synthetic_motion(
+                3 * (due_moves - self.moves) as i32,
+                -((due_moves - self.moves) as i32),
+            );
+            self.moves = due_moves;
+        } else if due_moves > self.moves {
             self.moves = due_moves;
             let angle = self.moves as f64 * 0.05;
             let (x, y) = (
@@ -177,6 +184,9 @@ fn view(
     // Whatever keyframe came first was just discarded (or is still to come);
     // ask for one, since a still picture would never send another.
     client.request_keyframe();
+    if o.relative_qa {
+        win::set_relative(viewer, true, false);
+    }
     let started = Instant::now();
     let mut synthetic = o.synthetic_input.then_some(SyntheticInput {
         hwnd: viewer,
@@ -213,6 +223,7 @@ fn view(
         cursor_shapes += cursor_updates;
         win::pump();
         lane.send(&media, &clock, win::take_input());
+        lane.tick(&media, clock.now_us());
         if let Some(clipboard) = &mut clipboard {
             clipboard.tick();
         }
@@ -271,6 +282,9 @@ fn view(
         }
         std::thread::sleep(Duration::from_micros(200));
     }
+    // Give the pointer back before the window goes.
+    win::set_relative(viewer, false, true);
+    let _ = win::take_input();
     lane.release_all();
     lane.print_summary(cursor_shapes);
     if let Some(audio) = &audio {
