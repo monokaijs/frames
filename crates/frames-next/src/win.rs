@@ -760,6 +760,8 @@ pub struct QaInputCounts {
     pub buttons: AtomicU64,
     pub wheels: AtomicU64,
     pub keys: AtomicU64,
+    /// Typed characters (WM_CHAR), and the last few as text.
+    pub chars: AtomicU64,
 }
 
 pub static QA_INPUT: QaInputCounts = QaInputCounts {
@@ -767,7 +769,11 @@ pub static QA_INPUT: QaInputCounts = QaInputCounts {
     buttons: AtomicU64::new(0),
     wheels: AtomicU64::new(0),
     keys: AtomicU64::new(0),
+    chars: AtomicU64::new(0),
 };
+
+/// The last characters the QA window received (at most 32).
+pub static QA_TEXT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 unsafe extern "system" fn qa_procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     let counter = match message {
@@ -776,6 +782,16 @@ unsafe extern "system" fn qa_procedure(hwnd: HWND, message: u32, w: WPARAM, l: L
         | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => Some(&QA_INPUT.buttons),
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => Some(&QA_INPUT.wheels),
         WM_KEYDOWN | WM_KEYUP => Some(&QA_INPUT.keys),
+        WM_CHAR => {
+            if let Some(c) = char::from_u32(w.0 as u32) {
+                let mut text = QA_TEXT.lock().unwrap();
+                text.push(c);
+                if text.chars().count() > 32 {
+                    text.remove(0);
+                }
+            }
+            Some(&QA_INPUT.chars)
+        }
         _ => None,
     };
     if let Some(counter) = counter {

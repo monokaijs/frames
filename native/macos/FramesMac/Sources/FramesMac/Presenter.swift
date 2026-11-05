@@ -1168,10 +1168,12 @@ final class InputView: NSView {
                 with: type, location: location, modifierFlags: [], timestamp: now, windowNumber: number,
                 context: nil, eventNumber: 0, clickCount: 1, pressure: type == .leftMouseDown ? 1 : 0)
         }
+        // Alternates a plain and an accented character (text input checks).
+        let typed = step % 250 == 0 ? "é" : "a"
         func key(_ type: NSEvent.EventType) -> NSEvent? {
             NSEvent.keyEvent(
                 with: type, location: location, modifierFlags: [], timestamp: now, windowNumber: number,
-                context: nil, characters: "a", charactersIgnoringModifiers: "a", isARepeat: false, keyCode: 0)
+                context: nil, characters: typed, charactersIgnoringModifiers: typed, isARepeat: false, keyCode: 0)
         }
         if relative {
             // Generated events carry no deltas: send the motion directly,

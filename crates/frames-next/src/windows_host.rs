@@ -1045,12 +1045,14 @@ fn stream(
                 let load =
                     |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
                 println!(
-                    "host input: applied {} | QA window received moves {} buttons {} wheels {} keys {}",
+                    "host input: applied {} | QA window received moves {} buttons {} wheels {} keys {} chars {} last {:?}",
                     injector.applied,
                     load(&counts.moves),
                     load(&counts.buttons),
                     load(&counts.wheels),
                     load(&counts.keys),
+                    load(&counts.chars),
+                    win::QA_TEXT.lock().unwrap().as_str(),
                 );
             }
             next_report += Duration::from_secs(1);
