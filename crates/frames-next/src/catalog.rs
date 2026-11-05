@@ -110,14 +110,32 @@ pub fn shared(filters: &[String], limit: usize) -> Vec<Window> {
         return Vec::new();
     }
     let filters: Vec<String> = filters.iter().map(|f| f.to_lowercase()).collect();
-    let mut windows: Vec<Window> = platform_windows()
-        .into_iter()
+    let all = platform_windows();
+    let chosen = |w: &Window| {
+        filters.is_empty() || {
+            let title = w.title.to_lowercase();
+            filters.iter().any(|f| title.contains(f))
+        }
+    };
+    // A selected window's own menus and tooltips come with it (untitled,
+    // so no filter matches them): by their parent, or for ownerless menus
+    // by their application.
+    let mut windows: Vec<Window> = all
+        .iter()
         .filter(|w| {
-            filters.is_empty() || {
-                let title = w.title.to_lowercase();
-                filters.iter().any(|f| title.contains(f))
-            }
+            chosen(w)
+                || (w.is_popup()
+                    && match w.parent {
+                        Some(p) => all.iter().any(|o| o.id == p && chosen(o)),
+                        None => {
+                            !w.app.is_empty()
+                                && all
+                                    .iter()
+                                    .any(|o| !o.is_popup() && chosen(o) && o.app == w.app)
+                        }
+                    })
         })
+        .cloned()
         .collect();
     windows.truncate(limit.min(MAX_WINDOWS));
     windows

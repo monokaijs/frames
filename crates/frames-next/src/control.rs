@@ -147,6 +147,12 @@ pub enum WindowAction {
     RefreshMenus,
     /// Relative mouse on or off (games; also Control+Option+F11).
     ToggleRelative,
+    /// Resize the host window's picture to this many pixels, as dragging
+    /// the window does in "Resize remote app" (scripted tests).
+    ResizeTo {
+        width: u16,
+        height: u16,
+    },
     /// Fetch this file (relative to the host user's home folder).
     Fetch {
         path: String,
@@ -451,6 +457,7 @@ pub fn send(command: Command) {
                     }
                     WindowAction::RefreshMenus
                     | WindowAction::ToggleRelative
+                    | WindowAction::ResizeTo { .. }
                     | WindowAction::Fetch { .. } => false,
                 };
                 if saved {
@@ -726,6 +733,9 @@ impl WindowLoop {
             match action {
                 WindowAction::RefreshMenus => send(frames_input::Event::RefreshMenus),
                 WindowAction::ToggleRelative => changes.toggle_relative = true,
+                WindowAction::ResizeTo { width, height } => {
+                    send(frames_input::Event::ResizeWindow { width, height })
+                }
                 WindowAction::Fetch { path } => {
                     let (session, dir) = (session.clone(), self.receive_dir.clone());
                     self.handle.spawn(async move {
