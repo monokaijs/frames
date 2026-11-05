@@ -1363,9 +1363,6 @@ pub fn run() -> Result<()> {
     };
     ui.set_audio(preferences.options.audio);
     ui.set_desktop(preferences.options.desktop);
-    if let Some(recent) = preferences.recent.first() {
-        ui.set_address(recent.address.clone().into());
-    }
     ui.set_default_audio(preferences.options.audio);
     ui.set_default_desktop(preferences.options.desktop);
     ui.set_clipboard(preferences.options.clipboard);

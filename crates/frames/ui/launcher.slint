@@ -385,12 +385,13 @@ export component Launcher inherits Window {
                                             VerticalLayout {
                                                 spacing: 3px;
                                                 Text { text: root.device-name; font-size: 15px; font-weight: 500; color: Theme.ink; overflow: elide; }
+                                                // One line, one size: code, then address, then a small copy button.
                                                 HorizontalLayout {
-                                                    spacing: 8px;
-                                                    TextInput { text: "Code " + root.device-code; read-only: true; single-line: true; font-size: 13px; font-weight: 600; color: Theme.ink; vertical-alignment: center; horizontal-stretch: 0; accessible-label: "This device's code. Other devices connect with it."; }
-                                                    if root.local-ip != "": TextInput { text: root.local-ip; read-only: true; single-line: true; font-size: 11px; color: Theme.muted; vertical-alignment: center; horizontal-stretch: 0; accessible-label: "This device's address on this network"; }
-                                                    Rectangle { horizontal-stretch: 1; }
-                                                    AppButton { label: "Copy ID"; quiet: true; a11y-label: "Copy this device's full ID, for connecting over the internet"; clicked => { root.copy-device-id(); } }
+                                                    height: 22px; spacing: 6px; alignment: start;
+                                                    TextInput { text: root.device-code; read-only: true; single-line: true; font-size: 12px; font-weight: 500; color: Theme.ink; vertical-alignment: center; accessible-label: "This device's code. Other devices connect with it."; }
+                                                    if root.local-ip != "": Text { text: "·"; font-size: 12px; color: Theme.muted; vertical-alignment: center; }
+                                                    if root.local-ip != "": TextInput { text: root.local-ip; read-only: true; single-line: true; font-size: 12px; color: Theme.muted; vertical-alignment: center; accessible-label: "This device's address on this network"; }
+                                                    AppButton { icon: @image-url("icons/copy.svg"); quiet: true; min-width: 22px; max-width: 22px; height: 22px; a11y-label: "Copy this device's full ID, for connecting over the internet"; clicked => { root.copy-device-id(); } }
                                                 }
                                             }
                                             // Controls sit on the card's bottom edge in both columns so they line up.
