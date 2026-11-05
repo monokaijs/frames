@@ -42,8 +42,23 @@ fn pcm_bytes(samples: &[f32]) -> Vec<u8> {
     samples.iter().flat_map(|s| s.to_le_bytes()).collect()
 }
 
-/// Host: streams `mode`'s audio until the session closes.
-pub async fn host(session: frames_net::Session, mode: Mode) -> anyhow::Result<()> {
+/// What a host's audio is.
+#[derive(Clone, Debug)]
+pub enum Source {
+    /// Everything this computer plays.
+    System,
+    /// One application's (sharing selected windows of one process, as v1).
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    Process {
+        pid: u32,
+        /// Where the Windows adapter is extracted (unused on macOS).
+        #[cfg_attr(not(windows), allow(dead_code))]
+        dir: std::path::PathBuf,
+    },
+}
+
+/// Host: streams `mode`'s audio from `source` until the session closes.
+pub async fn host(session: frames_net::Session, mode: Mode, source: Source) -> anyhow::Result<()> {
     if mode == Mode::Off {
         return Ok(());
     }
@@ -70,18 +85,24 @@ pub async fn host(session: frames_net::Session, mode: Mode) -> anyhow::Result<()
             });
         }
         Mode::On => {
-            let capture = start_capture()?;
+            let mut capture = start_capture(&source)?;
             format = PcmFormat {
                 rate: capture.format.rate,
                 channels: capture.format.channels,
             };
             println!(
-                "audio: capturing system audio at {} Hz, {} channels",
-                format.rate, format.channels
+                "audio: capturing {} audio at {} Hz, {} channels",
+                match source {
+                    Source::System => "system",
+                    Source::Process { .. } => "application",
+                },
+                format.rate,
+                format.channels
             );
             drop(pcm_tx);
-            let packets = std::mem::replace(&mut pcm_rx, tokio::sync::mpsc::channel(1).1);
-            pcm_rx = packets;
+            // The encoder reads the capture's PCM; the capture (its guard)
+            // stays alive with the session.
+            pcm_rx = std::mem::replace(&mut capture.packets, tokio::sync::mpsc::channel(1).1);
             _capture = Some(capture);
         }
         Mode::Off => unreachable!(),
@@ -111,10 +132,89 @@ pub async fn host(session: frames_net::Session, mode: Mode) -> anyhow::Result<()
     Ok(())
 }
 
-/// System audio: WASAPI loopback on Windows. (macOS capture comes from
-/// ScreenCaptureKit, not wired into v2 yet.)
-fn start_capture() -> anyhow::Result<frames_audio::AudioCapture> {
-    frames_audio::loopback()
+/// System audio: WASAPI loopback on Windows, ScreenCaptureKit on macOS.
+/// One application's: process loopback through the shared-input adapter
+/// (Windows), or ScreenCaptureKit filtered to that application (macOS).
+fn start_capture(source: &Source) -> anyhow::Result<frames_audio::AudioCapture> {
+    match source {
+        #[cfg(target_os = "macos")]
+        Source::System => mac_capture(None),
+        #[cfg(not(target_os = "macos"))]
+        Source::System => frames_audio::loopback(),
+        #[cfg(windows)]
+        Source::Process { pid, dir } => process_capture(*pid, dir),
+        #[cfg(target_os = "macos")]
+        Source::Process { pid, .. } => mac_capture(Some(*pid as i32)),
+        #[cfg(not(any(windows, target_os = "macos")))]
+        Source::Process { .. } => anyhow::bail!("application audio needs a Windows or macOS host"),
+    }
+}
+
+/// ScreenCaptureKit audio (Screen Recording permission), as v1's
+/// SystemAudioCapture: the whole Mac but Frames, or one application.
+#[cfg(target_os = "macos")]
+fn mac_capture(pid: Option<i32>) -> anyhow::Result<frames_audio::AudioCapture> {
+    use frames_platform_macos::audio::{CHANNELS, MacAudio, SAMPLE_RATE};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // ScreenCaptureKit hands over 10-20 ms at a time.
+    let (tx, packets) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+    let capture = MacAudio::start(pid, move |samples| {
+        if let Some(samples) = samples {
+            let _ = tx.try_send(pcm_bytes(samples));
+        }
+    })
+    .map_err(|reason| anyhow::anyhow!("macOS audio capture: {reason}"))?;
+    // The capture stops when the session's guard is dropped.
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    std::thread::Builder::new()
+        .name("frames-mac-audio".into())
+        .spawn(move || {
+            while !flag.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            drop(capture);
+        })?;
+    Ok(frames_audio::AudioCapture {
+        format: frames_audio::PcmFormat {
+            rate: SAMPLE_RATE,
+            channels: CHANNELS,
+        },
+        packets,
+        guard: frames_audio::Guard::new(stop),
+    })
+}
+
+#[cfg(windows)]
+fn process_capture(pid: u32, dir: &std::path::Path) -> anyhow::Result<frames_audio::AudioCapture> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut capture = frames_platform_windows::shared_input::ProcessAudio::start(pid, dir)?;
+    let (tx, packets) = tokio::sync::mpsc::channel(2);
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    std::thread::Builder::new()
+        .name("frames-app-audio".into())
+        .spawn(move || {
+            // 100 ms of 48 kHz stereo f32 at most per read.
+            let mut bytes = vec![0u8; 38_400];
+            while !flag.load(Ordering::Acquire) {
+                match capture.read(&mut bytes) {
+                    None => break,
+                    Some(0) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                    Some(n) => {
+                        let _ = tx.try_send(bytes[..n].to_vec());
+                    }
+                }
+            }
+        })?;
+    Ok(frames_audio::AudioCapture {
+        format: frames_audio::PcmFormat {
+            rate: 48_000,
+            channels: 2,
+        },
+        packets,
+        guard: frames_audio::Guard::new(stop),
+    })
 }
 
 /// What the viewer's audio did, for reports.

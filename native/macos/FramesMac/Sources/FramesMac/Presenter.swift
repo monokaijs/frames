@@ -30,7 +30,7 @@ final class Presenter: @unchecked Sendable {
     /// Files dropped on the window, for the host (ABI 4).
     let drops = DroppedFiles()
 
-    init?(width: Int, height: Int, windowed: Bool) {
+    init?(width: Int, height: Int, windowed: Bool, popup: Bool = false) {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { return nil }
         self.device = device
         self.queue = queue
@@ -61,6 +61,9 @@ final class Presenter: @unchecked Sendable {
         layer.maximumDrawableCount = 2
         layer.allowsNextDrawableTimeout = true
         layer.drawableSize = CGSize(width: width, height: height)
+        // Letterboxed ("fit"): the picture keeps its shape inside the view.
+        layer.contentsGravity = .resizeAspect
+        layer.backgroundColor = CGColor(gray: 0, alpha: 1)
         self.layer = layer
         self.windowed = windowed
         // Offscreen presenters never touch the main thread (it may not be
@@ -86,7 +89,8 @@ final class Presenter: @unchecked Sendable {
             }
             let frame = NSRect(x: 80, y: 80, width: size.width, height: size.height)
             let window = NSWindow(
-                contentRect: frame, styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+                contentRect: frame, styleMask: popup ? [.borderless] : [.titled, .closable, .resizable],
+                backing: .buffered, defer: false)
             window.title = "Frames presenter"
             window.isReleasedWhenClosed = false
             window.delegate = closed
@@ -98,9 +102,16 @@ final class Presenter: @unchecked Sendable {
             view.wantsLayer = true
             view.layer = layer
             window.contentView = view
+            closed.view = view
             window.acceptsMouseMovedEvents = true
-            window.makeKeyAndOrderFront(nil)
-            window.makeFirstResponder(view)
+            if popup {
+                // Shown by attach(), over its parent; never key.
+                window.hasShadow = true
+            } else {
+                addConnectionButton(window, view: view)
+                window.makeKeyAndOrderFront(nil)
+                window.makeFirstResponder(view)
+            }
             return (window, hz, view)
         }
         let made: (NSWindow?, Double, InputView)
@@ -118,7 +129,7 @@ final class Presenter: @unchecked Sendable {
     func setCursor(_ shape: CursorShape?, visible: Bool?) {
         guard let inputView else { return }
         let apply = { @MainActor in
-            inputView.setHostCursor(shape.flatMap(cursorImage), hotspot: shape?.hotspot ?? .zero, visible: visible)
+            inputView.setHostCursor(shape, visible: visible)
         }
         if Thread.isMainThread {
             MainActor.assumeIsolated { apply() }
@@ -133,7 +144,13 @@ final class Presenter: @unchecked Sendable {
     func resize(width: Int, height: Int) {
         layer.drawableSize = CGSize(width: width, height: height)
         guard let window else { return }
+        let view = inputView
+        let closed = self.closed
         let apply = { @MainActor in
+            view?.pictureChanged()
+            // "Resize remote app": the window keeps the size the user gave
+            // it (the host followed it); the picture fits inside.
+            guard view?.keepAspect ?? true else { return }
             let current = window.contentLayoutRect.size
             let old = window.contentAspectRatio
             let scale = old.width > 0 ? current.width / old.width : 0.5
@@ -143,7 +160,56 @@ final class Presenter: @unchecked Sendable {
                 size = NSSize(width: size.width * fit, height: size.height * fit)
             }
             window.contentAspectRatio = NSSize(width: CGFloat(width), height: CGFloat(height))
+            closed.programmatic = true
             window.setContentSize(size)
+            closed.programmatic = false
+        }
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { apply() }
+        } else {
+            DispatchQueue.main.async { MainActor.assumeIsolated { apply() } }
+        }
+    }
+
+    /// Shows this popup over its parent's picture (main thread), retrying
+    /// while the parent's window is not open yet.
+    func attach(parent: UInt64, frame: CGRect, parentSize: CGSize, role: UInt32, attempts: Int = 40) {
+        guard let window else { return }
+        let apply = { @MainActor in
+            guard
+                let parentView = NSApplication.shared.windows.compactMap({ $0.contentView as? InputView })
+                    .first(where: { $0.menuID == parent && $0.window?.styleMask.contains(.titled) == true }),
+                let parentWindow = parentView.window, parentSize.width > 0
+            else {
+                if attempts > 0 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        self.attach(parent: parent, frame: frame, parentSize: parentSize, role: role, attempts: attempts - 1)
+                    }
+                }
+                return
+            }
+            let picture = parentWindow.convertToScreen(parentView.convert(parentView.pictureRect, to: nil))
+            let scale = picture.width / parentSize.width
+            // The parent's title bar may be cropped: its picture starts
+            // below the top of its frame.
+            let crop = max(0, parentSize.height - picture.height / max(scale, 0.0001))
+            let shown = NSRect(
+                x: picture.minX + frame.minX * scale, y: picture.maxY - (frame.minY - crop + frame.height) * scale,
+                width: frame.width * scale, height: frame.height * scale)
+            window.setFrame(shown, display: false)
+            switch Int(role) {
+            case Int(FRAMES_MAC_POPUP_MENU): window.level = .popUpMenu
+            case Int(FRAMES_MAC_POPUP_TOOLTIP):
+                window.level = .popUpMenu
+                window.ignoresMouseEvents = true
+            case Int(FRAMES_MAC_POPUP_SHEET): window.level = parentWindow.level
+            default: window.level = .floating
+            }
+            if window.parent !== parentWindow {
+                window.parent?.removeChildWindow(window)
+                parentWindow.addChildWindow(window, ordered: .above)
+            }
+            window.orderFront(nil)
         }
         if Thread.isMainThread {
             MainActor.assumeIsolated { apply() }
@@ -184,6 +250,7 @@ final class Presenter: @unchecked Sendable {
     }
 
     func close() {
+        input.setText(context: nil, callback: nil)
         input.set(context: nil, callback: nil)
         guard let window else { return }
         self.window = nil
@@ -261,8 +328,10 @@ struct CursorShape: Sendable {
     let hotspot: NSPoint
 }
 
+/// The cursor as an image `scale` points per host pixel, so it covers as
+/// much of the picture as it does on the host.
 @MainActor
-private func cursorImage(_ shape: CursorShape) -> NSImage? {
+private func cursorImage(_ shape: CursorShape, scale: CGFloat) -> NSImage? {
     let (w, h) = (shape.width, shape.height)
     guard
         let bitmap = NSBitmapImageRep(
@@ -278,7 +347,7 @@ private func cursorImage(_ shape: CursorShape) -> NSImage? {
             pixels[i * 4 + 3] = bgra[i * 4 + 3]
         }
     }
-    let image = NSImage(size: NSSize(width: w, height: h))
+    let image = NSImage(size: NSSize(width: CGFloat(w) * scale, height: CGFloat(h) * scale))
     image.addRepresentation(bitmap)
     return image
 }
@@ -303,6 +372,10 @@ final class PresentedTime: @unchecked Sendable {
 /// asks the host window to close; its going away ends the session) and a
 /// second one closes the window.
 final class CloseWatcher: NSObject, NSWindowDelegate, @unchecked Sendable {
+    /// The window's view, told when the user resizes the window.
+    @MainActor weak var view: InputView?
+    /// Set while the presenter itself resizes the window.
+    @MainActor var programmatic = false
     private let lock = NSLock()
     private var value = false
     private var intercept = false
@@ -320,7 +393,13 @@ final class CloseWatcher: NSObject, NSWindowDelegate, @unchecked Sendable {
         return true
     }
 
+    @MainActor func windowDidResize(_ notification: Notification) {
+        view?.pictureChanged()
+        if !programmatic { view?.userResized() }
+    }
+
     @MainActor func windowWillClose(_ notification: Notification) {
+        view?.focusOwner()
         lock.lock()
         value = true
         lock.unlock()
@@ -354,18 +433,30 @@ public func framesMacPresenterResize(_ handle: UnsafeMutableRawPointer?, _ width
     borrowed(handle, as: Presenter.self).resize(width: Int(width), height: Int(height))
 }
 
-/// Paths of files dropped on a presenter window, until taken.
+/// Files dropped on a presenter window, until taken: paths, or with the
+/// point they were dropped at over the picture (ABI 6) {"path", "x", "y"}
+/// (0-65535, origin top left), for the host to drop them there too.
 final class DroppedFiles: @unchecked Sendable {
     private let lock = NSLock()
-    private var paths: [String] = []
+    private var paths: [Any] = []
 
-    func add(_ new: [String]) {
+    func add(_ new: [String], at point: (Int32, Int32)? = nil) {
         lock.lock()
-        paths.append(contentsOf: new)
+        if let point {
+            paths.append(contentsOf: new.map { ["path": $0, "x": point.0, "y": point.1] as [String: Any] })
+        } else {
+            paths.append(contentsOf: new)
+        }
         lock.unlock()
     }
 
-    func take() -> [String] {
+    func put(back: [Any]) {
+        lock.lock()
+        paths.insert(contentsOf: back, at: 0)
+        lock.unlock()
+    }
+
+    func take() -> [Any] {
         lock.lock()
         defer { lock.unlock() }
         let taken = paths
@@ -386,7 +477,7 @@ public func framesMacPresenterTakeDropped(
     let paths = drops.take()
     guard !paths.isEmpty, let json = try? JSONSerialization.data(withJSONObject: paths) else { return 0 }
     guard let buffer, json.count <= capacity else {
-        drops.add(paths)
+        drops.put(back: paths)
         return json.count
     }
     json.copyBytes(to: buffer, count: json.count)
@@ -405,9 +496,45 @@ public func framesMacPresenterSetMenus(_ handle: UnsafeMutableRawPointer?, _ utf
         MainActor.assumeIsolated {
             guard let view = presenter.view else { return }
             view.hostMenus = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] ?? []
-            refreshViewerMenu(for: view)
+            refreshViewerMenus()
         }
     }
+}
+
+@_cdecl("frames_mac_presenter_set_menu_id")
+public func framesMacPresenterSetMenuId(_ handle: UnsafeMutableRawPointer?, _ id: UInt64) {
+    guard let handle else { return }
+    let presenter = borrowed(handle, as: Presenter.self)
+    DispatchQueue.main.async {
+        MainActor.assumeIsolated {
+            presenter.view?.menuID = id
+            refreshViewerMenus()
+        }
+    }
+}
+
+@_cdecl("frames_mac_presenter_set_view_options")
+public func framesMacPresenterSetViewOptions(
+    _ handle: UnsafeMutableRawPointer?, _ fill: Bool, _ keepAspect: Bool, _ physicalKeys: Bool
+) {
+    guard let handle else { return }
+    let presenter = borrowed(handle, as: Presenter.self)
+    DispatchQueue.main.async {
+        MainActor.assumeIsolated {
+            guard let view = presenter.view else { return }
+            view.fill = fill
+            view.keepAspect = keepAspect
+            view.setPhysicalKeys(physicalKeys)
+        }
+    }
+}
+
+@_cdecl("frames_mac_presenter_set_text_input")
+public func framesMacPresenterSetTextInput(
+    _ handle: UnsafeMutableRawPointer?, _ context: UnsafeMutableRawPointer?, _ callback: FramesMacTextCallback?
+) {
+    guard let handle else { return }
+    borrowed(handle, as: Presenter.self).input.setText(context: context, callback: callback)
 }
 
 @_cdecl("frames_mac_presenter_intercept_close")
@@ -432,6 +559,25 @@ public func framesMacPresenterClosed(_ handle: UnsafeMutableRawPointer?) -> Bool
 public func framesMacPresenterNew(_ width: UInt32, _ height: UInt32, _ window: Bool) -> UnsafeMutableRawPointer? {
     guard let presenter = Presenter(width: Int(width), height: Int(height), windowed: window) else { return nil }
     return retainedHandle(presenter)
+}
+
+@_cdecl("frames_mac_presenter_new_popup")
+public func framesMacPresenterNewPopup(_ width: UInt32, _ height: UInt32) -> UnsafeMutableRawPointer? {
+    guard let presenter = Presenter(width: Int(width), height: Int(height), windowed: true, popup: true) else {
+        return nil
+    }
+    return retainedHandle(presenter)
+}
+
+@_cdecl("frames_mac_presenter_attach")
+public func framesMacPresenterAttach(
+    _ handle: UnsafeMutableRawPointer?, _ parent: UInt64, _ x: Double, _ y: Double, _ width: Double, _ height: Double,
+    _ parentWidth: Double, _ parentHeight: Double, _ role: UInt32
+) {
+    guard let handle else { return }
+    borrowed(handle, as: Presenter.self).attach(
+        parent: parent, frame: CGRect(x: x, y: y, width: width, height: height),
+        parentSize: CGSize(width: parentWidth, height: parentHeight), role: role)
 }
 
 @_cdecl("frames_mac_presenter_present")
@@ -470,6 +616,24 @@ final class InputRelay: @unchecked Sendable {
     private let lock = NSLock()
     private var context: UnsafeMutableRawPointer?
     private var callback: FramesMacInputCallback?
+    private var textContext: UnsafeMutableRawPointer?
+    private var textCallback: FramesMacTextCallback?
+
+    func setText(context: UnsafeMutableRawPointer?, callback: FramesMacTextCallback?) {
+        lock.lock()
+        textContext = context
+        textCallback = callback
+        lock.unlock()
+    }
+
+    func sendText(_ text: String, at seconds: TimeInterval) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let textCallback, !text.isEmpty else { return }
+        let nanos = seconds > 0 ? UInt64(seconds * 1_000_000_000) : uptimeNanos()
+        var text = text
+        text.withUTF8 { bytes in textCallback(textContext, bytes.baseAddress, bytes.count, nanos) }
+    }
 
     func set(context: UnsafeMutableRawPointer?, callback: FramesMacInputCallback?) {
         lock.lock()
@@ -537,13 +701,164 @@ final class InputView: NSView {
     private var modifiersDown: Set<UInt16> = []
     /// The host's cursor, shown over the video by the view's cursor rect.
     private var hostCursor: NSCursor?
+    private var hostShape: CursorShape?
+    private var cursorScale: CGFloat = 0
     private var hostCursorVisible = true
     private static let blank = NSCursor(image: NSImage(size: NSSize(width: 1, height: 1)), hotSpot: .zero)
+    /// The window's entry in the connection menus (ABI 5).
+    var menuID: UInt64 = 0
+    /// Every key goes as a key (terminals); otherwise printable keys go as
+    /// text composed here.
+    private(set) var physicalKeys = false
+    /// Keys whose press went as text (their release is not sent).
+    private var textKeys: Set<UInt16> = []
+    /// Option keys held here, and those the host was told about.
+    private var heldOptions: Set<UInt16> = []
+    private var sentOptions: Set<UInt16> = []
+    /// The key being interpreted, and an input method's composition.
+    private var typing: NSEvent?
+    private var marked = NSMutableAttributedString()
+    private var lastPoint = NSPoint.zero
 
-    func setHostCursor(_ image: NSImage?, hotspot: NSPoint, visible: Bool?) {
-        if let image { hostCursor = NSCursor(image: image, hotSpot: hotspot) }
+    private func clearTyping() {
+        textKeys.removeAll()
+        heldOptions.removeAll()
+        sentOptions.removeAll()
+        marked = NSMutableAttributedString()
+        inputContext?.discardMarkedText()
+    }
+    /// Stretch the picture over the view (otherwise it is letterboxed).
+    var fill = false {
+        didSet {
+            layer?.contentsGravity = fill ? .resize : .resizeAspect
+            pictureChanged()
+        }
+    }
+    /// The window keeps the picture's shape ("Stretch locally").
+    var keepAspect = true {
+        didSet {
+            guard keepAspect != oldValue, let window else { return }
+            if keepAspect {
+                let size = pictureSize
+                if size.width > 0, size.height > 0 { window.contentAspectRatio = size }
+            } else {
+                // Clears the aspect ratio (the two are exclusive).
+                window.contentResizeIncrements = NSSize(width: 1, height: 1)
+            }
+        }
+    }
+
+    /// The stream's size in pixels.
+    var pictureSize: NSSize { (layer as? CAMetalLayer)?.drawableSize ?? bounds.size }
+
+    /// Where the picture is drawn in the view: all of it with `fill`, else
+    /// the largest rect of the picture's shape, centred.
+    var pictureRect: NSRect {
+        let size = pictureSize
+        guard !fill, size.width > 0, size.height > 0, bounds.width > 0, bounds.height > 0 else { return bounds }
+        let scale = min(bounds.width / size.width, bounds.height / size.height)
+        let (w, h) = (size.width * scale, size.height * scale)
+        return NSRect(x: bounds.minX + (bounds.width - w) / 2, y: bounds.minY + (bounds.height - h) / 2, width: w, height: h)
+    }
+
+    func setHostCursor(_ shape: CursorShape?, visible: Bool?) {
+        if let shape {
+            hostShape = shape
+            cursorScale = 0
+        }
         if let visible { hostCursorVisible = visible }
+        refreshCursor()
+    }
+
+    /// Builds the host cursor at the picture's current scale.
+    private func refreshCursor() {
+        if let shape = hostShape {
+            let picture = pictureSize
+            var scale = picture.width > 0 ? pictureRect.width / picture.width : 1
+            // Never smaller than a third of its size on the host's screen.
+            let backing = window?.backingScaleFactor ?? 2
+            scale = max(scale, 1 / (backing * 3))
+            if abs(scale - cursorScale) > 0.001, let image = cursorImage(shape, scale: scale) {
+                cursorScale = scale
+                hostCursor = NSCursor(
+                    image: image, hotSpot: NSPoint(x: shape.hotspot.x * scale, y: shape.hotspot.y * scale))
+            }
+        }
         window?.invalidateCursorRects(for: self)
+    }
+
+    /// The view or the picture changed size.
+    func pictureChanged() {
+        refreshCursor()
+        layoutOverlay()
+    }
+
+    /// Tells the host when the window is minimized, covered or shown
+    /// again, and when it comes to the front or leaves it, so it sends no
+    /// frames, fewer frames or every frame (v1). Popups always count as
+    /// focused: they show while their window is in use.
+    func reportVisibility() {
+        guard let window else { return }
+        let shown = window.isVisible && !window.isMiniaturized && window.occlusionState.contains(.visible)
+        let focused = !window.styleMask.contains(.titled) || window.isKeyWindow
+        guard (shown, focused) != reportedVisibility else { return }
+        reportedVisibility = (shown, focused)
+        relay.send(Int32(FRAMES_MAC_INPUT_VISIBILITY), shown ? 1 : 0, focused ? 1 : 0, at: 0)
+    }
+
+    /// The window that blocks this one now (a remote modal dialog or sheet
+    /// shown here), as v1 redirected input to it.
+    func modalBlocker() -> InputView? {
+        let windows = viewerState["windows"] as? [[String: Any]] ?? []
+        guard
+            let blocker = windows.first(where: {
+                ($0["parent"] as? NSNumber)?.uint64Value == menuID && ($0["modal"] as? NSNumber)?.boolValue == true
+                    && ($0["shown"] as? NSNumber)?.boolValue == true
+            }), let id = (blocker["id"] as? NSNumber)?.uint64Value
+        else { return nil }
+        return NSApplication.shared.windows.compactMap { $0.contentView as? InputView }.first {
+            $0.menuID == id && $0.window?.isVisible == true
+        }
+    }
+
+    /// Input for a blocked window goes nowhere; its blocker comes forward
+    /// instead (it may be nested: the innermost blocker). True if blocked.
+    func redirectToBlocker() -> Bool {
+        guard var blocker = modalBlocker() else { return false }
+        var depth = 0
+        while let inner = blocker.modalBlocker(), depth < 8 {
+            blocker = inner
+            depth += 1
+        }
+        if blocker.window?.styleMask.contains(.titled) == true {
+            blocker.window?.makeKeyAndOrderFront(nil)
+        } else {
+            blocker.window?.orderFront(nil)
+        }
+        NSSound.beep()
+        return true
+    }
+
+    /// This window is closing while in front: its owner (the window a
+    /// dialog belongs to) comes forward, as v1.
+    func focusOwner() {
+        guard window?.isKeyWindow == true else { return }
+        let windows = viewerState["windows"] as? [[String: Any]] ?? []
+        guard
+            let entry = windows.first(where: { ($0["id"] as? NSNumber)?.uint64Value == menuID }),
+            let owner = (entry["parent"] as? NSNumber)?.uint64Value
+        else { return }
+        let view = NSApplication.shared.windows.compactMap { $0.contentView as? InputView }.first {
+            $0.menuID == owner && $0 !== self && $0.window?.isVisible == true
+        }
+        view?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// The user resized the window: its size in pixels, for "Resize remote app".
+    func userResized() {
+        let scale = window?.backingScaleFactor ?? 2
+        let (w, h) = (Int32((bounds.width * scale).rounded()), Int32((bounds.height * scale).rounded()))
+        relay.send(Int32(FRAMES_MAC_INPUT_SIZE), w, h, at: ProcessInfo.processInfo.systemUptime)
     }
 
     /// The cursor the view shows now (for tests).
@@ -553,13 +868,18 @@ final class InputView: NSView {
     }
 
     override func resetCursorRects() {
-        if let cursor = shownCursor { addCursorRect(bounds, cursor: cursor) }
+        if let cursor = shownCursor { addCursorRect(pictureRect, cursor: cursor) }
     }
 
     /// Where dropped files go.
     var drops: DroppedFiles?
     /// The shared application's menus (from the host), for the menu bar.
     var hostMenus: [[String: Any]] = []
+    /// The debug overlay's last content and its layer (`Overlay.swift`).
+    var overlayContent: OverlayContent?
+    var overlayLayer: CALayer?
+    /// What the host was last told about this window's visibility.
+    private var reportedVisibility: (shown: Bool, focused: Bool) = (true, true)
 
     init(frame: NSRect, relay: InputRelay) {
         self.relay = relay
@@ -573,7 +893,8 @@ final class InputView: NSView {
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
         let files = fileURLs(sender)
         guard !files.isEmpty else { return false }
-        drops?.add(files.map(\.path))
+        // The host drops them where they were dropped here (v1).
+        drops?.add(files.map(\.path), at: normalized(convert(sender.draggingLocation, from: nil)))
         return true
     }
 
@@ -590,17 +911,26 @@ final class InputView: NSView {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let tracking { removeTrackingArea(tracking) }
+        // A popup never becomes key; it follows the pointer anyway.
+        let popup = window.map { !$0.styleMask.contains(.titled) } ?? false
         let area = NSTrackingArea(
-            rect: bounds, options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect], owner: self, userInfo: nil)
+            rect: bounds, options: [.mouseMoved, popup ? .activeAlways : .activeInKeyWindow, .inVisibleRect],
+            owner: self, userInfo: nil)
         addTrackingArea(area)
         tracking = area
     }
 
-    /// Normalized position, origin top left.
+    /// Normalized position over the picture (where it is drawn), origin top
+    /// left; outside it, clamped to its edge.
     private func position(_ event: NSEvent) -> (Int32, Int32) {
-        let point = convert(event.locationInWindow, from: nil)
-        let width = max(bounds.width, 1), height = max(bounds.height, 1)
-        let x = min(max(point.x / width, 0), 1), y = min(max(1 - point.y / height, 0), 1)
+        normalized(convert(event.locationInWindow, from: nil))
+    }
+
+    func normalized(_ point: NSPoint) -> (Int32, Int32) {
+        let rect = pictureRect
+        let width = max(rect.width, 1), height = max(rect.height, 1)
+        let x = min(max((point.x - rect.minX) / width, 0), 1)
+        let y = min(max(1 - (point.y - rect.minY) / height, 0), 1)
         return (Int32((x * 65535).rounded()), Int32((y * 65535).rounded()))
     }
 
@@ -640,6 +970,9 @@ final class InputView: NSView {
     }
 
     private func button(_ event: NSEvent, _ button: Int32, down: Bool) {
+        if down && redirectToBlocker() { return }
+        if down { sendHeldOptions(at: event.timestamp) }
+        lastPoint = convert(event.locationInWindow, from: nil)
         let (x, y) = position(event)
         relay.send(Int32(FRAMES_MAC_INPUT_BUTTON), button, down ? 1 : 0, x, y, at: event.timestamp)
     }
@@ -674,17 +1007,16 @@ final class InputView: NSView {
         }
     }
 
-    /// A Frames menu command for this window's session.
-    func command(_ command: ViewerCommand) {
-        if command == .releaseInput {
-            releaseInput(at: ProcessInfo.processInfo.systemUptime)
-            return
-        }
-        relay.send(Int32(FRAMES_MAC_INPUT_COMMAND), command.rawValue, at: ProcessInfo.processInfo.systemUptime)
+    /// Gives the pointer and keys back (a menu opens, for example).
+    func releaseKeys() {
+        setRelative(false)
+        modifiersDown.removeAll()
+        clearTyping()
+        relay.send(Int32(FRAMES_MAC_INPUT_FOCUS_LOST), 0, at: 0)
     }
 
     /// Gives the pointer and keys back and minimizes the window.
-    private func releaseInput(at timestamp: TimeInterval) {
+    func releaseInput(at timestamp: TimeInterval) {
         setRelative(false, at: timestamp)
         modifiersDown.removeAll()
         relay.send(Int32(FRAMES_MAC_INPUT_FOCUS_LOST), 0, at: timestamp)
@@ -710,23 +1042,84 @@ final class InputView: NSView {
             setRelative(!relative, at: event.timestamp)
             return
         }
-        relay.send(Int32(FRAMES_MAC_INPUT_KEY), Int32(event.keyCode), 1, at: event.timestamp)
+        if redirectToBlocker() { return }
+        if !physicalKeys && !relative && wantsText(event) {
+            // Composed here (layout, dead keys, input methods); the text
+            // goes to the host, the key's release does not.
+            textKeys.insert(event.keyCode)
+            typing = event
+            interpretKeyEvents([event])
+            typing = nil
+            return
+        }
+        sendKey(event.keyCode, down: true, at: event.timestamp)
     }
 
     override func keyUp(with event: NSEvent) {
-        relay.send(Int32(FRAMES_MAC_INPUT_KEY), Int32(event.keyCode), 0, at: event.timestamp)
+        if textKeys.remove(event.keyCode) != nil { return }
+        sendKey(event.keyCode, down: false, at: event.timestamp)
     }
 
     override func flagsChanged(with event: NSEvent) {
         let code = event.keyCode
         let down = !modifiersDown.contains(code)
         if down { modifiersDown.insert(code) } else { modifiersDown.remove(code) }
+        if !physicalKeys {
+            // Caps Lock is already in the typed text.
+            if code == 57 { return }
+            // Option composes characters here; the host gets it only with a
+            // key that is not text (Option+arrow) or a click.
+            if code == 58 || code == 61 {
+                if down {
+                    heldOptions.insert(code)
+                } else {
+                    heldOptions.remove(code)
+                    if sentOptions.remove(code) != nil {
+                        relay.send(Int32(FRAMES_MAC_INPUT_KEY), Int32(code), 0, at: event.timestamp)
+                    }
+                }
+                return
+            }
+        }
         relay.send(Int32(FRAMES_MAC_INPUT_KEY), Int32(code), down ? 1 : 0, at: event.timestamp)
+    }
+
+    /// A key as a key, Option first when it is held but not yet sent.
+    func sendKey(_ code: UInt16, down: Bool, at timestamp: TimeInterval) {
+        if down { sendHeldOptions(at: timestamp) }
+        relay.send(Int32(FRAMES_MAC_INPUT_KEY), Int32(code), down ? 1 : 0, at: timestamp)
+    }
+
+    func sendHeldOptions(at timestamp: TimeInterval) {
+        for code in heldOptions.subtracting(sentOptions) {
+            sentOptions.insert(code)
+            relay.send(Int32(FRAMES_MAC_INPUT_KEY), Int32(code), 1, at: timestamp)
+        }
+    }
+
+    /// Whether `event` types text: no Command or Control, and printable
+    /// characters (or none, a dead key), or an input method is composing.
+    private func wantsText(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags
+        if flags.contains(.command) || flags.contains(.control) { return false }
+        if hasMarkedText() { return true }
+        guard let characters = event.characters else { return false }
+        if characters.isEmpty { return true }
+        return characters.unicodeScalars.allSatisfy { scalar in
+            scalar.value >= 0x20 && scalar.value != 0x7F && !(0xF700...0xF8FF).contains(scalar.value)
+        }
+    }
+
+    func setPhysicalKeys(_ on: Bool) {
+        guard on != physicalKeys else { return }
+        releaseKeys()
+        physicalKeys = on
     }
 
     override func resignFirstResponder() -> Bool {
         setRelative(false)
         modifiersDown.removeAll()
+        clearTyping()
         relay.send(Int32(FRAMES_MAC_INPUT_FOCUS_LOST), 0, at: 0)
         return super.resignFirstResponder()
     }
@@ -740,7 +1133,24 @@ final class InputView: NSView {
             forName: NSWindow.didResignKeyNotification, object: window, queue: .main
         ) { [relay] _ in
             MainActor.assumeIsolated { weak.view?.setRelative(false) }
-            relay.send(Int32(FRAMES_MAC_INPUT_FOCUS_LOST), 0, at: 0)
+            relay.send(Int32(FRAMES_MAC_INPUT_FOCUS_LOST), 1, at: 0)
+        }
+        // The host raises its window and reads its menus (v1's focus).
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main
+        ) { [relay] _ in
+            relay.send(Int32(FRAMES_MAC_INPUT_FOCUS_GAINED), 0, at: 0)
+            MainActor.assumeIsolated { weak.view?.reportVisibility() }
+        }
+        // Minimized, covered or shown again; in front or not (the host
+        // paces its frames by it).
+        for name in [
+            NSWindow.didChangeOcclusionStateNotification, NSWindow.didMiniaturizeNotification,
+            NSWindow.didDeminiaturizeNotification, NSWindow.didResignKeyNotification,
+        ] {
+            NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { _ in
+                MainActor.assumeIsolated { weak.view?.reportVisibility() }
+            }
         }
     }
 
@@ -777,6 +1187,59 @@ final class InputView: NSView {
         if let event = key(.keyDown) { keyDown(with: event) }
         if let event = key(.keyUp) { keyUp(with: event) }
     }
+}
+
+// MARK: Text input (ABI 5)
+
+extension InputView: @preconcurrency NSTextInputClient {
+    func insertText(_ string: Any, replacementRange: NSRange) {
+        let text = (string as? NSAttributedString)?.string ?? (string as? String) ?? ""
+        marked = NSMutableAttributedString()
+        relay.sendText(text, at: typing?.timestamp ?? 0)
+    }
+
+    override func doCommand(by selector: Selector) {
+        // The key means no text here (Return, an arrow in a composition's
+        // absence): it goes as a key after all.
+        guard let typing else { return }
+        textKeys.remove(typing.keyCode)
+        sendKey(typing.keyCode, down: true, at: typing.timestamp)
+    }
+
+    func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        if let attributed = string as? NSAttributedString {
+            marked = NSMutableAttributedString(attributedString: attributed)
+        } else {
+            marked = NSMutableAttributedString(string: string as? String ?? "")
+        }
+    }
+
+    func unmarkText() {
+        marked = NSMutableAttributedString()
+    }
+
+    func selectedRange() -> NSRange { NSRange(location: NSNotFound, length: 0) }
+
+    func markedRange() -> NSRange {
+        marked.length > 0 ? NSRange(location: 0, length: marked.length) : NSRange(location: NSNotFound, length: 0)
+    }
+
+    func hasMarkedText() -> Bool { marked.length > 0 }
+
+    func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
+        nil
+    }
+
+    func validAttributesForMarkedText() -> [NSAttributedString.Key] { [] }
+
+    /// Candidate windows open where the user last clicked.
+    func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
+        let local = NSRect(x: lastPoint.x, y: lastPoint.y - 20, width: 1, height: 20)
+        guard let window else { return local }
+        return window.convertToScreen(convert(local, to: nil))
+    }
+
+    func characterIndex(for point: NSPoint) -> Int { NSNotFound }
 }
 
 @_cdecl("frames_mac_presenter_set_input")

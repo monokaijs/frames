@@ -33,6 +33,18 @@ struct CGRect {
 
 type CGEventRef = *mut c_void;
 
+/// The main display's frame in global points (x, y, width, height).
+pub(crate) fn main_display_bounds() -> (f64, f64, f64, f64) {
+    // SAFETY: plain queries.
+    let rect = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+    (
+        rect.origin.x,
+        rect.origin.y,
+        rect.size.width,
+        rect.size.height,
+    )
+}
+
 // CGEventTypes.h
 const MOUSE_MOVED: u32 = 5;
 const LEFT_DOWN: u32 = 1;
@@ -65,6 +77,7 @@ unsafe extern "C" {
         button: u32,
     ) -> CGEventRef;
     fn CGEventCreateKeyboardEvent(source: *mut c_void, key: u16, down: bool) -> CGEventRef;
+    fn CGEventKeyboardSetUnicodeString(event: CGEventRef, length: usize, text: *const u16);
     fn CGEventCreateScrollWheelEvent2(
         source: *mut c_void,
         units: u32,
@@ -334,12 +347,35 @@ impl MacInjector {
                     Self::post(unsafe { CGEventCreateKeyboardEvent(self.source, code, down) });
                 }
             }
+            // Characters typed on the viewer (its layout, dead keys, IME),
+            // inserted as text as v1 did; at most 20 UTF-16 units per event.
+            Event::Text { text } => {
+                let units: Vec<u16> = text.encode_utf16().collect();
+                for chunk in units.chunks(20) {
+                    for down in [true, false] {
+                        // SAFETY: creates an event; posted and released by
+                        // `post`; `chunk` outlives the call.
+                        unsafe {
+                            let event = CGEventCreateKeyboardEvent(self.source, 0, down);
+                            if !event.is_null() {
+                                CGEventKeyboardSetUnicodeString(event, chunk.len(), chunk.as_ptr());
+                            }
+                            Self::post(event);
+                        }
+                    }
+                }
+            }
             // Window actions are the host session's, not the injector's.
             Event::ReleaseAll
             | Event::Mode { .. }
             | Event::CloseWindow
             | Event::MaxBitrate { .. }
-            | Event::Menu { .. } => {}
+            | Event::Menu { .. }
+            | Event::Header { .. }
+            | Event::RemoteCursor { .. }
+            | Event::RefreshMenus
+            | Event::ResizeWindow { .. }
+            | Event::Visibility { .. } => {}
         }
     }
 }

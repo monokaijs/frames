@@ -187,15 +187,31 @@ struct Pad {
     sequence: u64,
 }
 
-/// Attaches the inventory's controllers that have no slot yet (up to four).
+/// Which controllers to forward: every one (`--gamepads`) except those
+/// turned off in the Devices menu, or only those turned on there.
+#[derive(Default)]
+struct Choice {
+    all: bool,
+    on: std::collections::HashSet<String>,
+    off: std::collections::HashSet<String>,
+}
+
+impl Choice {
+    fn wants(&self, id: &str) -> bool {
+        self.on.contains(id) || (self.all && !self.off.contains(id))
+    }
+}
+
+/// Attaches the chosen controllers that have no slot yet (up to four).
 async fn attach_new(
     send: &mut iroh::endpoint::SendStream,
     inventory: &[frames_devices::protocol::DeviceInfo],
     pads: &mut HashMap<u8, Pad>,
     generation: &mut u64,
+    choice: &Choice,
 ) -> Result<()> {
     for device in inventory {
-        if pads.values().any(|p| p.id == device.id) {
+        if pads.values().any(|p| p.id == device.id) || !choice.wants(&device.id) {
             continue;
         }
         let Some(slot) = (0..MAX_GAMEPADS as u8).find(|s| !pads.contains_key(s)) else {
@@ -224,17 +240,80 @@ async fn attach_new(
     Ok(())
 }
 
-/// Viewer: forwards every connected controller (up to four) when
-/// `gamepads`, and the USB devices `usb` names (bus ids), until the
-/// session ends.
+/// The Devices menu's lists (`crate::control`).
+fn publish(
+    inventory: &[frames_devices::protocol::DeviceInfo],
+    pads: &HashMap<u8, Pad>,
+    usb: &[frames_devices::protocol::DeviceInfo],
+    exported: &HashMap<
+        String,
+        (
+            frames_devices::usb::ExportLease,
+            tokio::sync::watch::Sender<bool>,
+        ),
+    >,
+) {
+    let gamepads = inventory
+        .iter()
+        .map(|d| {
+            let pad = pads.values().find(|p| p.id == d.id);
+            crate::control::DeviceEntry {
+                id: d.id.clone(),
+                name: d.name.clone(),
+                forwarded: pad.is_some_and(|p| p.attached),
+                status: match pad {
+                    Some(p) if !p.attached => Some("connecting".into()),
+                    _ => d.error.clone().or(d.status.clone()),
+                },
+            }
+        })
+        .collect();
+    let usb = usb
+        .iter()
+        .map(|d| crate::control::DeviceEntry {
+            id: d.id.clone(),
+            name: d.name.clone(),
+            forwarded: exported.contains_key(&d.id),
+            status: d.error.clone().or(d.status.clone()),
+        })
+        .collect();
+    crate::control::update(|s| {
+        s.gamepads = gamepads;
+        s.usb = usb;
+    });
+}
+
+/// The local USB devices (Windows), for the Devices menu.
+async fn usb_inventory() -> (Vec<frames_devices::protocol::DeviceInfo>, Option<String>) {
+    match tokio::task::spawn_blocking(frames_devices::usb::inventory).await {
+        Ok(Ok(devices)) => (devices, None),
+        Ok(Err(error)) => (Vec::new(), Some(error.to_string())),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    }
+}
+
+/// Viewer: forwards the controllers chosen (every one, up to four, with
+/// `gamepads`) and the USB devices `usb` names (bus ids), and what the
+/// Devices menu turns on or off, until the session ends.
 pub async fn viewer(session: frames_net::Session, gamepads: bool, usb: Vec<String>) -> Result<()> {
     let (mut send, recv) = crate::streams::open(&session, crate::streams::DEVICES).await?;
     let mut incoming = lines(recv);
-    let mut capture = if gamepads {
-        Some(Capture::start()?)
-    } else {
-        None
+    // The controller helper also lists controllers for the Devices menu.
+    let mut capture = match Capture::start() {
+        Ok(capture) => Some(capture),
+        Err(error) => {
+            crate::control::update(|s| s.gamepad_error = Some(format!("{error:#}")));
+            None
+        }
     };
+    let mut choice = Choice {
+        all: gamepads,
+        ..Choice::default()
+    };
+    let (mut usb_devices, usb_error) = usb_inventory().await;
+    crate::control::update(|s| s.usb_error = usb_error);
+    let mut host_usb_error: Option<String> = None;
+    let mut capabilities_seen = false;
     // USB: the host's streams for exported devices, and their leases.
     let (usb_tx, mut usb_streams) = tokio::sync::mpsc::unbounded_channel();
     *USB_STREAMS.lock().unwrap() = Some(usb_tx);
@@ -250,7 +329,6 @@ pub async fn viewer(session: frames_net::Session, gamepads: bool, usb: Vec<Strin
         String,
         anyhow::Result<frames_devices::usb::ExportLease>,
     )>();
-    let mut usb_requested = false;
     let epoch = Instant::now();
     let elapsed = || epoch.elapsed().as_millis() as u64;
     let mut capture_offset = 0u64;
@@ -266,10 +344,77 @@ pub async fn viewer(session: frames_net::Session, gamepads: bool, usb: Vec<Strin
         },
     )
     .await?;
+    publish(&inventory, &pads, &usb_devices, &leases);
+    // Controllers drive the host only while a viewer window has focus.
+    let mut focused = crate::control::focused();
     loop {
         tokio::select! {
             () = session.closed() => break,
             _ = clock.tick() => write(&mut send, &DeviceMessage::Clock { elapsed_ms: elapsed() }).await?,
+            () = crate::control::devices_changed() => {
+                if focused != crate::control::focused() {
+                    focused = !focused;
+                    if let Some(capture) = &capture {
+                        let _ = capture.command(CaptureCommand::Focus { active: focused });
+                    }
+                }
+                for command in crate::control::take_device_commands() {
+                    match command {
+                        crate::control::Command::Gamepad { id, on } => {
+                            if on {
+                                choice.off.remove(&id);
+                                choice.on.insert(id);
+                                if !host_ok {
+                                    crate::control::notice("Gamepads need a Windows host with the gamepad driver (ViGEmBus) installed.");
+                                }
+                            } else {
+                                choice.on.remove(&id);
+                                choice.off.insert(id.clone());
+                                if let Some((&slot, pad)) = pads.iter().find(|(_, p)| p.id == id) {
+                                    let generation = pad.generation;
+                                    pads.remove(&slot);
+                                    if let Some(capture) = &capture {
+                                        let _ = capture.command(CaptureCommand::Remove { slot });
+                                    }
+                                    write(&mut send, &DeviceMessage::GamepadDetach { slot, generation }).await?;
+                                }
+                            }
+                            if host_ok {
+                                attach_new(&mut send, &inventory, &mut pads, &mut generation, &choice).await?;
+                            }
+                        }
+                        crate::control::Command::Usb { id, on } => {
+                            if on && !leases.contains_key(&id) {
+                                match &host_usb_error {
+                                    Some(error) => crate::control::notice(format!("USB: the host cannot take devices: {error}")),
+                                    None if !capabilities_seen => crate::control::notice("USB: the host has not answered yet"),
+                                    None => {
+                                        let done = exported_tx.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            let lease = frames_devices::usb::prepare_export(&id);
+                                            let _ = done.send((id, lease));
+                                        });
+                                    }
+                                }
+                            } else if !on {
+                                exports.lock().unwrap().remove(&id);
+                                if let Some((_, active)) = leases.remove(&id) {
+                                    let _ = active.send(false);
+                                    write(&mut send, &DeviceMessage::UsbDetach { id, generation }).await?;
+                                }
+                            }
+                        }
+                        crate::control::Command::RefreshDevices => {
+                            let (devices, error) = usb_inventory().await;
+                            usb_devices = devices;
+                            crate::control::update(|s| s.usb_error = error);
+                            write(&mut send, &DeviceMessage::Refresh).await?;
+                        }
+                        _ => {}
+                    }
+                }
+                publish(&inventory, &pads, &usb_devices, &leases);
+            }
             event = async { match &mut capture { Some(c) => c.events.recv().await, None => std::future::pending().await } } => {
                 let Some(event) = event else {
                     println!("gamepads: the controller helper stopped");
@@ -280,12 +425,13 @@ pub async fn viewer(session: frames_net::Session, gamepads: bool, usb: Vec<Strin
                 match event {
                     CaptureEvent::Ready { elapsed_ms } => {
                         capture_offset = elapsed().saturating_sub(elapsed_ms);
-                        capture.command(CaptureCommand::Focus { active: true })?;
+                        capture.command(CaptureCommand::Focus { active: focused })?;
                     }
                     CaptureEvent::Inventory { devices } => {
                         inventory = devices;
+                        publish(&inventory, &pads, &usb_devices, &leases);
                         if host_ok {
-                            attach_new(&mut send, &inventory, &mut pads, &mut generation).await?;
+                            attach_new(&mut send, &inventory, &mut pads, &mut generation, &choice).await?;
                         }
                     }
                     CaptureEvent::State { slot, generation, state, elapsed_ms } => {
@@ -329,8 +475,9 @@ pub async fn viewer(session: frames_net::Session, gamepads: bool, usb: Vec<Strin
                         leases.insert(bus.clone(), (lease, active));
                         write(&mut send, &DeviceMessage::UsbAttach { id: bus.clone(), generation, name: bus }).await?;
                     }
-                    Err(error) => println!("USB {bus}: {error:#}"),
+                    Err(error) => crate::control::notice(format!("USB {bus}: {error:#}")),
                 }
+                publish(&inventory, &pads, &usb_devices, &leases);
             }
             message = incoming.recv() => {
                 let Some(message) = message else { break };
@@ -344,13 +491,19 @@ pub async fn viewer(session: frames_net::Session, gamepads: bool, usb: Vec<Strin
                                 let _ = active.send(false);
                             }
                             if let Some(error) = error {
-                                println!("USB {id}: {error}");
+                                crate::control::notice(format!("USB {id}: {error}"));
                             }
                         }
+                        publish(&inventory, &pads, &usb_devices, &leases);
                     }
                     DeviceMessage::Capabilities(capabilities) => {
-                        if !usb.is_empty() && !usb_requested {
-                            usb_requested = true;
+                        host_usb_error = capabilities.usb_error.clone();
+                        crate::control::update(|s| {
+                            if capabilities.gamepad_error.is_some() {
+                                s.gamepad_error = capabilities.gamepad_error.clone().map(|e| format!("Host: {e}"));
+                            }
+                        });
+                        if !usb.is_empty() && !capabilities_seen {
                             match &capabilities.usb_error {
                                 Some(error) => println!("USB: the host cannot take devices: {error}"),
                                 None => {
@@ -365,12 +518,13 @@ pub async fn viewer(session: frames_net::Session, gamepads: bool, usb: Vec<Strin
                                 }
                             }
                         }
+                        capabilities_seen = true;
                         host_ok = capabilities.gamepad_host;
                         if let Some(error) = capabilities.gamepad_error {
                             println!("gamepads: the host cannot take them: {error}");
                         }
                         if host_ok {
-                            attach_new(&mut send, &inventory, &mut pads, &mut generation).await?;
+                            attach_new(&mut send, &inventory, &mut pads, &mut generation, &choice).await?;
                         }
                     }
                     DeviceMessage::GamepadStatus { slot, generation, attached, error } => {
@@ -387,9 +541,10 @@ pub async fn viewer(session: frames_net::Session, gamepads: bool, usb: Vec<Strin
                                     let _ = capture.command(CaptureCommand::Remove { slot });
                                 }
                                 if let Some(error) = error {
-                                    println!("gamepad {slot}: {error}");
+                                    crate::control::notice(format!("gamepad {slot}: {error}"));
                                 }
                             }
+                            publish(&inventory, &pads, &usb_devices, &leases);
                         }
                     }
                     DeviceMessage::Rumble { slot, generation, elapsed_ms, low, high } => {

@@ -218,6 +218,30 @@ pub struct Admitted {
     pub window_id: Option<u64>,
     /// The viewer asks for a preview image only.
     pub preview: bool,
+    /// Let in by the trust list: removing it there ends the session
+    /// ([`watch_trust`]).
+    pub trusted: bool,
+}
+
+/// Host: ends `session` within a second of its device being removed from
+/// the trust list (as v1: "device access revoked").
+pub async fn watch_trust(config: std::path::PathBuf, session: frames_net::Session) {
+    let path = TrustList::path_in(&config);
+    let device = session.remote();
+    loop {
+        tokio::select! {
+            () = session.closed() => return,
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+        // An unreadable list (being written) is checked again next time.
+        if let Ok(list) = TrustList::load(&path)
+            && list.get(&device).is_none()
+        {
+            println!("{}: device access revoked", short(&device));
+            session.close("device access revoked");
+            return;
+        }
+    }
 }
 
 /// Host: a device that proves it is a v1-trusted device gets that trust
@@ -323,6 +347,9 @@ pub async fn decide(
             control
         }
     };
+    let trusted = TrustList::load(&TrustList::path_in(config))?
+        .get(&session.remote())
+        .is_some();
     let name = hello.name.clone().unwrap_or_default();
     // A preview is not a connection to announce.
     if !hello.preview {
@@ -344,6 +371,7 @@ pub async fn decide(
         catalog: hello.catalog,
         window_id: hello.window_id,
         preview: hello.preview,
+        trusted,
     }))
 }
 

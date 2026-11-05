@@ -1,3 +1,4 @@
+import AppKit
 import ApplicationServices
 import CoreGraphics
 import Foundation
@@ -8,34 +9,39 @@ import Foundation
 /// has no close button, or Accessibility is not allowed.
 @_cdecl("frames_mac_close_window")
 public func framesMacCloseWindow(_ windowID: UInt32) -> Bool {
-    let info = CGWindowListCopyWindowInfo([.optionIncludingWindow], CGWindowID(windowID)) as? [[String: Any]] ?? []
+    guard let window = axWindow(CGWindowID(windowID)) else { return false }
+    var button: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(window, kAXCloseButtonAttribute as CFString, &button) == .success,
+        let button, CFGetTypeID(button) == AXUIElementGetTypeID()
+    else { return false }
+    return AXUIElementPerformAction(unsafeDowncast(button, to: AXUIElement.self), kAXPressAction as CFString)
+        == .success
+}
+
+/// The Accessibility element of a window (CGWindowID), found by its owner
+/// and frame; nil when none matches or Accessibility is not allowed.
+func axWindow(_ windowID: CGWindowID) -> AXUIElement? {
+    let info = CGWindowListCopyWindowInfo([.optionIncludingWindow], windowID) as? [[String: Any]] ?? []
     guard let entry = info.first,
         let pid = entry[kCGWindowOwnerPID as String] as? Int32,
         let boundsInfo = entry[kCGWindowBounds as String] as? NSDictionary,
         let bounds = CGRect(dictionaryRepresentation: boundsInfo)
-    else { return false }
+    else { return nil }
     let app = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(app, 0.2)
     var value: CFTypeRef?
     guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
         let windows = value as? [AXUIElement]
-    else { return false }
-    for window in windows {
-        guard let frame = axFrame(window),
-            abs(frame.minX - bounds.minX) < 2, abs(frame.minY - bounds.minY) < 2,
-            abs(frame.width - bounds.width) < 2, abs(frame.height - bounds.height) < 2
-        else { continue }
-        var button: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(window, kAXCloseButtonAttribute as CFString, &button) == .success,
-            let button, CFGetTypeID(button) == AXUIElementGetTypeID()
-        else { return false }
-        return AXUIElementPerformAction(unsafeDowncast(button, to: AXUIElement.self), kAXPressAction as CFString)
-            == .success
+    else { return nil }
+    return windows.first { window in
+        guard let frame = axFrame(window) else { return false }
+        return abs(frame.minX - bounds.minX) < 2 && abs(frame.minY - bounds.minY) < 2
+            && abs(frame.width - bounds.width) < 2 && abs(frame.height - bounds.height) < 2
     }
-    return false
 }
 
 /// A window's frame in global points (top-left origin), as Quartz reports it.
-private func axFrame(_ window: AXUIElement) -> CGRect? {
+func axFrame(_ window: AXUIElement) -> CGRect? {
     func value(_ attribute: String) -> AXValue? {
         var raw: CFTypeRef?
         guard AXUIElementCopyAttributeValue(window, attribute as CFString, &raw) == .success, let raw,
@@ -157,4 +163,33 @@ public func framesMacPressMenu(_ windowID: UInt32, _ id: UInt32) -> Bool {
         return true
     }
     return pressed
+}
+
+// MARK: Focus (ABI 5)
+
+/// Brings a shared window's application to the front when it is not
+/// (input to an inactive application goes elsewhere), and with `raise`
+/// the window above the application's others (a click must land on it).
+@_cdecl("frames_mac_activate_window")
+public func framesMacActivateWindow(_ windowID: UInt32, _ raise: Bool) -> Bool {
+    let id = CGWindowID(windowID)
+    let info = CGWindowListCopyWindowInfo([.optionIncludingWindow], id) as? [[String: Any]] ?? []
+    guard let pid = info.first?[kCGWindowOwnerPID as String] as? Int32,
+        let app = NSRunningApplication(processIdentifier: pid)
+    else { return false }
+    if raise && !isFrontWindow(id), let window = axWindow(id) {
+        _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    }
+    if !app.isActive {
+        return app.activate()
+    }
+    return true
+}
+
+/// Whether `id` is the frontmost ordinary window on screen.
+private func isFrontWindow(_ id: CGWindowID) -> Bool {
+    let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+        as? [[String: Any]] ?? []
+    let front = list.first { ($0[kCGWindowLayer as String] as? Int) == 0 }
+    return (front?[kCGWindowNumber as String] as? UInt32) == id
 }

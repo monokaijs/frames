@@ -31,7 +31,7 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
             cursor_streams,
             sizes_tx,
             menus_tx,
-            o.adb.then_some(o.adb_server),
+            o.adb_server,
         ));
         tokio::spawn(async move {
             let Some(mut recv) = cursor_incoming.recv().await else {
@@ -87,8 +87,34 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     result
 }
 
-/// Flipped by Control+Option+F10 on any viewer window of this process.
-static STATS_TOGGLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The connection menus' state last given to FramesMac (`control::version`).
+static MENUS_SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Gives FramesMac the connection menus' state when it changed.
+fn push_menus() {
+    let version = crate::control::version();
+    if MENUS_SHOWN.swap(version, std::sync::atomic::Ordering::Relaxed) != version {
+        system::viewer_set_state(&crate::control::snapshot_json());
+    }
+}
+
+/// `input` as what the lane sends: text longer than one event fits goes as
+/// several.
+fn captured_all(input: MacInput) -> Vec<Captured> {
+    match captured(input) {
+        Some(Captured::Event {
+            event: Event::Text { text },
+            at_us,
+        }) => Event::texts(&text)
+            .into_iter()
+            .map(|event| Captured::Event { event, at_us })
+            .collect(),
+        other => other.into_iter().collect(),
+    }
+}
+
+/// Relative mouse is on in a viewer window of this process.
+static RELATIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn captured(input: MacInput) -> Option<Captured> {
     let button = |code: u8| match code {
@@ -126,34 +152,67 @@ fn captured(input: MacInput) -> Option<Captured> {
             },
             at_us,
         },
-        MacInput::FocusLost { at_us } => Captured::Event {
-            event: Event::ReleaseAll,
-            at_us,
-        },
+        MacInput::FocusLost { at_us, window } => {
+            // Gamepads drive the host only while a viewer window has focus.
+            if window {
+                crate::control::set_focused(false);
+            }
+            Captured::Event {
+                event: Event::ReleaseAll,
+                at_us,
+            }
+        }
         MacInput::Motion { dx, dy, at_us } => Captured::Motion { dx, dy, at_us },
         MacInput::Mode { relative, at_us } => {
             println!("relative mouse {}", if relative { "on" } else { "off" });
+            RELATIVE.store(relative, std::sync::atomic::Ordering::Relaxed);
             Captured::Event {
                 event: Event::Mode { relative },
                 at_us,
             }
         }
         MacInput::ToggleStats | MacInput::Command(4) => {
-            STATS_TOGGLED.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+            crate::control::send(crate::control::Command::Stats);
             return None;
         }
-        // Image quality from the Frames menu: what the viewer receives at most.
-        MacInput::Command(command @ 1..=3) => Captured::Event {
-            event: Event::MaxBitrate {
-                mbps: crate::quality_mbps(command as u8 - 1),
-            },
-            at_us: frames_media::clock::SystemClock::new().now_us(),
+        // Image quality: what every window of this viewer receives at most
+        // (`control::WindowLoop` tells the host).
+        // Longer text (a paste through an input method) goes as several
+        // events (`captured_all`).
+        MacInput::Text { text, at_us } => Captured::Event {
+            event: Event::Text { text },
+            at_us,
         },
-        MacInput::Command(6) => {
-            crate::DISCONNECT.store(true, std::sync::atomic::Ordering::Relaxed);
+        // The window was minimized, covered or shown again, or another
+        // window came to the front: the host paces its frames (v1).
+        MacInput::Visibility {
+            shown,
+            focused,
+            at_us,
+        } => Captured::Event {
+            event: Event::Visibility { shown, focused },
+            at_us,
+        },
+        MacInput::Command(command @ 1..=3) => {
+            crate::control::send(crate::control::Command::Quality {
+                quality: command as u8 - 1,
+            });
             return None;
         }
-        MacInput::Command(_) => return None,
+        MacInput::Command(6) => {
+            crate::control::send(crate::control::Command::Disconnect);
+            return None;
+        }
+        MacInput::Command(_) | MacInput::Size { .. } => return None,
+        // The window came to the front: the host raises its window and
+        // reads its menus again (v1's focus action).
+        MacInput::FocusGained { at_us } => {
+            crate::control::set_focused(true);
+            Captured::Event {
+                event: Event::RefreshMenus,
+                at_us,
+            }
+        }
         MacInput::Menu(id) => Captured::Event {
             event: Event::Menu { id },
             at_us: frames_media::clock::SystemClock::new().now_us(),
@@ -177,23 +236,61 @@ fn view(
     // The window needs NSApplication on the main thread (frames-next runs it).
     // The picture at its own size when it fits (FramesMac fits it to the
     // screen), in its own shape.
-    let mut presenter = MacPresenter::new(info.width, info.height, true)?;
-    presenter.set_title(&crate::viewer_title(o, &info));
+    let mut presenter = match &o.popup {
+        Some(_) => MacPresenter::new_popup(info.width, info.height)?,
+        None => MacPresenter::new(info.width, info.height, true)?,
+    };
+    // A host menu, tooltip or sheet: over its window's picture.
+    if let Some((popup, parent)) = &o.popup {
+        use frames_platform_macos::presenter::PopupRole;
+        let role = match popup.role.as_str() {
+            "menu" => PopupRole::Menu,
+            "tooltip" => PopupRole::Tooltip,
+            "sheet" => PopupRole::Sheet,
+            _ => PopupRole::Popover,
+        };
+        let f = |v: f64| v;
+        presenter.attach(
+            parent.id,
+            (
+                f(popup.x - parent.x),
+                f(popup.y - parent.y),
+                f(popup.width),
+                f(popup.height),
+            ),
+            (f(parent.width), f(parent.height)),
+            role,
+        );
+    }
+    let base_title = crate::viewer_title(o, &info);
+    presenter.set_title(&format!("{base_title} — Waiting for video…"));
+    presenter.set_menu_id(o.menu_id);
+    system::viewer_set_command_handler(crate::control::send_json);
+    MENUS_SHOWN.store(0, std::sync::atomic::Ordering::Relaxed);
+    push_menus();
     system::viewer_app();
+    // The connection menus' choices for this window (`crate::control`).
+    let mut window_loop = crate::control::WindowLoop::new(o, &info);
+    window_loop.resize.streaming((info.width, info.height));
+    // The size the user last gave the window, in pixels.
+    let user_size = Arc::new(Mutex::new(None::<(u32, u32)>));
     // A window of a host application: closing it asks the host window to
     // close (its going away ends this session); a second close closes here.
-    let mut showing_stats = false;
     presenter.intercept_close(o.window_id.is_some());
     // Events are sent from the main thread as they arrive: the viewer loop
     // can wait up to a frame for a drawable, which would delay input.
     let lane = Arc::new(Mutex::new(lane));
     {
-        let (lane, media) = (lane.clone(), session.media());
+        let (lane, media, user_size) = (lane.clone(), session.media(), user_size.clone());
         presenter.set_input(move |input| {
-            if let Some(item) = captured(input) {
+            if let MacInput::Size { width, height } = input {
+                *user_size.lock().unwrap() = Some((width, height));
+            }
+            let items = captured_all(input);
+            if !items.is_empty() {
                 lane.lock()
                     .unwrap()
-                    .send(&media, &SystemClock::new(), vec![item]);
+                    .send(&media, &SystemClock::new(), items);
             }
         });
     }
@@ -224,6 +321,7 @@ fn view(
     // ask for one, since a still picture would never send another.
     client.request_keyframe();
     let started = Instant::now();
+    let mut path_key: Option<String> = None;
     let mut synthetic_step = 0u64;
     let mut cursor_updates = 0u64;
     let mut next_report = Duration::from_secs(1);
@@ -231,19 +329,48 @@ fn view(
     let mut presented = 0u64;
     let mut superseded = 0u64;
     let mut reported_clean = 0u64;
+    let mut menus_version = 0u64;
+    let mut stats_on = false;
+    // The debug overlay (Control+Option+F10, "Show debug overlay").
+    let mut overlay = crate::overlay::Recorder::default();
+    let mut overlay_shown = false;
+    let codec_name = info.codec.label();
+    let mut stream_size = (info.width, info.height);
+    let mut resize_remote = false;
+    let mut title_detail = String::new();
+    let mut notice: Option<String> = None;
+    let mut notice_until: Option<Instant> = None;
+    let mut status: Option<&str> = Some("Waiting for video…");
+    let mut shown_title = String::new();
     loop {
         if o.deadline().is_some_and(|d| started.elapsed() >= d)
             || presenter.closed()
-            || crate::DISCONNECT.load(std::sync::atomic::Ordering::Relaxed)
+            || crate::control::ending()
         {
             break;
         }
         if let Some(json) = presenter.take_dropped_json() {
-            for path in serde_json::from_str::<Vec<String>>(&json).unwrap_or_default() {
-                crate::transfer::send_dropped(session, path.into());
+            // Paths, or {"path", "x", "y"} for files dropped on the picture
+            // (normalized over it): the host drops them there too.
+            for dropped in serde_json::from_str::<Vec<serde_json::Value>>(&json).unwrap_or_default()
+            {
+                let (path, point) = match &dropped {
+                    serde_json::Value::String(path) => (Some(path.as_str()), None),
+                    entry => (
+                        entry["path"].as_str(),
+                        entry["x"]
+                            .as_u64()
+                            .zip(entry["y"].as_u64())
+                            .map(|(x, y)| (x.min(65535) as u16, y.min(65535) as u16)),
+                    ),
+                };
+                if let Some(path) = path {
+                    crate::transfer::send_dropped(session, path.into(), point);
+                }
             }
         }
         if presenter.take_close_request() {
+            status = Some("Closing remote window…");
             println!("asking the host to close its window");
             let at_us = clock.now_us();
             lane.lock().unwrap().send(
@@ -268,14 +395,83 @@ fn view(
             }
         }
         lane.lock().unwrap().tick(&media, clock.now_us());
+        // The connection menus: what changed for this window.
+        push_menus();
+        let send = |event: Event| {
+            let at_us = SystemClock::new().now_us();
+            lane.lock().unwrap().send(
+                &media,
+                &SystemClock::new(),
+                vec![Captured::Event { event, at_us }],
+            );
+        };
+        let changes = window_loop.tick(session, send);
+        if changes.toggle_relative {
+            presenter.set_relative(!RELATIVE.load(std::sync::atomic::Ordering::Relaxed), true);
+        }
+        if let Some(swap) = changes.swap {
+            let swap = swap && !o.physical_keys;
+            let mut lane = lane.lock().unwrap();
+            if lane.swap_modifiers != swap {
+                lane.release_all();
+                lane.swap_modifiers = swap;
+                println!(
+                    "keys: Control and Command {}",
+                    if swap { "swapped" } else { "as they are" }
+                );
+            }
+        }
+        let version = crate::control::version();
+        if version != menus_version || changes.prefs.is_some() {
+            menus_version = version;
+            let snapshot = crate::control::snapshot();
+            stats_on = snapshot.stats;
+            let prefs = window_loop.prefs();
+            let entry = snapshot.windows.iter().find(|w| w.id == o.menu_id);
+            let desktop = entry.is_none_or(|w| w.desktop);
+            let resizable = entry.is_some_and(|w| w.resizable) && !desktop;
+            resize_remote = prefs.resize_remote && resizable && o.popup.is_none();
+            // Popups fill their window, which has the popup's shape.
+            let fill = prefs.fill || o.popup.is_some();
+            let keep_aspect = !resize_remote && o.popup.is_none();
+            presenter.set_view_options(fill, keep_aspect, prefs.physical || o.physical_keys);
+            title_detail = if desktop {
+                String::new()
+            } else {
+                format!(
+                    " — {}{}",
+                    if resize_remote {
+                        "Resize remote"
+                    } else {
+                        "Stretch locally"
+                    },
+                    if prefs.physical || o.physical_keys {
+                        " / Physical keys"
+                    } else {
+                        ""
+                    }
+                )
+            };
+            if snapshot.notice != notice {
+                notice = snapshot.notice.clone();
+                notice_until = notice
+                    .as_ref()
+                    .map(|_| Instant::now() + Duration::from_secs(6));
+            }
+        }
+        if resize_remote && let Some(size) = *user_size.lock().unwrap() {
+            window_loop.local_size(size, send);
+        }
         // The host window resized: a decoder for the new size, and the
         // window in the new shape at its current scale.
         while let Ok(items) = updates.menus.try_recv() {
             println!("host menus: {}", crate::menus::summary(&items));
+            crate::control::set_window_details(o.menu_id, None, Some(!items.is_empty()));
             presenter.set_menus(&serde_json::to_string(&items).unwrap_or_default());
         }
         while let Ok((width, height)) = updates.sizes.try_recv() {
             println!("stream resized to {width}x{height}");
+            stream_size = (width, height);
             decoder = MacDecoder::new(info.codec.into())?;
             presenter.resize(width, height);
             client.request_keyframe();
@@ -304,6 +500,12 @@ fn view(
             clipboard.tick();
         }
         let path = media.path();
+        // Which path carries the stream, when it changes (diagnostics).
+        let key = media.selected_path_key();
+        if key != path_key {
+            println!("path: {}", media.describe_paths().join(" | "));
+            path_key = key;
+        }
         client.set_rtt(path.rtt_us);
         while let Some((datagram, arrived)) = media.try_recv_timed() {
             if datagram.first() == Some(&crate::audio::TAG) {
@@ -312,6 +514,7 @@ fn view(
                 }
                 continue;
             }
+            overlay.received(datagram.len());
             client.on_datagram(arrived.unwrap_or_else(|| clock.now_us()), &datagram);
         }
         // Every ready frame is decoded (later ones reference it), but only
@@ -324,7 +527,12 @@ fn view(
             match presenter.present(frame, mode) {
                 Ok(stamp) => {
                     presented += 1;
-                    latency.push(stamp.presented_us.saturating_sub(captured));
+                    if status == Some("Waiting for video…") {
+                        status = None;
+                    }
+                    let measured = stamp.presented_us.saturating_sub(captured);
+                    latency.push(measured);
+                    overlay.presented(measured);
                 }
                 Err(error) => eprintln!("present failed: {error}"),
             }
@@ -332,17 +540,59 @@ fn view(
         if let Some(feedback) = client.poll_feedback(clock.now_us()) {
             let _ = media.try_send(feedback);
         }
+        // The title: the window's name and sizing mode, then a status or
+        // a notice (a fetched file), as v1; statistics replace it.
+        if notice_until.is_some_and(|until| Instant::now() >= until) {
+            notice_until = None;
+        }
+        // The overlay over the picture; the title keeps the window's name
+        // (`--stats-title` puts statistics there for diagnostics).
+        if stats_on && overlay.due() {
+            let stats = client.stats();
+            let audio_counts = audio.as_ref().map(|audio| {
+                use std::sync::atomic::Ordering::Relaxed;
+                (
+                    audio.stats.packets.load(Relaxed),
+                    audio.stats.concealed.load(Relaxed),
+                )
+            });
+            if let Some(data) = overlay.snapshot(&crate::overlay::Input {
+                codec: codec_name,
+                width: stream_size.0,
+                height: stream_size.1,
+                decoder: "VideoToolbox · hardware",
+                path: &path,
+                stats,
+                superseded,
+                audio: audio_counts,
+                shortcut: "Control+Option+F10",
+            }) {
+                presenter.set_overlay(serde_json::to_string(&data).ok().as_deref());
+                overlay_shown = true;
+            }
+        } else if !stats_on && overlay_shown {
+            presenter.set_overlay(None);
+            overlay_shown = false;
+        }
+        if !o.stats_title {
+            let detail = match (status, notice_until.and(notice.as_deref())) {
+                (Some(status), _) => format!(" — {status}"),
+                (None, Some(notice)) => format!(" — {notice}"),
+                (None, None) => String::new(),
+            };
+            let title = format!("{base_title}{title_detail}{detail}");
+            if title != shown_title {
+                presenter.set_title(&title);
+                shown_title = title;
+            }
+        }
         if started.elapsed() >= next_report {
             let stats = client.stats();
             let (n, p50, p95) = latency.take_window();
-            let show = o.stats_title ^ STATS_TOGGLED.load(std::sync::atomic::Ordering::Relaxed);
-            if show {
+            if o.stats_title {
                 let title = crate::stats::window_title(n, p50, p95, &path, stats.frames_lost);
                 presenter.set_title(&title);
-                showing_stats = true;
-            } else if showing_stats {
-                presenter.set_title(&crate::viewer_title(o, &info));
-                showing_stats = false;
+                shown_title.clear();
             }
             println!(
                 "client t={:>3}s presented {n:>3}/s clean {:>3} lost {} | capture to present p50 {p50:>5.2} p95 {p95:>5.2} ms | recoveries {} nacks {} | {:?} rtt {:.1} ms offset {:.1} ms",

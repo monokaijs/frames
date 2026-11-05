@@ -235,7 +235,7 @@ impl Button {
 }
 
 /// Reliable input events.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// A button changed at the given normalized position (sent with the
     /// button so a click lands where it was made, even if pointer datagrams
@@ -264,6 +264,49 @@ pub enum Event {
     /// The viewer chose an item of the shared window's application menu,
     /// by the id the host gave it.
     Menu { id: u32 },
+    /// Show the shared window's title bar and borders (`true`), or only its
+    /// content (the default, as v1: the viewer's window has its own).
+    Header { show: bool },
+    /// Draw the host's cursor into the picture as well ("Show remote
+    /// cursor"); the viewer always shows its own.
+    RemoteCursor { show: bool },
+    /// Read the shared window's application menus again and send them.
+    RefreshMenus,
+    /// Resize the shared window so its picture is this many pixels
+    /// ("Resize remote app": the viewer's window was resized).
+    ResizeWindow { width: u16, height: u16 },
+    /// Typed text, composed on the viewer (its keyboard layout, dead keys,
+    /// IME), for the host to insert as characters. Not in physical-keys mode.
+    /// At most [`MAX_TEXT_BYTES`] per event; split longer text with
+    /// [`Event::texts`].
+    Text { text: String },
+    /// The viewer's window of this stream: `shown` false while it is
+    /// minimized or covered (the host stops encoding), `focused` false while
+    /// another window is in front (the host sends fewer frames), as v1.
+    Visibility { shown: bool, focused: bool },
+}
+
+/// The most UTF-8 bytes one [`Event::Text`] carries.
+pub const MAX_TEXT_BYTES: usize = 240;
+
+impl Event {
+    /// `text` as [`Event::Text`] events, split on character boundaries.
+    pub fn texts(text: &str) -> Vec<Event> {
+        let mut out = Vec::new();
+        let mut chunk = String::new();
+        for c in text.chars() {
+            if chunk.len() + c.len_utf8() > MAX_TEXT_BYTES {
+                out.push(Event::Text {
+                    text: std::mem::take(&mut chunk),
+                });
+            }
+            chunk.push(c);
+        }
+        if !chunk.is_empty() {
+            out.push(Event::Text { text: chunk });
+        }
+        out
+    }
 }
 
 const KIND_BUTTON: u8 = 1;
@@ -274,12 +317,28 @@ const KIND_MODE: u8 = 5;
 const KIND_CLOSE_WINDOW: u8 = 6;
 const KIND_MAX_BITRATE: u8 = 7;
 const KIND_MENU: u8 = 8;
+const KIND_HEADER: u8 = 9;
+const KIND_REMOTE_CURSOR: u8 = 10;
+const KIND_REFRESH_MENUS: u8 = 11;
+const KIND_RESIZE_WINDOW: u8 = 12;
+const KIND_TEXT: u8 = 13;
+const KIND_VISIBILITY: u8 = 14;
 
 impl Event {
     /// Appends the length-prefixed record to `out`.
     pub fn encode(&self, out: &mut Vec<u8>) {
         let start = out.len();
         out.push(0);
+        if let Self::Text { text } = self {
+            out.push(KIND_TEXT);
+            let mut end = text.len().min(MAX_TEXT_BYTES);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.extend(&text.as_bytes()[..end]);
+            out[start] = (out.len() - start - 1) as u8;
+            return;
+        }
         match *self {
             Self::Button { button, down, x, y } => {
                 out.extend([KIND_BUTTON, button.code(), u8::from(down)]);
@@ -307,6 +366,18 @@ impl Event {
                 out.push(KIND_MENU);
                 out.extend(id.to_le_bytes());
             }
+            Self::Header { show } => out.extend([KIND_HEADER, u8::from(show)]),
+            Self::RemoteCursor { show } => out.extend([KIND_REMOTE_CURSOR, u8::from(show)]),
+            Self::RefreshMenus => out.push(KIND_REFRESH_MENUS),
+            Self::ResizeWindow { width, height } => {
+                out.push(KIND_RESIZE_WINDOW);
+                out.extend(width.to_le_bytes());
+                out.extend(height.to_le_bytes());
+            }
+            Self::Visibility { shown, focused } => {
+                out.extend([KIND_VISIBILITY, u8::from(shown), u8::from(focused)])
+            }
+            Self::Text { .. } => unreachable!("encoded above"),
         }
         out[start] = (out.len() - start - 1) as u8;
     }
@@ -369,6 +440,20 @@ fn decode_record(record: &[u8]) -> Option<Event> {
         KIND_MENU if body.len() == 4 => Event::Menu {
             id: u32::from_le_bytes(body.try_into().ok()?),
         },
+        KIND_HEADER if body.len() == 1 => Event::Header { show: flag(0)? },
+        KIND_REMOTE_CURSOR if body.len() == 1 => Event::RemoteCursor { show: flag(0)? },
+        KIND_REFRESH_MENUS if body.is_empty() => Event::RefreshMenus,
+        KIND_VISIBILITY if body.len() == 2 => Event::Visibility {
+            shown: flag(0)?,
+            focused: flag(1)?,
+        },
+        KIND_TEXT if !body.is_empty() => Event::Text {
+            text: String::from_utf8(body.to_vec()).ok()?,
+        },
+        KIND_RESIZE_WINDOW if body.len() == 4 => Event::ResizeWindow {
+            width: u16_at(0)?,
+            height: u16_at(2)?,
+        },
         _ => return None,
     };
     Some(event)
@@ -402,7 +487,13 @@ impl Held {
             | Event::Mode { .. }
             | Event::CloseWindow
             | Event::MaxBitrate { .. }
-            | Event::Menu { .. } => {}
+            | Event::Menu { .. }
+            | Event::Header { .. }
+            | Event::RemoteCursor { .. }
+            | Event::RefreshMenus
+            | Event::ResizeWindow { .. }
+            | Event::Text { .. }
+            | Event::Visibility { .. } => {}
         }
     }
 
@@ -521,6 +612,26 @@ mod tests {
     }
 
     #[test]
+    fn long_text_splits_on_character_boundaries() {
+        let text = "é".repeat(300);
+        let events = Event::texts(&text);
+        assert_eq!(events.len(), 3);
+        let mut bytes = Vec::new();
+        for event in &events {
+            event.encode(&mut bytes);
+        }
+        let joined: String = EventReader::default()
+            .push(&bytes)
+            .into_iter()
+            .map(|e| match e {
+                Event::Text { text } => text,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(joined, text);
+    }
+
+    #[test]
     fn mode_records_round_trip() {
         let mut bytes = Vec::new();
         Event::Mode { relative: true }.encode(&mut bytes);
@@ -528,6 +639,22 @@ mod tests {
         Event::CloseWindow.encode(&mut bytes);
         Event::MaxBitrate { mbps: 12 }.encode(&mut bytes);
         Event::Menu { id: 70_000 }.encode(&mut bytes);
+        Event::Header { show: true }.encode(&mut bytes);
+        Event::RemoteCursor { show: false }.encode(&mut bytes);
+        Event::RefreshMenus.encode(&mut bytes);
+        Event::ResizeWindow {
+            width: 1280,
+            height: 720,
+        }
+        .encode(&mut bytes);
+        for event in Event::texts("héllo 世界") {
+            event.encode(&mut bytes);
+        }
+        Event::Visibility {
+            shown: false,
+            focused: true,
+        }
+        .encode(&mut bytes);
         assert_eq!(
             EventReader::default().push(&bytes),
             vec![
@@ -535,7 +662,21 @@ mod tests {
                 Event::Mode { relative: false },
                 Event::CloseWindow,
                 Event::MaxBitrate { mbps: 12 },
-                Event::Menu { id: 70_000 }
+                Event::Menu { id: 70_000 },
+                Event::Header { show: true },
+                Event::RemoteCursor { show: false },
+                Event::RefreshMenus,
+                Event::ResizeWindow {
+                    width: 1280,
+                    height: 720
+                },
+                Event::Text {
+                    text: "héllo 世界".into()
+                },
+                Event::Visibility {
+                    shown: false,
+                    focused: true
+                }
             ]
         );
     }

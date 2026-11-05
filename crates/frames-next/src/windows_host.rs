@@ -434,6 +434,46 @@ pub fn probe_backends(o: &Options) -> Vec<Probe> {
         .collect()
 }
 
+/// v1's "Window compatibility" for the shared window's executable: its
+/// verified record, or why it is untested.
+fn compatibility(hwnd: windows::Win32::Foundation::HWND) -> String {
+    use sha2::{Digest, Sha256};
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    let hash = (|| -> Result<String> {
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)? };
+        let mut path = vec![0u16; 32768];
+        let mut size = path.len() as u32;
+        let named = unsafe {
+            QueryFullProcessImageNameW(
+                process,
+                PROCESS_NAME_WIN32,
+                windows::core::PWSTR(path.as_mut_ptr()),
+                &mut size,
+            )
+        };
+        let _ = unsafe { CloseHandle(process) };
+        named?;
+        let path = String::from_utf16_lossy(&path[..size as usize]);
+        let mut file = std::fs::File::open(path)?;
+        let mut hash = Sha256::new();
+        std::io::copy(&mut file, &mut hash)?;
+        Ok(format!("{:x}", hash.finalize()))
+    })();
+    match (hash, frames_core::shared_game::Catalog::bundled()) {
+        (Ok(hash), Ok(catalog)) => catalog.lookup(&hash).description(),
+        (Err(error), _) | (_, Err(error)) => {
+            format!("Untested\nThe executable could not be checked: {error:#}")
+        }
+    }
+}
+
 /// Capture failing is not the encoder's fault, so it is reported apart.
 #[derive(Debug)]
 struct CaptureFailed;
@@ -456,7 +496,13 @@ fn open_backend(
     let (device, context, adapter) = backend_device(backend)?;
     let capture = || -> Result<_> {
         let mut capture = match source {
-            Some(hwnd) => WgcCapture::window(hwnd, &device, shared.clone())?,
+            Some(hwnd) => {
+                let mut capture = WgcCapture::window(hwnd, &device, shared.clone())?;
+                // Only the window's content, as v1 ("Show remote window
+                // header" in the viewer's menu shows the rest).
+                capture.set_header(false);
+                capture
+            }
             None => WgcCapture::primary_monitor(&device, shared.clone())?,
         };
         capture.configure(CaptureConfig {
@@ -576,12 +622,17 @@ fn stream(
     );
     let mut injector = InputInjector::new(match (&qa, shared_window) {
         (Some(source), _) => InputTarget::Window(source.hwnd()),
-        (None, Some(hwnd)) => InputTarget::WindowArea(hwnd),
+        (None, Some(hwnd)) => InputTarget::WindowArea {
+            hwnd,
+            header: false,
+        },
         (None, None) => InputTarget::Desktop(primary_monitor_rect()),
     });
     // One window with isolated input: into that window's process only. If
     // the adapter cannot attach, the viewer gets no input at all rather
     // than the host's own mouse and keyboard.
+    // Why input did not reach the shared window, for the viewer's title.
+    let mut notices = crate::streams::Notices::new(session.clone(), handle.clone());
     let mut isolated = match (o.isolated, shared_window) {
         (true, Some(hwnd)) if o.control => {
             let config = crate::admit::config_dir(o.config_dir.as_ref())?;
@@ -619,6 +670,7 @@ fn stream(
         fps: o.fps,
         platform: crate::platform().into(),
         name: crate::device_name(o),
+        compatibility: shared_window.filter(|_| o.isolated).map(compatibility),
     };
     handle
         .block_on(send_info(session, info))
@@ -627,7 +679,7 @@ fn stream(
     // viewer accepts the two streams in that order.
     let (mut cursor_stream, _) =
         handle.block_on(crate::streams::open(session, crate::streams::CURSOR))?;
-    if o.adb && o.control {
+    if o.adb && o.control && o.windows.is_empty() {
         handle.spawn(crate::streams::adb_listener(session.clone(), o.adb_listen));
     }
     let (cursor_tx, mut cursor_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -698,9 +750,14 @@ fn stream(
     let mut follower = crate::resize::Follower::new((width, height));
     // A shared application window's menus, for the viewer's window.
     let mut host_menus = o.window_id.map(crate::menus::HostMenus::start);
+    // The shared window's title bar and borders are in the picture.
+    let mut header = false;
     let mut resize_stream = None;
     let mut frames = 0u64;
     let mut encode_us = Vec::new();
+    // The viewer's window hidden or behind others (`Event::Visibility`).
+    let mut visibility = crate::pacing::Visibility::default();
+    let mut held = None;
     loop {
         if o.deadline().is_some_and(|d| started.elapsed() >= d) {
             break;
@@ -786,6 +843,10 @@ fn stream(
             }
             None => None,
         };
+        let frame = visibility.admit(frame, &mut held, clock.now_us(), last_encode_us);
+        if frame.is_some() && visibility.take_keyframe() {
+            encoder.control(EncoderControl::ForceKeyframe)?;
+        }
         let sized = frame.map(|frame| {
             let size = frame.surface.size();
             (frame, size)
@@ -860,6 +921,56 @@ fn stream(
             host_menus = None;
         }
         while let Ok(event) = events.try_recv() {
+            match event {
+                frames_input::Event::Visibility { shown, focused } => {
+                    if visibility.set(shown, focused) {
+                        println!("the viewer's window: {}", visibility.describe());
+                    }
+                    continue;
+                }
+                frames_input::Event::Header { show } => {
+                    // Isolated input maps onto the client area only.
+                    if let Some(hwnd) = shared_window.filter(|_| isolated.is_none()) {
+                        capture.set_header(show);
+                        injector.set_target(InputTarget::WindowArea { hwnd, header: show });
+                        header = show;
+                        println!(
+                            "the viewer {} the window's title bar",
+                            if show { "shows" } else { "hides" }
+                        );
+                    }
+                    continue;
+                }
+                frames_input::Event::RemoteCursor { show } => {
+                    if let Err(error) = capture.set_cursor_capture(show) {
+                        println!("cannot change cursor capture: {error}");
+                    } else {
+                        println!(
+                            "host cursor in the picture: {}",
+                            if show { "on" } else { "off" }
+                        );
+                    }
+                    continue;
+                }
+                frames_input::Event::RefreshMenus => {
+                    if let Some(menus) = &mut host_menus {
+                        menus.refresh();
+                    }
+                    continue;
+                }
+                frames_input::Event::ResizeWindow { width, height } => {
+                    if o.control
+                        && let Some(hwnd) = shared_window
+                    {
+                        match resize_window(hwnd, header, u32::from(width), u32::from(height)) {
+                            Ok(()) => println!("the viewer resized the window to {width}x{height}"),
+                            Err(error) => println!("cannot resize the window: {error:#}"),
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             if let frames_input::Event::Menu { id } = event {
                 if o.control
                     && let Some(menus) = &host_menus
@@ -896,10 +1007,14 @@ fn stream(
             } else if let Some(input) = &mut isolated {
                 if let Err(error) = input.event(event) {
                     println!("isolated input stopped, viewing only: {error:#}");
+                    notices.send(&format!("Input stopped (view only now): {error:#}"));
                     isolated = None;
                 }
             } else if global_input {
                 injector.event(event);
+                if let Some(problem) = injector.take_problem() {
+                    notices.send(problem);
+                }
             }
         }
         if started.elapsed() >= next_report {
@@ -952,5 +1067,86 @@ fn stream(
         );
     }
     session.close("host stopped");
+    Ok(())
+}
+
+/// Resizes a shared window so the part the viewer sees (`header`: with its
+/// title bar and borders) becomes `width` x `height` pixels, as v1's
+/// "Resize remote app": within its own size limits and the work area.
+fn resize_window(
+    hwnd: windows::Win32::Foundation::HWND,
+    header: bool,
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    use windows::Win32::Foundation::{LPARAM, RECT, WPARAM};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    unsafe {
+        anyhow::ensure!(
+            !IsZoomed(hwnd).as_bool() && !IsIconic(hwnd).as_bool(),
+            "the window is maximized or minimized"
+        );
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        anyhow::ensure!(style & WS_THICKFRAME.0 != 0, "the window has a fixed size");
+        let mut outer = RECT::default();
+        GetWindowRect(hwnd, &mut outer)?;
+        let shown = frames_platform_windows::input::captured_rect(hwnd, header);
+        let mut limits = MINMAXINFO::default();
+        let _ = SendMessageTimeoutW(
+            hwnd,
+            WM_GETMINMAXINFO,
+            WPARAM(0),
+            LPARAM(&mut limits as *mut _ as isize),
+            SMTO_ABORTIFHUNG,
+            10,
+            None,
+        );
+        anyhow::ensure!(
+            !(limits.ptMinTrackSize.x > 0 && limits.ptMinTrackSize == limits.ptMaxTrackSize),
+            "the window has a fixed size"
+        );
+        let mut monitor = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let _ = GetMonitorInfoW(
+            MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+            &mut monitor,
+        );
+        let work = monitor.rcWork;
+        let extra_w = (outer.right - outer.left) - (shown.right - shown.left);
+        let extra_h = (outer.bottom - outer.top) - (shown.bottom - shown.top);
+        let clamp = |value: i32, min: i32, max: i32, screen: i32| {
+            let max = if max > 0 { max } else { 32768 };
+            value.min(max).min(screen.max(200)).max(min.max(100))
+        };
+        let new_w = clamp(
+            width as i32 + extra_w,
+            limits.ptMinTrackSize.x,
+            limits.ptMaxTrackSize.x,
+            work.right - work.left,
+        );
+        let new_h = clamp(
+            height as i32 + extra_h,
+            limits.ptMinTrackSize.y,
+            limits.ptMaxTrackSize.y,
+            work.bottom - work.top,
+        );
+        if (new_w, new_h) == (outer.right - outer.left, outer.bottom - outer.top) {
+            return Ok(());
+        }
+        SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            new_w,
+            new_h,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )?;
+    }
     Ok(())
 }

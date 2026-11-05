@@ -107,6 +107,11 @@ pub(super) enum Report {
     Code(String),
     /// Viewer: the host's id and name, once it started the stream.
     Host { device: String, name: String },
+    /// Viewer: the user switched views in the connection menu.
+    View { desktop: bool },
+    /// Viewer: image quality (0 high, 1 medium, 2 low) or the remote cursor
+    /// changed in the connection menu.
+    Choices { quality: i32, remote_cursor: bool },
     /// Host: a device it let in.
     Viewer {
         device: String,
@@ -133,6 +138,13 @@ pub(super) fn parse(line: &str) -> Option<Report> {
         "host" => Report::Host {
             device: text("device"),
             name: text("name"),
+        },
+        "choices" => Report::Choices {
+            quality: value["quality"].as_i64().unwrap_or(0) as i32,
+            remote_cursor: value["remote_cursor"].as_bool().unwrap_or(false),
+        },
+        "view" => Report::View {
+            desktop: value["view"].as_str() == Some("desktop"),
         },
         "viewer" => Report::Viewer {
             device: text("device"),
@@ -189,11 +201,24 @@ pub(super) fn target(value: &str, devices: &[Device]) -> Result<String> {
                 )
             });
     }
+    // A short code ("9710-3C89") or the start of an id: the nearby device
+    // it names, when exactly one does; otherwise the session looks for it.
+    let code = frames_next::directory::normalize_code(value);
     anyhow::ensure!(
-        value.len() >= 8 && value.bytes().all(|b| b.is_ascii_hexdigit()),
-        "Enter the device ID shown on the other device (at least its first 8 characters)."
+        code.len() >= 8 && code.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Enter the code shown on the other device (such as 9710-3C89), its device ID, or its IP address on this network."
     );
-    Ok(value.to_ascii_lowercase())
+    if frames_next::directory::is_device_id(&code) {
+        return Ok(code);
+    }
+    let matches: Vec<&Device> = devices
+        .iter()
+        .filter(|d| d.online && d.fingerprint.starts_with(&code))
+        .collect();
+    Ok(match matches.as_slice() {
+        [device] => device.fingerprint.clone(),
+        _ => code,
+    })
 }
 
 #[cfg(test)]
@@ -266,5 +291,9 @@ mod tests {
         assert!(target("192.168.0.9", &devices).is_err());
         assert_eq!(target("ABCDEF12", &devices).unwrap(), "abcdef12");
         assert!(target("abc", &devices).is_err());
+        // The short code as shown, with its dash or spaces, finds the
+        // nearby device.
+        assert_eq!(target("AAAA-AAAA", &devices).unwrap(), id);
+        assert_eq!(target(" aaaa aaaa ", &devices).unwrap(), id);
     }
 }

@@ -1,7 +1,12 @@
 # Frames v2 parity checklist
 
 The Phase 6 gate (docs/V2_PLAN.md) requires every v1 feature in the README
-to work on the v2 stack before the cutover. Status as of 2026-11-05.
+to work on the v2 stack before the cutover. Status as of 2026-11-06.
+
+0.5.0 shipped claiming more than it had: per-window viewing lacked v1's
+connection menu, title-bar dropdown and window options. Those were ported
+on 2026-11-06 (see "Viewer windows and connection menu" below); the
+checks say what ran on hardware and what only passed tests.
 **Done** means implemented on v2 and checked on real machines; **Partial**
 says what is missing; **Not started** has no v2 code yet.
 
@@ -14,7 +19,7 @@ launcher, installer, updater, and service still run v1.
 
 | v1 feature | v2 status |
 |---|---|
-| Direct LAN/VPN connections | **Done**: iroh, direct paths found automatically (PC ↔ Mac on the LAN). |
+| Direct LAN/VPN connections | **Done**, with a caveat: iroh, direct paths found automatically. With a Mac host and a Windows viewer the selected direct path can go silent one way (iroh multipath); hosts send a heartbeat and viewers drop a silent direct path within 0.5 s and carry on over the relay (checked: losses 448 → 33 frames in 60 s; short hitches remain while iroh retries direct). |
 | Internet connections (new in v2) | **Partial**: n0 relays and self-hosted relays work; NAT matrix not run. |
 | Nearby discovery | **Done**: hosts advertise `_frames2._udp` (device id and name); the launcher's Devices list shows them (`frames discover` too), and connecting dials a nearby host's LAN addresses directly (works without internet) or an unambiguous id prefix. |
 | Pairing code confirmation | **Done**: the host shows the viewer's name and the code in a launcher prompt (`--ask-launcher`: a `Frames pairing:` line, answered on the host's stdin), or on its terminal from the command line; the viewer's Sessions row shows the code while it waits. |
@@ -27,6 +32,31 @@ launcher, installer, updater, and service still run v1.
 | Device cards with screenshots, recent devices | **Done**: cards with names, online state and recent devices; trusted nearby hosts send a 480 px PNG preview of their screen at most once a minute (`PREVIEW` stream; refused to untrusted devices without asking anyone). Checked: laptop → Mac 480×300 PNG; an untrusted device refused. |
 | Sessions tab with live progress | **Done**: connecting, waiting (with the pairing code), connected, with the host's name; failures explained (refused, not found, no answer). |
 
+## Viewer windows and connection menu (ported 2026-11-06)
+
+The viewer's menus come from one controller (`crates/frames-next/src/control.rs`):
+a snapshot the platforms build menus from, and commands they send back.
+`--qa-command <s>=<json>` runs commands on a timer (unattended tests).
+
+| v1 feature | v2 status |
+|---|---|
+| Title-bar dropdown ("Connection menu") | **Done**: a chevron beside minimize on Windows, a title-bar accessory on Mac, with v1's labels and order; not clicked through by a person yet. |
+| Windows list, show / hide, Show all, Hide all, Ignore / hide this window | **Done**: hiding stops that window's stream; checked with scripted commands (hide closed the session, Show all reopened it). Windows shows "Frames connection" when every window is hidden. |
+| Per-window view / Full desktop view during a session | **Done**: checked windows → desktop → windows with scripted commands; the launcher remembers the last view per device. |
+| Image quality, Show remote cursor (remembered per device) | **Done**: checked with scripted commands (host capped at 4 Mbps, cursor drawn into the picture). |
+| Show remote window header (cropped by default) | **Done**: Windows hosts crop to the client area (checked: Notepad client 1797x1256, picture 1796x1256) and re-crop at once on a change; Mac hosts crop the standard title bar (Accessibility). |
+| Resize remote app / Stretch locally / Fill or fit | **Done** in code on both platforms; remote resize not exercised (it would resize someone's window). |
+| Swap Control / Command, Physical keys, typed text (IME, dead keys, AltGr) | **Done** in code on both platforms; typing through an IME not exercised. |
+| Refresh application menus, Fetch remote file…, received-files list | **Done**: Fetch prompt and list on both platforms; drag out of the list, Cancel transfers. |
+| Remote menus, tooltips, popups | **Done** in code: listed by the host with a parent and shown as frameless child windows; about 0.5 s late (catalog poll). |
+| Raise the host window before input, host input errors in the title | **Done**: notices on a `NOTICE` stream (Windows: focus refused; Mac: Accessibility missing). |
+| Window icons, taskbar grouping (Windows), Dock menu per remote app (Mac) | **Done**: Mac has one Dock tile with a menu per remote app (one process has one tile). |
+| Remote modal dialogs (Mac) | **Done** in code: input to a blocked window goes to its dialog. |
+| Debug overlay with graphs | **Done**: v1's panel and graphs on both viewers (checked rendering on both). |
+| Hidden or unfocused windows | **Done**: paused while hidden, 24 fps unfocused (`Event::Visibility`). |
+| Devices menu (gamepads, USB, ADB during a session) | **Done** in code; gamepads only while a viewer window has focus. |
+| One window (games): Relative mouse, Window compatibility, physical keys | **Done**: compatibility from v1's bundled catalog by the executable's SHA-256. |
+
 ## Streaming
 
 | v1 feature | v2 status |
@@ -34,11 +64,11 @@ launcher, installer, updater, and service still run v1.
 | Full desktop view | **Done** on Windows (WGC monitor capture); macOS uses ScreenCaptureKit but was only run with the generated source (Screen Recording grant needed). |
 | Individual remote application windows | **Done**: the host lists its application windows on a catalog stream as they open, close and are renamed (at most Settings > Shared window limit); the viewer (`--apps`, the launcher's Application windows view) opens a session and local window per remote window, titled like it. Windows hosts capture by HWND (WGC), Mac hosts by CGWindowID (ScreenCaptureKit, ABI 4). A resized remote window is followed live (encoder reconfigured with a keyframe, viewer window reshaped at the same scale); local windows keep the picture's shape, so no bars appear (checked with Notepad on the laptop resized twice). Closing a local window asks the host window to close (WM_CLOSE; its close button through Accessibility on macOS); a second close closes it locally. The application's menus are shown in the viewer window (Win32 menu bars read on the host; macOS menu bars through Accessibility) and run on the host when chosen (checked: System Information's File/Edit/View/Help, 22 items, reached the Mac viewer; choosing items not exercised automatically). Not yet: child-window placement and z-order. |
 | Selected windows / One window sharing scopes | **Done**: Selected windows lists only those windows to the viewer (`--window` filters on the host); One window shares one window and, on a Windows host, uses isolated input (below). |
-| Isolated input for games (One window) | **Done** on Windows hosts: `--isolated` (the launcher's One window) attaches the `FramesInput.dll` adapter (built and embedded by frames-platform-windows) to the window's process; viewer input goes there only, heartbeats keep the 500 ms lease, the next click or key resumes after a pause, and the game's cursor is sent to the viewer. If it cannot attach, the viewer gets no input rather than the host's mouse and keyboard. Checked with the shared-input fixture, Mac viewer → laptop: 1151 mouse and 18 key events delivered raw and legacy, 0 errors, the host's real cursor unmoved. macOS hosts use normal input, as in v1. |
+| Isolated input for games (One window) | **Done** on Windows hosts: `--isolated` (the launcher's One window) attaches the `FramesInput.dll` adapter (built and embedded by frames-platform-windows) to the window's process; viewer input goes there only, heartbeats keep the 500 ms lease, the next click or key resumes after a pause, and the game's cursor is sent to the viewer. If it cannot attach, the viewer gets no input rather than the host's mouse and keyboard. Checked with the shared-input fixture, Mac viewer → laptop: input delivered raw and legacy, 0 errors, the host's real cursor unmoved. On 2026-11-06 the fixture (DPI-unaware, on a 150% display) showed clicks landing 1.5x too far: positions were computed in this process's DPI context; they now use the game window's own. macOS hosts use normal input, as in v1. |
 | Codec choice and automatic selection | **Done**: NVENC (H.264/HEVC), AMF/QSV/MF and software AV1 through FFmpeg, VideoToolbox; host picks the best shared codec. VP9 dropped. Without `--encoder`, a Windows host tries NVENC, AMF, QSV (for the GPUs present), then MF and software AV1, keeping the first whose test encode of the first frame works, so an NVIDIA driver too old for NVENC falls back instead of failing. NVENC runs on API 13.1 (driver 570+), 12.2 (551+), 12.1 (531+) or 12.0 (522+), whichever is the newest the driver has: the same encoder code is compiled against each version's header. 13.1 ran on the RTX 3080 Ti (driver 621); 12.2, 12.1 and 12.0 on the laptop's RTX 4050 (driver 555, with `FRAMES_NVENC_API=12.1` or `12.0` forcing the older ones, which a newer driver accepts): each passes the doctor's test encode, and 30 s live on 12.0 gave capture to present p50 8.4 ms, p95 10.7 ms, encode 2.5 ms, nothing lost. On the laptop (RTX 4050, driver 555) NVENC now runs on API 12.2: 60 s to the Mac at 60 fps, HEVC encode p50 2.4 ms (QSV took 11.5 ms), capture to present p50 9.0 ms, p95 14.7 ms (QSV: 21.6 and 28.8 ms); a Wi-Fi stall at 18 s (rtt 12 ms) was recovered by invalidation (5) with 7 keyframes in all. `frames next doctor` test-encodes each one with a generated frame (no screen capture needed). Checked on a laptop with driver 555: NVENC (API 12.2), QSV HEVC/H.264 on the Iris Xe, MF H.264 and software AV1 all working; before the 12.x bindings NVENC was refused there and QSV chosen. The test encode also changes the bitrate once, since QSV on that laptop failed only then (`MFXVideoENCODE_Reset`: incompatible video parameters, with HRD conformance, low power and external BRC each tried off). Encoders that cannot change bitrate live (QSV, MF) restart with a keyframe instead: soon (at most once a second) to fall, every 5 s and only by 25% or more to climb. The replacement opens on another thread while the old one keeps encoding, because a restart took QSV HEVC 0.25 s, QSV H.264 1.1 s and MF 0.1 s, and frame numbers carry on across it. A frame QSV skips ("Invalid FrameType:0") is dropped rather than ending the session. Live from that laptop's desktop to the Mac: QSV HEVC at 60 fps, capture to present p50 21 ms; a 60 s run through six bitrate changes (60 to 13.7 Mbps and back) finished without a stall or error. With the desktop unlocked: 60 s at 58 fps (3436 frames, 5 lost to a Wi-Fi burst and recovered), capture to present p50 21.6 ms, p95 28.8 ms, while the target fell 60 to 24 Mbps; QSV HEVC encode is 11.5 ms of that. |
-| Host audio | **Partial**: 10 ms Opus datagrams with the previous packet repeated, v1's jitter buffer and drift-corrected playback (`frames-audio`, cpal on both platforms), `frames-next --audio on|qa` on both ends. QA run PC host → Mac viewer (generated 440 Hz tone, silent sink): 800 of 800 packets in 8 s, none concealed, the tone's 880 zero crossings per second recovered. Windows loopback capture and real playback are ported but not exercised automatically (they would capture and play the user's audio); macOS host capture (ScreenCaptureKit audio) is not wired yet. |
+| Host audio | **Partial**: real capture never reached the encoder before 2026-11-06 (only the QA tone did); fixed. A Windows host sends system audio, or only the shared app's (process loopback) when sharing selected windows of one app (checked: 3982 packets laptop → Mac, none lost). Mac hosts capture through ScreenCaptureKit (whole Mac or one app), not yet run with the Screen Recording grant. 10 ms Opus datagrams with the previous packet repeated, v1's jitter buffer and drift-corrected playback (`frames-audio`, cpal on both platforms), `frames-next --audio on|qa` on both ends. QA run PC host → Mac viewer (generated 440 Hz tone, silent sink): 800 of 800 packets in 8 s, none concealed, the tone's 880 zero crossings per second recovered. Windows loopback capture and real playback are ported but not exercised automatically (they would capture and play the user's audio); macOS host capture (ScreenCaptureKit audio) is not wired yet. |
 | Image quality settings, live change | **Done**: Settings > Image quality and Bandwidth limit cap what the viewer receives (sent in the hello); the viewer's Frames menu changes it during the session (`Event::MaxBitrate`, applied by the host's rate control at once). |
-| Debug overlay | **Partial**: Ctrl+Alt+F10 (Control+Option+F10, or Frames menu > Show statistics) shows frame rate, capture → present p50/p95, path and RTT and frames lost in the window title, refreshed each second; per-second statistics in the session log. No graphs panel. |
+| Debug overlay | **Done**: see the connection menu section. |
 | Low latency | **Done**: PC capture → present p50 3-5 ms; PC ↔ Mac 8-12 ms; photodiode check pending. |
 | Host display stays awake while viewed (new in v2) | **Done**: the host holds a display and system wake request for the session (`SetThreadExecutionState` on Windows, a `PreventUserIdleDisplaySleep` assertion on macOS); a viewer is not local input, and a sleeping display gave Windows capture a few frames a second. Both checked with `powercfg /requests` and `pmset -g assertions`. |
 

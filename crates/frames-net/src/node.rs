@@ -15,6 +15,15 @@ use std::time::Duration;
 /// Datagrams waiting for the engine beyond this are dropped (oldest first):
 /// a stalled consumer must not grow memory, and stale media is useless.
 const INBOX_LIMIT: usize = 8192;
+/// A host's "still here" datagram, ten a second: a viewer whose selected
+/// direct path delivers nothing (not even these) drops that path and
+/// carries on over the relay ([`Session::guard_direct_paths`]). Media
+/// datagrams start with their version in the top nibble (2), audio with
+/// 0x02; this one never reaches the engine.
+pub const HEARTBEAT: u8 = 0x03;
+const HEARTBEAT_EVERY: Duration = Duration::from_millis(100);
+/// How long a selected direct path may deliver nothing before it is dropped.
+const DIRECT_SILENCE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug)]
 pub enum Relays {
@@ -163,7 +172,9 @@ impl Node {
             .await
             .context("connecting")?;
         let connection = connecting.await.context("connecting")?;
-        Ok(Session::new(connection, target))
+        let session = Session::new(connection, target);
+        session.guard_direct_paths();
+        Ok(session)
     }
 
     /// The next incoming session, or `None` once the node is closed.
@@ -172,7 +183,11 @@ impl Node {
         Some(
             incoming
                 .await
-                .map(|connection| Session::new(connection, self.accepted_target.clone()))
+                .map(|connection| {
+                    let session = Session::new(connection, self.accepted_target.clone());
+                    session.send_heartbeats();
+                    session
+                })
                 .map_err(|error| anyhow!("accepting: {error}")),
         )
     }
@@ -220,6 +235,66 @@ impl Session {
         self.media.clone()
     }
 
+    /// Host: sends [`HEARTBEAT`]s until the session closes, so the viewer
+    /// can tell a dead path from a still picture.
+    fn send_heartbeats(&self) {
+        let connection = self.connection.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(HEARTBEAT_EVERY);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            while connection.close_reason().is_none() {
+                tick.tick().await;
+                let _ = connection.send_datagram(Bytes::from_static(&[HEARTBEAT]));
+            }
+        });
+    }
+
+    /// Viewer: drops the selected direct path when nothing (not even the
+    /// host's heartbeats) arrived on it for [`DIRECT_SILENCE`], so the
+    /// session carries on over the relay within a second instead of
+    /// freezing until the path times out. Seen on a LAN with a Mac host and
+    /// a Windows viewer, where the direct path goes silent one way (an
+    /// iroh multipath issue, vendor/iroh/FRAMES-PATCH.md).
+    fn guard_direct_paths(&self) {
+        let (connection, media) = (self.connection.clone(), self.media.clone());
+        tokio::spawn(async move {
+            let clock = frames_media::clock::SystemClock::new();
+            let mut tick = tokio::time::interval(Duration::from_millis(200));
+            // The direct path selected, and when it was first seen selected.
+            let mut watching: Option<(iroh::endpoint::PathId, u64)> = None;
+            while connection.close_reason().is_none() {
+                tick.tick().await;
+                let paths = connection.paths();
+                let selected = paths.iter().find(|p| p.is_selected());
+                let has_relay = paths.iter().any(|p| p.is_relay());
+                let Some(path) = selected.filter(|p| p.is_ip() && has_relay) else {
+                    watching = None;
+                    continue;
+                };
+                let now = frames_media::api::MediaClock::now_us(&clock);
+                let since = match watching {
+                    Some((id, since)) if id == path.id() => since,
+                    _ => {
+                        watching = Some((path.id(), now));
+                        now
+                    }
+                };
+                let last = media
+                    .last_arrival
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .max(since);
+                if now.saturating_sub(last) > DIRECT_SILENCE.as_micros() as u64 {
+                    println!(
+                        "network: the direct path to {:?} stopped delivering; using the relay",
+                        path.remote_addr()
+                    );
+                    connection.close_path(path.id());
+                    watching = None;
+                }
+            }
+        });
+    }
+
     /// A reliable, ordered channel (one QUIC stream pair).
     pub async fn open_channel(
         &self,
@@ -264,6 +339,8 @@ impl Session {
 /// Media datagrams for the engine: non-blocking send, polled receive.
 pub struct MediaChannel {
     connection: Connection,
+    /// When the last datagram (heartbeats included) arrived, SystemClock µs.
+    last_arrival: std::sync::atomic::AtomicU64,
     /// Datagrams with their arrival time (SystemClock µs).
     inbox: Mutex<VecDeque<(Bytes, u64)>>,
     target: MediaTarget,
@@ -273,6 +350,7 @@ impl MediaChannel {
     fn spawn(connection: Connection, target: MediaTarget) -> Arc<Self> {
         let channel = Arc::new(Self {
             connection: connection.clone(),
+            last_arrival: std::sync::atomic::AtomicU64::new(0),
             inbox: Mutex::new(VecDeque::new()),
             target,
         });
@@ -282,6 +360,12 @@ impl MediaChannel {
             while let Ok(datagram) = connection.read_datagram().await {
                 let arrived = frames_media::api::MediaClock::now_us(&clock);
                 let Some(channel) = weak.upgrade() else { break };
+                channel
+                    .last_arrival
+                    .store(arrived, std::sync::atomic::Ordering::Relaxed);
+                if datagram.as_ref() == [HEARTBEAT] {
+                    continue;
+                }
                 let mut inbox = channel.inbox.lock().unwrap();
                 if inbox.len() >= INBOX_LIMIT {
                     inbox.pop_front();

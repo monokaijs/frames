@@ -24,6 +24,7 @@ mod admit;
 mod audio;
 mod catalog;
 mod clip;
+pub mod control;
 pub mod directory;
 mod doctor;
 mod impair;
@@ -36,6 +37,11 @@ mod mac_client;
 #[cfg(target_os = "macos")]
 mod mac_host;
 mod menus;
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+mod overlay;
+#[cfg(windows)]
+mod overlay_raster;
+mod pacing;
 mod pads;
 pub mod password;
 mod preview;
@@ -47,6 +53,10 @@ mod transfer;
 mod usb;
 #[cfg(windows)]
 mod win;
+#[cfg(windows)]
+mod win_files;
+#[cfg(windows)]
+mod win_overlay;
 #[cfg(windows)]
 mod windows_client;
 #[cfg(windows)]
@@ -66,6 +76,10 @@ pub struct StreamInfo {
     /// The host's device name.
     #[serde(default)]
     pub name: String,
+    /// One window with isolated input ("One window", games): v1's "Window
+    /// compatibility" text for its executable. Viewers send physical keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<String>,
 }
 
 /// This machine's OS, as [`StreamInfo::platform`] names it.
@@ -84,6 +98,17 @@ pub enum Codec {
     H264,
     Hevc,
     Av1,
+}
+
+impl Codec {
+    /// How the debug overlay names it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::Hevc => "HEVC",
+            Self::Av1 => "AV1",
+        }
+    }
 }
 
 impl From<Codec> for frames_media::api::Codec {
@@ -162,6 +187,10 @@ pub struct Options {
     /// Viewer: start in relative mouse mode without locking the pointer
     /// (unattended tests; users press Control+Option+F11).
     pub relative_qa: bool,
+    /// Viewer: connection-menu commands to run as if chosen, each
+    /// `<seconds>=<Command JSON>`; `{window}` stands for the first listed
+    /// window's id (unattended tests of the menus).
+    pub qa_commands: Vec<(f64, String)>,
     /// Host: `nvenc` (direct), or an FFmpeg backend: `amf`, `qsv`, `mf`,
     /// `software`.
     pub encoder: String,
@@ -190,6 +219,24 @@ pub struct Options {
     pub max_mbps_cap: Option<u32>,
     /// Viewer: the window title (default: the host's name).
     pub title: Option<String>,
+    /// Viewer: the shared window's application (its options are saved per
+    /// application, `crate::control`).
+    pub app: Option<String>,
+    /// Viewer: this window's id in the connection menus (`crate::control`):
+    /// the host's window id, or 0 for the desktop.
+    pub menu_id: u64,
+    /// Viewer: this window is a host menu, tooltip or sheet, shown over its
+    /// parent window's picture: (it, its parent) from the catalog.
+    pub popup: Option<(catalog::Window, catalog::Window)>,
+    /// Viewer: the catalog entry of the host window this session shows
+    /// (its role, owner, place and icon).
+    pub window_info: Option<catalog::Window>,
+    /// Viewer: the window an owned popup or dialog belongs to (its owner,
+    /// or for an ownerless menu its application's front window).
+    pub parent_info: Option<catalog::Window>,
+    /// Viewer: start with the host's cursor drawn into the picture
+    /// ("Show remote cursor", remembered per device by the launcher).
+    pub remote_cursor: bool,
     /// Viewer: show live statistics in the window title (diagnostics).
     pub stats_title: bool,
     /// Viewer: send keys as the same physical keys on the host (Control as
@@ -244,6 +291,7 @@ impl Options {
             receive_dir: None,
             synthetic_input: false,
             relative_qa: false,
+            qa_commands: Vec::new(),
             encoder: "nvenc".into(),
             encoder_explicit: false,
             prefer_encoder: None,
@@ -256,6 +304,12 @@ impl Options {
             viewer_decoders: Vec::new(),
             max_mbps_cap: None,
             title: None,
+            app: None,
+            menu_id: 0,
+            popup: None,
+            window_info: None,
+            parent_info: None,
+            remote_cursor: false,
             stats_title: false,
             physical_keys: false,
             gamepads: false,
@@ -323,6 +377,13 @@ impl Options {
                 }
                 "--synthetic-input" => o.synthetic_input = true,
                 "--relative-qa" => o.relative_qa = true,
+                "--qa-command" => {
+                    let value = value()?;
+                    let (at, json) = value
+                        .split_once('=')
+                        .context("--qa-command takes <seconds>=<command JSON>")?;
+                    o.qa_commands.push((at.parse()?, json.to_string()));
+                }
                 "--encoder" => {
                     o.encoder = value()?.to_string();
                     o.encoder_explicit = true;
@@ -353,6 +414,7 @@ impl Options {
                     o.prefer_encoder = Some(name.to_string());
                 }
                 "--max-mbps" => o.max_mbps_cap = Some(value()?.parse::<u32>()?.max(1)),
+                "--remote-cursor" => o.remote_cursor = true,
                 "--stay" => o.stay = true,
                 "--approve" => {
                     let text = value()?;
@@ -484,6 +546,9 @@ async fn host(o: Options) -> Result<()> {
                     continue;
                 }
             };
+        if admitted.trusted {
+            tokio::spawn(admit::watch_trust(config.clone(), session.clone()));
+        }
         let mut session_options = o.clone();
         session_options.control = admitted.control;
         session_options.viewer_decoders = admitted.decoders;
@@ -505,7 +570,8 @@ async fn host(o: Options) -> Result<()> {
                 session.close("no such window");
                 continue;
             }
-            session_options.window_id = Some(id);
+            // The secure desktop streams the screen (`catalog::SECURE_DESKTOP`).
+            session_options.window_id = (id != catalog::SECURE_DESKTOP).then_some(id);
             session_options.window = None;
         } else {
             let index = admitted.window.unwrap_or(0) as usize;
@@ -527,11 +593,19 @@ async fn host(o: Options) -> Result<()> {
             audio::Mode::Off
         };
         let audio_free = audio_free.clone();
+        let audio_source = audio_source(&o, &config);
         sessions.spawn(async move {
             let audio = tokio::spawn({
                 let session = session.clone();
                 async move {
-                    if let Err(error) = audio::host(session, audio_mode).await {
+                    let source = match audio_source {
+                        Ok(source) => source,
+                        Err(reason) => {
+                            println!("audio: {reason}");
+                            return;
+                        }
+                    };
+                    if let Err(error) = audio::host(session, audio_mode, source).await {
                         println!("audio stopped: {error:#}");
                     }
                 }
@@ -589,10 +663,66 @@ async fn connect(id: &str, o: Options) -> Result<()> {
             .context("not a device id, and no single nearby device starts with it")?
             .into(),
     };
-    if o.apps {
-        return catalog::view(&node, target, &o, started).await;
+    let peer = nearby
+        .as_ref()
+        .map(|h| h.name.clone())
+        .unwrap_or_else(|| id.chars().take(8).collect());
+    let quality = match o.max_mbps_cap {
+        Some(cap) if cap < u32::from(quality_mbps(1)) => 2,
+        Some(cap) if cap < u32::from(quality_mbps(0)) => 1,
+        _ => 0,
+    };
+    let mut view = if o.apps {
+        control::View::Windows
+    } else {
+        control::View::Desktop
+    };
+    control::start(&target.id.to_string(), &peer, view, quality, o.adb, &config);
+    control::update(|s| s.remote_cursor = o.remote_cursor);
+    for (at, json) in o.qa_commands.clone() {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs_f64(at)).await;
+            let window = control::snapshot()
+                .windows
+                .iter()
+                .find(|w| !w.popup)
+                .map_or(0, |w| w.id);
+            let json = json.replace("{window}", &window.to_string());
+            println!("QA menu command: {json}");
+            control::send_json(&json);
+        });
     }
-    // One session per shared window the viewer opens (--windows N).
+    // "Per-window view" / "Full desktop view" in the connection menu end
+    // the current view and open the other one on the same host.
+    let mut first = true;
+    loop {
+        let result = match view {
+            control::View::Windows => {
+                catalog::view(&node, target.clone(), &o, started, first).await
+            }
+            control::View::Desktop => desktop(&node, target.clone(), &o, started, first).await,
+        };
+        first = false;
+        if control::switching() && !DISCONNECT.load(std::sync::atomic::Ordering::Relaxed) {
+            control::switched();
+            view = control::snapshot().view;
+            println!("switching to the {view:?} view");
+            launcher::report("view", &serde_json::json!({ "view": view }));
+            continue;
+        }
+        return result;
+    }
+}
+
+/// Viewer: the host's screen in one window (or `--windows N` shared
+/// windows, one window each).
+async fn desktop(
+    node: &frames_net::Node,
+    target: iroh::EndpointAddr,
+    o: &Options,
+    started: std::time::Instant,
+    first: bool,
+) -> Result<()> {
     let mut viewers = tokio::task::JoinSet::new();
     for index in 0..o.open_windows {
         let session = node.connect(target.clone()).await?;
@@ -604,7 +734,7 @@ async fn connect(id: &str, o: Options) -> Result<()> {
             admit::Asks {
                 decoders: viewer_decoders(),
                 window,
-                name: device_name(&o),
+                name: device_name(o),
                 audio: index == 0 && o.audio != audio::Mode::Off,
                 max_mbps: o.max_mbps_cap,
                 catalog: false,
@@ -615,7 +745,10 @@ async fn connect(id: &str, o: Options) -> Result<()> {
         )
         .await?;
         if index == 0 {
-            start_services(&session, &o);
+            if first {
+                start_transfers(&session, o);
+            }
+            start_devices(&session, o);
         }
         let code = session.pairing_code()?;
         println!(
@@ -625,7 +758,24 @@ async fn connect(id: &str, o: Options) -> Result<()> {
         if index == 0 {
             launcher::report("code", &serde_json::json!({ "code": code }));
         }
-        let session_options = o.clone();
+        let id = u64::from(index);
+        control::set_windows(vec![control::WindowEntry {
+            id,
+            title: "Remote desktop — primary display".into(),
+            app: "Remote desktop".into(),
+            shown: true,
+            desktop: o.window_id.is_none() && window.is_none(),
+            popup: false,
+            parent: None,
+            modal: false,
+            resizable: false,
+            has_menus: false,
+            prefs: Default::default(),
+        }]);
+        control::update(|s| s.connected = true);
+        let mut session_options = o.clone();
+        session_options.app = Some("Remote desktop".into());
+        session_options.menu_id = id;
         viewers.spawn(async move {
             let result = run_client(session.clone(), session_options).await;
             match (&result, session.close_reason()) {
@@ -652,22 +802,88 @@ async fn connect(id: &str, o: Options) -> Result<()> {
     outcome
 }
 
-/// Viewer: the session's extras, on its first streaming session: files
-/// given with --get and --send, and gamepads (`--gamepads`).
-fn start_services(session: &frames_net::Session, o: &Options) {
-    start_transfers(session, o);
-    if o.gamepads || !o.usb.is_empty() {
-        let (session, gamepads, usb) = (session.clone(), o.gamepads, o.usb.clone());
-        tokio::spawn(async move {
-            if let Err(error) = pads::viewer(session, gamepads, usb).await {
-                println!("gamepads stopped: {error:#}");
-            }
-        });
+/// Host: whose audio a session gets. Sharing selected windows (or one)
+/// sends only their application's, when they are all one process (v1);
+/// otherwise none, since everything else stays private.
+fn audio_source(
+    o: &Options,
+    config: &std::path::Path,
+) -> std::result::Result<audio::Source, &'static str> {
+    if o.windows.is_empty() {
+        return Ok(audio::Source::System);
+    }
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+        let pids: Vec<u32> = catalog::shared(&o.windows, o.max_windows)
+            .iter()
+            .map(|w| {
+                let mut pid = 0;
+                unsafe {
+                    GetWindowThreadProcessId(
+                        windows::Win32::Foundation::HWND(w.id as usize as *mut _),
+                        Some(&mut pid),
+                    )
+                };
+                pid
+            })
+            .collect();
+        one_application(pids, config)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let shared: Vec<u64> = catalog::shared(&o.windows, o.max_windows)
+            .iter()
+            .map(|w| w.id)
+            .collect();
+        let listed: Vec<serde_json::Value> =
+            serde_json::from_str(&frames_platform_macos::capture::windows_json())
+                .unwrap_or_default();
+        let pids: Vec<u32> = listed
+            .iter()
+            .filter(|w| w["id"].as_u64().is_some_and(|id| shared.contains(&id)))
+            .filter_map(|w| w["pid"].as_u64().map(|pid| pid as u32))
+            .collect();
+        one_application(pids, config)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = config;
+        Err("selected-window audio needs a Windows or macOS host")
     }
 }
 
+/// The application whose audio a selected-window share sends: the shared
+/// windows' one process, or v1's message when they belong to several.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn one_application(
+    mut pids: Vec<u32>,
+    config: &std::path::Path,
+) -> std::result::Result<audio::Source, &'static str> {
+    pids.sort_unstable();
+    pids.dedup();
+    match pids.as_slice() {
+        [pid] if *pid != 0 => Ok(audio::Source::Process {
+            pid: *pid,
+            dir: config.to_path_buf(),
+        }),
+        _ => Err("Selected-window audio is unavailable for this combination of applications"),
+    }
+}
+
+/// Viewer: gamepads and USB devices (the Devices menu, `--gamepads`,
+/// `--usb`), on one streaming session at a time.
+pub(crate) fn start_devices(session: &frames_net::Session, o: &Options) {
+    let (session, gamepads, usb) = (session.clone(), o.gamepads, o.usb.clone());
+    tokio::spawn(async move {
+        if let Err(error) = pads::viewer(session, gamepads, usb).await {
+            println!("devices stopped: {error:#}");
+        }
+    });
+}
+
 /// The files given with --get and --send, on the first session.
-fn start_transfers(session: &frames_net::Session, o: &Options) {
+pub(crate) fn start_transfers(session: &frames_net::Session, o: &Options) {
     for path in o.get_files.clone() {
         let session = session.clone();
         let dir = o
@@ -1001,6 +1217,24 @@ async fn run(args: Vec<String>) -> Result<()> {
 #[cfg(test)]
 mod codec_tests {
     use super::*;
+
+    #[test]
+    fn selected_windows_send_their_one_applications_audio() {
+        let dir = std::path::Path::new("/tmp");
+        assert!(matches!(
+            one_application(vec![42, 42], dir),
+            Ok(audio::Source::Process { pid: 42, .. })
+        ));
+        for mixed in [vec![42, 7], vec![], vec![0]] {
+            assert_eq!(
+                one_application(mixed, dir).unwrap_err(),
+                "Selected-window audio is unavailable for this combination of applications"
+            );
+        }
+        // Sharing everything sends everything.
+        let o = Options::parse(&[]).unwrap();
+        assert!(matches!(audio_source(&o, dir), Ok(audio::Source::System)));
+    }
 
     fn options(decoders: Vec<Codec>) -> Options {
         let mut o = Options::parse(&[]).unwrap();

@@ -275,6 +275,11 @@ export component Launcher inherits Window {
     callback device-name-edited();
     callback trust(string);
     in property <string> local-address;
+    // What others enter to connect: the short code, and this computer's
+    // address on its network; Copy ID copies the full id (for the internet).
+    in property <string> device-code;
+    in property <string> local-ip;
+    callback copy-device-id();
     in-out property <string> status;
     in-out property <bool> status-error: false;
     in-out property <string> notice;
@@ -380,7 +385,13 @@ export component Launcher inherits Window {
                                             VerticalLayout {
                                                 spacing: 3px;
                                                 Text { text: root.device-name; font-size: 15px; font-weight: 500; color: Theme.ink; overflow: elide; }
-                                                TextInput { text: root.local-address; read-only: true; single-line: true; font-size: 11px; color: Theme.muted; accessible-label: "This device's ID. Other devices connect to it."; }
+                                                HorizontalLayout {
+                                                    spacing: 8px;
+                                                    TextInput { text: "Code " + root.device-code; read-only: true; single-line: true; font-size: 13px; font-weight: 600; color: Theme.ink; vertical-alignment: center; horizontal-stretch: 0; accessible-label: "This device's code. Other devices connect with it."; }
+                                                    if root.local-ip != "": TextInput { text: root.local-ip; read-only: true; single-line: true; font-size: 11px; color: Theme.muted; vertical-alignment: center; horizontal-stretch: 0; accessible-label: "This device's address on this network"; }
+                                                    Rectangle { horizontal-stretch: 1; }
+                                                    AppButton { label: "Copy ID"; quiet: true; a11y-label: "Copy this device's full ID, for connecting over the internet"; clicked => { root.copy-device-id(); } }
+                                                }
                                             }
                                             // Controls sit on the card's bottom edge in both columns so they line up.
                                             Rectangle { vertical-stretch: 1; }
@@ -400,11 +411,11 @@ export component Launcher inherits Window {
                                         VerticalLayout {
                                             min-width: 290px; horizontal-stretch: 1.1; spacing: 10px;
                                             SectionTitle { text: "Connect to a device"; }
-                                            MutedText { text: "Enter the device ID shown on the other device, or pick it under Devices."; font-size: 11px; }
+                                            MutedText { text: "Enter the code shown on the other device (or its full ID over the internet), or pick it under Devices."; font-size: 11px; }
                                             Rectangle { vertical-stretch: 1; }
                                             HorizontalLayout {
                                                 spacing: 8px;
-                                                LineEdit { height: 32px; horizontal-stretch: 1; text <=> root.address; placeholder-text: "Device ID, or its IP address on this network"; accessible-label: "Device ID of the other device"; edited => { root.connection-address-edited(); } accepted => { if root.address != "" { root.connect(root.address); } } }
+                                                LineEdit { height: 32px; horizontal-stretch: 1; text <=> root.address; placeholder-text: "Code such as 9710-3C89, device ID, or IP"; accessible-label: "Code or device ID of the other device"; edited => { root.connection-address-edited(); } accepted => { if root.address != "" { root.connect(root.address); } } }
                                                 ConnectionButton {
                                                     primary: true; enabled: root.address != "";
                                                     audio <=> root.audio; desktop <=> root.desktop;

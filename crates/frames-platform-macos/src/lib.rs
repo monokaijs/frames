@@ -5,6 +5,8 @@
 //!   references through VideoToolbox's acknowledgement tokens.
 //! - [`decoder::MacDecoder`]: hardware VideoToolbox to IOSurface BGRA.
 //! - [`presenter::MacPresenter`]: Metal, immediate or vsync presentation.
+//! - [`audio::MacAudio`]: host audio from ScreenCaptureKit (the whole Mac
+//!   or one application).
 //! - [`clipboard::MacClipboard`]: the general pasteboard (text and PNG).
 //! - [`input::MacInjector`]: applies viewer input with Quartz events
 //!   (needs the Accessibility permission).
@@ -18,6 +20,7 @@
 //! this crate is empty.
 #![cfg(target_os = "macos")]
 
+pub mod audio;
 pub mod capture;
 pub mod clipboard;
 pub mod decoder;

@@ -91,6 +91,8 @@ fn stream(
         println!("isolated input is Windows-only; this Mac uses its normal input for the viewer");
     }
     let mut injector = (o.control && !o.qa_source).then(MacInjector::new);
+    // Why input does not reach the Mac, for the viewer's title.
+    let mut notices = crate::streams::Notices::new(session.clone(), handle.clone());
     if injector.is_some() && !MacInjector::trusted() {
         println!(
             "input: this program lacks the Accessibility permission; macOS will ignore the viewer's input"
@@ -128,6 +130,7 @@ fn stream(
         fps: o.fps,
         platform: crate::platform().into(),
         name: crate::device_name(o),
+        compatibility: None,
     };
     handle
         .block_on(send_info(session, info))
@@ -135,7 +138,7 @@ fn stream(
     // The viewer accepts a cursor stream after the description.
     let (mut cursor_stream, _) =
         handle.block_on(crate::streams::open(session, crate::streams::CURSOR))?;
-    if o.adb && o.control {
+    if o.adb && o.control && o.windows.is_empty() {
         handle.spawn(crate::streams::adb_listener(session.clone(), o.adb_listen));
     }
     handle.spawn(async move {
@@ -223,6 +226,12 @@ fn stream(
         })
     });
     let _stop_watching = StopOnDrop(watching);
+    // The viewer's choices for this window's picture (`Event::Header`,
+    // `Event::RemoteCursor`): title bar cropped, cursor not drawn in.
+    let (mut show_header, mut show_cursor) = (false, false);
+    // The viewer's window hidden or behind others (`Event::Visibility`).
+    let mut visibility = crate::pacing::Visibility::default();
+    let mut held = None;
     loop {
         if o.deadline().is_some_and(|d| started.elapsed() >= d) {
             break;
@@ -231,10 +240,16 @@ fn stream(
             println!("the viewer left");
             break;
         }
+        // Input maps to what is captured: the window without its title bar,
+        // as the capture reports it, else the window's frame.
+        let area = capture.geometry().or(*bounds.lock().unwrap());
         if let Some(injector) = &mut injector
-            && let Some((x, y, width, height)) = *bounds.lock().unwrap()
+            && let Some((x, y, width, height)) = area
         {
             injector.set_area(x, y, width, height);
+        }
+        if let (Some(id), Some(area)) = (o.window_id, area) {
+            CAPTURED.lock().unwrap().insert(id, area);
         }
         let path = media.path();
         let key = media.selected_path_key();
@@ -277,6 +292,10 @@ fn stream(
             }
             None => None,
         };
+        let frame = visibility.admit(frame, &mut held, clock.now_us(), last_encode_us);
+        if frame.is_some() && visibility.take_keyframe() {
+            encoder.control(EncoderControl::ForceKeyframe)?;
+        }
         let sized = frame.map(|frame| {
             let size = frame.surface.size();
             (frame, size)
@@ -366,6 +385,58 @@ fn stream(
                 println!("the viewer's image quality: at most {mbps} Mbps");
                 continue;
             }
+            match event {
+                frames_input::Event::Visibility { shown, focused } => {
+                    if visibility.set(shown, focused) {
+                        println!("the viewer's window: {}", visibility.describe());
+                    }
+                    continue;
+                }
+                frames_input::Event::Header { show } => {
+                    show_header = show;
+                    capture.set_options(show_header, show_cursor);
+                    println!("title bar {}", if show { "shown" } else { "cropped" });
+                    continue;
+                }
+                frames_input::Event::RemoteCursor { show } => {
+                    show_cursor = show;
+                    capture.set_options(show_header, show_cursor);
+                    println!(
+                        "cursor {} the picture",
+                        if show { "drawn into" } else { "left out of" }
+                    );
+                    continue;
+                }
+                frames_input::Event::RefreshMenus => {
+                    if let Some(menus) = &mut host_menus {
+                        menus.refresh();
+                    }
+                    // The viewer's window came to the front (or asked):
+                    // so does this one, as v1 did.
+                    if o.control
+                        && !o.qa_source
+                        && let Some(id) = o.window_id.and_then(|id| u32::try_from(id).ok())
+                    {
+                        frames_platform_macos::capture::activate_window(id, true);
+                    }
+                    continue;
+                }
+                frames_input::Event::ResizeWindow { width, height } => {
+                    if o.control && o.window_id.is_some() {
+                        let resized = capture.resize_window(u32::from(width), u32::from(height));
+                        println!(
+                            "the viewer asked for {width}x{height}: {}",
+                            if resized {
+                                "resizing"
+                            } else {
+                                "this window cannot be resized"
+                            }
+                        );
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             if event == frames_input::Event::CloseWindow {
                 // As the window's close button would; it may ask to save.
                 if o.control
@@ -392,8 +463,28 @@ fn stream(
                 qa_relative = relative;
                 qa_motion.restart();
             }
+            // A click or typing reaches a window whose application is not
+            // in front: bring it forward first (v1), or macOS sends the
+            // keys elsewhere.
+            if injector.is_some()
+                && matches!(
+                    event,
+                    frames_input::Event::Button { down: true, .. }
+                        | frames_input::Event::Key { down: true, .. }
+                        | frames_input::Event::Text { .. }
+                )
+                && let Some(id) = o.window_id.and_then(|id| u32::try_from(id).ok())
+            {
+                let click = matches!(event, frames_input::Event::Button { .. });
+                frames_platform_macos::capture::activate_window(id, click);
+            }
             if let Some(injector) = &mut injector {
                 injector.event(event);
+                if !MacInjector::trusted() {
+                    notices.send(
+                        "Input blocked: allow Frames under Privacy & Security → Accessibility on the Mac",
+                    );
+                }
             }
         }
         if started.elapsed() >= next_report {
@@ -446,4 +537,17 @@ fn stream(
     }
     session.close("host stopped");
     Ok(())
+}
+
+/// A rectangle on screen in global points: x, y, width, height.
+type ScreenRect = (f64, f64, f64, f64);
+
+/// Where each shared window's picture is on screen, for files dropped on
+/// it (`crate::services`).
+static CAPTURED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, ScreenRect>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The shared window `id`'s picture on screen, while a session shows it.
+pub fn captured_rect(id: u64) -> Option<ScreenRect> {
+    CAPTURED.lock().unwrap().get(&id).copied()
 }

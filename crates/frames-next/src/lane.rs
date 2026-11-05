@@ -11,7 +11,7 @@ use frames_media::clock::SystemClock;
 
 /// Input a viewer window received, stamped with the engine clock at the
 /// event's own time.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Captured {
     Move {
         x: u16,

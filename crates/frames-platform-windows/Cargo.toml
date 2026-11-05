@@ -19,7 +19,7 @@ frames-input = { path = "../frames-input" }
 frames-clipboard = { path = "../frames-clipboard" }
 sha2.workspace = true
 tracing.workspace = true
-windows = { workspace = true, features = ["Win32_System_StationsAndDesktops"] }
+windows = { workspace = true, features = ["Win32_System_StationsAndDesktops", "Win32_Graphics_Dwm"] }
 
 [dev-dependencies]
 frames-testkit = { path = "../frames-testkit" }

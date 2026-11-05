@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -21,6 +21,8 @@ use windows::core::{PCWSTR, w};
 
 #[path = "win_menus.rs"]
 pub mod menus;
+#[path = "win_session.rs"]
+pub mod session;
 
 pub fn dpi_aware() {
     unsafe {
@@ -28,14 +30,47 @@ pub fn dpi_aware() {
     }
 }
 
+/// How the picture sits in the viewer window.
+#[derive(Clone, Copy)]
+struct Layout {
+    /// The picture's size.
+    source: Option<(u32, u32)>,
+    /// Stretched to the whole window ("Fill window").
+    fill: bool,
+    /// The window keeps the picture's shape when resized ("Stretch
+    /// locally"), so the picture fills it (no bars).
+    lock: bool,
+}
+
 thread_local! {
-    /// The picture's size: the viewer window keeps its shape when resized,
-    /// so the picture fills it (no bars).
-    static ASPECT: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
-    /// Live statistics in the title, flipped by Ctrl+Alt+F10.
-    static STATS: Cell<bool> = const { Cell::new(false) };
+    static LAYOUT: Cell<Layout> = const {
+        Cell::new(Layout {
+            source: None,
+            fill: false,
+            lock: true,
+        })
+    };
+    /// The connection menu's chevron beside the minimize button.
+    static CAPTION: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
+    /// What the connection menu shows for this thread's viewer window.
+    static MENU_CONTEXT: RefCell<session::Context> = RefCell::new(session::Context::default());
+    /// The user is dragging the window's frame.
+    static SIZING: Cell<bool> = const { Cell::new(false) };
+    /// The user resized the window (a drag, maximize or restore) since
+    /// [`take_user_resize`].
+    static USER_RESIZED: Cell<bool> = const { Cell::new(false) };
+    /// Physical keys (terminals): every key goes as a key. Otherwise typed
+    /// characters go as text, composed here (layout, dead keys, AltGr, IME).
+    static PHYSICAL: Cell<bool> = const { Cell::new(false) };
+    /// Keys sent down as keys (the rest went as text), so their releases
+    /// follow them.
+    static FORWARDED: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
+    /// The first half of a character outside the Basic Multilingual Plane.
+    static SURROGATE: Cell<Option<u16>> = const { Cell::new(None) };
     /// Files dropped on the viewer, for the host.
     static DROPPED: RefCell<Vec<std::path::PathBuf>> = const { RefCell::new(Vec::new()) };
+    /// Where the last files were dropped, in client pixels.
+    static DROP_POINT: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// Set when the user closes a window this thread created (each viewer
     /// window runs on its own thread, so closing one ends only its session).
     static CLOSED: Cell<bool> = const { Cell::new(false) };
@@ -307,11 +342,29 @@ fn client_extent(hwnd: HWND) -> (u32, u32) {
     )
 }
 
+/// A client-area point as a position in the picture, which is where the
+/// presenter draws it (letterboxed unless filled), so a click lands on the
+/// host where it was made.
 fn position(hwnd: HWND, l: LPARAM) -> (u16, u16) {
-    let (width, height) = client_extent(hwnd);
+    let client = client_extent(hwnd);
     let x = (l.0 & 0xffff) as i16 as i32;
     let y = ((l.0 >> 16) & 0xffff) as i16 as i32;
-    (normalize(x, width), normalize(y, height))
+    let layout = LAYOUT.with(Cell::get);
+    let picture = frames_platform_windows::present::picture_rect(
+        layout.source.unwrap_or(client),
+        client,
+        layout.fill,
+    );
+    (
+        normalize(
+            x - picture.left,
+            (picture.right - picture.left).max(1) as u32,
+        ),
+        normalize(
+            y - picture.top,
+            (picture.bottom - picture.top).max(1) as u32,
+        ),
+    )
 }
 
 fn viewer_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<Captured> {
@@ -368,7 +421,9 @@ fn viewer_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<Captur
         // Ctrl+Alt+F10: live statistics on or off (v1's debug overlay
         // shortcut); never sent.
         WM_KEYDOWN | WM_SYSKEYDOWN if w.0 == usize::from(VK_F10.0) && release_shortcut_held() => {
-            STATS.with(|stats| stats.set(!stats.get()));
+            if (l.0 >> 30) & 1 == 0 {
+                crate::control::send(crate::control::Command::Stats);
+            }
             None
         }
         WM_KEYDOWN | WM_SYSKEYDOWN if w.0 == usize::from(VK_F11.0) && release_shortcut_held() => {
@@ -385,14 +440,35 @@ fn viewer_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<Captur
                 at_us,
             })
         }
-        WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
-            let code = ((l.0 >> 16) & 0xff) as u16;
-            let extended = (l.0 >> 24) & 1 == 1;
-            let scan = if extended { 0xe000 | code } else { code };
-            let usage = keys::scan_to_usage(scan)?;
-            let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+        WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => key_input(message, w, l, at_us),
+        // Characters typed (TranslateMessage; IME results arrive this way
+        // too): text, unless in physical keys mode or a Ctrl/Alt shortcut.
+        WM_CHAR | WM_SYSCHAR => {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{
+                GetKeyState, VK_CONTROL, VK_MENU, VK_RMENU,
+            };
+            let held = |key: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe {
+                GetKeyState(i32::from(key.0)) < 0
+            };
+            let shortcut = (held(VK_CONTROL) || held(VK_MENU)) && !held(VK_RMENU);
+            if PHYSICAL.with(Cell::get) || shortcut {
+                return None;
+            }
+            let unit = w.0 as u16;
+            if (0xd800..=0xdbff).contains(&unit) {
+                SURROGATE.with(|s| s.set(Some(unit)));
+                return None;
+            }
+            let units = match SURROGATE.with(|s| s.take()) {
+                Some(high) => vec![high, unit],
+                None => vec![unit],
+            };
+            let text = String::from_utf16_lossy(&units);
+            if text.chars().any(char::is_control) {
+                return None;
+            }
             Some(Captured::Event {
-                event: Event::Key { usage, down },
+                event: Event::Text { text },
                 at_us,
             })
         }
@@ -405,6 +481,88 @@ fn viewer_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<Captur
             })
         }
         _ => None,
+    }
+}
+
+/// A key message as a key event, as v1 sent them: in text mode printable
+/// keys without Ctrl/Alt go as characters instead (WM_CHAR), AltGr is
+/// composed here (and Windows' synthetic left Control undone), and
+/// Alt+Tab stays on this computer.
+fn key_input(message: u32, w: WPARAM, l: LPARAM, at_us: u64) -> Option<Captured> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyState, VK_CONTROL, VK_MENU, VK_RMENU, VK_TAB,
+    };
+    let held = |key: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe {
+        GetKeyState(i32::from(key.0)) < 0
+    };
+    let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+    let (ctrl, alt, altgr) = (held(VK_CONTROL), held(VK_MENU), held(VK_RMENU));
+    if alt && w.0 == usize::from(VK_TAB.0) {
+        FORWARDED.with(|f| f.borrow_mut().clear());
+        SURROGATE.with(|s| s.set(None));
+        return Some(Captured::Event {
+            event: Event::ReleaseAll,
+            at_us,
+        });
+    }
+    let code = ((l.0 >> 16) & 0xff) as u16;
+    let extended = (l.0 >> 24) & 1 == 1;
+    let scan = if extended { 0xe000 | code } else { code };
+    let usage = keys::scan_to_usage(scan)?;
+    let key = |usage, down| Captured::Event {
+        event: Event::Key { usage, down },
+        at_us,
+    };
+    if PHYSICAL.with(Cell::get) {
+        return Some(key(usage, down));
+    }
+    if usage == 0xe6 {
+        // AltGr composes text here; undo Windows' synthetic left Control.
+        let undo = down
+            && FORWARDED.with(|f| {
+                let mut f = f.borrow_mut();
+                let had = f.contains(&0xe0);
+                f.retain(|&u| u != 0xe0);
+                had
+            });
+        return undo.then(|| key(0xe0, false));
+    }
+    let printable = (4..=39).contains(&usage) || (44..=56).contains(&usage);
+    let forward = if down {
+        let forward = !(printable || altgr && usage == 0xe0) || ((ctrl || alt) && !altgr);
+        if forward {
+            FORWARDED.with(|f| {
+                let mut f = f.borrow_mut();
+                if !f.contains(&usage) {
+                    f.push(usage);
+                }
+            });
+        }
+        forward
+    } else {
+        FORWARDED.with(|f| {
+            let mut f = f.borrow_mut();
+            let had = f.contains(&usage);
+            f.retain(|&u| u != usage);
+            had
+        })
+    };
+    forward.then(|| key(usage, down))
+}
+
+/// Physical keys mode on or off (the window's options); held keys are
+/// released when it changes.
+pub fn set_physical(physical: bool) {
+    if PHYSICAL.with(|p| p.replace(physical)) != physical {
+        FORWARDED.with(|f| f.borrow_mut().clear());
+        SURROGATE.with(|s| s.set(None));
+        let at_us = SystemClock::new().now_us();
+        CAPTURED.with(|c| {
+            c.borrow_mut().push(Captured::Event {
+                event: Event::ReleaseAll,
+                at_us,
+            })
+        });
     }
 }
 
@@ -433,6 +591,71 @@ unsafe extern "system" fn viewer_procedure(
             return LRESULT(1);
         }
     }
+    // The caption chevron, or "Connection menu" in the window menu.
+    if message == WM_COMMAND && w.0 & 0xffff == session::MENU_BUTTON && l.0 == 0 {
+        connection_menu(hwnd);
+        return LRESULT(0);
+    }
+    if matches!(
+        message,
+        WM_SIZE
+            | WM_MOVE
+            | WM_ACTIVATE
+            | WM_NCACTIVATE
+            | WM_SHOWWINDOW
+            | WM_WINDOWPOSCHANGED
+            | WM_SETTINGCHANGE
+            | WM_THEMECHANGED
+    ) {
+        let result = procedure(hwnd, message, w, l);
+        if message == WM_SIZE && SIZING.with(Cell::get) {
+            USER_RESIZED.with(|r| r.set(true));
+        }
+        session::layout_button(hwnd, CAPTION.with(Cell::get));
+        if message == WM_ACTIVATE && (w.0 & 0xffff) as u32 == WA_INACTIVE {
+            let at_us = SystemClock::new().now_us();
+            set_relative(hwnd, false, true);
+            CAPTURED.with(|c| {
+                c.borrow_mut().push(Captured::Event {
+                    event: Event::ReleaseAll,
+                    at_us,
+                })
+            });
+        }
+        return result;
+    }
+    match message {
+        WM_ENTERSIZEMOVE => SIZING.with(|s| s.set(true)),
+        WM_EXITSIZEMOVE => {
+            SIZING.with(|s| s.set(false));
+            USER_RESIZED.with(|r| r.set(true));
+        }
+        WM_SYSCOMMAND if matches!(w.0 & 0xfff0, 0xF030 | 0xF120) => {
+            // SC_MAXIMIZE, SC_RESTORE.
+            let result = procedure(hwnd, message, w, l);
+            USER_RESIZED.with(|r| r.set(true));
+            return result;
+        }
+        _ => {}
+    }
+    // Moved to a monitor of another scale: take the size Windows suggests.
+    if message == WM_DPICHANGED {
+        // SAFETY: WM_DPICHANGED carries the suggested window rectangle.
+        let rect = unsafe { &*(l.0 as *const RECT) };
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        session::layout_button(hwnd, CAPTION.with(Cell::get));
+        return LRESULT(0);
+    }
     // An item of the host application's menus (`set_host_menu`).
     if message == WM_COMMAND && (w.0 & 0xffff) >= HOST_MENU_BASE && (l.0 == 0) {
         let id = ((w.0 & 0xffff) - HOST_MENU_BASE) as u32;
@@ -447,22 +670,24 @@ unsafe extern "system" fn viewer_procedure(
     }
     if message == WM_SYSCOMMAND {
         let at_us = SystemClock::new().now_us();
-        let quality = |quality: u8| Captured::Event {
-            event: Event::MaxBitrate {
-                mbps: crate::quality_mbps(quality),
-            },
-            at_us,
+        let quality = |quality: u8| {
+            crate::control::send(crate::control::Command::Quality { quality });
+            Some(None)
         };
         let handled = match w.0 & 0xfff0 {
-            MENU_HIGH => Some(Some(quality(0))),
-            MENU_MEDIUM => Some(Some(quality(1))),
-            MENU_LOW => Some(Some(quality(2))),
+            MENU_CONNECTION => {
+                connection_menu(hwnd);
+                Some(None)
+            }
+            MENU_HIGH => quality(0),
+            MENU_MEDIUM => quality(1),
+            MENU_LOW => quality(2),
             MENU_SEND => {
                 choose_files(hwnd);
                 Some(None)
             }
             MENU_STATS => {
-                STATS.with(|stats| stats.set(!stats.get()));
+                crate::control::send(crate::control::Command::Stats);
                 Some(None)
             }
             MENU_RELEASE => {
@@ -476,7 +701,7 @@ unsafe extern "system" fn viewer_procedure(
                 }))
             }
             MENU_DISCONNECT => {
-                crate::DISCONNECT.store(true, Ordering::Relaxed);
+                crate::control::send(crate::control::Command::Disconnect);
                 Some(None)
             }
             _ => None,
@@ -489,24 +714,42 @@ unsafe extern "system" fn viewer_procedure(
         }
     }
     if message == WM_DROPFILES {
-        let files = dropped_files(windows::Win32::UI::Shell::HDROP(w.0 as *mut _));
+        let drop = windows::Win32::UI::Shell::HDROP(w.0 as *mut _);
+        let mut at = POINT::default();
+        // Where over the picture (client pixels), for the host's drop.
+        if unsafe { windows::Win32::UI::Shell::DragQueryPoint(drop, &mut at) }.as_bool() {
+            DROP_POINT.with(|point| point.set(Some((at.x, at.y))));
+        }
+        let files = dropped_files(drop);
         DROPPED.with(|dropped| dropped.borrow_mut().extend(files));
         return LRESULT(0);
     }
     if message == WM_SIZING
-        && let Some(aspect) = ASPECT.with(Cell::get)
+        && let Layout {
+            source: Some(aspect),
+            lock: true,
+            fill: false,
+        } = LAYOUT.with(Cell::get)
     {
         // SAFETY: WM_SIZING carries the proposed window rectangle.
         let rect = unsafe { &mut *(l.0 as *mut RECT) };
         keep_aspect(hwnd, rect, w.0 as u32, aspect);
         return LRESULT(1);
     }
+    if message == WM_ACTIVATEAPP {
+        // Gamepads drive the host only while a viewer window has focus.
+        crate::control::set_focused(w.0 != 0);
+    }
+    let alt_tab = matches!(message, WM_SYSKEYDOWN | WM_SYSKEYUP)
+        && w.0 == usize::from(windows::Win32::UI::Input::KeyboardAndMouse::VK_TAB.0);
     if let Some(captured) = viewer_input(hwnd, message, w, l) {
         CAPTURED.with(|c| c.borrow_mut().push(captured));
-        // Keys go to the host only; F10/Alt must not open the system menu.
-        if matches!(message, WM_SYSKEYDOWN | WM_SYSKEYUP) {
-            return LRESULT(0);
-        }
+    }
+    // Keys go to the host only; F10/Alt must not open the system menu, and
+    // Alt combinations' characters must not open the local menu. Alt+Tab
+    // stays here.
+    if matches!(message, WM_SYSKEYDOWN | WM_SYSKEYUP | WM_CHAR | WM_SYSCHAR) && !alt_tab {
+        return LRESULT(0);
     }
     procedure(hwnd, message, w, l)
 }
@@ -590,6 +833,7 @@ pub fn window(title: PCWSTR, kind: Kind, x: i32, width: u32, height: u32) -> Res
         if matches!(kind, Kind::Viewer) {
             windows::Win32::UI::Shell::DragAcceptFiles(hwnd, true);
             add_frames_menu(hwnd);
+            CAPTION.with(|c| c.set(session::create_button(hwnd)));
         }
         Ok(hwnd)
     }
@@ -604,12 +848,14 @@ const MENU_SEND: usize = 0x130;
 const MENU_STATS: usize = 0x140;
 const MENU_RELEASE: usize = 0x150;
 const MENU_DISCONNECT: usize = 0x160;
+const MENU_CONNECTION: usize = 0x170;
 
 fn add_frames_menu(hwnd: HWND) {
     unsafe {
         let menu = GetSystemMenu(hwnd, false);
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         for (id, label) in [
+            (MENU_CONNECTION, w!("Connection menu")),
             (MENU_HIGH, w!("High quality")),
             (MENU_MEDIUM, w!("Medium quality")),
             (MENU_LOW, w!("Low quality")),
@@ -674,9 +920,73 @@ fn choose_files(hwnd: HWND) {
     });
 }
 
-/// Whether Ctrl+Alt+F10 turned live statistics on for this thread's viewer.
-pub fn stats_toggled() -> bool {
-    STATS.with(Cell::get)
+/// Opens the connection menu under the caption chevron and runs the choice
+/// (remote input is released first: the menu takes the keyboard).
+fn connection_menu(hwnd: HWND) {
+    let at_us = SystemClock::new().now_us();
+    set_relative(hwnd, false, true);
+    CAPTURED.with(|c| {
+        c.borrow_mut().push(Captured::Event {
+            event: Event::ReleaseAll,
+            at_us,
+        })
+    });
+    let at = session::menu_point(CAPTION.with(Cell::get));
+    // A copy: the menu loop runs window messages that may update it.
+    let context = MENU_CONTEXT.with(|context| context.borrow().clone());
+    let choice = session::show_menu(hwnd, at, &context);
+    match choice {
+        Some(session::Choice::Host(id)) => {
+            let at_us = SystemClock::new().now_us();
+            CAPTURED.with(|c| {
+                c.borrow_mut().push(Captured::Event {
+                    event: Event::Menu { id },
+                    at_us,
+                })
+            });
+        }
+        Some(choice) => session::run(choice, hwnd),
+        None => {}
+    }
+}
+
+/// This thread's viewer window is `window` in the connection menus, of a
+/// host on `host_platform`.
+pub fn set_menu_context(window: u64, host_platform: &str) {
+    MENU_CONTEXT.with(|context| {
+        let mut context = context.borrow_mut();
+        context.window = Some(window);
+        context.host_platform = host_platform.to_string();
+    });
+}
+
+/// How the picture sits in this thread's viewer window: `fill` stretches it
+/// to the window; `lock` keeps the window in the picture's shape while the
+/// user resizes it.
+pub fn set_layout(fill: bool, lock: bool) {
+    LAYOUT.with(|layout| {
+        let mut current = layout.get();
+        current.fill = fill;
+        current.lock = lock;
+        layout.set(current);
+    });
+}
+
+/// Whether the user resized this thread's viewer window since the last call.
+pub fn take_user_resize() -> bool {
+    USER_RESIZED.with(|r| r.replace(false))
+}
+
+/// Closes a viewer window (its thread may live on in a pool).
+pub fn destroy(hwnd: HWND) {
+    unsafe {
+        let caption = CAPTION.with(|c| c.replace(HWND::default()));
+        if !caption.is_invalid() {
+            let _ = DestroyWindow(caption);
+        }
+        let _ = DestroyWindow(hwnd);
+    }
+    pump();
 }
 
 /// Files dropped on (or chosen for) this viewer window since the last call.
@@ -692,6 +1002,12 @@ pub fn take_dropped(viewer: HWND) -> Vec<std::path::PathBuf> {
     );
     chosen.retain(|(o, _)| *o != owner);
     files
+}
+
+/// Where the files just taken were dropped (client pixels; `None` for
+/// files chosen with Send File…).
+pub fn take_drop_point() -> Option<(i32, i32)> {
+    DROP_POINT.with(|point| point.take())
 }
 
 /// The files of a WM_DROPFILES message.
@@ -730,6 +1046,7 @@ const HOST_MENU_BASE: usize = 0x8000;
 /// Shows the host application's menus as this viewer window's menu bar,
 /// keeping its client size.
 pub fn set_host_menu(hwnd: HWND, items: &[crate::menus::Item]) {
+    MENU_CONTEXT.with(|context| context.borrow_mut().host_items = items.to_vec());
     fn build(items: &[crate::menus::Item]) -> HMENU {
         unsafe {
             let menu = CreatePopupMenu().unwrap_or_default();
@@ -818,9 +1135,14 @@ fn keep_aspect(hwnd: HWND, rect: &mut RECT, edge: u32, (width, height): (u32, u3
     }
 }
 
-/// The viewer window keeps this picture shape while the user resizes it.
+/// The picture's size (the window keeps this shape while the user resizes
+/// it in "Stretch locally", and input maps onto it).
 pub fn set_aspect(width: u32, height: u32) {
-    ASPECT.with(|aspect| aspect.set(Some((width, height))));
+    LAYOUT.with(|layout| {
+        let mut current = layout.get();
+        current.source = Some((width, height));
+        layout.set(current);
+    });
 }
 
 /// The size of a window's client area.
@@ -976,7 +1298,9 @@ fn paint(hwnd: HWND, n: u64, width: u32, height: u32) {
     }
 }
 
-/// Visible top-level windows with a title, in z order: `(handle, title)`.
+/// Visible top-level windows in z order, `(handle, title)`: titled
+/// application windows, and (as v1) what they own (dialogs, popups) and
+/// open menus and tooltips, which may have no title.
 pub fn shareable_windows() -> Vec<(HWND, String)> {
     unsafe extern "system" fn each(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
         let found = unsafe { &mut *(found.0 as *mut Vec<(HWND, String)>) };
@@ -985,7 +1309,12 @@ pub fn shareable_windows() -> Vec<(HWND, String)> {
         let tool = style & WS_EX_TOOLWINDOW.0 != 0;
         let mut title = [0u16; 512];
         let len = unsafe { GetWindowTextW(hwnd, &mut title) } as usize;
-        if visible && !tool && len > 0 {
+        let mut class = [0u16; 64];
+        let class_len = unsafe { GetClassNameW(hwnd, &mut class) } as usize;
+        let class = String::from_utf16_lossy(&class[..class_len]);
+        let popup = class == "#32768" || class == "tooltips_class32";
+        let owned = unsafe { GetWindow(hwnd, GW_OWNER) }.is_ok_and(|o| !o.is_invalid());
+        if visible && (popup || owned || (!tool && len > 0)) {
             found.push((hwnd, String::from_utf16_lossy(&title[..len])));
         }
         true.into()
@@ -1011,4 +1340,321 @@ pub fn set_title(hwnd: HWND, title: &str) {
     unsafe {
         let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
     }
+}
+
+/// An application's icon as a PNG of at most 64x64, base64, for the
+/// viewer's window and taskbar button (cached per application).
+pub fn icon_png(hwnd: HWND, app: &str) -> Option<String> {
+    use base64::Engine;
+    type Cache = std::collections::HashMap<String, Option<String>>;
+    static CACHE: std::sync::Mutex<Option<Cache>> = std::sync::Mutex::new(None);
+    if let Some(cached) = CACHE.lock().unwrap().as_ref().and_then(|c| c.get(app)) {
+        return cached.clone();
+    }
+    let png = unsafe {
+        (|| -> Option<String> {
+            let mut result = 0usize;
+            let _ = SendMessageTimeoutW(
+                hwnd,
+                WM_GETICON,
+                WPARAM(ICON_BIG as usize),
+                LPARAM(0),
+                SMTO_ABORTIFHUNG,
+                50,
+                Some(&mut result),
+            );
+            let icon = HICON(if result != 0 {
+                result as *mut _
+            } else {
+                GetClassLongPtrW(hwnd, GCLP_HICON) as *mut _
+            });
+            if icon.is_invalid() {
+                return None;
+            }
+            let mut info = ICONINFO::default();
+            GetIconInfo(icon, &mut info).ok()?;
+            let pixels = (|| {
+                let mut bitmap = BITMAP::default();
+                if GetObjectW(
+                    info.hbmColor.into(),
+                    std::mem::size_of::<BITMAP>() as i32,
+                    Some(&mut bitmap as *mut _ as *mut _),
+                ) == 0
+                {
+                    return None;
+                }
+                let (w, h) = (bitmap.bmWidth as u32, bitmap.bmHeight as u32);
+                if w == 0 || h == 0 || w > 256 || h > 256 {
+                    return None;
+                }
+                let mut pixels = vec![0u8; (w * h * 4) as usize];
+                let mut header = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: w as i32,
+                        biHeight: -(h as i32),
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let dc = GetDC(None);
+                let rows = GetDIBits(
+                    dc,
+                    info.hbmColor,
+                    0,
+                    h,
+                    Some(pixels.as_mut_ptr().cast()),
+                    &mut header,
+                    DIB_RGB_COLORS,
+                );
+                ReleaseDC(None, dc);
+                (rows != 0).then_some((pixels, w, h))
+            })();
+            if !info.hbmColor.is_invalid() {
+                let _ = DeleteObject(info.hbmColor.into());
+            }
+            if !info.hbmMask.is_invalid() {
+                let _ = DeleteObject(info.hbmMask.into());
+            }
+            let (mut pixels, w, h) = pixels?;
+            let alpha = pixels.chunks(4).any(|p| p[3] != 0);
+            for p in pixels.chunks_mut(4) {
+                p.swap(0, 2);
+                if !alpha {
+                    p[3] = 255;
+                }
+            }
+            let mut image = image::RgbaImage::from_raw(w, h, pixels)?;
+            if w > 64 || h > 64 {
+                image =
+                    image::imageops::resize(&image, 64, 64, image::imageops::FilterType::Triangle);
+            }
+            let mut png = Vec::new();
+            image::DynamicImage::ImageRgba8(image)
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .ok()?;
+            Some(base64::engine::general_purpose::STANDARD.encode(png))
+        })()
+    };
+    CACHE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .insert(app.to_string(), png.clone());
+    png
+}
+
+/// A host application's icon (`icon_png`) as this viewer window's big and
+/// small icon.
+pub fn set_icon(hwnd: HWND, png: &str) {
+    use base64::Engine;
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(png) else {
+        return;
+    };
+    let Ok(image) = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png) else {
+        return;
+    };
+    let image = image
+        .resize_exact(64, 64, image::imageops::FilterType::Triangle)
+        .to_rgba8();
+    let (w, h) = image.dimensions();
+    let mut bgra = image.into_raw();
+    for p in bgra.chunks_mut(4) {
+        p.swap(0, 2);
+    }
+    unsafe {
+        let header = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w as i32,
+                biHeight: -(h as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let Ok(color) = CreateDIBSection(None, &header, DIB_RGB_COLORS, &mut bits, None, 0) else {
+            return;
+        };
+        std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits.cast::<u8>(), bgra.len());
+        let mask = CreateBitmap(w as i32, h as i32, 1, 1, None);
+        let info = ICONINFO {
+            fIcon: true.into(),
+            hbmColor: color,
+            hbmMask: mask,
+            ..Default::default()
+        };
+        if let Ok(icon) = CreateIconIndirect(&info) {
+            for size in [ICON_BIG, ICON_SMALL] {
+                SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    Some(WPARAM(size as usize)),
+                    Some(LPARAM(icon.0 as isize)),
+                );
+            }
+        }
+        let _ = DeleteObject(color.into());
+        let _ = DeleteObject(mask.into());
+    }
+}
+
+/// Groups this viewer window's taskbar button with the other windows of
+/// the same host application (v1's AppUserModelID per remote app).
+pub fn set_app_id(hwnd: HWND, host: &str, app: &str) {
+    use windows::Win32::Foundation::PROPERTYKEY;
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::Win32::UI::Shell::PropertiesSystem::{
+        IPropertyStore, SHGetPropertyStoreForWindow,
+    };
+    // FNV-1a: short and stable across runs.
+    let hash = app.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    let host: String = host
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(24)
+        .collect();
+    let id = format!("Frames.{host}.{hash:016x}");
+    unsafe {
+        if let Ok(store) = SHGetPropertyStoreForWindow::<IPropertyStore>(hwnd) {
+            let key = PROPERTYKEY {
+                fmtid: windows::core::GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3),
+                pid: 5,
+            };
+            let value = PROPVARIANT::from(id.as_str());
+            let _ = store.SetValue(&key, &value);
+            let _ = store.Commit();
+        }
+    }
+}
+
+/// Where each viewer window of this process shows its picture, by host
+/// window id: `(id, hwnd, picture x, picture y on screen, screen pixels per
+/// host pixel)`. Owned popups and dialogs are placed by their owner's.
+type Placement = (u64, usize, i32, i32, f64);
+static VIEWERS: std::sync::Mutex<Vec<Placement>> = std::sync::Mutex::new(Vec::new());
+
+/// Records where viewer window `hwnd` (host window `id`, streaming
+/// `stream` pixels) shows its picture now.
+pub fn register_viewer(id: u64, hwnd: HWND, stream: (u32, u32)) {
+    let client = client_size(hwnd);
+    let fill = LAYOUT.with(Cell::get).fill;
+    let picture = frames_platform_windows::present::picture_rect(stream, client, fill);
+    let mut origin = windows::Win32::Foundation::POINT {
+        x: picture.left,
+        y: picture.top,
+    };
+    unsafe {
+        let _ = ClientToScreen(hwnd, &mut origin);
+    }
+    let scale = f64::from(picture.right - picture.left) / f64::from(stream.0.max(1));
+    let mut viewers = VIEWERS.lock().unwrap();
+    viewers.retain(|v| v.0 != id);
+    viewers.push((id, hwnd.0 as usize, origin.x, origin.y, scale));
+}
+
+pub fn unregister_viewer(id: u64) {
+    VIEWERS.lock().unwrap().retain(|v| v.0 != id);
+}
+
+/// A viewer window's picture placement: `(hwnd, x, y, scale)`.
+pub fn viewer_placement(id: u64) -> Option<(HWND, i32, i32, f64)> {
+    VIEWERS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|v| v.0 == id)
+        .map(|v| (HWND(v.1 as *mut _), v.2, v.3, v.4))
+}
+
+/// A frameless window for a host menu, tooltip or owned popup (v1): no
+/// caption, not in the taskbar, shown without taking the focus, above
+/// `owner`. Its client area is `width` x `height` at screen `(x, y)`.
+pub fn popup_window(owner: Option<HWND>, x: i32, y: i32, width: u32, height: u32) -> Result<HWND> {
+    unsafe {
+        let instance = GetModuleHandleW(None)?;
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(viewer_procedure),
+            hInstance: instance.into(),
+            lpszClassName: w!("FramesNextPopup"),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            ..Default::default()
+        };
+        RegisterClassW(&wc);
+        let mut rect = RECT {
+            left: x,
+            top: y,
+            right: x + width as i32,
+            bottom: y + height as i32,
+        };
+        AdjustWindowRectEx(&mut rect, WS_POPUP | WS_BORDER, false, WS_EX_TOOLWINDOW)?;
+        let hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            w!("FramesNextPopup"),
+            w!("Frames popup"),
+            WS_POPUP | WS_BORDER,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            owner,
+            None,
+            Some(instance.into()),
+            None,
+        )?;
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        Ok(hwnd)
+    }
+}
+
+/// Makes a viewer window owned by another (a host dialog above its owner)
+/// and puts its client area's top left at screen `(x, y)`.
+pub fn own_and_place(hwnd: HWND, owner: Option<HWND>, at: Option<(i32, i32)>) {
+    unsafe {
+        if let Some(owner) = owner {
+            SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner.0 as isize);
+            // Owned windows have no taskbar button unless they ask (v1
+            // gave every dialog its own).
+            let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+            SetWindowLongW(hwnd, GWL_EXSTYLE, (ex | WS_EX_APPWINDOW.0) as i32);
+        }
+        if let Some((x, y)) = at {
+            let mut window = RECT::default();
+            let mut origin = windows::Win32::Foundation::POINT::default();
+            let _ = GetWindowRect(hwnd, &mut window);
+            let _ = ClientToScreen(hwnd, &mut origin);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                x - (origin.x - window.left),
+                y - (origin.y - window.top),
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
+/// v1's first size for a viewer window: the picture at its own size, at
+/// most 1400 x 900 (at 100% scale) and 90% x 85% of the work area, in its
+/// own shape.
+pub fn initial_size(stream: (u32, u32)) -> (u32, u32) {
+    let scale = f64::from(unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() }.max(96)) / 96.0;
+    let work = work_area();
+    let max_w = (1400.0 * scale).min(f64::from(work.0.max(640)) * 0.9);
+    let max_h = (900.0 * scale).min(f64::from(work.1.max(480)) * 0.85);
+    let (w, h) = (f64::from(stream.0.max(1)), f64::from(stream.1.max(1)));
+    let fit = (max_w / w).min(max_h / h).min(1.0);
+    (
+        ((w * fit).round() as u32).max(1),
+        ((h * fit).round() as u32).max(1),
+    )
 }

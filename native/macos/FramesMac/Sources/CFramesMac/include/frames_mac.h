@@ -11,7 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define FRAMES_MAC_ABI_VERSION 4u
+#define FRAMES_MAC_ABI_VERSION 7u
 
 typedef struct FramesMacCallbacks {
     void *context;
@@ -33,6 +33,8 @@ enum {
     FRAMES_MAC_EVENT_LOG = 1,             // UTF-8 text
     FRAMES_MAC_EVENT_CAPTURE_FAILED = 2,  // UTF-8 reason
     FRAMES_MAC_EVENT_CAPTURE_STARTED = 3, // UTF-8 "real WxH" or "synthetic WxH"
+    FRAMES_MAC_EVENT_GEOMETRY = 4,        // window capture (ABI 5): UTF-8 "x y w h", the captured
+                                          // rect in global points, top-left origin
 };
 
 enum {
@@ -81,6 +83,14 @@ void *frames_mac_capture_start_window(uint32_t window_id, uint32_t fps, FramesMa
 // (global points, top-left origin), front to back. Writes it to
 // `buffer` when it fits in `capacity` bytes; returns its length either way.
 size_t frames_mac_windows(uint8_t *buffer, size_t capacity);
+// Window capture options (ABI 5): `show_header` keeps the window's standard
+// title bar in the picture (otherwise it is cropped when Accessibility
+// verifies one); `show_cursor` draws the cursor into the pixels. Display
+// captures only take `show_cursor`.
+void frames_mac_capture_set_options(void *capture, bool show_header, bool show_cursor);
+// Resizes the captured window so its picture is `width` x `height` pixels
+// (ABI 5), through Accessibility. False when it cannot be resized.
+bool frames_mac_capture_resize_window(void *capture, uint32_t width, uint32_t height);
 
 // A deterministic generated BGRA picture for `index` (+1). Two calls with the
 // same index produce identical pixels.
@@ -113,6 +123,22 @@ void frames_mac_decoder_free(void *decoder);
 // `present` draws a borrowed BGRA pixel buffer on the calling thread; with
 // `vsync` false it presents immediately (displaySyncEnabled = false).
 void *frames_mac_presenter_new(uint32_t width, uint32_t height, bool window);
+// A host menu, tooltip, popover or sheet (ABI 5): a borderless window that
+// never takes focus, shown once attached.
+void *frames_mac_presenter_new_popup(uint32_t width, uint32_t height);
+enum {
+    FRAMES_MAC_POPUP_MENU = 1,
+    FRAMES_MAC_POPUP_TOOLTIP = 2,
+    FRAMES_MAC_POPUP_POPOVER = 3,
+    FRAMES_MAC_POPUP_SHEET = 4,
+};
+// Shows a popup presenter over the picture of the viewer window whose menu
+// id is `parent_id` (ABI 5): `x`, `y`, `width`, `height` are its frame
+// relative to its parent's frame, and `parent_width`, `parent_height` the
+// parent's frame size, in host points. Waits a few seconds for the parent's
+// window to open.
+void frames_mac_presenter_attach(void *presenter, uint64_t parent_id, double x, double y, double width,
+                                 double height, double parent_width, double parent_height, uint32_t role);
 int32_t frames_mac_presenter_present(void *presenter, void *pixel_buffer, bool vsync,
                                      uint64_t *presented_ns);
 // Host time (ns) the most recently presented drawable reached the glass, or 0
@@ -134,18 +160,32 @@ enum {
     FRAMES_MAC_INPUT_STATS = 8,      // Control+Option+F10: show or hide live statistics (ABI 4)
     FRAMES_MAC_INPUT_MENU = 10,      // an item of the host application's menus, a = id (ABI 4)
     FRAMES_MAC_INPUT_COMMAND = 9,    // a Frames menu command, a = 1-3 quality high/medium/low, 4 statistics, 6 disconnect (ABI 4)
+    FRAMES_MAC_INPUT_SIZE = 11,      // the user resized the window (ABI 5): a = width, b = height, in pixels
+    FRAMES_MAC_INPUT_FOCUS_GAINED = 12, // the window became key (ABI 5)
+    FRAMES_MAC_INPUT_VISIBILITY = 13,   // the window was shown or hidden (minimized, covered) or came to the front
+                                        // or left it (ABI 6): a = shown, b = focused; sent when either changes
 };
 typedef void (*FramesMacInputCallback)(void *context, uint32_t kind, int32_t a, int32_t b,
                                        int32_t c, int32_t d, uint64_t event_ns);
 // Installs (or with NULL, removes) the input callback. Removing waits for a
 // callback in progress, so the context may be freed once this returns.
 void frames_mac_presenter_set_input(void *presenter, void *context, FramesMacInputCallback callback);
+// Typed text (ABI 5), composed here (keyboard layout, dead keys, input
+// methods) when the window is not in physical-keys mode: UTF-8, valid
+// during the call. Installed and removed like the input callback.
+typedef void (*FramesMacTextCallback)(void *context, const uint8_t *utf8, size_t length, uint64_t event_ns);
+void frames_mac_presenter_set_text_input(void *presenter, void *context, FramesMacTextCallback callback);
 // The host's cursor over the presenter's view (ABI 2): straight-alpha BGRA,
 // top row first (borrowed). Without a shape, or with visible false, the
 // system cursor is hidden over the view.
 void frames_mac_presenter_set_cursor(void *presenter, const uint8_t *bgra, uint32_t width,
                                      uint32_t height, uint32_t hotspot_x, uint32_t hotspot_y);
 void frames_mac_presenter_set_cursor_visible(void *presenter, bool visible);
+// The debug overlay over the picture's top left (ABI 6): `utf8` is a
+// frames-next `overlay::Overlay` as JSON (lines, frame and bitrate graphs),
+// borrowed; length 0 hides it. Not shown on popups or windows smaller than
+// 360x260 points.
+void frames_mac_presenter_set_overlay(void *presenter, const uint8_t *utf8, size_t length);
 // The presenter window's title (UTF-8, borrowed), e.g. live statistics.
 void frames_mac_presenter_set_title(void *presenter, const uint8_t *utf8, size_t length);
 // Feeds generated mouse, wheel and key events for `step` through the same
@@ -159,6 +199,25 @@ void frames_mac_presenter_free(void *presenter);
 // Makes the process a regular app (Dock icon) with the viewer's menu bar,
 // whose commands reach the front window as FRAMES_MAC_INPUT_COMMAND (ABI 4).
 void frames_mac_viewer_app(void);
+// The viewer's connection menus (ABI 5): `utf8` is the session's state as
+// JSON (frames-next `control::Snapshot`), borrowed; the menu bar and every
+// window's title-bar menu are rebuilt from it.
+void frames_mac_viewer_set_state(const uint8_t *utf8, size_t length);
+// Where menu choices go (ABI 5): `utf8` is a frames-next `control::Command`
+// as JSON, valid during the call. Called on the main thread.
+typedef void (*FramesMacCommandCallback)(void *context, const uint8_t *utf8, size_t length);
+void frames_mac_viewer_set_command_handler(void *context, FramesMacCommandCallback callback);
+// The window's entry in the connection menus (ABI 5): the host's window id,
+// 0 for the desktop view.
+void frames_mac_presenter_set_menu_id(void *presenter, uint64_t id);
+// How the picture fits the window (ABI 5): `fill` stretches it over the
+// window, otherwise it is letterboxed (input maps to the picture either
+// way); `keep_aspect` keeps the window in the picture's shape while the user
+// resizes it and resize() reshapes it ("Stretch locally"); without, the
+// window keeps the size the user gives it ("Resize remote app").
+// `physical_keys` sends every key as a key (terminals); otherwise printable
+// keys go as composed text (FramesMacTextCallback).
+void frames_mac_presenter_set_view_options(void *presenter, bool fill, bool keep_aspect, bool physical_keys);
 // Whether the user closed a windowed presenter's window (ABI 4).
 bool frames_mac_presenter_closed(void *presenter);
 // With `on`, the window's first close is only recorded (a request the
@@ -183,6 +242,18 @@ bool frames_mac_close_window(uint32_t window_id);
 // in order. Written to `buffer` when it fits; returns its length either
 // way (0: none).
 size_t frames_mac_app_menus(uint32_t window_id, uint8_t *buffer, size_t capacity);
+// Brings the application owning `window_id` to the front when it is not,
+// and with `raise` the window above its others (ABI 5). False when the
+// window is gone.
+bool frames_mac_activate_window(uint32_t window_id, bool raise);
+// Drops the file at `path` (UTF-8, borrowed) into the window `window_id`
+// at (`x`, `y`) in global points, top-left origin, as dragging it there
+// from Finder would (ABI 6): Accessibility moves the pointer for the drag.
+// False when the application did not take it.
+bool frames_mac_drop_file(uint32_t window_id, const uint8_t *path, size_t length, double x, double y);
+// This Mac's user session (ABI 6): 0 active and unlocked, 1 locked, 2 not
+// the console session (another user is in front), 3 no session.
+int32_t frames_mac_session_state(void);
 // Presses leaf item `id` of that tree (ABI 4). False when it is not there.
 bool frames_mac_press_menu(uint32_t window_id, uint32_t id);
 // The stream's new size (ABI 4): the drawable follows it and the window
@@ -198,6 +269,18 @@ int64_t frames_mac_clipboard_png(uint8_t **out);
 int32_t frames_mac_clipboard_set_text(const uint8_t *utf8, size_t length);
 int32_t frames_mac_clipboard_set_png(const uint8_t *png, size_t length);
 void frames_mac_free(void *pointer);
+
+// Host audio from ScreenCaptureKit (ABI 7): everything this Mac plays
+// except this process (pid 0), or one application's (its pid). PCM arrives
+// on a capture queue as interleaved f32, 48 kHz, `channels` (2) per frame;
+// `samples` NULL with 0 frames means the capture ended. Needs the Screen
+// Recording permission. Returns NULL and writes a UTF-8 reason into `error`
+// (`error_capacity` bytes, NUL-terminated) when it cannot start.
+typedef void (*FramesMacAudioCallback)(void *context, const float *samples, size_t frames,
+                                       uint32_t channels);
+void *frames_mac_audio_start(int32_t pid, FramesMacAudioCallback callback, void *context,
+                             char *error, size_t error_capacity);
+void frames_mac_audio_stop(void *handle);
 
 // Runs NSApplication on the calling (main) thread until stopped or `seconds`
 // elapse (0 = until stopped). Never call while another toolkit owns it.

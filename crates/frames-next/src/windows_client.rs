@@ -16,6 +16,8 @@ use windows::core::w;
 
 pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     let info = crate::await_stream(&session).await?;
+    // Files fetched from the host show in the received-files window.
+    crate::win_files::start_shelf();
     // The host's cursor shape and visibility, applied on the viewer thread.
     let (cursor_tx, cursor_rx) = std::sync::mpsc::channel();
     let (sizes_tx, sizes) = std::sync::mpsc::channel();
@@ -28,7 +30,7 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
             cursor_streams,
             sizes_tx,
             menus_tx,
-            o.adb.then_some(o.adb_server),
+            o.adb_server,
         ));
         tokio::spawn(async move {
             let Some(mut recv) = cursor_incoming.recv().await else {
@@ -50,14 +52,11 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     };
     // Buttons, keys, and wheel: one reliable stream, written by a task.
     let (mut lane, writer) = InputLane::open(&session).await?;
-    // Cross-platform sessions swap Control and Command, as v1 does.
-    // Control and Command trade places across platforms, unless the user
-    // wants the same physical keys (`--physical-keys`, for terminals).
+    // Control and Command trade places across platforms (as v1) unless
+    // the user wants the same physical keys (`--physical-keys`, or the
+    // window's options in the connection menu, applied by the view loop).
     lane.swap_modifiers =
         !o.physical_keys && !info.platform.is_empty() && info.platform != crate::platform();
-    if lane.swap_modifiers {
-        println!("keys: Control and Command swapped ({} host)", info.platform);
-    }
     // Clipboard sharing: one two-way stream, opened after the input stream.
     let clipboard = if o.clipboard == crate::clip::Mode::Off {
         None
@@ -151,23 +150,93 @@ fn view(
     // The picture at its own size when it fits, else as large as fits on
     // the screen, always in its own shape.
     let mut stream_size = (info.width, info.height);
-    let screen = win::work_area();
-    let (width, height) = crate::resize::window_size(
-        stream_size,
-        stream_size,
-        stream_size,
-        (screen.0 * 9 / 10, screen.1 * 9 / 10),
-    );
-    let viewer = win::window(w!("Frames Next"), win::Kind::Viewer, 200, width, height)?;
+    // A host menu, tooltip or owned dialog goes where its owner's picture
+    // shows it, at the owner's scale (v1); other windows open at their own
+    // size within v1's limits.
+    let window_info = o.window_info.clone();
+    let popup = window_info.as_ref().is_some_and(|w| w.is_popup());
+    let placement = match (&window_info, &o.parent_info) {
+        (Some(window), Some(parent)) => {
+            let until = Instant::now() + Duration::from_secs(1);
+            let mut found = win::viewer_placement(parent.id);
+            while found.is_none() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+                found = win::viewer_placement(parent.id);
+            }
+            found.map(|(owner, x, y, scale)| {
+                let at = (
+                    x + ((window.x - parent.x) * scale).round() as i32,
+                    y + ((window.y - parent.y) * scale).round() as i32,
+                );
+                let size = (
+                    ((f64::from(stream_size.0) * scale).round() as u32).max(1),
+                    ((f64::from(stream_size.1) * scale).round() as u32).max(1),
+                );
+                (owner, at, size)
+            })
+        }
+        _ => None,
+    };
+    let viewer = match placement {
+        Some((owner, at, size)) if popup => {
+            win::popup_window(Some(owner), at.0, at.1, size.0, size.1)?
+        }
+        _ => {
+            let (width, height) = match placement {
+                Some((_, _, size)) => size,
+                None => win::initial_size(stream_size),
+            };
+            let viewer = win::window(w!("Frames Next"), win::Kind::Viewer, 200, width, height)?;
+            if let Some((owner, at, _)) = placement {
+                win::own_and_place(viewer, Some(owner), Some(at));
+            }
+            viewer
+        }
+    };
+    if popup {
+        // The picture is exactly the window.
+        win::set_layout(true, false);
+    }
+    if let Some(window) = &window_info {
+        if let Some(icon) = &window.icon {
+            win::set_icon(viewer, icon);
+        }
+        if !popup && !window.app.is_empty() {
+            win::set_app_id(viewer, &info.name, &window.app);
+        }
+    }
     win::set_aspect(info.width, info.height);
     win::set_title(viewer, &crate::viewer_title(o, &info));
+    win::set_menu_context(o.menu_id, &info.platform);
+    win::session::start_connection_window();
     win::pump();
+    // The connection menu's choices for this window (`crate::control`).
+    let mut menus = crate::control::WindowLoop::new(o, &info);
+    menus.resize.streaming(stream_size);
+    let mut menu_version = 0;
+    let mut entry = crate::control::WindowEntry::default();
+    let mut notice: Option<(String, Instant)> = None;
+    let mut title = String::new();
+    let mut stats_on = false;
+    // The debug overlay (Ctrl+Alt+F10, "Debug overlay"): v1's panel over the
+    // picture's top left.
+    let mut overlay = crate::overlay::Recorder::default();
+    let mut panel: Option<crate::win_overlay::DebugPanel> = None;
+    let mut fill = false;
+    let mut user_resize_until: Option<Instant> = None;
+    let mut last_placement = Instant::now() - Duration::from_secs(1);
+    // Whether the decoder in use is the hardware one (the debug overlay).
+    let hardware_decode = std::cell::Cell::new(true);
     let open_decoder = |(width, height): (u32, u32)| -> Result<FfmpegDecoder> {
         Ok(
             match FfmpegDecoder::new(info.codec.into(), width, height, true) {
-                Ok(decoder) => decoder,
+                Ok(decoder) => {
+                    hardware_decode.set(true);
+                    decoder
+                }
                 Err(error) => {
                     println!("hardware decode unavailable ({error}); decoding in software");
+                    hardware_decode.set(false);
                     FfmpegDecoder::new(info.codec.into(), width, height, false)?
                 }
             },
@@ -202,6 +271,7 @@ fn view(
         win::set_relative(viewer, true, false);
     }
     let started = Instant::now();
+    let mut path_key: Option<String> = None;
     let mut synthetic = o.synthetic_input.then_some(SyntheticInput {
         hwnd: viewer,
         started,
@@ -217,17 +287,37 @@ fn view(
     let mut reported_clean = 0u64;
     let mut close_asked = false;
     let mut showing_stats = false;
+    let mut stats_line = String::new();
     loop {
-        if o.deadline().is_some_and(|d| started.elapsed() >= d)
-            || crate::DISCONNECT.load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if o.deadline().is_some_and(|d| started.elapsed() >= d) || crate::control::ending() {
             break;
         }
         // A window of a host application: the first close asks the host
         // window to close (its going away ends this session); a second one
         // closes here.
-        for path in win::take_dropped(viewer) {
-            crate::transfer::send_dropped(session, path);
+        let dropped = win::take_dropped(viewer);
+        if !dropped.is_empty() {
+            // Over the picture: the host drops the files there too.
+            let picture = frames_platform_windows::present::picture_rect(
+                stream_size,
+                win::client_size(viewer),
+                fill,
+            );
+            let point = win::take_drop_point().map(|(x, y)| {
+                (
+                    frames_input::normalize(
+                        x - picture.left,
+                        (picture.right - picture.left).max(1) as u32,
+                    ),
+                    frames_input::normalize(
+                        y - picture.top,
+                        (picture.bottom - picture.top).max(1) as u32,
+                    ),
+                )
+            });
+            for path in dropped {
+                crate::transfer::send_dropped(session, path, point);
+            }
         }
         if win::close_requested() {
             if o.window_id.is_none() || close_asked {
@@ -258,18 +348,141 @@ fn view(
         // window in the new shape at its current scale.
         while let Ok(items) = updates.menus.try_recv() {
             println!("host menus: {}", crate::menus::summary(&items));
+            crate::control::set_window_details(o.menu_id, None, Some(!items.is_empty()));
             win::set_host_menu(viewer, &items);
+        }
+        // The menus changed: this window's entry, the statistics, a notice.
+        if crate::control::version() != menu_version {
+            menu_version = crate::control::version();
+            let snapshot = crate::control::snapshot();
+            if let Some(found) = snapshot.windows.iter().find(|w| w.id == o.menu_id) {
+                entry = found.clone();
+            }
+            stats_on = snapshot.stats;
+            if let Some(text) = &snapshot.notice
+                && notice.as_ref().is_none_or(|(old, _)| old != text)
+            {
+                notice = Some((text.clone(), Instant::now()));
+            }
+        }
+        let resize_remote = entry.prefs.resize_remote && entry.resizable && !entry.desktop;
+        let mut host_events = Vec::new();
+        let changes = menus.tick(session, |event| host_events.push(event));
+        if changes.toggle_relative {
+            win::set_relative(viewer, !win::relative(), true);
+        }
+        if let Some(prefs) = &changes.prefs
+            && let Some(swap) = changes.swap
+        {
+            // Settings' physical keys hold until this window's own choice.
+            let swap = swap && !(o.physical_keys && prefs.swap.is_none());
+            lane.swap_modifiers = swap;
+            println!(
+                "keys: Control and Command {}",
+                if swap { "swapped" } else { "as they are" }
+            );
+        }
+        if let Some(prefs) = changes.prefs {
+            presenter.set_fill(prefs.fill);
+            fill = prefs.fill;
+            // Physical keys (the window's option or Settings') send every
+            // key as a key; otherwise typed characters go as text.
+            win::set_physical(prefs.physical || o.physical_keys);
+            println!(
+                "window options: {}{}{}",
+                if prefs.resize_remote {
+                    "resize remote"
+                } else {
+                    "stretch locally"
+                },
+                if prefs.fill { ", fill" } else { "" },
+                if prefs.header { ", header" } else { "" },
+            );
+        }
+        if !popup {
+            win::set_layout(entry.prefs.fill, !resize_remote);
+        }
+        if last_placement.elapsed() >= Duration::from_millis(100) {
+            last_placement = Instant::now();
+            win::register_viewer(o.menu_id, viewer, stream_size);
         }
         while let Ok(size) = updates.sizes.try_recv() {
             println!("stream resized to {}x{}", size.0, size.1);
             decoder = open_decoder(size)?;
             let screen = win::work_area();
-            let (width, height) =
-                crate::resize::window_size(win::client_size(viewer), stream_size, size, screen);
+            let current = win::client_size(viewer);
+            // "Resize remote app": the host followed this window (or its
+            // header changed); pixels stay 1:1 unless that does not fit.
+            let (width, height) = if resize_remote {
+                crate::resize::window_size(size, size, size, screen)
+            } else {
+                crate::resize::window_size(current, stream_size, size, screen)
+            };
             win::set_aspect(size.0, size.1);
-            win::set_client_size(viewer, width, height);
+            if (width, height) != current {
+                win::set_client_size(viewer, width, height);
+            }
             stream_size = size;
+            menus.resize = crate::control::RemoteResize::default();
+            menus.resize.streaming(win::client_size(viewer));
             client.request_keyframe();
+        }
+        // Only the user's own resizing resizes the host window (v1).
+        if win::take_user_resize() {
+            user_resize_until = Some(Instant::now() + Duration::from_secs(1));
+        }
+        if resize_remote && user_resize_until.is_some_and(|until| Instant::now() < until) {
+            menus.local_size(win::client_size(viewer), |event| host_events.push(event));
+        }
+        if !host_events.is_empty() {
+            let at_us = clock.now_us();
+            lane.send(
+                &media,
+                &clock,
+                host_events
+                    .into_iter()
+                    .map(|event| Captured::Event { event, at_us })
+                    .collect(),
+            );
+        }
+        // v1's title: the window, its sizing mode, keys and any notice.
+        let wanted = if showing_stats {
+            stats_line.clone()
+        } else {
+            let mut wanted = format!(
+                "{} — {}",
+                crate::viewer_title(o, &info),
+                if resize_remote {
+                    "Resize remote"
+                } else {
+                    "Stretch locally"
+                }
+            );
+            if entry.prefs.physical {
+                wanted.push_str(" / Physical keys");
+            }
+            // v1's statuses, then any recent notice.
+            let status = if close_asked {
+                Some("Closing remote window…")
+            } else if presented == 0 {
+                Some("Waiting for video…")
+            } else {
+                None
+            };
+            if let Some(status) = status {
+                wanted.push_str(" — ");
+                wanted.push_str(status);
+            } else if let Some((text, at)) = &notice
+                && at.elapsed() < Duration::from_secs(8)
+            {
+                wanted.push_str(" — ");
+                wanted.push_str(text);
+            }
+            wanted
+        };
+        if wanted != title {
+            win::set_title(viewer, &wanted);
+            title = wanted;
         }
         while let Ok(message) = updates.cursor.try_recv() {
             win::apply_cursor(&message);
@@ -286,6 +499,12 @@ fn view(
             clipboard.tick();
         }
         let path = media.path();
+        // Which path carries the stream, when it changes (diagnostics).
+        let key = media.selected_path_key();
+        if key != path_key {
+            println!("path: {}", media.describe_paths().join(" | "));
+            path_key = key;
+        }
         client.set_rtt(path.rtt_us);
         while let Some((datagram, arrived)) = media.try_recv_timed() {
             if datagram.first() == Some(&crate::audio::TAG) {
@@ -294,6 +513,7 @@ fn view(
                 }
                 continue;
             }
+            overlay.received(datagram.len());
             client.on_datagram(arrived.unwrap_or_else(|| clock.now_us()), &datagram);
         }
         // Every ready frame is decoded (later ones reference it), but only
@@ -306,7 +526,9 @@ fn view(
             match presenter.present(frame, mode) {
                 Ok(stamp) => {
                     presented += 1;
-                    latency.push(stamp.presented_us.saturating_sub(captured));
+                    let measured = stamp.presented_us.saturating_sub(captured);
+                    latency.push(measured);
+                    overlay.presented(measured);
                 }
                 Err(error) => {
                     errors += 1;
@@ -319,16 +541,58 @@ fn view(
         if let Some(feedback) = client.poll_feedback(clock.now_us()) {
             let _ = media.try_send(feedback);
         }
+        // Not on popups, and only where it fits (the panel checks).
+        if stats_on && !popup && overlay.due() {
+            let audio_counts = audio.as_ref().map(|audio| {
+                use std::sync::atomic::Ordering::Relaxed;
+                (
+                    audio.stats.packets.load(Relaxed),
+                    audio.stats.concealed.load(Relaxed),
+                )
+            });
+            let decoder_label = if hardware_decode.get() {
+                "FFmpeg D3D11VA · hardware"
+            } else {
+                "FFmpeg · software"
+            };
+            if let Some(data) = overlay.snapshot(&crate::overlay::Input {
+                codec: info.codec.label(),
+                width: stream_size.0,
+                height: stream_size.1,
+                decoder: decoder_label,
+                path: &path,
+                stats: client.stats(),
+                superseded,
+                audio: audio_counts,
+                shortcut: "Ctrl+Alt+F10",
+            }) {
+                if panel.is_none() {
+                    match unsafe { crate::win_overlay::DebugPanel::new(viewer) } {
+                        Ok(created) => panel = Some(created),
+                        Err(error) => println!("debug overlay unavailable: {error:#}"),
+                    }
+                }
+                if let Some(panel) = &panel {
+                    let content = frames_platform_windows::present::picture_rect(
+                        stream_size,
+                        win::client_size(viewer),
+                        fill,
+                    );
+                    if let Err(error) = unsafe { panel.show(&data, content) } {
+                        println!("debug overlay: {error:#}");
+                    }
+                }
+            }
+        } else if !stats_on && let Some(shown) = panel.take() {
+            unsafe { shown.hide() };
+        }
         if started.elapsed() >= next_report {
             let stats = client.stats();
             let (n, p50, p95) = latency.take_window();
-            if o.stats_title ^ win::stats_toggled() {
-                let title = crate::stats::window_title(n, p50, p95, &path, stats.frames_lost);
-                win::set_title(viewer, &title);
-                showing_stats = true;
-            } else if showing_stats {
-                win::set_title(viewer, &crate::viewer_title(o, &info));
-                showing_stats = false;
+            // The overlay shows them; the title only for diagnostics.
+            showing_stats = o.stats_title;
+            if showing_stats {
+                stats_line = crate::stats::window_title(n, p50, p95, &path, stats.frames_lost);
             }
             println!(
                 "client t={:>3}s presented {n:>3}/s clean {:>3} lost {} | capture to present p50 {p50:>5.2} p95 {p95:>5.2} ms | recoveries {} nacks {} | {:?} rtt {:.1} ms",
@@ -349,6 +613,8 @@ fn view(
     // Give the pointer back before the window goes.
     win::set_relative(viewer, false, true);
     let _ = win::take_input();
+    win::unregister_viewer(o.menu_id);
+    win::destroy(viewer);
     lane.release_all();
     lane.print_summary(cursor_shapes);
     if let Some(audio) = &audio {

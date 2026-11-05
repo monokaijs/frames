@@ -261,6 +261,13 @@ fn main() {
         // A running session defers update downloads (see `update`).
         let _lease = matches!(std::env::args().nth(2).as_deref(), Some("host" | "connect"))
             .then(update::session_lease);
+        // Transport and engine logs on stderr, only when asked (RUST_LOG).
+        if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .init();
+        }
         if let Err(error) = frames_next::main_from(std::env::args().skip(2).collect()) {
             eprintln!("Frames Next: {error:#}");
             std::process::exit(1);

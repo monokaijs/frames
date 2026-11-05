@@ -26,6 +26,12 @@ pub struct AudioCapture {
     pub guard: Guard,
 }
 pub struct Guard(Arc<AtomicBool>);
+impl Guard {
+    /// Sets `stop` when dropped (captures that run their own thread).
+    pub fn new(stop: Arc<AtomicBool>) -> Self {
+        Self(stop)
+    }
+}
 impl Drop for Guard {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Release);

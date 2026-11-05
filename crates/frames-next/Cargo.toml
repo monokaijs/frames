@@ -39,7 +39,12 @@ tempfile = "3"
 [target.'cfg(windows)'.dependencies]
 frames-codec = { path = "../frames-codec" }
 frames-platform-windows = { path = "../frames-platform-windows" }
-windows.workspace = true
+windows = { workspace = true, features = ["Win32_UI_Controls", "Win32_System_Ole", "Win32_System_SystemServices", "Win32_UI_Shell_Common"] }
+# The `implement` macro (file drag sources) expands to `windows_core` paths.
+windows-core = "0.62.2"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 frames-platform-macos = { path = "../frames-platform-macos" }

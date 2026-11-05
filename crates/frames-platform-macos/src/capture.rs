@@ -25,6 +25,8 @@ struct State {
     cursor: Option<CursorUpdate>,
     events: VecDeque<String>,
     synthetic: Option<bool>,
+    /// Window capture: the captured rect in global points (x, y, w, h).
+    geometry: Option<(f64, f64, f64, f64)>,
 }
 
 unsafe extern "C" fn on_frame(
@@ -66,6 +68,13 @@ unsafe extern "C" fn on_event(context: *mut c_void, kind: u32, data: *const u8, 
         String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(data, length) }).into_owned()
     };
     let mut state = shared.state.lock().unwrap();
+    if kind == ffi::EVENT_GEOMETRY {
+        let numbers: Vec<f64> = text.split(' ').filter_map(|n| n.parse().ok()).collect();
+        if let [x, y, w, h] = numbers[..] {
+            state.geometry = Some((x, y, w, h));
+        }
+        return;
+    }
     let entry = match kind {
         ffi::EVENT_CAPTURE_STARTED => {
             state.synthetic = Some(text.starts_with("synthetic"));
@@ -117,6 +126,40 @@ pub fn app_menus_json(window_id: u32) -> Option<String> {
             return Some(String::from_utf8_lossy(&buffer).into_owned());
         }
         buffer.resize(length, 0);
+    }
+}
+
+/// Brings the application owning `window_id` to the front when it is not,
+/// and with `raise` the window above its others (Accessibility).
+pub fn activate_window(window_id: u32, raise: bool) -> bool {
+    // SAFETY: plain call.
+    unsafe { ffi::frames_mac_activate_window(window_id, raise) }
+}
+
+/// Drops `path` into window `window_id` at (`x`, `y`) in global points, as
+/// dragging it there from Finder would (needs Accessibility; moves the
+/// pointer). False when the application did not take it.
+pub fn drop_file(window_id: u32, path: &std::path::Path, x: f64, y: f64) -> bool {
+    let path = path.to_string_lossy();
+    // SAFETY: Swift copies the path during the call.
+    unsafe { ffi::frames_mac_drop_file(window_id, path.as_ptr(), path.len(), x, y) }
+}
+
+/// The main display's frame in global points (x, y, width, height).
+pub fn main_display_bounds() -> (f64, f64, f64, f64) {
+    crate::input::main_display_bounds()
+}
+
+/// Why this Mac cannot share its windows now (v1's messages), if it cannot.
+pub fn session_problem() -> Option<&'static str> {
+    // SAFETY: plain call.
+    match unsafe { ffi::frames_mac_session_state() } {
+        1 => Some("Mac is locked. Unlock it on the Mac to use app windows."),
+        2 => Some(
+            "Mac user session is inactive. Switch back to this user on the Mac to use app windows.",
+        ),
+        3 => Some("No interactive Mac session. Sign in on the Mac to use app windows."),
+        _ => None,
     }
 }
 
@@ -180,6 +223,26 @@ impl MacCapture {
             fps,
             next_id: 0,
         })
+    }
+
+    /// Window capture: `show_header` keeps the window's title bar in the
+    /// picture (cropped by default); `show_cursor` draws the cursor in.
+    pub fn set_options(&self, show_header: bool, show_cursor: bool) {
+        // SAFETY: live capture.
+        unsafe { ffi::frames_mac_capture_set_options(self.handle, show_header, show_cursor) };
+    }
+
+    /// Resizes the captured window so its picture is `width` x `height`
+    /// pixels (Accessibility). False when it cannot be resized.
+    pub fn resize_window(&self, width: u32, height: u32) -> bool {
+        // SAFETY: live capture.
+        unsafe { ffi::frames_mac_capture_resize_window(self.handle, width, height) }
+    }
+
+    /// Window capture: the captured rect in global points (x, y, width,
+    /// height), once known; input maps to it.
+    pub fn geometry(&self) -> Option<(f64, f64, f64, f64)> {
+        self.shared.state.lock().unwrap().geometry
     }
 
     /// Whether frames come from the generated source, once known.

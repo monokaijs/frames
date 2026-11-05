@@ -54,6 +54,7 @@ pub struct D3D11Presenter {
     state: Option<State>,
     refresh_hz: u32,
     tearing: bool,
+    fill: bool,
 }
 
 // The swap chain is driven from one thread at a time.
@@ -96,7 +97,14 @@ impl D3D11Presenter {
             state: None,
             refresh_hz: display_refresh_hz(),
             tearing: false,
+            fill: false,
         }
+    }
+
+    /// Stretch the picture to the whole window ("Fill window") instead of
+    /// fitting it in its own shape.
+    pub fn set_fill(&mut self, fill: bool) {
+        self.fill = fill;
     }
 
     fn client_size(&self) -> (u32, u32) {
@@ -276,6 +284,20 @@ impl State {
     }
 }
 
+/// Where a `source` picture is drawn in a `target` window: all of it with
+/// `fill`, else [`fit`]. Viewers map input onto this rectangle.
+pub fn picture_rect(source: (u32, u32), target: (u32, u32), fill: bool) -> RECT {
+    if fill {
+        return RECT {
+            left: 0,
+            top: 0,
+            right: target.0 as i32,
+            bottom: target.1 as i32,
+        };
+    }
+    fit(source, target)
+}
+
 /// Largest rectangle with the source's aspect ratio centred in `target`.
 /// Within 1% of the target's shape (rounding of window and picture sizes)
 /// it fills the target, so no thin bar shows at an edge.
@@ -330,6 +352,7 @@ impl Presenter for D3D11Presenter {
     ) -> Result<PresentStamp, MediaError> {
         let device = self.device_for(&frame.surface)?;
         let size = self.client_size();
+        let self_fill = self.fill;
         let state = self.state_for(device)?;
         if state.size != size {
             state.processor = None;
@@ -414,7 +437,7 @@ impl Presenter for D3D11Presenter {
             let colour = D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
                 _bitfield: (u32::from(matrix_709) << 2) | (if full_range { 2 } else { 1 } << 4),
             };
-            let target = fit(input, size);
+            let target = picture_rect(input, size, self_fill);
             let vc = &state.video_context;
             vc.VideoProcessorSetStreamColorSpace(&video_processor, 0, &colour);
             vc.VideoProcessorSetOutputColorSpace(

@@ -6,6 +6,10 @@
 //! 3. Sender → the bytes from `offset`, then finishes the stream.
 //! 4. Receiver checks the whole file's SHA-256, moves it to a name that does
 //!    not exist yet (never overwriting), and → `{"saved"}` or `{"error"}`.
+//!
+//! A file dropped on a viewer window carries where (`"drop"`, normalized
+//! over the picture); the host then drops it into the shared window there,
+//! as v1 did, and says how that went (`"note"`) with `{"saved"}`.
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -20,6 +24,9 @@ struct Offer {
     name: String,
     size: u64,
     sha256: String,
+    /// Dropped on the viewer's window here (0-65535 over the picture).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drop: Option<[u16; 2]>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -33,6 +40,9 @@ struct Done {
     saved: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// What happened after saving (the drop into the application).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 async fn write_line<T: Serialize>(send: &mut iroh::endpoint::SendStream, value: &T) -> Result<()> {
@@ -82,25 +92,51 @@ pub async fn send(session: &frames_net::Session, path: &Path) -> Result<String> 
     send_on(streams, path).await
 }
 
-/// Viewer: sends a file dropped on its window to the host's receive
-/// folder, in the background (from a viewer thread inside the runtime).
-pub fn send_dropped(session: &frames_net::Session, path: std::path::PathBuf) {
+/// Viewer: sends a file dropped on its window (at `point` over the
+/// picture, when known) to the host, which saves it and drops it into the
+/// shared window there; in the background, from a viewer thread inside the
+/// runtime.
+pub fn send_dropped(
+    session: &frames_net::Session,
+    path: std::path::PathBuf,
+    point: Option<(u16, u16)>,
+) {
     let session = session.clone();
     tokio::runtime::Handle::current().spawn(async move {
         let started = std::time::Instant::now();
-        match send(&session, &path).await {
-            Ok(saved) => println!(
-                "FILE sent {} in {:.1} s (saved as {saved})",
-                path.display(),
-                started.elapsed().as_secs_f64()
-            ),
-            Err(error) => println!("FILE sending {} failed: {error:#}", path.display()),
+        let sent = async {
+            let streams = crate::streams::open(&session, crate::streams::FILE).await?;
+            send_offer(streams, &path, point.map(|(x, y)| [x, y])).await
+        };
+        match sent.await {
+            Ok((saved, note)) => {
+                println!(
+                    "FILE sent {} in {:.1} s (saved as {saved})",
+                    path.display(),
+                    started.elapsed().as_secs_f64()
+                );
+                if let Some(note) = note {
+                    crate::control::notice(note);
+                }
+            }
+            Err(error) => {
+                crate::control::notice(format!("Sending {} failed: {error:#}", path.display()))
+            }
         }
     });
 }
 
 /// Sends `path` over a file stream (either direction).
-pub async fn send_on((mut send, mut recv): crate::streams::Streams, path: &Path) -> Result<String> {
+pub async fn send_on(streams: crate::streams::Streams, path: &Path) -> Result<String> {
+    Ok(send_offer(streams, path, None).await?.0)
+}
+
+/// Sends `path`; returns the saved name and the receiver's note.
+async fn send_offer(
+    (mut send, mut recv): crate::streams::Streams,
+    path: &Path,
+    drop: Option<[u16; 2]>,
+) -> Result<(String, Option<String>)> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -108,7 +144,16 @@ pub async fn send_on((mut send, mut recv): crate::streams::Streams, path: &Path)
         .to_string();
     let size = tokio::fs::metadata(path).await?.len();
     let sha256 = sha256_of(path).await?;
-    write_line(&mut send, &Offer { name, size, sha256 }).await?;
+    write_line(
+        &mut send,
+        &Offer {
+            name,
+            size,
+            sha256,
+            drop,
+        },
+    )
+    .await?;
     let resume: Resume = read_line(&mut recv).await?;
     ensure!(
         resume.offset <= size,
@@ -134,7 +179,7 @@ pub async fn send_on((mut send, mut recv): crate::streams::Streams, path: &Path)
     send.finish()?;
     let done: Done = read_line(&mut recv).await?;
     match (done.saved, done.error) {
-        (Some(saved), _) => Ok(saved),
+        (Some(saved), _) => Ok((saved, done.note)),
         (None, Some(error)) => bail!("the receiver rejected the file: {error}"),
         _ => bail!("the receiver did not confirm the file"),
     }
@@ -176,9 +221,16 @@ pub fn unused_path(dir: &Path, name: &str) -> PathBuf {
 }
 
 /// Host: receives one file into `dir`.
-pub async fn receive(
+pub async fn receive(streams: crate::streams::Streams, dir: PathBuf) -> Result<PathBuf> {
+    receive_then(streams, dir, |_, _| None).await
+}
+
+/// Host: receives one file into `dir`, then runs `after` with it and the
+/// point it was dropped at (if it was), whose note goes back to the sender.
+pub async fn receive_then(
     (mut send, mut recv): crate::streams::Streams,
     dir: PathBuf,
+    after: impl FnOnce(&Path, Option<(u16, u16)>) -> Option<String> + Send + 'static,
 ) -> Result<PathBuf> {
     // A fetch the host refuses answers with {"error"} instead of an offer.
     let first: serde_json::Value = read_line(&mut recv).await?;
@@ -187,6 +239,16 @@ pub async fn receive(
     }
     let offer: Offer = serde_json::from_value(first)?;
     let result = receive_offer(&offer, &mut send, &mut recv, &dir).await;
+    let note = match &result {
+        Ok(path) => {
+            let (path, point) = (path.clone(), offer.drop.map(|[x, y]| (x, y)));
+            tokio::task::spawn_blocking(move || after(&path, point))
+                .await
+                .ok()
+                .flatten()
+        }
+        Err(_) => None,
+    };
     let done = match &result {
         Ok(path) => Done {
             saved: Some(
@@ -196,10 +258,12 @@ pub async fn receive(
                     .into_owned(),
             ),
             error: None,
+            note,
         },
         Err(error) => Done {
             saved: None,
             error: Some(format!("{error:#}")),
+            note: None,
         },
     };
     let _ = write_line(&mut send, &done).await;

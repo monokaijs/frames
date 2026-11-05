@@ -83,6 +83,9 @@ type Attach = unsafe extern "C" fn(*const u16, u64, u64, *mut u32) -> *mut c_voi
 type SendCommand = unsafe extern "C" fn(*mut c_void, *const Command) -> BOOL;
 type Poll = unsafe extern "C" fn(*mut c_void, *mut NativeStatus) -> BOOL;
 type Close = unsafe extern "C" fn(*mut c_void);
+type AudioStart = unsafe extern "C" fn(u32, *mut i32) -> *mut c_void;
+type AudioRead = unsafe extern "C" fn(*mut c_void, *mut u8, u32) -> u32;
+type AudioClose = unsafe extern "C" fn(*mut c_void);
 
 struct Library {
     _module: HMODULE,
@@ -91,6 +94,9 @@ struct Library {
     send: SendCommand,
     poll: Poll,
     close: Close,
+    audio_start: AudioStart,
+    audio_read: AudioRead,
+    audio_close: AudioClose,
 }
 
 // The functions are thread-safe per broker handle; the module stays loaded.
@@ -149,7 +155,51 @@ fn load(dir: &Path) -> Result<Library> {
             send: symbol!("FramesBrokerSend", SendCommand),
             poll: symbol!("FramesBrokerPoll", Poll),
             close: symbol!("FramesBrokerClose", Close),
+            audio_start: symbol!("FramesAudioStart", AudioStart),
+            audio_read: symbol!("FramesAudioRead", AudioRead),
+            audio_close: symbol!("FramesAudioClose", AudioClose),
         })
+    }
+}
+
+/// One process's audio (and its children's), as v1 captured a shared
+/// application's: process loopback, 48 kHz stereo f32 PCM.
+pub struct ProcessAudio {
+    library: Arc<Library>,
+    handle: *mut c_void,
+}
+
+// The capture handle is read from one thread at a time.
+unsafe impl Send for ProcessAudio {}
+
+impl ProcessAudio {
+    /// Starts capturing `pid`'s audio; `dir` holds the extracted adapter.
+    /// Needs Windows build 20348 or later.
+    pub fn start(pid: u32, dir: &Path) -> Result<Self> {
+        let library = library(dir)?;
+        let mut error = 0;
+        let handle = unsafe { (library.audio_start)(pid, &mut error) };
+        anyhow::ensure!(
+            !handle.is_null(),
+            "application audio is unavailable (HRESULT 0x{:08x}); it needs Windows build 20348 or later",
+            error as u32
+        );
+        Ok(Self { library, handle })
+    }
+
+    /// Reads PCM into `buffer`: its length (0 for nothing yet), or `None`
+    /// once the capture ended.
+    pub fn read(&mut self, buffer: &mut [u8]) -> Option<usize> {
+        let count = unsafe {
+            (self.library.audio_read)(self.handle, buffer.as_mut_ptr(), buffer.len() as u32)
+        };
+        (count != u32::MAX).then_some(count as usize)
+    }
+}
+
+impl Drop for ProcessAudio {
+    fn drop(&mut self) {
+        unsafe { (self.library.audio_close)(self.handle) };
     }
 }
 
@@ -242,9 +292,20 @@ impl SharedInput {
     /// A normalized position (0-65535) in the window's client area, in
     /// client pixels.
     fn client_point(&self, x: u16, y: u16) -> (i32, i32) {
+        use windows::Win32::UI::HiDpi::{
+            GetWindowDpiAwarenessContext, SetThreadDpiAwarenessContext,
+        };
         let mut rect = windows::Win32::Foundation::RECT::default();
         unsafe {
+            // In the window's own coordinates: the adapter delivers them
+            // inside the game, and a DPI-unaware game's client area is
+            // smaller than what this DPI-aware thread would be told (by the
+            // display's scale; clicks landed that much too far).
+            let previous = SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(self.hwnd));
             let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(self.hwnd, &mut rect);
+            if !previous.is_invalid() {
+                SetThreadDpiAwarenessContext(previous);
+            }
         }
         let scale = |value: u16, extent: i32| {
             (f64::from(value) / 65535.0 * f64::from((extent - 1).max(0))).round() as i32

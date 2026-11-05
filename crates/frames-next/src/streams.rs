@@ -26,6 +26,47 @@ pub const RESIZE: u8 = 13;
 pub const PREVIEW: u8 = 14;
 /// The shared window's application menus (`crate::menus`).
 pub const MENU: u8 = 15;
+/// Host: a line of text for the viewer's window title, such as why input
+/// did not reach the shared window (v1's host input errors).
+pub const NOTICE: u8 = 16;
+
+/// Host: tells the viewer `text` (at most once every 5 s per text), in the
+/// background.
+pub struct Notices {
+    session: frames_net::Session,
+    handle: tokio::runtime::Handle,
+    last: std::collections::HashMap<String, std::time::Instant>,
+}
+
+impl Notices {
+    pub fn new(session: frames_net::Session, handle: tokio::runtime::Handle) -> Self {
+        Self {
+            session,
+            handle,
+            last: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn send(&mut self, text: &str) {
+        let now = std::time::Instant::now();
+        if self
+            .last
+            .get(text)
+            .is_some_and(|at| now.duration_since(*at) < std::time::Duration::from_secs(5))
+        {
+            return;
+        }
+        self.last.insert(text.to_string(), now);
+        println!("telling the viewer: {text}");
+        let (session, line) = (self.session.clone(), format!("{text}\n"));
+        self.handle.spawn(async move {
+            if let Ok((mut send, _)) = open(&session, NOTICE).await {
+                let _ = send.write_all(line.as_bytes()).await;
+                let _ = send.finish();
+            }
+        });
+    }
+}
 
 pub type Streams = (iroh::endpoint::SendStream, iroh::endpoint::RecvStream);
 
@@ -90,14 +131,14 @@ pub async fn route(session: frames_net::Session, routes: Routes) {
 
 /// Viewer: accepts the host's streams after its stream description: the
 /// cursor stream goes to `cursor`; size changes go to `sizes`; ADB streams
-/// are piped to `adb` (the viewer's ADB server) when the viewer turned the
-/// bridge on.
+/// are piped to `adb` (the viewer's ADB server) while the bridge is on
+/// ("Android ADB bridge" in the Devices menu).
 pub async fn route_viewer(
     session: frames_net::Session,
     cursor: tokio::sync::mpsc::UnboundedSender<iroh::endpoint::RecvStream>,
     sizes: std::sync::mpsc::Sender<(u32, u32)>,
     menus: std::sync::mpsc::Sender<Vec<crate::menus::Item>>,
-    adb: Option<std::net::SocketAddr>,
+    adb: std::net::SocketAddr,
 ) {
     loop {
         let Ok((send, mut recv)) = session.accept_channel().await else {
@@ -107,6 +148,7 @@ pub async fn route_viewer(
         if recv.read_exact(&mut kind).await.is_err() {
             continue;
         }
+        let adb = crate::control::adb_on().then_some(adb);
         match (kind[0], adb) {
             (CURSOR, _) => {
                 let _ = cursor.send(recv);
@@ -116,6 +158,17 @@ pub async fn route_viewer(
             }
             (MENU, _) => {
                 tokio::spawn(crate::menus::receive(recv, menus.clone()));
+            }
+            (NOTICE, _) => {
+                tokio::spawn(async move {
+                    let mut recv = recv;
+                    if let Ok(bytes) = recv.read_to_end(1024).await {
+                        let text = String::from_utf8_lossy(&bytes).trim().to_string();
+                        if !text.is_empty() {
+                            crate::control::notice(text);
+                        }
+                    }
+                });
             }
             (USB, _) => {
                 if let Some(route) = crate::pads::USB_STREAMS.lock().unwrap().as_ref() {

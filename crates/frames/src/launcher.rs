@@ -482,6 +482,8 @@ struct Session {
     offset: u64,
     /// Viewers: the pairing code a new host shows, as "1234 5678".
     code: String,
+    /// Viewers: the host's device id, once it started the stream.
+    device: String,
 }
 impl Session {
     /// Sessions-list detail for a viewer: its phase and choices, with the
@@ -565,7 +567,39 @@ impl Worker {
                         if !name.is_empty() {
                             session.name = name.clone();
                         }
+                        session.device = device.clone();
                         let _ = crate::connection_history::remember(&device, &device, &name, false);
+                        changed = true;
+                    }
+                    Report::Choices {
+                        quality,
+                        remote_cursor,
+                    } if !session.host => {
+                        if !session.device.is_empty() {
+                            let _ = crate::connection_preferences::update(&session.device, |p| {
+                                if let Some(preset) =
+                                    frames_core::adaptive::QualityPreset::from_index(quality)
+                                {
+                                    p.quality = preset;
+                                }
+                                p.remote_cursor = remote_cursor;
+                            });
+                        }
+                    }
+                    Report::View { desktop } if !session.host => {
+                        // The next connection opens the view chosen last.
+                        if !session.device.is_empty() {
+                            let _ = crate::connection_preferences::update(&session.device, |p| {
+                                p.desktop = desktop
+                            });
+                        }
+                        session.mode = if desktop {
+                            "full desktop view".into()
+                        } else {
+                            "per-window view".into()
+                        };
+                        session.detail = session.status();
+                        self.publish_devices();
                         changed = true;
                     }
                     Report::Viewer {
@@ -704,6 +738,7 @@ impl Worker {
             stdin,
             offset: 0,
             code: String::new(),
+            device: String::new(),
         });
         self.publish_sessions();
         Ok(())
@@ -790,10 +825,16 @@ impl Worker {
                 options.audio = audio;
                 options.desktop = desktop;
                 let device_id = connection_device_id(&target, &expected_id);
-                if let Some(saved) = crate::connection_preferences::load()?.get(&device_id) {
+                let saved = crate::connection_preferences::load()?
+                    .get(&device_id)
+                    .cloned();
+                if let Some(saved) = &saved {
                     options.quality = saved.quality;
                 }
-                let args = options.connection_args(&target);
+                let mut args = options.connection_args(&target);
+                if saved.is_some_and(|s| s.remote_cursor) {
+                    args.push("--remote-cursor".into());
+                }
                 let address = target.as_str();
                 let name = self
                     .devices
@@ -1284,6 +1325,34 @@ pub fn run() -> Result<()> {
     );
     ui.set_system_device_name(frames_native::system_device_name().into());
     ui.set_local_address(local_address().into());
+    ui.set_device_code(
+        frames_next::directory::own_code()
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_local_ip(
+        frames_next::directory::local_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_default()
+            .into(),
+    );
+    let weak = ui.as_weak();
+    ui.on_copy_device_id(move || {
+        let result = frames_next::directory::own_id()
+            .and_then(|id| frames_next::directory::copy_text(&id));
+        if let Some(ui) = weak.upgrade() {
+            match result {
+                Ok(()) => {
+                    ui.set_notice("Device ID copied. Send it to connect over the internet; on the same network the code is enough.".into());
+                    ui.set_notice_error(false);
+                }
+                Err(error) => {
+                    ui.set_notice(format!("Couldn't copy the device ID: {error:#}").into());
+                    ui.set_notice_error(true);
+                }
+            }
+        }
+    });
     let preferences = match Preferences::load() {
         Ok(prefs) => prefs,
         Err(error) => {

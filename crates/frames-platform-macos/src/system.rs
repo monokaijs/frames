@@ -39,6 +39,40 @@ pub fn viewer_app() {
     unsafe { ffi::frames_mac_viewer_app() }
 }
 
+/// The viewer's connection menus are rebuilt from `json` (the session's
+/// state, frames-next `control::Snapshot`).
+pub fn viewer_set_state(json: &str) {
+    // SAFETY: Swift copies the text.
+    unsafe { ffi::frames_mac_viewer_set_state(json.as_ptr(), json.len()) }
+}
+
+/// Where the connection menus' choices go: `handler` gets each as JSON (a
+/// frames-next `control::Command`), on the main thread.
+pub fn viewer_set_command_handler(handler: fn(&str)) {
+    unsafe extern "C" fn on_command(
+        context: *mut std::ffi::c_void,
+        utf8: *const u8,
+        length: usize,
+    ) {
+        if utf8.is_null() || context.is_null() {
+            return;
+        }
+        // SAFETY: `context` is the `fn(&str)` given below; the text is valid
+        // for the call.
+        let handler: fn(&str) =
+            unsafe { std::mem::transmute::<*mut std::ffi::c_void, fn(&str)>(context) };
+        let bytes = unsafe { std::slice::from_raw_parts(utf8, length) };
+        handler(&String::from_utf8_lossy(bytes));
+    }
+    // SAFETY: a plain function pointer as the context; it is never freed.
+    unsafe {
+        ffi::frames_mac_viewer_set_command_handler(
+            handler as *mut std::ffi::c_void,
+            Some(on_command),
+        )
+    }
+}
+
 pub fn stop_app() {
     // SAFETY: posts to the main queue.
     unsafe { ffi::frames_mac_stop_app() }

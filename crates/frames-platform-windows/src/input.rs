@@ -27,8 +27,11 @@ pub enum InputTarget {
     /// A window's client area, by message (no global side effects).
     Window(HWND),
     /// Real input (`SendInput`) onto wherever this window is on screen now,
-    /// for sharing one window; follows the window when it moves.
-    WindowArea(HWND),
+    /// for sharing one window; follows the window when it moves. With
+    /// `header`, positions cover its whole visible frame, else only its
+    /// client area: always the rectangle the capture shows
+    /// ([`captured_rect`]).
+    WindowArea { hwnd: HWND, header: bool },
 }
 
 pub struct InputInjector {
@@ -43,12 +46,26 @@ pub struct InputInjector {
     position: (u16, u16),
     /// Pointer datagrams and events applied, for statistics.
     pub applied: u64,
+    /// Why input may not have reached the shared window (for the viewer's
+    /// title, as v1 said), until taken.
+    problem: std::cell::Cell<Option<&'static str>>,
 }
 
 // The HWND is only used with thread-safe message posting.
 unsafe impl Send for InputInjector {}
 
 impl InputInjector {
+    /// Positions map onto `target` from now on (the shared window's header
+    /// was shown or hidden).
+    pub fn set_target(&mut self, target: InputTarget) {
+        self.target = target;
+    }
+
+    /// What kept input from the shared window since the last call.
+    pub fn take_problem(&self) -> Option<&'static str> {
+        self.problem.take()
+    }
+
     pub fn new(target: InputTarget) -> Self {
         Self {
             target,
@@ -58,6 +75,7 @@ impl InputInjector {
             held: Held::default(),
             position: (0, 0),
             applied: 0,
+            problem: std::cell::Cell::new(None),
         }
     }
 
@@ -121,26 +139,99 @@ impl InputInjector {
                     self.position = (x, y);
                     self.move_to(x, y);
                 }
+                // The shared window comes to the front first, so a click on
+                // it lands on it even where other windows cover it (v1).
+                if down {
+                    self.raise();
+                }
                 self.button(button, down);
             }
             Event::Wheel { dx, dy } => self.wheel(dx, dy),
             Event::Key { usage, down } => {
                 if let Some(scan) = keys::usage_to_scan(usage) {
+                    // Keys go to the foreground window: the shared one.
+                    if down {
+                        self.raise();
+                    }
                     self.key(scan, down);
                 }
+            }
+            Event::Text { text } => {
+                self.raise();
+                self.text(&text)
             }
             // Window actions are the host session's, not the injector's.
             Event::ReleaseAll
             | Event::Mode { .. }
             | Event::CloseWindow
             | Event::MaxBitrate { .. }
-            | Event::Menu { .. } => {}
+            | Event::Menu { .. }
+            | Event::Header { .. }
+            | Event::RemoteCursor { .. }
+            | Event::RefreshMenus
+            | Event::ResizeWindow { .. }
+            | Event::Visibility { .. } => {}
+        }
+    }
+
+    /// Brings a shared window to the front and gives it the keyboard, unless
+    /// it (or a window it owns, such as its dialog or menu) has it already.
+    fn raise(&self) {
+        let InputTarget::WindowArea { hwnd, .. } = self.target else {
+            return;
+        };
+        unsafe {
+            // Menus, tooltips and other popups must not take the focus
+            // (that would close a menu).
+            let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+            if style & WS_POPUP.0 != 0 && style & WS_CAPTION.0 != WS_CAPTION.0 {
+                return;
+            }
+            let foreground = GetForegroundWindow();
+            if foreground == hwnd
+                || GetWindow(foreground, GW_OWNER).is_ok_and(|owner| owner == hwnd)
+                || GetAncestor(foreground, GA_ROOTOWNER) == hwnd
+            {
+                return;
+            }
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            let _ = SetForegroundWindow(hwnd);
+            // Windows can refuse to hand over the foreground (another app
+            // holds it, a full-screen game, focus-stealing rules).
+            let now = GetForegroundWindow();
+            if now != hwnd && GetAncestor(now, GA_ROOTOWNER) != hwnd {
+                self.problem.set(Some(
+                    "host OS denied keyboard focus; click the remote application first",
+                ));
+            }
         }
     }
 
     fn client_point(hwnd: HWND, x: u16, y: u16) -> (i32, i32) {
+        use windows::Win32::UI::HiDpi::{
+            GetWindowDpiAwarenessContext, SetThreadDpiAwarenessContext,
+        };
         let mut rect = RECT::default();
-        let _ = unsafe { GetClientRect(hwnd, &mut rect) };
+        // Messages carry the window's own client coordinates, which for a
+        // DPI-unaware window are smaller than this thread would be told.
+        unsafe {
+            let previous = SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(hwnd));
+            let _ = GetClientRect(hwnd, &mut rect);
+            if !previous.is_invalid() {
+                SetThreadDpiAwarenessContext(previous);
+            }
+        }
         (
             denormalize(x, (rect.right - rect.left).max(1) as u32),
             denormalize(y, (rect.bottom - rect.top).max(1) as u32),
@@ -159,11 +250,7 @@ impl InputInjector {
     fn area(&self) -> RECT {
         match self.target {
             InputTarget::Desktop(rect) => rect,
-            InputTarget::WindowArea(hwnd) => {
-                let mut rect = RECT::default();
-                let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
-                rect
-            }
+            InputTarget::WindowArea { hwnd, header } => captured_rect(hwnd, header),
             InputTarget::Window(_) => RECT::default(),
         }
     }
@@ -174,7 +261,7 @@ impl InputInjector {
                 let (px, py) = Self::client_point(hwnd, x, y);
                 Self::post(hwnd, WM_MOUSEMOVE, 0, Self::pack(px, py));
             }
-            InputTarget::Desktop(_) | InputTarget::WindowArea(_) => {
+            InputTarget::Desktop(_) | InputTarget::WindowArea { .. } => {
                 let monitor = self.area();
                 let px = monitor.left + denormalize(x, (monitor.right - monitor.left) as u32);
                 let py = monitor.top + denormalize(y, (monitor.bottom - monitor.top) as u32);
@@ -216,7 +303,7 @@ impl InputInjector {
                 };
                 Self::post(hwnd, message, wparam, Self::pack(x, y));
             }
-            InputTarget::Desktop(_) | InputTarget::WindowArea(_) => {
+            InputTarget::Desktop(_) | InputTarget::WindowArea { .. } => {
                 let (flags, data) = match (button, down) {
                     (Button::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
                     (Button::Left, false) => (MOUSEEVENTF_LEFTUP, 0),
@@ -251,13 +338,47 @@ impl InputInjector {
                     }
                 }
             }
-            InputTarget::Desktop(_) | InputTarget::WindowArea(_) => {
+            InputTarget::Desktop(_) | InputTarget::WindowArea { .. } => {
                 if dy != 0 {
                     send(&[mouse(MOUSEEVENTF_WHEEL, 0, 0, i32::from(dy))]);
                 }
                 if dx != 0 {
                     send(&[mouse(MOUSEEVENTF_HWHEEL, 0, 0, i32::from(dx))]);
                 }
+            }
+        }
+    }
+
+    /// Characters typed on the viewer (its layout, dead keys, IME), as v1
+    /// inserted them: KEYEVENTF_UNICODE (surrogate pairs as two units), or
+    /// WM_CHAR for a window by message.
+    fn text(&self, text: &str) {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        match self.target {
+            InputTarget::Window(hwnd) => {
+                for unit in units {
+                    Self::post(hwnd, WM_CHAR, usize::from(unit), 1);
+                }
+            }
+            InputTarget::Desktop(_) | InputTarget::WindowArea { .. } => {
+                let inputs: Vec<INPUT> = units
+                    .iter()
+                    .flat_map(|&unit| {
+                        [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP].map(|flags| {
+                            INPUT {
+                                r#type: INPUT_KEYBOARD,
+                                Anonymous: INPUT_0 {
+                                    ki: KEYBDINPUT {
+                                        wScan: unit,
+                                        dwFlags: flags,
+                                        ..Default::default()
+                                    },
+                                },
+                            }
+                        })
+                    })
+                    .collect();
+                send(&inputs);
             }
         }
     }
@@ -277,7 +398,7 @@ impl InputInjector {
                 let vk = unsafe { MapVirtualKeyW(u32::from(scan), MAPVK_VSC_TO_VK_EX) } as usize;
                 Self::post(hwnd, if down { WM_KEYDOWN } else { WM_KEYUP }, vk, lparam);
             }
-            InputTarget::Desktop(_) | InputTarget::WindowArea(_) => {
+            InputTarget::Desktop(_) | InputTarget::WindowArea { .. } => {
                 let mut flags = KEYEVENTF_SCANCODE;
                 if extended {
                     flags |= KEYEVENTF_EXTENDEDKEY;
@@ -320,4 +441,54 @@ fn send(inputs: &[INPUT]) {
     if sent as usize != inputs.len() {
         tracing::debug!("SendInput applied {sent} of {} inputs", inputs.len());
     }
+}
+
+/// The part of a window that window capture shows: DWM's visible frame.
+/// `GetWindowRect` also counts the invisible resize borders (about 7 px
+/// each side on Windows 10 and 11), which put clicks off by that much.
+pub fn visible_bounds(hwnd: HWND) -> RECT {
+    use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
+    let mut rect = RECT::default();
+    let visible = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut RECT as *mut _,
+            std::mem::size_of::<RECT>() as u32,
+        )
+    };
+    if visible.is_err() || rect.right <= rect.left {
+        let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
+    }
+    rect
+}
+
+/// The screen rectangle window capture shows of `hwnd`: its visible frame
+/// with `header`, else only its client area (no title bar, borders or menu
+/// bar, as v1), cut to even sizes as encoders need. Input maps onto exactly
+/// this rectangle, so a click lands where it was made.
+pub fn captured_rect(hwnd: HWND, header: bool) -> RECT {
+    let frame = visible_bounds(hwnd);
+    let mut rect = frame;
+    if !header {
+        let mut client = RECT::default();
+        let mut origin = POINT::default();
+        let ok = unsafe {
+            GetClientRect(hwnd, &mut client).is_ok() && ClientToScreen(hwnd, &mut origin).as_bool()
+        };
+        if ok && client.right > client.left && client.bottom > client.top {
+            rect = RECT {
+                left: (origin.x).max(frame.left),
+                top: (origin.y).max(frame.top),
+                right: (origin.x + client.right).min(frame.right),
+                bottom: (origin.y + client.bottom).min(frame.bottom),
+            };
+            if rect.right <= rect.left || rect.bottom <= rect.top {
+                rect = frame;
+            }
+        }
+    }
+    rect.right = rect.left + ((rect.right - rect.left).max(0) & !1);
+    rect.bottom = rect.top + ((rect.bottom - rect.top).max(0) & !1);
+    rect
 }

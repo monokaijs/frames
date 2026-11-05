@@ -1057,6 +1057,15 @@ impl<T: ConnectionState> Connection<T> {
         self.inner.rtt(path_id)
     }
 
+    /// Frames patch: closes one path, for a direct path that stopped
+    /// delivering, so the connection carries on over its other paths (the
+    /// relay). False when there is no such path or it cannot close.
+    pub fn close_path(&self, path_id: PathId) -> bool {
+        self.inner
+            .path(path_id)
+            .is_some_and(|path| path.close().is_ok())
+    }
+
     /// Returns connection statistics.
     #[inline]
     pub fn stats(&self) -> ConnectionStats {

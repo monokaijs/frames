@@ -37,6 +37,8 @@ pub struct HostMenus {
     stream: Option<iroh::endpoint::SendStream>,
     window: u64,
     running: Arc<std::sync::atomic::AtomicBool>,
+    /// Read the menus now and send them even if unchanged.
+    wanted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HostMenus {
@@ -44,19 +46,25 @@ impl HostMenus {
     pub fn start(window: u64) -> Self {
         let latest = Arc::new(Mutex::new((0, Vec::new())));
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let wanted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
-            let (latest, running) = (latest.clone(), running.clone());
+            let (latest, running, wanted) = (latest.clone(), running.clone(), wanted.clone());
             std::thread::spawn(move || {
+                use std::sync::atomic::Ordering::Relaxed;
                 let mut last = None;
-                while running.load(std::sync::atomic::Ordering::Relaxed) {
+                while running.load(Relaxed) {
+                    let forced = wanted.swap(false, Relaxed);
                     let items = read(window);
-                    if last.as_ref() != Some(&items) {
+                    if forced || last.as_ref() != Some(&items) {
                         let mut slot = latest.lock().unwrap();
                         slot.0 += 1;
                         slot.1 = items.clone();
                         last = Some(items);
                     }
-                    std::thread::sleep(POLL);
+                    let since = std::time::Instant::now();
+                    while since.elapsed() < POLL && running.load(Relaxed) && !wanted.load(Relaxed) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                 }
             });
         }
@@ -66,6 +74,7 @@ impl HostMenus {
             stream: None,
             window,
             running,
+            wanted,
         }
     }
 
@@ -96,6 +105,14 @@ impl HostMenus {
         let send = self.stream.as_mut().expect("opened above");
         handle.block_on(send.write_all(&line))?;
         Ok(())
+    }
+
+    /// Reads the menus now and sends them again on the next
+    /// [`Self::send_changes`] ("Refresh application menus").
+    pub fn refresh(&mut self) {
+        self.sent = 0;
+        self.wanted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Runs the item `id` of the tree last sent.

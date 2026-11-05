@@ -194,14 +194,124 @@ final class FramesMacTests: XCTestCase {
     func testInputViewShowsTheHostCursorAndHidesIt() {
         let view = InputView(frame: NSRect(x: 0, y: 0, width: 200, height: 100), relay: InputRelay())
         XCTAssertNil(view.shownCursor, "the system cursor until the host sends one")
-        let image = NSImage(size: NSSize(width: 16, height: 16))
-        view.setHostCursor(image, hotspot: NSPoint(x: 2, y: 3), visible: nil)
+        let shape = CursorShape(bgra: Data(count: 16 * 16 * 4), width: 16, height: 16, hotspot: NSPoint(x: 2, y: 3))
+        view.setHostCursor(shape, visible: nil)
+        // No picture size yet: one point per host pixel.
         XCTAssertEqual(view.shownCursor?.hotSpot, NSPoint(x: 2, y: 3))
-        view.setHostCursor(nil, hotspot: .zero, visible: false)
+        view.setHostCursor(nil, visible: false)
         XCTAssertNotNil(view.shownCursor)
         XCTAssertNotEqual(view.shownCursor?.hotSpot, NSPoint(x: 2, y: 3), "hidden: a blank cursor")
-        view.setHostCursor(nil, hotspot: .zero, visible: true)
+        view.setHostCursor(nil, visible: true)
         XCTAssertEqual(view.shownCursor?.hotSpot, NSPoint(x: 2, y: 3), "shown again")
+    }
+
+    @MainActor
+    func testHostCursorFollowsThePictureScale() {
+        let view = InputView(frame: NSRect(x: 0, y: 0, width: 200, height: 100), relay: InputRelay())
+        let layer = CAMetalLayer()
+        layer.drawableSize = CGSize(width: 400, height: 200)
+        view.wantsLayer = true
+        view.layer = layer
+        let shape = CursorShape(bgra: Data(count: 32 * 32 * 4), width: 32, height: 32, hotspot: NSPoint(x: 10, y: 4))
+        view.setHostCursor(shape, visible: nil)
+        // 400 host pixels in 200 points: half a point each.
+        XCTAssertEqual(view.shownCursor?.image.size, NSSize(width: 16, height: 16))
+        XCTAssertEqual(view.shownCursor?.hotSpot, NSPoint(x: 5, y: 2))
+    }
+
+    @MainActor
+    func testLetterboxedPicturesMapInputToThePictureOnly() {
+        let view = InputView(frame: NSRect(x: 0, y: 0, width: 200, height: 100), relay: InputRelay())
+        let layer = CAMetalLayer()
+        layer.drawableSize = CGSize(width: 100, height: 100)
+        view.wantsLayer = true
+        view.layer = layer
+        // A square picture in a 200x100 view: drawn from x 50 to 150.
+        XCTAssertEqual(view.pictureRect, NSRect(x: 50, y: 0, width: 100, height: 100))
+        XCTAssertEqual(view.normalized(NSPoint(x: 50, y: 100)).0, 0)
+        XCTAssertEqual(view.normalized(NSPoint(x: 100, y: 50)).0, 32768)
+        XCTAssertEqual(view.normalized(NSPoint(x: 150, y: 0)).0, 65535)
+        XCTAssertEqual(view.normalized(NSPoint(x: 10, y: 0)).0, 0, "the bars clamp to the edge")
+        view.fill = true
+        XCTAssertEqual(view.pictureRect, view.bounds, "filled: the whole view")
+        XCTAssertEqual(view.normalized(NSPoint(x: 200, y: 0)).0, 65535)
+    }
+
+    @MainActor
+    func testPrintableKeysGoAsTextUnlessPhysicalOrWithCommand() {
+        final class Box: @unchecked Sendable {
+            var keys: [(Int32, Int32)] = []
+            var texts: [String] = []
+        }
+        let box = Box()
+        let relay = InputRelay()
+        let context = Unmanaged.passUnretained(box).toOpaque()
+        relay.set(context: context) { context, kind, a, b, _, _, _ in
+            if kind == UInt32(FRAMES_MAC_INPUT_KEY) {
+                Unmanaged<Box>.fromOpaque(context!).takeUnretainedValue().keys.append((a, b))
+            }
+        }
+        relay.setText(context: context) { context, utf8, length, _ in
+            let text = String(decoding: UnsafeBufferPointer(start: utf8, count: length), as: UTF8.self)
+            Unmanaged<Box>.fromOpaque(context!).takeUnretainedValue().texts.append(text)
+        }
+        let view = InputView(frame: NSRect(x: 0, y: 0, width: 100, height: 100), relay: relay)
+        func key(_ type: NSEvent.EventType, _ code: UInt16, _ text: String, _ flags: NSEvent.ModifierFlags = []) -> NSEvent {
+            NSEvent.keyEvent(
+                with: type, location: .zero, modifierFlags: flags, timestamp: 1, windowNumber: 0, context: nil,
+                characters: text, charactersIgnoringModifiers: text, isARepeat: false, keyCode: code)!
+        }
+        view.insertText("é", replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertEqual(box.texts, ["é"], "committed text goes as text")
+        view.keyUp(with: key(.keyUp, 0, "a"))
+        XCTAssertEqual(box.keys.count, 1, "a release without a press still goes (as a key)")
+        box.keys.removeAll()
+        view.keyDown(with: key(.keyDown, 0, "a", [.command]))
+        view.keyUp(with: key(.keyUp, 0, "a", [.command]))
+        XCTAssertEqual(box.keys.map(\.1), [1, 0], "Command+A is a shortcut: keys")
+        box.keys.removeAll()
+        view.keyDown(with: key(.keyDown, 123, "\u{F702}"))
+        XCTAssertEqual(box.keys.map(\.0), [123], "arrows are keys")
+        box.keys.removeAll()
+        view.setPhysicalKeys(true)
+        view.keyDown(with: key(.keyDown, 0, "a"))
+        view.keyUp(with: key(.keyUp, 0, "a"))
+        XCTAssertEqual(box.keys.map(\.1), [1, 0], "physical keys: every key is a key")
+        relay.set(context: nil, callback: nil)
+        relay.setText(context: nil, callback: nil)
+    }
+
+    @MainActor
+    func testConnectionMenuShowsV1Items() {
+        viewerState = [
+            "quality": 1, "view": "windows", "remote_cursor": false, "stats": false, "adb": true,
+            "host_platform": "windows",
+            "windows": [
+                ["id": 7, "title": "Notepad", "app": "notepad", "shown": true, "desktop": false, "resizable": true,
+                 "prefs": ["resize_remote": true, "fill": false, "header": false, "physical": false]],
+            ],
+            "gamepads": [], "usb": [],
+        ]
+        let view = InputView(frame: NSRect(x: 0, y: 0, width: 100, height: 100), relay: InputRelay())
+        view.menuID = 7
+        let titles = framesMenu(for: view).items.map(\.title)
+        for title in [
+            "Image quality", "Windows", "Show all windows", "Hide all windows", "Ignore / hide this window",
+            "Per-window view", "Full desktop view", "Show remote cursor", "Show debug overlay (Control+Option+F10)",
+            "Show remote window header", "Resize remote app", "Stretch locally", "Toggle aspect fit / fill",
+            "Toggle Control / Command swap", "Toggle physical keys (terminal)", "Refresh application menus",
+            "Fetch remote file...", "Disconnect",
+        ] {
+            XCTAssertTrue(titles.contains(title), title)
+        }
+        let menu = framesMenu(for: view)
+        XCTAssertEqual(menu.item(withTitle: "Resize remote app")?.state, .on)
+        XCTAssertEqual(menu.item(withTitle: "Toggle Control / Command swap")?.state, .on, "Windows host: swapped")
+        XCTAssertEqual(menu.item(withTitle: "Image quality")?.submenu?.items[1].state, .on)
+        let devices = devicesMenu().items.map(\.title)
+        XCTAssertEqual(devices, ["Gamepads", "USB devices", "Refresh devices", "Android ADB bridge", "Device forwarding support..."])
+        XCTAssertEqual(devicesMenu().item(withTitle: "Android ADB bridge")?.state, .on)
+        viewerState = [:]
     }
 
     @MainActor
@@ -243,7 +353,7 @@ final class FramesMacTests: XCTestCase {
         func key(_ code: UInt16, _ flags: NSEvent.ModifierFlags) -> NSEvent {
             NSEvent.keyEvent(
                 with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 1, windowNumber: 0,
-                context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: code)!
+                context: nil, characters: "\u{F70F}", charactersIgnoringModifiers: "\u{F70F}", isARepeat: false, keyCode: code)!
         }
         view.keyDown(with: key(111, [.control, .option]))
         view.keyDown(with: key(111, []))
@@ -303,5 +413,78 @@ final class FramesMacTests: XCTestCase {
         XCTAssertEqual(box.events[1].2, -3, "up is negative")
         XCTAssertEqual(box.events[2].1, 0, "off")
         XCTAssertFalse(box.events.contains { $0.0 == UInt32(FRAMES_MAC_INPUT_KEY) }, "F11 never reaches the host")
+    }
+
+    func testDebugOverlayDrawsV1sPanelAtTheWindowScale() throws {
+        let json = """
+            {"lines":[{"text":"HEVC 1920×1080 · 60 fps","level":"normal"},{"text":"Latency  p50 9.0 ms","level":"warn"}],
+             "frames":[[16667,9000],[16667,12000]],"frame_budget_us":16666,"bitrate_kbps":[12000,14000],"sample_ms":200}
+            """
+        let content = try XCTUnwrap(OverlayContent(json: Data(json.utf8)))
+        XCTAssertEqual(content.lines.count, 2)
+        XCTAssertEqual(content.lines[1].level, "warn")
+        XCTAssertEqual(content.frames.count, 2)
+        let image = try XCTUnwrap(renderOverlay(content, scale: 2))
+        // To look at it: FRAMES_OVERLAY_PNG=/path/overlay.png swift test.
+        if let path = ProcessInfo.processInfo.environment["FRAMES_OVERLAY_PNG"] {
+            let rep = NSBitmapImageRep(cgImage: image)
+            try rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+        }
+        XCTAssertEqual(image.width, Int(OverlayLayout.width * 2))
+        XCTAssertEqual(image.height, Int(OverlayLayout.height(lines: 2) * 2))
+        XCTAssertNil(OverlayContent(json: Data("[]".utf8)), "not an overlay")
+    }
+
+    func testDroppedFilesCarryWhereTheyWereDropped() throws {
+        let drops = DroppedFiles()
+        drops.add(["/tmp/a.txt"], at: (100, 65535))
+        drops.add(["/tmp/b.txt"])
+        let taken = drops.take()
+        XCTAssertEqual((taken[0] as? [String: Any])?["path"] as? String, "/tmp/a.txt")
+        XCTAssertEqual((taken[0] as? [String: Any])?["y"] as? Int32, 65535)
+        XCTAssertEqual(taken[1] as? String, "/tmp/b.txt")
+        XCTAssertTrue(drops.take().isEmpty)
+    }
+
+    @MainActor
+    func testInputGoesToTheModalDialogBlockingTheWindow() {
+        final class Box: @unchecked Sendable { var kinds: [UInt32] = [] }
+        let box = Box()
+        let relay = InputRelay()
+        relay.set(context: Unmanaged.passUnretained(box).toOpaque()) { context, kind, _, _, _, _, _ in
+            Unmanaged<Box>.fromOpaque(context!).takeUnretainedValue().kinds.append(kind)
+        }
+        let owner = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 300), styleMask: [.titled], backing: .buffered,
+            defer: false)
+        let ownerView = InputView(frame: owner.contentLayoutRect, relay: relay)
+        ownerView.menuID = 10
+        owner.contentView = ownerView
+        let dialog = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 100), styleMask: [.titled], backing: .buffered,
+            defer: false)
+        let dialogView = InputView(frame: dialog.contentLayoutRect, relay: InputRelay())
+        dialogView.menuID = 11
+        dialog.contentView = dialogView
+        dialog.orderFront(nil)
+        defer {
+            dialog.orderOut(nil)
+            viewerState = [:]
+            relay.set(context: nil, callback: nil)
+        }
+        viewerState = [
+            "windows": [
+                ["id": 10, "shown": true],
+                ["id": 11, "shown": true, "parent": 10, "modal": true],
+            ]
+        ]
+        XCTAssertTrue(ownerView.modalBlocker() === dialogView)
+        let click = NSEvent.mouseEvent(
+            with: .leftMouseDown, location: NSPoint(x: 10, y: 10), modifierFlags: [], timestamp: 0,
+            windowNumber: owner.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        ownerView.mouseDown(with: click)
+        XCTAssertFalse(box.kinds.contains(UInt32(FRAMES_MAC_INPUT_BUTTON)), "the blocked window sends no click")
+        viewerState = ["windows": [["id": 10, "shown": true], ["id": 11, "shown": true, "parent": 10]]]
+        XCTAssertNil(ownerView.modalBlocker(), "a modeless dialog blocks nothing")
     }
 }

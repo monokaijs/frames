@@ -20,7 +20,7 @@ pub struct MacPresenter {
 /// Input from the presenter window, with the event's time on the
 /// [`frames_media::clock::SystemClock`] (µs). Positions are 0-65535 over the
 /// view, origin top left.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MacInput {
     Move {
         x: u16,
@@ -47,8 +47,11 @@ pub enum MacInput {
         down: bool,
         at_us: u64,
     },
+    /// Input released; `window`: the window stopped being key (not a
+    /// menu opening).
     FocusLost {
         at_us: u64,
+        window: bool,
     },
     /// Relative mouse motion in points; positive is right and down.
     Motion {
@@ -68,6 +71,27 @@ pub enum MacInput {
     Command(i32),
     /// An item of the host application's menus, by its id.
     Menu(u32),
+    /// The user resized the window to this many pixels.
+    Size {
+        width: u32,
+        height: u32,
+    },
+    /// The window came to the front.
+    FocusGained {
+        at_us: u64,
+    },
+    /// The window was shown or hidden (minimized, fully covered), or
+    /// came to the front or left it.
+    Visibility {
+        shown: bool,
+        focused: bool,
+        at_us: u64,
+    },
+    /// Text typed, composed here (not in physical-keys mode).
+    Text {
+        text: String,
+        at_us: u64,
+    },
 }
 
 type InputHandler = Box<dyn FnMut(MacInput) + Send>;
@@ -106,7 +130,10 @@ unsafe extern "C" fn on_input(
             down: b != 0,
             at_us,
         },
-        ffi::INPUT_FOCUS_LOST => MacInput::FocusLost { at_us },
+        ffi::INPUT_FOCUS_LOST => MacInput::FocusLost {
+            at_us,
+            window: a != 0,
+        },
         ffi::INPUT_MOTION => MacInput::Motion {
             dx: a,
             dy: b,
@@ -115,6 +142,16 @@ unsafe extern "C" fn on_input(
         ffi::INPUT_STATS => MacInput::ToggleStats,
         ffi::INPUT_COMMAND => MacInput::Command(a),
         ffi::INPUT_MENU => MacInput::Menu(a.max(0) as u32),
+        ffi::INPUT_FOCUS_GAINED => MacInput::FocusGained { at_us },
+        ffi::INPUT_VISIBILITY => MacInput::Visibility {
+            shown: a != 0,
+            focused: b != 0,
+            at_us,
+        },
+        ffi::INPUT_SIZE => MacInput::Size {
+            width: a.max(0) as u32,
+            height: b.max(0) as u32,
+        },
         ffi::INPUT_MODE => MacInput::Mode {
             relative: a != 0,
             at_us,
@@ -123,6 +160,21 @@ unsafe extern "C" fn on_input(
     };
     // SAFETY: the context is the handler installed by `set_input`, which
     // stays alive until Swift confirms it no longer calls it.
+    let handler = unsafe { &mut *context.cast::<InputHandler>() };
+    handler(event);
+}
+
+unsafe extern "C" fn on_text(context: *mut c_void, utf8: *const u8, length: usize, event_ns: u64) {
+    if utf8.is_null() {
+        return;
+    }
+    // SAFETY: the text is valid for the call.
+    let bytes = unsafe { std::slice::from_raw_parts(utf8, length) };
+    let event = MacInput::Text {
+        text: String::from_utf8_lossy(bytes).into_owned(),
+        at_us: uptime_to_clock_us(event_ns),
+    };
+    // SAFETY: as in `on_input`.
     let handler = unsafe { &mut *context.cast::<InputHandler>() };
     handler(event);
 }
@@ -150,6 +202,60 @@ impl MacPresenter {
     }
 }
 
+/// What a popup presenter shows ([`MacPresenter::attach`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopupRole {
+    Menu = 1,
+    Tooltip = 2,
+    Popover = 3,
+    Sheet = 4,
+}
+
+impl MacPresenter {
+    /// A host menu, tooltip, popover or sheet: a borderless window that
+    /// never takes focus, shown by [`Self::attach`].
+    pub fn new_popup(width: u32, height: u32) -> Result<Self, MediaError> {
+        // SAFETY: returns a retained Swift object or null.
+        let handle = unsafe { ffi::frames_mac_presenter_new_popup(width, height) };
+        if handle.is_null() {
+            return Err(MediaError::Backend("Metal presenter unavailable".into()));
+        }
+        // SAFETY: live presenter.
+        let refresh_hz = unsafe { ffi::frames_mac_presenter_refresh_hz(handle) }.round() as u32;
+        Ok(Self {
+            handle,
+            refresh_hz,
+            input: None,
+        })
+    }
+
+    /// Shows a popup over the picture of the viewer window `parent_id`:
+    /// `frame` (x, y, width, height) relative to the parent's frame, whose
+    /// size is `parent`, in host points.
+    pub fn attach(
+        &self,
+        parent_id: u64,
+        frame: (f64, f64, f64, f64),
+        parent: (f64, f64),
+        role: PopupRole,
+    ) {
+        // SAFETY: live presenter.
+        unsafe {
+            ffi::frames_mac_presenter_attach(
+                self.handle,
+                parent_id,
+                frame.0,
+                frame.1,
+                frame.2,
+                frame.3,
+                parent.0,
+                parent.1,
+                role as u32,
+            )
+        };
+    }
+}
+
 impl MacPresenter {
     /// Sends the window's mouse, wheel, and key events to `handler` (on the
     /// main thread). Replaces any earlier handler.
@@ -157,7 +263,10 @@ impl MacPresenter {
         self.clear_input();
         let boxed: *mut InputHandler = Box::into_raw(Box::new(Box::new(handler)));
         // SAFETY: live presenter; `boxed` lives until `clear_input`.
-        unsafe { ffi::frames_mac_presenter_set_input(self.handle, boxed.cast(), Some(on_input)) };
+        unsafe {
+            ffi::frames_mac_presenter_set_input(self.handle, boxed.cast(), Some(on_input));
+            ffi::frames_mac_presenter_set_text_input(self.handle, boxed.cast(), Some(on_text));
+        }
         self.input = Some(boxed);
     }
 
@@ -166,6 +275,7 @@ impl MacPresenter {
             // SAFETY: removing waits for a call in progress; afterwards Swift
             // never uses the context again, so it can be freed.
             unsafe {
+                ffi::frames_mac_presenter_set_text_input(self.handle, std::ptr::null_mut(), None);
                 ffi::frames_mac_presenter_set_input(self.handle, std::ptr::null_mut(), None);
                 drop(Box::from_raw(boxed));
             }
@@ -211,6 +321,29 @@ impl MacPresenter {
     pub fn resize(&self, width: u32, height: u32) {
         // SAFETY: live presenter.
         unsafe { ffi::frames_mac_presenter_resize(self.handle, width, height) };
+    }
+
+    /// The window's entry in the viewer's connection menus.
+    pub fn set_menu_id(&self, id: u64) {
+        // SAFETY: live presenter.
+        unsafe { ffi::frames_mac_presenter_set_menu_id(self.handle, id) };
+    }
+
+    /// `fill` stretches the picture over the window (otherwise it is
+    /// letterboxed); `keep_aspect` keeps the window in the picture's shape
+    /// ("Stretch locally"), otherwise it keeps the user's size;
+    /// `physical_keys` sends every key as a key, otherwise printable ones
+    /// arrive as [`MacInput::Text`].
+    pub fn set_view_options(&self, fill: bool, keep_aspect: bool, physical_keys: bool) {
+        // SAFETY: live presenter.
+        unsafe {
+            ffi::frames_mac_presenter_set_view_options(
+                self.handle,
+                fill,
+                keep_aspect,
+                physical_keys,
+            )
+        };
     }
 
     /// With `on`, the window's first close is only a request
@@ -261,6 +394,13 @@ impl MacPresenter {
     pub fn closed(&self) -> bool {
         // SAFETY: live presenter.
         unsafe { ffi::frames_mac_presenter_closed(self.handle) }
+    }
+
+    /// The debug overlay (`None` hides it): a frames-next overlay as JSON.
+    pub fn set_overlay(&self, json: Option<&str>) {
+        let json = json.unwrap_or("");
+        // SAFETY: live presenter; Swift copies the text.
+        unsafe { ffi::frames_mac_presenter_set_overlay(self.handle, json.as_ptr(), json.len()) };
     }
 
     pub fn set_title(&self, title: &str) {

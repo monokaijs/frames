@@ -60,6 +60,15 @@ pub struct WgcCapture {
     next_id: u64,
     config: CaptureConfig,
     cursor: Option<(isize, i32, i32, bool)>,
+    /// A window capture: the window, and whether its title bar and borders
+    /// are kept (`set_header`); otherwise frames are its client area.
+    window: Option<HWND>,
+    header: bool,
+    /// Window captures: a copy of the last whole frame (and when it was
+    /// captured), so a header change re-crops at once; a still window
+    /// sends no new frame.
+    last: Option<(ID3D11Texture2D, u32, u32, u64)>,
+    recrop: bool,
 }
 
 // WinRT capture objects created free-threaded; the source is used by one
@@ -77,9 +86,28 @@ impl WgcCapture {
         device: &ID3D11Device,
         clock: Arc<dyn MediaClock>,
     ) -> Result<Self, MediaError> {
-        Self::start(device, clock, |interop| unsafe {
+        let mut capture = Self::start(device, clock, |interop| unsafe {
             interop.CreateForWindow(hwnd)
-        })
+        })?;
+        capture.window = Some(hwnd);
+        Ok(capture)
+    }
+
+    /// A window capture shows the window's title bar and borders (`true`,
+    /// the default) or only its client area, which is what input maps onto
+    /// (`crate::input::captured_rect`).
+    pub fn set_header(&mut self, header: bool) {
+        if self.header != header {
+            self.recrop = true;
+        }
+        self.header = header;
+    }
+
+    /// Draws the host's cursor into the frames too ("Show remote cursor").
+    pub fn set_cursor_capture(&mut self, on: bool) -> Result<(), MediaError> {
+        let mut config = self.config;
+        config.separate_cursor = !on;
+        self.configure(config)
     }
 
     /// Captures the primary monitor.
@@ -146,6 +174,10 @@ impl WgcCapture {
             next_id: 0,
             config,
             cursor: None,
+            window: None,
+            header: true,
+            last: None,
+            recrop: false,
         };
         capture.configure(config)?;
         let _ = capture.session.SetIsBorderRequired(false);
@@ -213,6 +245,131 @@ impl WgcCapture {
     }
 }
 
+impl WgcCapture {
+    /// Copies the whole captured frame into `last` (made when the size
+    /// changes) and returns that copy.
+    fn keep_last(
+        &mut self,
+        source: &ID3D11Texture2D,
+        width: u32,
+        height: u32,
+        captured_us: u64,
+    ) -> Result<ID3D11Texture2D, MediaError> {
+        let reuse = self
+            .last
+            .as_ref()
+            .filter(|(_, w, h, _)| (*w, *h) == (width, height))
+            .map(|(texture, ..)| texture.clone());
+        let copy = match reuse {
+            Some(texture) => texture,
+            None => {
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                unsafe { source.GetDesc(&mut desc) };
+                desc.Width = width.min(desc.Width);
+                desc.Height = height.min(desc.Height);
+                desc.MiscFlags = 0;
+                desc.BindFlags = D3D11_BIND_SHADER_RESOURCE.0 as u32;
+                desc.Usage = D3D11_USAGE_DEFAULT;
+                desc.CPUAccessFlags = 0;
+                let mut texture = None;
+                unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut texture)) }
+                    .map_err(backend)?;
+                texture.expect("created")
+            }
+        };
+        unsafe {
+            self.context.CopySubresourceRegion(
+                &copy,
+                0,
+                0,
+                0,
+                0,
+                source,
+                0,
+                Some(&D3D11_BOX {
+                    left: 0,
+                    top: 0,
+                    front: 0,
+                    right: width,
+                    bottom: height,
+                    back: 1,
+                }),
+            );
+        }
+        self.last = Some((copy.clone(), width, height, captured_us));
+        self.recrop = false;
+        Ok(copy)
+    }
+
+    /// The part of a `content_w`x`content_h` frame in `source` to send: the
+    /// client area of a window without its header (relative to the visible
+    /// frame, which is what window capture shows), else everything.
+    /// Encoders want even dimensions.
+    fn crop(
+        &mut self,
+        source: &ID3D11Texture2D,
+        content_w: u32,
+        content_h: u32,
+        captured_us: u64,
+    ) -> Result<CaptureEvent, MediaError> {
+        let (left, top, width, height) = match self.window {
+            Some(hwnd) if !self.header => {
+                let frame = crate::input::visible_bounds(hwnd);
+                let keep = crate::input::captured_rect(hwnd, false);
+                let left = ((keep.left - frame.left).max(0) as u32).min(content_w);
+                let top = ((keep.top - frame.top).max(0) as u32).min(content_h);
+                let width = ((keep.right - keep.left).max(0) as u32).min(content_w - left) & !1;
+                let height = ((keep.bottom - keep.top).max(0) as u32).min(content_h - top) & !1;
+                if width < 2 || height < 2 {
+                    (0, 0, content_w & !1, content_h & !1)
+                } else {
+                    (left, top, width, height)
+                }
+            }
+            _ => (0, 0, content_w & !1, content_h & !1),
+        };
+        self.ensure_ring(width, height)?;
+        let target = self.ring[self.next_slot].clone();
+        self.next_slot = (self.next_slot + 1) % RING;
+        unsafe {
+            self.context.CopySubresourceRegion(
+                &target,
+                0,
+                0,
+                0,
+                0,
+                source,
+                0,
+                Some(&D3D11_BOX {
+                    left,
+                    top,
+                    front: 0,
+                    right: left + width,
+                    bottom: top + height,
+                    back: 1,
+                }),
+            );
+            self.context.Flush();
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        Ok(CaptureEvent::Frame(VideoFrame {
+            id,
+            captured_us,
+            surface: Surface::Platform(Arc::new(D3D11Surface {
+                texture: target,
+                subresource: 0,
+                width,
+                height,
+                matrix_709: true,
+                full_range: true,
+                keepalive: None,
+            })),
+            dirty: None,
+        }))
+    }
+}
+
 impl CaptureSource for WgcCapture {
     fn caps(&self) -> CaptureCaps {
         CaptureCaps {
@@ -277,48 +434,25 @@ impl CaptureSource for WgcCapture {
                         frame.Surface().and_then(|s| s.cast()).map_err(backend)?;
                     let source: ID3D11Texture2D =
                         unsafe { access.GetInterface() }.map_err(backend)?;
-                    // Encoders want even dimensions.
-                    let (width, height) = (content.Width as u32 & !1, content.Height as u32 & !1);
-                    self.ensure_ring(width, height)?;
-                    let target = self.ring[self.next_slot].clone();
-                    self.next_slot = (self.next_slot + 1) % RING;
-                    unsafe {
-                        self.context.CopySubresourceRegion(
-                            &target,
-                            0,
-                            0,
-                            0,
-                            0,
-                            &source,
-                            0,
-                            Some(&D3D11_BOX {
-                                left: 0,
-                                top: 0,
-                                front: 0,
-                                right: width,
-                                bottom: height,
-                                back: 1,
-                            }),
-                        );
-                        self.context.Flush();
-                    }
+                    let (width, height) = (content.Width as u32, content.Height as u32);
+                    let frame_out = if self.window.is_some() {
+                        // Keep the whole frame for re-cropping, then crop
+                        // from that copy.
+                        let copy = self.keep_last(&source, width, height, captured_us)?;
+                        self.crop(&copy, width, height, captured_us)
+                    } else {
+                        self.crop(&source, width, height, captured_us)
+                    };
                     let _ = frame.Close();
-                    let id = self.next_id;
-                    self.next_id += 1;
-                    return Ok(CaptureEvent::Frame(VideoFrame {
-                        id,
-                        captured_us,
-                        surface: Surface::Platform(Arc::new(D3D11Surface {
-                            texture: target,
-                            subresource: 0,
-                            width,
-                            height,
-                            matrix_709: true,
-                            full_range: true,
-                            keepalive: None,
-                        })),
-                        dirty: None,
-                    }));
+                    return frame_out;
+                }
+                Err(_) if self.recrop && self.last.is_some() => {
+                    // The header was shown or hidden: the last frame again,
+                    // cropped the new way.
+                    self.recrop = false;
+                    let (copy, width, height, _) = self.last.clone().expect("checked");
+                    let now = self.clock.now_us();
+                    return self.crop(&copy, width, height, now);
                 }
                 Err(_) => {
                     let now = self.clock.now_us();

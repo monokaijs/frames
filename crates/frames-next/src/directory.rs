@@ -153,6 +153,55 @@ pub async fn preview(id: &str, wait: Duration) -> Result<Vec<u8>> {
         .context("no preview in time")?
 }
 
+/// This device's short code: the first 8 characters of its id, as
+/// "9710-3C89", to read out or type. Devices on the same network find it
+/// by that prefix; across the internet the full id is needed.
+pub fn own_code() -> Result<String> {
+    Ok(short_code(&own_id()?))
+}
+
+/// The short code of a device id.
+pub fn short_code(id: &str) -> String {
+    let code = id.get(..8).unwrap_or(id).to_ascii_uppercase();
+    format!(
+        "{}-{}",
+        &code[..4.min(code.len())],
+        &code[4.min(code.len())..]
+    )
+}
+
+/// What someone typed as a device code or id, without the spaces and
+/// dashes a code is shown with, in lower case.
+pub fn normalize_code(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// This computer's address on its local network (the one routes leave
+/// by), for connecting on the same network.
+pub fn local_ip() -> Option<IpAddr> {
+    // Connecting a UDP socket picks a route without sending anything.
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    Some(socket.local_addr().ok()?.ip())
+}
+
+/// Puts `text` on this computer's clipboard (for Copy ID).
+pub fn copy_text(text: &str) -> Result<()> {
+    use frames_clipboard::{Clipboard, Content};
+    #[cfg(target_os = "macos")]
+    let mut clipboard = frames_platform_macos::clipboard::MacClipboard;
+    #[cfg(windows)]
+    let mut clipboard = frames_platform_windows::clipboard::WindowsClipboard;
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let mut clipboard = frames_clipboard::MemoryClipboard::default();
+    clipboard
+        .write(&Content::Text(text.to_string()))
+        .map_err(anyhow::Error::msg)
+}
+
 /// Whether `text` is a full device id (64 hex digits).
 pub fn is_device_id(text: &str) -> bool {
     text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit())
