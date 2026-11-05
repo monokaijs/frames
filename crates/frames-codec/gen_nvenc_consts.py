@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Emits src/nvenc/v<major>/consts.rs: the GUIDs and struct-version macros of
+"""Emits src/nvenc/v<major>_<minor>/consts.rs: the GUIDs and struct-version macros of
 an NVENC header, which bindgen cannot translate (static const values and
 function-like macros). Run from crates/frames-codec after
-gen_nvenc_bindings.sh, as `gen_nvenc_consts.py 13.1` (or 12.2)."""
+gen_nvenc_bindings.sh, as `gen_nvenc_consts.py 13.1` (or 12.2, 12.1, 12.0)."""
 
 import pathlib
 import re
@@ -37,4 +37,4 @@ version = re.compile(
 for name, number, high in version.findall(header):
     value = f"struct_version({number})" + (" | (1 << 31)" if high else "")
     out.append(f"pub const {name}: u32 = {value};")
-(here / "src" / "nvenc" / f"v{api.split('.')[0]}" / "consts.rs").write_text("\n".join(out) + "\n")
+(here / "src" / "nvenc" / f"v{api.replace('.', '_')}" / "consts.rs").write_text("\n".join(out) + "\n")

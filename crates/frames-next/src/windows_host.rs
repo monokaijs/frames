@@ -58,7 +58,7 @@ fn first_frame(capture: &mut WgcCapture, clock: &SystemClock) -> Result<VideoFra
 /// Encoders to try, best first: `--encoder` alone when given; otherwise
 /// each hardware encoder whose GPU is present (discrete first), then Media
 /// Foundation and software AV1, so a missing or outdated driver (NVENC
-/// needs API 12.2, driver 551+) falls back instead of failing.
+/// needs API 12.0, driver 522+) falls back instead of failing.
 pub fn backends(o: &Options) -> Vec<&'static str> {
     if o.encoder_explicit {
         return vec![match o.encoder.as_str() {

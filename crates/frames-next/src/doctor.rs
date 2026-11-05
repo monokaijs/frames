@@ -232,7 +232,7 @@ fn windows(report: &mut Report, o: &Options) {
             Err(error) if backend == "nvenc" => report.line(
                 false,
                 "encoder nvenc",
-                format!("{error:#}. Hosting falls back to the next encoder; an NVIDIA driver 551 or newer gives the lowest latency"),
+                format!("{error:#}. Hosting falls back to the next encoder; an NVIDIA driver 522 or newer gives the lowest latency"),
             ),
             Err(error) => report.info(&format!("encoder {backend}"), format!("unavailable: {error:#}")),
         }
