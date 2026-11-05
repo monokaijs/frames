@@ -94,8 +94,42 @@ pub struct MacCapture {
 // only used from the owning thread and freed once.
 unsafe impl Send for MacCapture {}
 
+/// Other processes' on-screen application windows as JSON:
+/// `[{"id": CGWindowID, "title": "..."}]`, front to back.
+pub fn windows_json() -> String {
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        // SAFETY: Swift writes at most `capacity` bytes.
+        let length = unsafe { ffi::frames_mac_windows(buffer.as_mut_ptr(), buffer.len()) };
+        if length <= buffer.len() {
+            buffer.truncate(length);
+            return String::from_utf8_lossy(&buffer).into_owned();
+        }
+        buffer.resize(length, 0);
+    }
+}
+
 impl MacCapture {
     pub fn start(fps: u32, synthetic: bool) -> Result<Self, MediaError> {
+        Self::open(fps, |callbacks| unsafe {
+            // SAFETY: the callbacks' context outlives the capture.
+            ffi::frames_mac_capture_start(fps, synthetic, callbacks)
+        })
+    }
+
+    /// One window by CGWindowID. It reports a failure (see [`Self::events`])
+    /// and delivers nothing when that window cannot be captured.
+    pub fn window(window_id: u32, fps: u32) -> Result<Self, MediaError> {
+        Self::open(fps, |callbacks| unsafe {
+            // SAFETY: as in `start`.
+            ffi::frames_mac_capture_start_window(window_id, fps, callbacks)
+        })
+    }
+
+    fn open(
+        fps: u32,
+        start: impl FnOnce(ffi::Callbacks) -> *mut c_void,
+    ) -> Result<Self, MediaError> {
         let shared = Box::new(Shared::default());
         let callbacks = ffi::Callbacks {
             on_frame: Some(on_frame),
@@ -103,8 +137,8 @@ impl MacCapture {
             on_event: Some(on_event),
             ..ffi::Callbacks::empty(&*shared as *const Shared as *mut c_void)
         };
-        // SAFETY: `shared` outlives the capture (stopped in Drop first).
-        let handle = unsafe { ffi::frames_mac_capture_start(fps, synthetic, callbacks) };
+        // `shared` outlives the capture (stopped in Drop first).
+        let handle = start(callbacks);
         if handle.is_null() {
             return Err(MediaError::Backend("capture could not start".into()));
         }

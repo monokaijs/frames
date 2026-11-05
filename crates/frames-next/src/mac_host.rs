@@ -10,8 +10,8 @@ use crate::{Options, StreamInfo, send_info};
 use anyhow::{Context, Result, bail};
 use frames_input::{Motion, MotionReceiver, Pointer};
 use frames_media::api::{
-    CaptureConfig, CaptureEvent, CaptureSource, EncodeParams, Gop, MediaClock, MediaTransport,
-    PathKind, VideoFrame,
+    CaptureConfig, CaptureEvent, CaptureSource, EncodeParams, EncoderControl, Gop, MediaClock,
+    MediaTransport, PathKind, VideoEncoder, VideoFrame,
 };
 use frames_media::clock::SystemClock;
 use frames_media::host::{HostConfig, HostSession};
@@ -28,6 +28,15 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     // Input, clipboard, and files arrive on the viewer's tagged streams.
     let services = crate::services::HostServices::start(&session, &o);
     tokio::task::spawn_blocking(move || stream(&handle, &session, &o, &services)).await?
+}
+
+/// Clears a flag when dropped, so a helper thread stops with the session.
+struct StopOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
 }
 
 fn first_frame(capture: &mut MacCapture, clock: &SystemClock) -> Result<VideoFrame> {
@@ -65,7 +74,10 @@ fn stream(
             "input: this program lacks the Accessibility permission; macOS will ignore the viewer's input"
         );
     }
-    let mut capture = MacCapture::start(o.fps, o.qa_source)?;
+    let mut capture = match o.window_id {
+        Some(id) => MacCapture::window(u32::try_from(id).context("not a window id")?, o.fps)?,
+        None => MacCapture::start(o.fps, o.qa_source)?,
+    };
     capture.configure(CaptureConfig {
         fps: o.fps,
         separate_cursor: true,
@@ -93,6 +105,7 @@ fn stream(
         height,
         fps: o.fps,
         platform: crate::platform().into(),
+        name: crate::device_name(o),
     };
     handle
         .block_on(send_info(session, info))
@@ -114,7 +127,7 @@ fn stream(
         width,
         height,
         fps: o.fps,
-        bitrate_bps: o.mbps * 1_000_000,
+        bitrate_bps: o.start_mbps() * 1_000_000,
         vbv_frames: 1.0,
         gop: Gop::Infinite,
         intra_refresh_frames: None,
@@ -124,8 +137,8 @@ fn stream(
     let media = session.media();
     let rate = RateConfig {
         min_bps: 2_000_000,
-        max_bps: (o.mbps * 2).max(20) * 1_000_000,
-        start_bps: o.mbps * 1_000_000,
+        max_bps: o.max_mbps() * 1_000_000,
+        start_bps: o.start_mbps() * 1_000_000,
     };
     let mut config = HostConfig::new(1, 1, rate);
     if let Some(pacing) = o.pacing {
@@ -153,12 +166,28 @@ fn stream(
     let mut last_encode_us = 0u64;
     let frame_interval_us = 1_000_000 / u64::from(o.fps.max(1));
     let mut pending = Some(first);
+    let mut follower = crate::resize::Follower::new((width, height));
+    let mut resize_stream = None;
     let (mut frames, mut pointers) = (0u64, 0u64);
     // QA runs have no injector: relative motion is summed here instead, so
     // a run can check that all of it arrived once.
     let (mut qa_relative, mut qa_motion, mut qa_total) =
         (false, MotionReceiver::default(), (0i64, 0i64));
     let mut encode_us = Vec::new();
+    // A shared window moves: input follows its current frame, looked up off
+    // this thread (listing windows takes milliseconds).
+    let bounds = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let watching = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let _watcher = o.window_id.filter(|_| injector.is_some()).map(|id| {
+        let (bounds, watching) = (bounds.clone(), watching.clone());
+        std::thread::spawn(move || {
+            while watching.load(Ordering::Relaxed) {
+                *bounds.lock().unwrap() = crate::catalog::mac_bounds(id);
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        })
+    });
+    let _stop_watching = StopOnDrop(watching);
     loop {
         if o.deadline().is_some_and(|d| started.elapsed() >= d) {
             break;
@@ -166,6 +195,11 @@ fn stream(
         if session.is_closed() {
             println!("the viewer left");
             break;
+        }
+        if let Some(injector) = &mut injector
+            && let Some((x, y, width, height)) = *bounds.lock().unwrap()
+        {
+            injector.set_area(x, y, width, height);
         }
         let path = media.path();
         let key = media.selected_path_key();
@@ -188,9 +222,8 @@ fn stream(
             None => match capture.next(clock.now_us() + 500) {
                 Ok(CaptureEvent::Frame(frame)) => Some(frame),
                 Ok(CaptureEvent::Lost) => bail!("the capture source went away"),
-                Ok(CaptureEvent::Resized { width, height }) => {
-                    bail!("the source resized to {width}x{height}; restart the host")
-                }
+                // Frames follow at the new size (`crate::resize`).
+                Ok(CaptureEvent::Resized { .. }) => None,
                 Ok(CaptureEvent::Timeout) => None,
                 Err(error) => bail!("capture failed: {error}"),
             },
@@ -212,7 +245,23 @@ fn stream(
             }
             None => None,
         };
-        if let Some(frame) = frame {
+        let sized = frame.map(|frame| {
+            let size = frame.surface.size();
+            (frame, size)
+        });
+        if let crate::resize::Step::Encode(frame, resized) = follower.step(sized, Instant::now()) {
+            if let Some(size) = resized {
+                let params = EncodeParams {
+                    width: size.0,
+                    height: size.1,
+                    bitrate_bps: host.target_bps(),
+                    ..params
+                };
+                encoder.control(EncoderControl::Reconfigure(params))?;
+                encoder.control(EncoderControl::ForceKeyframe)?;
+                println!("source resized to {}x{}", size.0, size.1);
+                crate::resize::announce(handle, session, &mut resize_stream, size)?;
+            }
             let before = clock.now_us();
             last_encode_us = before;
             host.encode(before, &mut encoder, &frame)?;

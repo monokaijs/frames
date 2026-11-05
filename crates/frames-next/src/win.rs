@@ -6,7 +6,7 @@ use frames_media::api::MediaClock;
 use frames_media::clock::SystemClock;
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -25,16 +25,22 @@ pub fn dpi_aware() {
     }
 }
 
-/// Set when the user closes a window created here.
-static CLOSED: AtomicU32 = AtomicU32::new(0);
+thread_local! {
+    /// The picture's size: the viewer window keeps its shape when resized,
+    /// so the picture fills it (no bars).
+    static ASPECT: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
+    /// Set when the user closes a window this thread created (each viewer
+    /// window runs on its own thread, so closing one ends only its session).
+    static CLOSED: Cell<bool> = const { Cell::new(false) };
+}
 
 pub fn close_requested() -> bool {
-    CLOSED.load(Ordering::Relaxed) > 0
+    CLOSED.with(Cell::get)
 }
 
 fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     if message == WM_CLOSE {
-        CLOSED.fetch_add(1, Ordering::Relaxed);
+        CLOSED.with(|closed| closed.set(true));
         return LRESULT(0);
     }
     unsafe { DefWindowProcW(hwnd, message, w, l) }
@@ -409,6 +415,14 @@ unsafe extern "system" fn viewer_procedure(
             return LRESULT(1);
         }
     }
+    if message == WM_SIZING
+        && let Some(aspect) = ASPECT.with(Cell::get)
+    {
+        // SAFETY: WM_SIZING carries the proposed window rectangle.
+        let rect = unsafe { &mut *(l.0 as *mut RECT) };
+        keep_aspect(rect, w.0 as u32, aspect);
+        return LRESULT(1);
+    }
     if let Some(captured) = viewer_input(hwnd, message, w, l) {
         CAPTURED.with(|c| c.borrow_mut().push(captured));
         // Keys go to the host only; F10/Alt must not open the system menu.
@@ -493,6 +507,88 @@ pub fn window(title: PCWSTR, kind: Kind, x: i32, width: u32, height: u32) -> Res
             Some(instance.into()),
             None,
         )?)
+    }
+}
+
+/// Border and title bar sizes of a viewer window (left+right, top+bottom).
+fn frame_extra() -> (i32, i32) {
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false);
+    }
+    (rect.right - rect.left, rect.bottom - rect.top)
+}
+
+/// Adjusts a window rectangle being dragged so its client area has the
+/// picture's shape: the dragged edge decides, the opposite one follows.
+fn keep_aspect(rect: &mut RECT, edge: u32, (width, height): (u32, u32)) {
+    let (extra_w, extra_h) = frame_extra();
+    let client_w = (rect.right - rect.left - extra_w).max(1);
+    let client_h = (rect.bottom - rect.top - extra_h).max(1);
+    let ratio = f64::from(width.max(1)) / f64::from(height.max(1));
+    if matches!(edge, WMSZ_TOP | WMSZ_BOTTOM) {
+        let new_w = (f64::from(client_h) * ratio).round() as i32;
+        rect.right = rect.left + new_w + extra_w;
+    } else {
+        let new_h = (f64::from(client_w) / ratio).round() as i32;
+        if matches!(edge, WMSZ_TOP | WMSZ_TOPLEFT | WMSZ_TOPRIGHT) {
+            rect.top = rect.bottom - new_h - extra_h;
+        } else {
+            rect.bottom = rect.top + new_h + extra_h;
+        }
+    }
+}
+
+/// The viewer window keeps this picture shape while the user resizes it.
+pub fn set_aspect(width: u32, height: u32) {
+    ASPECT.with(|aspect| aspect.set(Some((width, height))));
+}
+
+/// The size of a window's client area.
+pub fn client_size(hwnd: HWND) -> (u32, u32) {
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut rect);
+    }
+    (
+        (rect.right - rect.left).max(0) as u32,
+        (rect.bottom - rect.top).max(0) as u32,
+    )
+}
+
+/// The usable desktop area (without the taskbar), for sizing viewers.
+pub fn work_area() -> (u32, u32) {
+    let mut rect = RECT::default();
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut rect as *mut RECT as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if ok.is_err() || rect.right <= rect.left {
+        return (1280, 720);
+    }
+    (
+        (rect.right - rect.left) as u32,
+        (rect.bottom - rect.top) as u32,
+    )
+}
+
+/// Gives a window this client size, keeping its position.
+pub fn set_client_size(hwnd: HWND, width: u32, height: u32) {
+    let (extra_w, extra_h) = frame_extra();
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            width as i32 + extra_w,
+            height as i32 + extra_h,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
     }
 }
 

@@ -11,7 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define FRAMES_MAC_ABI_VERSION 3u
+#define FRAMES_MAC_ABI_VERSION 4u
 
 typedef struct FramesMacCallbacks {
     void *context;
@@ -73,6 +73,14 @@ bool frames_mac_screen_capture_preflight(void);
 // Screen Recording permission) uses a generated 1920x1080 source instead.
 void *frames_mac_capture_start(uint32_t fps, bool synthetic, FramesMacCallbacks callbacks);
 void frames_mac_capture_stop(void *capture);
+// Captures one window (ABI 4) by CGWindowID, cursor excluded; no generated
+// fallback: a window that cannot be captured reports CAPTURE_FAILED.
+void *frames_mac_capture_start_window(uint32_t window_id, uint32_t fps, FramesMacCallbacks callbacks);
+// Other processes' on-screen application windows (ABI 4) as a UTF-8 JSON
+// array of {"id": CGWindowID, "title": string, "x", "y", "width", "height"}
+// (global points, top-left origin), front to back. Writes it to
+// `buffer` when it fits in `capacity` bytes; returns its length either way.
+size_t frames_mac_windows(uint8_t *buffer, size_t capacity);
 
 // A deterministic generated BGRA picture for `index` (+1). Two calls with the
 // same index produce identical pixels.
@@ -145,6 +153,11 @@ void frames_mac_presenter_post_synthetic_input(void *presenter, uint64_t step);
 void frames_mac_presenter_set_relative(void *presenter, bool relative, bool lock_pointer);
 double frames_mac_presenter_refresh_hz(void *presenter);
 void frames_mac_presenter_free(void *presenter);
+// Whether the user closed a windowed presenter's window (ABI 4).
+bool frames_mac_presenter_closed(void *presenter);
+// The stream's new size (ABI 4): the drawable follows it and the window
+// takes its shape at its current scale, within the screen.
+void frames_mac_presenter_resize(void *presenter, uint32_t width, uint32_t height);
 
 // The general pasteboard (ABI 2), for clipboard sharing. Reads return the
 // length and a malloc'd copy in *out (free it with frames_mac_free), or -1

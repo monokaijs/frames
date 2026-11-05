@@ -1,7 +1,6 @@
 //! Slint owns the main thread; network discovery, helpers and child supervision
 //! run off-thread. Remote application windows still use the native clients.
 use anyhow::{Context, Result};
-use frames_core::trust::TrustStore;
 use serde::{Deserialize, Serialize};
 use slint::winit_030::{
     EventResult as WinitEventResult, WinitWindowAccessor, winit::event::WindowEvent,
@@ -10,7 +9,7 @@ use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use std::{
     collections::BTreeSet,
     fs,
-    net::{IpAddr, SocketAddr, UdpSocket},
+    net::IpAddr,
     path::PathBuf,
     process::{Child, Command, Stdio},
     rc::Rc,
@@ -27,6 +26,8 @@ mod launcher_instance;
 #[cfg(any(windows, target_os = "macos"))]
 #[path = "launcher_tray.rs"]
 mod launcher_tray;
+#[path = "next_sessions.rs"]
+mod next_sessions;
 #[path = "sharing_picker.rs"]
 mod sharing_picker;
 #[path = "window_style.rs"]
@@ -121,45 +122,12 @@ impl SessionOptions {
         );
         Ok(())
     }
-    fn connection_args(&self, address: SocketAddr) -> Vec<String> {
-        let mut args = vec![
-            "connect".into(),
-            address.to_string(),
-            "--codec".into(),
-            self.codec.clone(),
-        ];
-        args.extend(["--quality".into(), self.quality.name().into()]);
-        if self.bandwidth_mbps != 0 {
-            args.extend(["--bandwidth-mbps".into(), self.bandwidth_mbps.to_string()]);
-        }
-        if self.audio {
-            args.push("--audio".into());
-        }
-        if self.desktop {
-            args.extend(["--view".into(), "desktop".into()]);
-        }
-        if !self.clipboard {
-            args.push("--no-clipboard".into());
-        }
-        args
+    /// Sessions run on the v2 stack (`frames next`, see `next_sessions`).
+    fn connection_args(&self, target: &str) -> Vec<String> {
+        next_sessions::connect_args(self, target)
     }
     fn sharing_args(&self) -> Vec<String> {
-        let mut args = vec![
-            "host".into(),
-            "--pair".into(),
-            "--max-streams".into(),
-            self.max_streams.to_string(),
-        ];
-        if self.unattended {
-            args.push("--unattended".into());
-        }
-        if !self.clipboard {
-            args.push("--no-clipboard".into());
-        }
-        if self.encoder != "auto" {
-            args.extend(["--encoder".into(), self.encoder.clone()]);
-        }
-        args
+        next_sessions::sharing_args(self)
     }
     fn from_ui(ui: &Launcher) -> Self {
         Self {
@@ -214,7 +182,7 @@ impl Preferences {
         fs::rename(temporary, path)?;
         Ok(())
     }
-    fn remember(&mut self, address: SocketAddr) {
+    fn remember(&mut self, address: &str) {
         let address = address.to_string();
         self.recent.retain(|item| item.address != address);
         self.recent.insert(
@@ -234,28 +202,17 @@ fn now() -> u64 {
         .as_secs()
 }
 
-/// Only numeric IP endpoints are accepted by the transport. Supply the normal
-/// Frames port when omitted, including for bare IPv6 addresses.
-fn endpoint(value: &str) -> Result<SocketAddr> {
-    let value = value.trim();
-    if let Ok(address) = value.parse::<SocketAddr>() {
-        anyhow::ensure!(address.port() != 0, "Use a port between 1 and 65535.");
-        return Ok(address);
-    }
-    if let Ok(ip) = value.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, 47990));
-    }
-    anyhow::bail!("Enter a numeric IP address, such as 192.168.1.10:47990 or [::1]:47990.")
-}
-
-fn connection_device_id(address: SocketAddr, expected_id: &str) -> String {
+fn connection_device_id(target: &str, expected_id: &str) -> String {
     if !expected_id.is_empty() {
         return expected_id.into();
+    }
+    if frames_next::directory::is_device_id(target) {
+        return target.into();
     }
     crate::connection_history::load()
         .unwrap_or_default()
         .into_iter()
-        .find(|c| c.address == address.to_string())
+        .find(|c| c.address == target)
         .map(|c| c.device_id)
         .unwrap_or_default()
 }
@@ -273,6 +230,8 @@ struct Device {
     preview: Vec<u8>,
     connection_audio: bool,
     connection_desktop: bool,
+    /// Where a nearby device answered, so a typed IP finds its id.
+    addresses: Vec<IpAddr>,
 }
 impl From<Device> for DeviceRow {
     fn from(value: Device) -> Self {
@@ -342,21 +301,18 @@ fn recent_rows(prefs: &Preferences) -> Vec<Device> {
         .collect()
 }
 fn trusted_rows() -> Result<Vec<Device>> {
-    Ok(TrustStore::load()?
-        .peers
+    Ok(frames_next::directory::trusted()?
         .into_iter()
-        .map(|(id, peer)| Device {
-            name: peer.name,
-            address: String::new(),
-            detail: if !peer.allow_control {
-                "Host only"
-            } else if peer.unattended {
-                "Unattended"
+        .map(|device| Device {
+            name: device.name,
+            address: device.id.clone(),
+            detail: if device.control {
+                "Connects without a prompt"
             } else {
-                "Ask to connect"
+                "View only"
             }
             .into(),
-            fingerprint: id,
+            fingerprint: device.id,
             trusted: true,
             ..Default::default()
         })
@@ -376,6 +332,8 @@ enum Action {
     SaveDeviceName(String),
     SaveCloseBehavior(CloseBehavior, bool),
     Stop(i32),
+    /// The answer to the open pairing prompt (`frames_next::launcher`).
+    AnswerPairing(String),
     Discover,
     Refresh,
     Permission(String),
@@ -401,6 +359,8 @@ enum Event {
     Nearby(Result<Vec<Device>, String>),
     Permissions(Result<serde_json::Value, String>),
     Sessions(Vec<(i32, String, String, bool)>),
+    /// A device asks to connect to this host: its name and pairing code.
+    Pairing(Option<(String, String)>),
 }
 
 fn bind_settings_autosave(ui: &Launcher, actions: mpsc::Sender<Action>) {
@@ -482,6 +442,25 @@ struct Session {
     host: bool,
     child: Child,
     log: PathBuf,
+    /// Answers pairing requests (hosts).
+    stdin: Option<std::process::ChildStdin>,
+    /// How far the log has been read for reports.
+    offset: u64,
+    /// Viewers: the pairing code a new host shows, as "1234 5678".
+    code: String,
+}
+impl Session {
+    /// Sessions-list detail for a viewer: its phase and choices, with the
+    /// pairing code while the host decides.
+    fn status(&self) -> String {
+        use crate::launcher_status::Phase;
+        let detail = crate::launcher_status::session_detail(self.phase, &self.mode);
+        if matches!(self.phase, Phase::Waiting | Phase::Pairing) && !self.code.is_empty() {
+            format!("{detail} · pairing code {}", self.code)
+        } else {
+            detail
+        }
+    }
 }
 impl Drop for Session {
     fn drop(&mut self) {
@@ -503,8 +482,81 @@ struct Worker {
     requested_permissions: BTreeSet<String>,
     discovery_done: mpsc::Receiver<Result<Vec<Device>, String>>,
     discovery_tx: mpsc::Sender<Result<Vec<Device>, String>>,
+    /// The device whose pairing prompt is open.
+    pairing: Option<String>,
 }
 impl Worker {
+    fn close_pairing(&mut self) {
+        if self.pairing.take().is_some() {
+            let _ = self.events.send(Event::Pairing(None));
+        }
+    }
+    /// Acts on what session processes reported since the last poll; true
+    /// when the sessions list changed.
+    fn read_reports(&mut self) -> bool {
+        use next_sessions::Report;
+        let mut changed = false;
+        for index in 0..self.sessions.len() {
+            let session = &mut self.sessions[index];
+            let reports = next_sessions::read_reports(&session.log, &mut session.offset);
+            for report in reports {
+                let session = &mut self.sessions[index];
+                match report {
+                    Report::Pairing { device, name, code } if session.host => {
+                        self.pairing = Some(device);
+                        let code = format!(
+                            "{} {}",
+                            &code[..4.min(code.len())],
+                            &code[4.min(code.len())..]
+                        );
+                        let _ = self.events.send(Event::Pairing(Some((name, code))));
+                    }
+                    Report::PairingDone { device } => {
+                        if self.pairing.as_deref() == Some(device.as_str()) {
+                            self.close_pairing();
+                        }
+                    }
+                    Report::Code(code) if !session.host => {
+                        session.code = format!(
+                            "{} {}",
+                            &code[..4.min(code.len())],
+                            &code[4.min(code.len())..]
+                        );
+                        session.detail = session.status();
+                        changed = true;
+                    }
+                    Report::Host { device, name } if !session.host => {
+                        if !name.is_empty() {
+                            session.name = name.clone();
+                        }
+                        let _ = crate::connection_history::remember(&device, &device, &name, false);
+                        changed = true;
+                    }
+                    Report::Viewer {
+                        device,
+                        name,
+                        control,
+                    } if session.host => {
+                        let _ = crate::connection_history::remember(&device, &device, &name, true);
+                        self.notice(
+                            format!(
+                                "{} connected{}.",
+                                if name.is_empty() {
+                                    "A device"
+                                } else {
+                                    name.as_str()
+                                },
+                                if control { "" } else { " (view only)" }
+                            ),
+                            false,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        changed
+    }
     fn notice(&self, message: impl Into<String>, error: bool) {
         let _ = self.events.send(Event::Notice(message.into(), error));
     }
@@ -558,6 +610,7 @@ impl Worker {
         } else {
             format!("connection-{id}.log")
         });
+        let log_file = fs::File::create(&log)?;
         let mut command = Command::new(std::env::current_exe()?);
         command
             .args(args)
@@ -565,10 +618,10 @@ impl Worker {
             .env("FRAMES_LAUNCHER_PID", std::process::id().to_string())
             // Only this process holds the write end: the session ends when the
             // launcher does, even when it exits without running shutdown code.
-            .env(crate::lifetime::ENV, "1")
+            .env(frames_next::launcher::LIFETIME_ENV, "1")
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(fs::File::create(&log)?);
+            .stdout(log_file.try_clone()?)
+            .stderr(log_file);
         command.env_remove("FRAMES_EXPECTED_DEVICE_ID");
         if !expected_id.is_empty() {
             command.env("FRAMES_EXPECTED_DEVICE_ID", expected_id);
@@ -578,7 +631,8 @@ impl Worker {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000); // CREATE_NO_WINDOW, native pairing still works.
         }
-        let child = command.spawn().context("couldn't start session")?;
+        let mut child = command.spawn().context("couldn't start session")?;
+        let stdin = child.stdin.take();
         let phase = crate::launcher_status::Phase::Starting;
         // Hosts show their sharing scope; clients show live connection phase
         // followed by their view and audio choices.
@@ -593,10 +647,11 @@ impl Worker {
         self.sessions.push(Session {
             id,
             name,
+            // `next connect <target>`.
             address: if host {
                 String::new()
             } else {
-                args.get(1).cloned().unwrap_or_default()
+                args.get(2).cloned().unwrap_or_default()
             },
             detail,
             mode,
@@ -604,6 +659,9 @@ impl Worker {
             host,
             child,
             log,
+            stdin,
+            offset: 0,
+            code: String::new(),
         });
         self.publish_sessions();
         Ok(())
@@ -645,12 +703,17 @@ impl Worker {
                             .is_some_and(|selection| selection.argument() == *argument))),
                     "Refresh the window selection before sharing"
                 );
+                // v2 shares windows by title (each viewer window shows one).
                 let mut args = self.preferences.options.sharing_args();
-                if mode == 2 {
-                    args.push("--one-window".into());
-                }
                 for argument in windows {
-                    args.extend(["--share-window".into(), argument]);
+                    if let Some(choice) = self.sharing_choices.iter().find(|choice| {
+                        choice
+                            .selection
+                            .as_ref()
+                            .is_some_and(|selection| selection.argument() == argument)
+                    }) {
+                        args.extend(["--window".into(), choice.window.title.clone()]);
+                    }
                 }
                 self.spawn(
                     &args,
@@ -667,32 +730,34 @@ impl Worker {
                 self.notice("Sharing started with the windows you selected.", false);
             }
             Action::Connect(value, expected_id, audio, desktop) => {
-                let address = endpoint(&value)?;
+                let target = if frames_next::directory::is_device_id(&expected_id) {
+                    expected_id.clone()
+                } else {
+                    next_sessions::target(&value, &self.devices)?
+                };
                 anyhow::ensure!(
-                    !self
-                        .sessions
-                        .iter()
-                        .any(|s| !s.host && s.address == address.to_string()),
-                    "A connection to this address is already running. Manage it under Your sessions."
+                    !self.sessions.iter().any(|s| !s.host && s.address == target),
+                    "A connection to this device is already running. Manage it under Your sessions."
                 );
                 let mut options = self.preferences.options.clone();
                 options.audio = audio;
                 options.desktop = desktop;
-                let device_id = connection_device_id(address, &expected_id);
+                let device_id = connection_device_id(&target, &expected_id);
                 if let Some(saved) = crate::connection_preferences::load()?.get(&device_id) {
                     options.quality = saved.quality;
                 }
-                let args = options.connection_args(address);
+                let args = options.connection_args(&target);
+                let address = target.as_str();
                 let name = self
                     .devices
                     .iter()
-                    .find(|d| d.address == address.to_string())
+                    .find(|d| d.fingerprint == target)
                     .map(|d| d.name.clone())
                     .or_else(|| {
                         crate::connection_history::load()
                             .ok()?
                             .into_iter()
-                            .find(|c| c.address == address.to_string())
+                            .find(|c| c.device_id == target || c.address == target)
                             .map(|c| c.name)
                     })
                     .unwrap_or_else(|| "Remote device".into());
@@ -721,14 +786,14 @@ impl Worker {
                         true,
                     );
                 } else {
-                    self.notice("Connection started. If prompted, compare the pairing code on both devices.", false);
+                    self.notice(
+                        "Connecting. A new device must be approved on the other device.",
+                        false,
+                    );
                 }
             }
             Action::SaveConnectionChoices(value, expected_id, audio, desktop) => {
-                let Ok(address) = endpoint(&value) else {
-                    return Ok(());
-                };
-                let id = connection_device_id(address, &expected_id);
+                let id = connection_device_id(value.trim(), &expected_id);
                 if !id.is_empty() {
                     let saved = crate::connection_preferences::load()?;
                     crate::connection_preferences::update(&id, |p| {
@@ -774,6 +839,7 @@ impl Worker {
             Action::ToggleSharing => {
                 if let Some(index) = self.sessions.iter().position(|s| s.host) {
                     self.sessions.remove(index);
+                    self.close_pairing();
                     self.notice(
                         "Sharing stopped. This computer is no longer accepting connections.",
                         false,
@@ -815,9 +881,26 @@ impl Worker {
             }
             Action::Stop(id) => {
                 if let Some(index) = self.sessions.iter().position(|s| s.id == id) {
-                    self.sessions.remove(index);
+                    if self.sessions.remove(index).host {
+                        self.close_pairing();
+                    }
                     self.publish_sessions();
                     self.notice("Session stopped. The remote applications stay open.", false);
+                }
+            }
+            Action::AnswerPairing(answer) => {
+                self.close_pairing();
+                if let Some(stdin) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|s| s.host)
+                    .and_then(|s| s.stdin.as_mut())
+                {
+                    use std::io::Write;
+                    stdin
+                        .write_all(format!("{answer}\n").as_bytes())
+                        .and_then(|()| stdin.flush())
+                        .context("couldn't answer the pairing request")?;
                 }
             }
             Action::Discover => {
@@ -845,8 +928,8 @@ impl Worker {
             }
             Action::Revoke(id) => {
                 anyhow::ensure!(
-                    TrustStore::load()?.revoke(&id)?,
-                    "That device is no longer in the trust store."
+                    frames_next::directory::revoke(&id)?,
+                    "That device is no longer trusted."
                 );
                 self.refresh();
                 if let Ok(path) = crate::connection_history::preview_path(&id, false) {
@@ -862,12 +945,7 @@ impl Worker {
                     .into_iter()
                     .find(|c| c.device_id == id)
                     .context("Connect and verify this device before saving trust.")?;
-                TrustStore::load()?.approve(
-                    id,
-                    connection.name,
-                    self.preferences.options.unattended,
-                    connection.incoming,
-                )?;
+                frames_next::directory::trust(&id, &connection.name, true)?;
                 self.refresh();
                 self.notice("Device saved as trusted.", false);
             }
@@ -899,6 +977,7 @@ impl Worker {
         Ok(())
     }
     fn poll(&mut self) {
+        let reported = self.read_reports();
         if let Ok(result) = self.discovery_done.try_recv() {
             self.discovering = false;
             match result {
@@ -914,7 +993,7 @@ impl Worker {
         if !self.discovering && self.last_discovery.elapsed() >= Duration::from_secs(12) {
             let _ = self.handle(Action::Discover);
         }
-        let mut changed = false;
+        let mut changed = reported;
         if self.last_history_refresh.elapsed() >= Duration::from_secs(2) {
             self.last_history_refresh = std::time::Instant::now();
             if let Ok(history) = crate::connection_history::load() {
@@ -957,8 +1036,7 @@ impl Worker {
                         && phase != session.phase
                     {
                         session.phase = phase;
-                        session.detail =
-                            crate::launcher_status::session_detail(phase, &session.mode);
+                        session.detail = session.status();
                         changed = true;
                     }
                     index += 1;
@@ -1050,15 +1128,11 @@ fn open_permission(kind: &str) -> Result<()> {
         Ok(())
     }
 }
+/// What other devices enter to connect: this device's id.
 fn local_address() -> String {
-    // UDP connect selects a route without sending traffic or contacting a server.
-    UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| {
-            s.connect("192.0.2.1:47990")?;
-            s.local_addr()
-        })
-        .map(|a| format!("{}:47990", a.ip()))
-        .unwrap_or_else(|_| "Port 47990".into())
+    frames_next::directory::own_id()
+        .map(|id| format!("Device ID {id}"))
+        .unwrap_or_else(|error| format!("No device ID: {error:#}"))
 }
 
 pub fn run() -> Result<()> {
@@ -1171,6 +1245,7 @@ pub fn run() -> Result<()> {
             requested_permissions: BTreeSet::new(),
             discovery_tx,
             discovery_done,
+            pairing: None,
         };
         worker.refresh();
         loop {
@@ -1236,9 +1311,8 @@ pub fn run() -> Result<()> {
     let weak = ui.as_weak();
     ui.on_connection_address_edited(move || {
         if let Some(ui) = weak.upgrade()
-            && let Ok(address) = endpoint(&ui.get_address())
             && let Ok(saved) = crate::connection_preferences::load()
-            && let Some(p) = saved.get(&connection_device_id(address, ""))
+            && let Some(p) = saved.get(&connection_device_id(ui.get_address().trim(), ""))
         {
             ui.set_audio(p.audio);
             ui.set_desktop(p.desktop);
@@ -1303,6 +1377,14 @@ pub fn run() -> Result<()> {
     let tx = actions.clone();
     ui.on_revoke(move |id| {
         let _ = tx.send(Action::Revoke(id.to_string()));
+    });
+    let tx = actions.clone();
+    let weak = ui.as_weak();
+    ui.on_pairing_answer(move |answer| {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_pairing_open(false);
+        }
+        let _ = tx.send(Action::AnswerPairing(answer.to_string()));
     });
     let tx = actions.clone();
     ui.on_clear_history(move || {
@@ -1415,6 +1497,18 @@ pub fn run() -> Result<()> {
                         ui.set_screen_permission(-1); ui.set_control_permission(-1);
                         ui.set_notice(format!("Couldn't check macOS permissions: {error}").into()); ui.set_notice_error(true);
                     }
+                },
+                Event::Pairing(prompt) => match prompt {
+                    Some((name, code)) => {
+                        ui.set_pairing_name(name.into());
+                        ui.set_pairing_code(code.into());
+                        ui.set_pairing_open(true);
+                        // The person at this device has to see it, even with
+                        // the launcher hidden in the tray.
+                        ui.window().set_minimized(false);
+                        let _ = ui.show();
+                    }
+                    None => ui.set_pairing_open(false),
                 },
                 Event::Sessions(rows) => {
                     if rows.iter().any(|row| !row.3) { ui.set_connection_tab(1); }
@@ -1555,12 +1649,6 @@ mod tests {
         let saved = serde_json::to_string(&SessionOptions::from_ui(&ui)).unwrap();
         let options: SessionOptions = serde_json::from_str(&saved).unwrap();
         assert!(options.unattended);
-        assert!(
-            options
-                .sharing_args()
-                .iter()
-                .any(|arg| arg == "--unattended")
-        );
 
         ui.set_sharing(true);
         assert!(
@@ -1604,7 +1692,7 @@ mod tests {
         let path = directory.path().join("launcher.json");
         let mut preferences = Preferences::default();
         preferences.options.audio = true;
-        preferences.remember("127.0.0.1:47990".parse().unwrap());
+        preferences.remember("127.0.0.1:47990");
         for behavior in [CloseBehavior::Hide, CloseBehavior::Quit, CloseBehavior::Ask] {
             preferences.close_behavior = behavior;
             preferences.save_to(&path).unwrap();
@@ -1617,7 +1705,6 @@ mod tests {
 
     #[test]
     fn settings_reach_the_real_host_and_connect_cli() {
-        use clap::Parser;
         let options = SessionOptions {
             audio: true,
             desktop: true,
@@ -1625,54 +1712,38 @@ mod tests {
             unattended: true,
             codec: "hevc".into(),
             encoder: "qsv".into(),
-            bandwidth_mbps: 50,
+            bandwidth_mbps: 8,
             quality: frames_core::adaptive::QualityPreset::High,
             max_streams: 12,
         };
-        let connect = crate::Args::try_parse_from(
-            std::iter::once("frames".to_string())
-                .chain(options.connection_args(endpoint("127.0.0.1").unwrap())),
-        )
-        .unwrap();
-        assert!(matches!(
-            connect.command,
-            Some(crate::Command::Connect {
-                audio: true,
-                no_clipboard: true,
-                view: crate::ViewChoice::Desktop,
-                codec: crate::CodecChoice::Hevc,
-                bandwidth_mbps: 50,
-                ..
-            })
-        ));
-        let host = crate::Args::try_parse_from(
-            std::iter::once("frames".to_string()).chain(options.sharing_args()),
-        )
-        .unwrap();
-        assert!(matches!(
-            host.command,
-            Some(crate::Command::Host {
-                pair: true,
-                unattended: true,
-                no_clipboard: true,
-                max_streams: 12,
-                encoder: crate::EncoderChoice::Qsv,
-                ..
-            })
-        ));
+        let id = "a".repeat(64);
+        let connect = options.connection_args(&id);
+        assert!(frames_next::valid_command(&connect[1..]), "{connect:?}");
+        let has = |args: &[String], pair: [&str; 2]| args.windows(2).any(|w| w == pair);
+        assert!(has(&connect, ["--audio", "on"]));
+        assert!(has(&connect, ["--clipboard", "off"]));
+        assert!(has(&connect, ["--codec", "hevc"]));
+        // The bandwidth limit caps the quality preset's 50 Mbps.
+        assert!(has(&connect, ["--max-mbps", "8"]));
+        let host = options.sharing_args();
+        assert!(frames_next::valid_command(&host[1..]), "{host:?}");
+        assert!(has(&host, ["--prefer-encoder", "qsv"]));
+        assert!(has(&host, ["--clipboard", "off"]));
+        assert!(host.iter().any(|a| a == "--ask-launcher") && host.iter().any(|a| a == "--stay"));
         let defaults = SessionOptions::default();
         assert!(
             !defaults
                 .sharing_args()
                 .iter()
-                .any(|arg| arg == "--unattended" || arg == "--no-clipboard" || arg == "--encoder")
+                .any(|a| a == "--prefer-encoder")
         );
-        assert!(
-            !defaults
-                .connection_args(endpoint("127.0.0.1").unwrap())
-                .iter()
-                .any(|arg| arg == "--audio" || arg == "--view" || arg == "--no-clipboard")
-        );
+        let connect = defaults.connection_args(&id);
+        assert!(frames_next::valid_command(&connect[1..]));
+        assert!(has(&connect, ["--audio", "off"]) && !connect.iter().any(|a| a == "--codec"));
+        assert!(has(&connect, ["--max-mbps", "50"]));
+        // Application windows (the default view) or the full desktop.
+        assert!(connect.iter().any(|a| a == "--apps"));
+        assert!(!options.connection_args(&id).iter().any(|a| a == "--apps"));
     }
 
     #[test]
@@ -1723,9 +1794,10 @@ mod tests {
             .is_err()
         );
         // Every Settings choice is one the core and the host CLI accept.
+        // Every Settings choice is one the v2 host accepts.
         for encoder in &ENCODERS[1..] {
-            assert!(frames_core::codec::ENCODERS.contains(encoder));
-            assert!(crate::Args::try_parse_from(["frames", "host", "--encoder", encoder]).is_ok());
+            let args = ["host", "--prefer-encoder", encoder].map(String::from);
+            assert!(frames_next::valid_command(&args), "{encoder}");
         }
     }
 
@@ -1751,25 +1823,13 @@ mod tests {
     }
 
     #[test]
-    fn endpoints_supply_the_default_port_without_accepting_hostnames() {
-        assert_eq!(
-            endpoint(" 192.168.1.10 ").unwrap().to_string(),
-            "192.168.1.10:47990"
-        );
-        assert_eq!(endpoint("::1").unwrap().to_string(), "[::1]:47990");
-        assert_eq!(endpoint("[::1]:48000").unwrap().port(), 48000);
-        assert!(endpoint("example.com:47990").is_err());
-        assert!(endpoint("127.0.0.1:0").is_err());
-        assert!(endpoint("127.0.0.1:99999").is_err());
-    }
-    #[test]
     fn history_deduplicates_and_caps_recent_addresses() {
         let mut prefs = Preferences::default();
         for port in 1..=25 {
-            prefs.remember(SocketAddr::from(([127, 0, 0, 1], port)));
+            prefs.remember(&format!("127.0.0.1:{port}"));
         }
         assert_eq!(prefs.recent.len(), 20);
-        prefs.remember(SocketAddr::from(([127, 0, 0, 1], 20)));
+        prefs.remember("127.0.0.1:20");
         assert_eq!(prefs.recent.len(), 20);
         assert_eq!(prefs.recent[0].address, "127.0.0.1:20");
         assert_eq!(

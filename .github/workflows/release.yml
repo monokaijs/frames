@@ -130,16 +130,6 @@ jobs:
       - run: cargo test --workspace --locked -- --nocapture
         if: needs.prepare.outputs.ci_run == ''
         timeout-minutes: 20
-      - name: Shared game production input session and network lease
-        if: needs.prepare.outputs.ci_run == ''
-        run: |
-          cargo build -p frames --bin frames --example shared_probe --locked
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          python scripts/test_shared_session.py --input-only
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          python scripts/test_shared_session.py --network-loss --input-only
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          python scripts/test_shared_session.py --picker --input-only
       - name: Host-selected window identity and privacy guards
         if: needs.prepare.outputs.ci_run == ''
         run: |

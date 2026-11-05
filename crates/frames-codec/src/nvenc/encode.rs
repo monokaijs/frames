@@ -3,7 +3,7 @@
 
 use super::consts::*;
 use super::sys::*;
-use super::{DPB_FRAMES, EncodeTiming, NvencEncoder, POLL_SLEEP, nv_error};
+use super::{DPB_FRAMES, EncodeTiming, NvencEncoder, POLL_SLEEP, READ_TIMEOUT_US, nv_error};
 use crate::d3d11::D3D11Surface;
 use frames_media::api::{
     Chunk, Codec, EncodeParams, EncoderCaps, EncoderControl, EncoderFeatures, FrameKind,
@@ -256,6 +256,11 @@ impl NvencEncoder {
             let status = unsafe { lock_bitstream(self.encoder, &mut lock) };
             timing.polls += 1;
             if status == NV_ENC_ERR_LOCK_BUSY {
+                if clock.now_us().saturating_sub(picture.submit_us) > READ_TIMEOUT_US {
+                    return Err(MediaError::Backend(
+                        "NVENC did not finish the picture within 2 s".into(),
+                    ));
+                }
                 std::thread::sleep(POLL_SLEEP);
                 continue;
             }

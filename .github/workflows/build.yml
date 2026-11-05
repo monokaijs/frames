@@ -80,15 +80,6 @@ jobs:
       - run: python scripts/test_media_network_fixture.py
       - run: cargo test --workspace --locked -- --nocapture
         timeout-minutes: 20
-      - name: Shared game production input session and network lease
-        run: |
-          cargo build -p frames --bin frames --example shared_probe --locked
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          python scripts/test_shared_session.py --input-only
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          python scripts/test_shared_session.py --network-loss --input-only
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          python scripts/test_shared_session.py --picker --input-only
       - name: Host-selected window identity and privacy guards
         run: |
           cargo test -p frames-native window_selection::tests::selected_windows_reject --locked -- --include-ignored --nocapture

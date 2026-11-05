@@ -1,0 +1,196 @@
+//! A shared window that changes size, followed end to end so the viewer's
+//! window keeps the picture's shape (no bars above and below it).
+//!
+//! The host waits for the size to settle (a drag resizes many times a
+//! second), reconfigures its encoder at the new size with a keyframe, and
+//! tells the viewer on a `RESIZE` stream (one JSON line per change). The
+//! viewer recreates its decoder and resizes its window to the new shape at
+//! its current scale.
+
+use anyhow::Result;
+use std::time::{Duration, Instant};
+
+/// How long a new size must hold before the encoder follows it.
+const SETTLE: Duration = Duration::from_millis(150);
+
+/// What to do with a captured frame.
+pub enum Step<F> {
+    /// Encode it, first reconfiguring to this size when it is new.
+    Encode(F, Option<(u32, u32)>),
+    /// The size is still changing; the frame is held for later.
+    Wait,
+}
+
+/// Host: tracks the encoder's size against captured frames.
+pub struct Follower<F> {
+    current: (u32, u32),
+    /// The newest frame at a size not yet followed, and since when frames
+    /// have had that size.
+    held: Option<(F, (u32, u32), Instant)>,
+}
+
+impl<F> Follower<F> {
+    pub fn new(size: (u32, u32)) -> Self {
+        Self {
+            current: size,
+            held: None,
+        }
+    }
+
+    /// `frame` of `size` just arrived (`None`: no new frame, but a held one
+    /// may have settled by now).
+    pub fn step(&mut self, frame: Option<(F, (u32, u32))>, now: Instant) -> Step<F> {
+        match frame {
+            Some((frame, size)) if size == self.current => {
+                self.held = None;
+                Step::Encode(frame, None)
+            }
+            Some((frame, size)) => {
+                let since = match &self.held {
+                    Some((_, held, since)) if *held == size => *since,
+                    _ => now,
+                };
+                self.held = Some((frame, size, since));
+                self.settle(now)
+            }
+            None => self.settle(now),
+        }
+    }
+
+    fn settle(&mut self, now: Instant) -> Step<F> {
+        match self.held.take() {
+            Some((frame, size, since)) if now.duration_since(since) >= SETTLE => {
+                self.current = size;
+                Step::Encode(frame, Some(size))
+            }
+            held => {
+                self.held = held;
+                Step::Wait
+            }
+        }
+    }
+}
+
+/// Host: tells the viewer the stream's new size, opening the stream the
+/// first time.
+pub fn announce(
+    handle: &tokio::runtime::Handle,
+    session: &frames_net::Session,
+    stream: &mut Option<iroh::endpoint::SendStream>,
+    (width, height): (u32, u32),
+) -> Result<()> {
+    if stream.is_none() {
+        let (send, _) = handle.block_on(crate::streams::open(session, crate::streams::RESIZE))?;
+        *stream = Some(send);
+    }
+    let mut line = serde_json::to_vec(&serde_json::json!({"width": width, "height": height}))?;
+    line.push(b'\n');
+    let send = stream.as_mut().expect("opened above");
+    handle.block_on(send.write_all(&line))?;
+    Ok(())
+}
+
+/// Viewer: the host's size changes, from its `RESIZE` stream.
+pub async fn receive(recv: iroh::endpoint::RecvStream, sizes: std::sync::mpsc::Sender<(u32, u32)>) {
+    let mut lines = tokio::io::BufReader::new(recv);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match tokio::io::AsyncBufReadExt::read_line(&mut lines, &mut line).await {
+            Ok(n) if n > 0 => {}
+            _ => return,
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        let (Some(width), Some(height)) = (value["width"].as_u64(), value["height"].as_u64())
+        else {
+            continue;
+        };
+        if sizes.send((width as u32, height as u32)).is_err() {
+            return;
+        }
+    }
+}
+
+/// Viewer (Windows; FramesMac does this itself): the window's new client size for a stream that changed from
+/// `old` to `new`, keeping its current scale, within `limit` (the screen).
+#[cfg(any(windows, test))]
+pub fn window_size(
+    client: (u32, u32),
+    old: (u32, u32),
+    new: (u32, u32),
+    limit: (u32, u32),
+) -> (u32, u32) {
+    let scale = f64::from(client.0.max(1)) / f64::from(old.0.max(1));
+    let fit = (f64::from(limit.0) / f64::from(new.0.max(1)))
+        .min(f64::from(limit.1) / f64::from(new.1.max(1)));
+    let scale = scale.min(fit);
+    (
+        (f64::from(new.0) * scale).round().max(1.0) as u32,
+        (f64::from(new.1) * scale).round().max(1.0) as u32,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_drag_is_followed_once_it_settles_and_frames_wait_meanwhile() {
+        let t = Instant::now();
+        let ms = |n| t + Duration::from_millis(n);
+        let mut follower = Follower::new((800, 600));
+        assert!(matches!(
+            follower.step(Some((1, (800, 600))), ms(0)),
+            Step::Encode(1, None)
+        ));
+        // Dragging: sizes change faster than they settle.
+        assert!(matches!(
+            follower.step(Some((2, (810, 600))), ms(10)),
+            Step::Wait
+        ));
+        assert!(matches!(
+            follower.step(Some((3, (830, 610))), ms(100)),
+            Step::Wait
+        ));
+        assert!(matches!(
+            follower.step(Some((4, (830, 610))), ms(200)),
+            Step::Wait
+        ));
+        // Still since 100 ms: the held frame goes out at the new size even
+        // without another frame (a still window sends none).
+        assert!(matches!(
+            follower.step(None, ms(260)),
+            Step::Encode(4, Some((830, 610)))
+        ));
+        assert!(matches!(
+            follower.step(Some((5, (830, 610))), ms(270)),
+            Step::Encode(5, None)
+        ));
+        // Back to the old size before settling: nothing to reconfigure.
+        assert!(matches!(
+            follower.step(Some((6, (900, 610))), ms(300)),
+            Step::Wait
+        ));
+        assert!(matches!(
+            follower.step(Some((7, (830, 610))), ms(320)),
+            Step::Encode(7, None)
+        ));
+        assert!(matches!(follower.step(None, ms(600)), Step::Wait));
+    }
+
+    #[test]
+    fn the_viewer_window_keeps_its_scale_within_the_screen() {
+        // Half scale, the host window grows taller.
+        assert_eq!(
+            window_size((400, 300), (800, 600), (800, 800), (1920, 1080)),
+            (400, 400)
+        );
+        // Too tall for the screen at that scale: fitted.
+        assert_eq!(
+            window_size((800, 600), (800, 600), (800, 2400), (1920, 1080)),
+            (360, 1080)
+        );
+    }
+}

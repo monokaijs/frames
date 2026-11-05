@@ -3,7 +3,7 @@
 
 use std::ffi::c_void;
 
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 pub const CODEC_H264: u32 = 0;
 pub const CODEC_HEVC: u32 = 1;
@@ -62,6 +62,12 @@ unsafe extern "C" {
     pub fn frames_mac_capture_start(fps: u32, synthetic: bool, callbacks: Callbacks)
     -> *mut c_void;
     pub fn frames_mac_capture_stop(capture: *mut c_void);
+    pub fn frames_mac_capture_start_window(
+        window_id: u32,
+        fps: u32,
+        callbacks: Callbacks,
+    ) -> *mut c_void;
+    pub fn frames_mac_windows(buffer: *mut u8, capacity: usize) -> usize;
     pub fn frames_mac_synthetic_frame(width: u32, height: u32, index: u64) -> *mut c_void;
     pub fn frames_mac_pixel_buffer_difference(a: *mut c_void, b: *mut c_void) -> f64;
     pub fn frames_mac_encoder_new(
@@ -102,6 +108,8 @@ unsafe extern "C" {
     pub fn frames_mac_presenter_last_on_glass_ns(presenter: *mut c_void) -> u64;
     pub fn frames_mac_presenter_refresh_hz(presenter: *mut c_void) -> f64;
     pub fn frames_mac_presenter_free(presenter: *mut c_void);
+    pub fn frames_mac_presenter_closed(presenter: *mut c_void) -> bool;
+    pub fn frames_mac_presenter_resize(presenter: *mut c_void, width: u32, height: u32);
     pub fn frames_mac_presenter_set_input(
         presenter: *mut c_void,
         context: *mut c_void,

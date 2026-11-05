@@ -274,6 +274,11 @@ export component Launcher inherits Window {
     in property <bool> update-ready: false;
     in property <bool> update-error: false;
     in-out property <bool> update-prompt-open: false;
+    // A device asks to connect while this device shares.
+    in-out property <bool> pairing-open: false;
+    in property <string> pairing-name;
+    in property <string> pairing-code;
+    callback pairing-answer(string);
     in-out property <bool> update-restart-busy: false;
     in-out property <string> update-restart-error;
     in property <[DeviceRow]> nearby;
@@ -305,7 +310,7 @@ export component Launcher inherits Window {
     callback confirm-restart-update();
 
     FocusScope {
-        enabled: root.revoke-id == "" && !root.permissions-open && !root.close-prompt-open && !root.window-picker-open;
+        enabled: root.revoke-id == "" && !root.permissions-open && !root.close-prompt-open && !root.window-picker-open && !root.pairing-open;
         HorizontalLayout {
             spacing: 0px;
             Rectangle { width: 56px; }
@@ -353,7 +358,7 @@ export component Launcher inherits Window {
                                             VerticalLayout {
                                                 spacing: 3px;
                                                 Text { text: root.device-name; font-size: 15px; font-weight: 500; color: Theme.ink; overflow: elide; }
-                                                TextInput { text: root.local-address; read-only: true; single-line: true; font-size: 11px; color: Theme.muted; accessible-label: "This device's address. Other devices connect to it."; }
+                                                TextInput { text: root.local-address; read-only: true; single-line: true; font-size: 11px; color: Theme.muted; accessible-label: "This device's ID. Other devices connect to it."; }
                                             }
                                             // Controls sit on the card's bottom edge in both columns so they line up.
                                             Rectangle { vertical-stretch: 1; }
@@ -373,11 +378,11 @@ export component Launcher inherits Window {
                                         VerticalLayout {
                                             min-width: 290px; horizontal-stretch: 1.1; spacing: 10px;
                                             SectionTitle { text: "Connect to a device"; }
-                                            MutedText { text: "Enter the address shown on the other device."; font-size: 11px; }
+                                            MutedText { text: "Enter the device ID shown on the other device, or pick it under Devices."; font-size: 11px; }
                                             Rectangle { vertical-stretch: 1; }
                                             HorizontalLayout {
                                                 spacing: 8px;
-                                                LineEdit { height: 32px; horizontal-stretch: 1; text <=> root.address; placeholder-text: "192.168.1.10 or 192.168.1.10:47990"; accessible-label: "Address of the other device"; edited => { root.connection-address-edited(); } accepted => { if root.address != "" { root.connect(root.address); } } }
+                                                LineEdit { height: 32px; horizontal-stretch: 1; text <=> root.address; placeholder-text: "Device ID, or its IP address on this network"; accessible-label: "Device ID of the other device"; edited => { root.connection-address-edited(); } accepted => { if root.address != "" { root.connect(root.address); } } }
                                                 ConnectionButton {
                                                     primary: true; enabled: root.address != "";
                                                     audio <=> root.audio; desktop <=> root.desktop;
@@ -498,10 +503,6 @@ export component Launcher inherits Window {
                             }
                             SettingsSection {
                                 title: "Sharing";
-                                SettingRow { title: "Unattended access"; detail: root.background-sharing-running ? "Enabled by sharing at login. Accept and trust devices to allow prompt-free access." : root.sharing ? "Stop sharing to change this setting." : "Enable, then accept and trust a device to allow reconnecting without a prompt.";
-                                    if root.background-sharing-running: AppSwitch { checked: true; enabled: false; accessible-label: "Unattended access"; }
-                                    if !root.background-sharing-running: AppSwitch { checked <=> root.unattended; toggled => { root.settings-edited(); } enabled: root.unattended-editable; accessible-label: "Unattended access"; }
-                                }
                                 SettingRow { title: "Shared window limit"; detail: "Maximum windows streamed at the same time, per connection.";
                                     SpinBox { width: 140px; minimum: 1; maximum: 32; value <=> root.max-streams; edited => { root.settings-edited(); } accessible-label: "Shared window limit"; }
                                 }
@@ -669,6 +670,31 @@ export component Launcher inherits Window {
                     alignment: end; spacing: 8px;
                     AppButton { label: "Cancel"; enabled: !root.update-restart-busy; clicked => { root.update-prompt-open = false; } }
                     AppButton { label: root.update-restart-busy ? "Preparing update..." : "Disconnect and update"; primary: true; enabled: !root.update-restart-busy; clicked => { root.confirm-restart-update(); } }
+                }
+            }
+        }
+    }
+    if root.pairing-open: ModalFocus {
+        key-pressed(event) => { if event.text == Key.Escape { root.pairing-answer("refuse"); return accept; } return reject; }
+        Rectangle { background: #00000066; }
+        TouchArea { }
+        Card {
+            width: min(480px, parent.width - 48px); height: 262px;
+            x: round((parent.width - self.width) / (2 * 1phx)) * 1phx;
+            y: round((parent.height - self.height) / (2 * 1phx)) * 1phx;
+            VerticalLayout {
+                padding: 24px; spacing: 12px;
+                SectionTitle { text: "Allow " + (root.pairing-name == "" ? "a new device" : root.pairing-name) + " to connect?"; font-size: 18px; }
+                MutedText { text: "Only allow it if the other device shows the same pairing code."; }
+                Text { text: root.pairing-code; font-size: 28px; font-weight: 600; color: Theme.ink; horizontal-alignment: center; accessible-label: "Pairing code"; }
+                MutedText { text: "Trusted devices connect again without this prompt. Remove them under Devices."; font-size: 11px; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    AppButton { label: "Decline"; clicked => { root.pairing-answer("refuse"); } }
+                    Rectangle { horizontal-stretch: 1; }
+                    AppButton { label: "Accept this time"; clicked => { root.pairing-answer("control-once"); } }
+                    AppButton { label: "Accept and trust"; primary: true; clicked => { root.pairing-answer("control"); } }
                 }
             }
         }

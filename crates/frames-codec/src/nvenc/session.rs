@@ -19,6 +19,11 @@ use windows::core::{Interface, s, w};
 /// Reference frames kept in the decoded picture buffer, so invalidation has
 /// older frames to fall back on (spike 0-C verified 4 with RFI).
 const DPB_FRAMES: usize = 4;
+/// The largest width and height a session can be resized to.
+const MAX_RESIZE: u32 = 4096;
+/// A picture not read back within this long failed (NVENC reports busy
+/// forever when it cannot encode one).
+const READ_TIMEOUT_US: u64 = 2_000_000;
 /// Registered input textures kept before the cache is reset.
 const MAX_REGISTERED: usize = 16;
 /// Sleep between sub-frame polls: a slice takes ~0.4-0.8 ms at 1080p, and
@@ -347,10 +352,12 @@ impl NvencEncoder {
         init.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
         init.encodeWidth = p.width;
         init.darWidth = p.width;
-        init.maxEncodeWidth = p.width;
         init.encodeHeight = p.height;
         init.darHeight = p.height;
-        init.maxEncodeHeight = p.height;
+        // Room to grow: a shared window can be resized up to this without
+        // a new session (Reconfigure cannot exceed the maximum).
+        init.maxEncodeWidth = p.width.max(MAX_RESIZE);
+        init.maxEncodeHeight = p.height.max(MAX_RESIZE);
         init.frameRateNum = p.fps.max(1);
         init.frameRateDen = 1;
         init.enablePTD = 1;

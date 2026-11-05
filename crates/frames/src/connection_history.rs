@@ -2,7 +2,6 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    net::SocketAddr,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -26,7 +25,13 @@ pub fn load() -> Result<Vec<Connection>> {
     }
 }
 
-pub fn remember(address: SocketAddr, device_id: &str, name: &str, incoming: bool) -> Result<()> {
+/// `address`: a socket address (v1) or the device id (v2 dials by id).
+pub fn remember(
+    address: impl std::fmt::Display,
+    device_id: &str,
+    name: &str,
+    incoming: bool,
+) -> Result<()> {
     let root = frames_core::trust::config_dir()?;
     let lock = fs::OpenOptions::new()
         .create(true)
@@ -77,7 +82,11 @@ pub fn clear() -> Result<()> {
     write_atomic(root.join("connections.json"), b"[]")
 }
 
-pub fn update_discovered(device_id: &str, name: &str, address: SocketAddr) -> Result<()> {
+pub fn update_discovered(
+    device_id: &str,
+    name: &str,
+    address: impl std::fmt::Display,
+) -> Result<()> {
     let root = frames_core::trust::config_dir()?;
     let lock = fs::OpenOptions::new()
         .create(true)

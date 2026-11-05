@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use frames_core::{media::RawFrame, model::WindowId};
-use image::{DynamicImage, ImageFormat, imageops::FilterType};
+use image::{DynamicImage, ImageFormat};
 use std::{io::Cursor, sync::Arc, time::Duration};
 
 pub const MAX_PREVIEW_BYTES: usize = 512 * 1024;
@@ -36,27 +36,6 @@ pub fn decode(bytes: &[u8]) -> Result<DynamicImage> {
     limits.max_alloc = Some(4 * 1024 * 1024);
     reader.limits(limits);
     Ok(reader.decode()?)
-}
-
-pub fn save(device_id: &str, bytes: &[u8], trusted: bool) -> Result<()> {
-    let image = decode(bytes)?;
-    // Destroy small details before blurring; untrusted cards never load the
-    // original pixels, even after a previously trusted device is revoked.
-    let blurred = image
-        .resize_exact(24, 14, FilterType::Triangle)
-        .resize_exact(image.width(), image.height(), FilterType::Triangle)
-        .blur(8.0);
-    crate::connection_history::write_atomic(
-        crate::connection_history::preview_path(device_id, true)?,
-        &encode(&blurred)?,
-    )?;
-    if trusted {
-        crate::connection_history::write_atomic(
-            crate::connection_history::preview_path(device_id, false)?,
-            bytes,
-        )?;
-    }
-    Ok(())
 }
 
 pub async fn capture(

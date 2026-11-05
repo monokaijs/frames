@@ -196,6 +196,19 @@ impl MacPresenter {
     }
 
     /// The window's title (live statistics, for example).
+    /// The stream's new size: the window takes its shape at its current
+    /// scale (and keeps it while the user resizes it).
+    pub fn resize(&self, width: u32, height: u32) {
+        // SAFETY: live presenter.
+        unsafe { ffi::frames_mac_presenter_resize(self.handle, width, height) };
+    }
+
+    /// Whether the user closed the window.
+    pub fn closed(&self) -> bool {
+        // SAFETY: live presenter.
+        unsafe { ffi::frames_mac_presenter_closed(self.handle) }
+    }
+
     pub fn set_title(&self, title: &str) {
         // SAFETY: live presenter; Swift copies the text.
         unsafe { ffi::frames_mac_presenter_set_title(self.handle, title.as_ptr(), title.len()) };

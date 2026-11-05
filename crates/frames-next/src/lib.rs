@@ -22,14 +22,18 @@ use std::time::Duration;
 
 mod admit;
 mod audio;
+mod catalog;
 mod clip;
+pub mod directory;
 mod doctor;
 mod impair;
 mod lane;
+pub mod launcher;
 #[cfg(target_os = "macos")]
 mod mac_client;
 #[cfg(target_os = "macos")]
 mod mac_host;
+mod resize;
 mod services;
 mod stats;
 mod streams;
@@ -52,6 +56,9 @@ pub struct StreamInfo {
     /// when it differs from theirs.
     #[serde(default)]
     pub platform: String,
+    /// The host's device name.
+    #[serde(default)]
+    pub name: String,
 }
 
 /// This machine's OS, as [`StreamInfo::platform`] names it.
@@ -115,8 +122,16 @@ pub struct Options {
     /// Host: share these windows (each the first whose title contains the
     /// text) instead of the screen, one viewer session per window.
     pub windows: Vec<String>,
-    /// Host, set at admission: the window this session shares.
+    /// Host, set at admission: the window this session shares, by title.
     pub window: Option<String>,
+    /// Host, set at admission: the window this session shares, by catalog
+    /// id; viewer: the window to show (`--apps` sets it per session).
+    pub window_id: Option<u64>,
+    /// Viewer: open each of the host's application windows in its own
+    /// window (`crate::catalog`), instead of one view of its screen.
+    pub apps: bool,
+    /// Host: the most application windows one viewer is offered.
+    pub max_windows: usize,
     /// Viewer: how many of the host's shared windows to open.
     pub open_windows: u32,
     /// ADB bridge: the viewer forwards its ADB server to the host.
@@ -145,16 +160,31 @@ pub struct Options {
     pub encoder: String,
     /// `--encoder` was given: use that one or fail, no fallback.
     pub encoder_explicit: bool,
+    /// Host: try this encoder first, then the usual order (Settings).
+    pub prefer_encoder: Option<String>,
     /// Where the device key and trust list live (default: v1's directory).
     pub config_dir: Option<std::path::PathBuf>,
     /// Host: approve unknown devices without asking (unattended tests).
     pub approve: Option<admit::Approve>,
+    /// Host: ask the launcher that started it about new devices
+    /// (`crate::launcher`).
+    pub ask_launcher: bool,
+    /// Host: keep sharing after the last viewer leaves (the launcher stops
+    /// it); otherwise the host ends with its last session.
+    pub stay: bool,
     /// Host, set at admission: this viewer may send input.
     pub control: bool,
     /// `--codec` was given; otherwise the host picks (see [`choose_codec`]).
     pub codec_explicit: bool,
     /// Host, set at admission: what the viewer decodes, best first.
     pub viewer_decoders: Vec<Codec>,
+    /// Viewer: the most it wants to receive (its quality setting), sent to
+    /// the host; host, set at admission: that cap for this session.
+    pub max_mbps_cap: Option<u32>,
+    /// Viewer: the window title (default: the host's name).
+    pub title: Option<String>,
+    /// Viewer: show live statistics in the window title (diagnostics).
+    pub stats_title: bool,
 }
 
 impl Options {
@@ -178,6 +208,9 @@ impl Options {
             clipboard: clip::Mode::Off,
             windows: Vec::new(),
             window: None,
+            window_id: None,
+            apps: false,
+            max_windows: catalog::MAX_WINDOWS,
             open_windows: 1,
             adb: false,
             adb_server: ([127, 0, 0, 1], 5037).into(),
@@ -191,11 +224,17 @@ impl Options {
             relative_qa: false,
             encoder: "nvenc".into(),
             encoder_explicit: false,
+            prefer_encoder: None,
             config_dir: None,
             approve: None,
+            ask_launcher: false,
+            stay: false,
             control: false,
             codec_explicit: false,
             viewer_decoders: Vec::new(),
+            max_mbps_cap: None,
+            title: None,
+            stats_title: false,
         };
         let mut args = args.iter();
         while let Some(arg) = args.next() {
@@ -260,6 +299,21 @@ impl Options {
                     o.encoder_explicit = true;
                 }
                 "--config-dir" => o.config_dir = Some(value()?.into()),
+                "--ask-launcher" => o.ask_launcher = true,
+                "--title" => o.title = Some(value()?.to_string()),
+                "--apps" => o.apps = true,
+                "--max-windows" => o.max_windows = value()?.parse::<usize>()?.clamp(1, 32),
+                "--stats-title" => o.stats_title = true,
+                "--prefer-encoder" => {
+                    let name = value()?;
+                    anyhow::ensure!(
+                        ["nvenc", "amf", "qsv", "mf", "software"].contains(&name),
+                        "--prefer-encoder takes nvenc, amf, qsv, mf or software, not {name}"
+                    );
+                    o.prefer_encoder = Some(name.to_string());
+                }
+                "--max-mbps" => o.max_mbps_cap = Some(value()?.parse::<u32>()?.max(1)),
+                "--stay" => o.stay = true,
                 "--approve" => {
                     let text = value()?;
                     o.approve = Some(admit::Approve::parse(text).with_context(|| {
@@ -272,6 +326,18 @@ impl Options {
             }
         }
         Ok(o)
+    }
+
+    /// Host: the rate control ceiling, twice `--mbps` (at least 20), under
+    /// the viewer's cap.
+    pub fn max_mbps(&self) -> u32 {
+        let ceiling = (self.mbps * 2).max(20);
+        self.max_mbps_cap.map_or(ceiling, |cap| ceiling.min(cap))
+    }
+
+    /// Host: the first bitrate, `--mbps` under the viewer's cap.
+    pub fn start_mbps(&self) -> u32 {
+        self.mbps.min(self.max_mbps())
     }
 
     /// How long to run; 0 runs until the peer leaves.
@@ -341,43 +407,88 @@ async fn host(o: Options) -> Result<()> {
     // Each viewer session (one per shared window) runs on its own; the host
     // ends when the last one has.
     let mut sessions = tokio::task::JoinSet::new();
-    let mut audio_taken = false;
+    // One session at a time carries host audio; it is free again when that
+    // session ends.
+    let audio_free = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut approved = std::collections::HashMap::new();
     loop {
         let session = tokio::select! {
+            () = launcher::gone() => {
+                println!("stopped sharing: the launcher is gone");
+                return Ok(());
+            }
             accepted = node.accept() => accepted.context("node closed")??,
             Some(done) = sessions.join_next(), if !sessions.is_empty() => {
                 if let Ok(Err(error)) = done {
                     println!("session ended: {error:#}");
                 }
-                if sessions.is_empty() {
+                if sessions.is_empty() && !o.stay {
                     return Ok(());
                 }
                 continue;
             }
         };
-        let Some(admitted) = admit::decide(&config, &session, o.approve).await? else {
-            session.close("not approved");
-            continue;
+        // One device's admission failing (say, the trust list cannot be
+        // written) refuses that device, not every later one.
+        let admitted = match admit::decide(
+            &config,
+            &session,
+            o.approve,
+            o.ask_launcher,
+            &mut approved,
+        )
+        .await
+        {
+            Ok(Some(admitted)) => admitted,
+            Ok(None) => {
+                session.close("not approved");
+                continue;
+            }
+            Err(error) => {
+                println!("could not admit {}: {error:#}", session.remote());
+                session.close("not approved");
+                continue;
+            }
         };
         let mut session_options = o.clone();
         session_options.control = admitted.control;
         session_options.viewer_decoders = admitted.decoders;
-        let index = admitted.window.unwrap_or(0) as usize;
-        session_options.window = match (o.windows.get(index), o.windows.is_empty()) {
-            (Some(title), _) => Some(title.clone()),
-            (None, true) => None,
-            (None, false) => {
+        session_options.max_mbps_cap = admitted.max_mbps;
+        if admitted.catalog {
+            sessions.spawn(catalog::serve(session, o.windows.clone(), o.max_windows));
+            continue;
+        }
+        if let Some(id) = admitted.window_id {
+            // Only a window this host shares, by its current catalog.
+            let filters = o.windows.clone();
+            let limit = o.max_windows;
+            if !tokio::task::spawn_blocking(move || catalog::is_shared(&filters, limit, id)).await?
+            {
                 session.close("no such window");
                 continue;
             }
-        };
-        // Audio goes with the first session only.
-        let audio_mode = if audio_taken {
-            audio::Mode::Off
+            session_options.window_id = Some(id);
+            session_options.window = None;
         } else {
+            let index = admitted.window.unwrap_or(0) as usize;
+            session_options.window = match (o.windows.get(index), o.windows.is_empty()) {
+                (Some(title), _) => Some(title.clone()),
+                (None, true) => None,
+                (None, false) => {
+                    session.close("no such window");
+                    continue;
+                }
+            };
+        }
+        let audio_mode = if admitted.audio
+            && o.audio != audio::Mode::Off
+            && audio_free.swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
             o.audio
+        } else {
+            audio::Mode::Off
         };
-        audio_taken |= o.audio != audio::Mode::Off;
+        let audio_free = audio_free.clone();
         sessions.spawn(async move {
             let audio = tokio::spawn({
                 let session = session.clone();
@@ -389,6 +500,9 @@ async fn host(o: Options) -> Result<()> {
             });
             let result = run_host(session, session_options).await;
             audio.abort();
+            if audio_mode != audio::Mode::Off {
+                audio_free.store(true, std::sync::atomic::Ordering::Release);
+            }
             result
         });
     }
@@ -410,6 +524,7 @@ async fn run_host(_: frames_net::Session, _: Options) -> Result<()> {
 }
 
 async fn connect(id: &str, o: Options) -> Result<()> {
+    println!("Frames status: connecting");
     let config = admit::config_dir(o.config_dir.as_ref())?;
     let node = frames_net::Node::bind(&admit::device_key(&config)?, node_config(&o)?).await?;
     let started = std::time::Instant::now();
@@ -436,6 +551,9 @@ async fn connect(id: &str, o: Options) -> Result<()> {
             .context("not a device id, and no single nearby device starts with it")?
             .into(),
     };
+    if o.apps {
+        return catalog::view(&node, target, &o, started).await;
+    }
     // One session per shared window the viewer opens (--windows N).
     let mut viewers = tokio::task::JoinSet::new();
     for index in 0..o.open_windows {
@@ -445,18 +563,28 @@ async fn connect(id: &str, o: Options) -> Result<()> {
             &session,
             &node.id(),
             o.migrate_v1,
-            viewer_decoders(),
-            window,
+            admit::Asks {
+                decoders: viewer_decoders(),
+                window,
+                name: device_name(&o),
+                audio: index == 0 && o.audio != audio::Mode::Off,
+                max_mbps: o.max_mbps_cap,
+                catalog: false,
+                window_id: o.window_id,
+            },
         )
         .await?;
         if index == 0 {
             start_transfers(&session, &o);
         }
+        let code = session.pairing_code()?;
         println!(
-            "connected in {:.0} ms, pairing code {} (a new host shows the same code)",
+            "connected in {:.0} ms, pairing code {code} (a new host shows the same code)",
             started.elapsed().as_secs_f64() * 1e3,
-            session.pairing_code()?
         );
+        if index == 0 {
+            launcher::report("code", &serde_json::json!({ "code": code }));
+        }
         let session_options = o.clone();
         viewers.spawn(async move {
             let result = run_client(session.clone(), session_options).await;
@@ -532,10 +660,21 @@ async fn run_client(_: frames_net::Session, _: Options) -> Result<()> {
     bail!("viewing needs the Windows or macOS backends")
 }
 
-/// The name nearby devices see.
+/// The name other devices see: `--name`, else the name chosen in the
+/// launcher's Settings (`device-name.json`, shared with v1), else the
+/// computer's name.
 fn device_name(o: &Options) -> String {
     o.name
         .clone()
+        .or_else(|| {
+            let config = admit::config_dir(o.config_dir.as_ref()).ok()?;
+            let bytes = std::fs::read(config.join("device-name.json")).ok()?;
+            serde_json::from_slice::<Option<String>>(&bytes)
+                .ok()
+                .flatten()
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+        })
         .or_else(|| std::env::var("COMPUTERNAME").ok())
         .or_else(|| {
             std::process::Command::new("scutil")
@@ -589,6 +728,38 @@ pub async fn send_info(session: &frames_net::Session, info: StreamInfo) -> Resul
     Ok(())
 }
 
+/// Viewer: its window's title, `--title` or else the host's name.
+pub fn viewer_title(o: &Options, info: &StreamInfo) -> String {
+    o.title.clone().unwrap_or_else(|| {
+        if info.name.is_empty() {
+            "Frames".into()
+        } else {
+            info.name.clone()
+        }
+    })
+}
+
+/// Viewer: waits for the host to approve this device and describe its
+/// stream. Prints `Frames status:` lines for the launcher's Sessions list.
+pub async fn await_stream(session: &frames_net::Session) -> Result<StreamInfo> {
+    // A host seeing this device for the first time asks its user.
+    println!("Frames status: waiting");
+    println!("waiting for the host (it may be asking to approve this device)");
+    let info = tokio::time::timeout(Duration::from_secs(150), receive_info(session))
+        .await
+        .context("the host did not start the stream within 150 s")??;
+    println!(
+        "stream: {:?} {}x{} at {} fps",
+        info.codec, info.width, info.height, info.fps
+    );
+    launcher::report(
+        "host",
+        &serde_json::json!({"device": session.remote().to_string(), "name": info.name}),
+    );
+    println!("Frames status: connected");
+    Ok(info)
+}
+
 pub async fn receive_info(session: &frames_net::Session) -> Result<StreamInfo> {
     let (_send, mut recv) = session.accept_channel().await?;
     let bytes = recv.read_to_end(4096).await?;
@@ -628,7 +799,19 @@ pub fn main_from(args: Vec<String>) -> Result<()> {
     runtime.block_on(run(args))
 }
 
+/// Whether `args` (what follows `frames next`) is a `host` or `connect`
+/// command line this build accepts. For callers that build them, such as
+/// the launcher, to test against.
+pub fn valid_command(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        Some("host") => Options::parse(&args[1..]).is_ok(),
+        Some("connect") => args.len() >= 2 && Options::parse(&args[2..]).is_ok(),
+        _ => false,
+    }
+}
+
 async fn run(args: Vec<String>) -> Result<()> {
+    launcher::watch();
     match args.first().map(String::as_str) {
         Some("host") => host(Options::parse(&args[1..])?).await,
         #[cfg(windows)]
@@ -690,7 +873,14 @@ async fn run(args: Vec<String>) -> Result<()> {
         }
         Some("connect") => {
             let id = args.get(1).context("connect needs an endpoint id")?;
-            connect(id, Options::parse(&args[2..])?).await
+            let o = Options::parse(&args[2..])?;
+            tokio::select! {
+                result = connect(id, o) => result,
+                () = launcher::gone() => {
+                    println!("disconnected: the launcher is gone");
+                    Ok(())
+                }
+            }
         }
         _ => bail!(
             "usage: frames-next doctor [--config-dir DIR] [--relay URL]

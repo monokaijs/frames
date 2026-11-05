@@ -2,56 +2,47 @@
 
 Native remote control for Windows 11 x64 and macOS 14.2+ on Apple silicon. Open individual remote applications in local windows, or switch to a full desktop view.
 
-[Download the latest release](https://github.com/monokaijs/frames/releases/latest). Media codecs are bundled and run inside Frames; no FFmpeg executable is required. Both computers need matching Frames builds; the current protocol is **10**.
+[Download the latest release](https://github.com/monokaijs/frames/releases/latest). Media codecs are bundled and run inside Frames; no FFmpeg executable is required. Both computers need Frames 0.5 or newer: sessions run on the Frames Next engine, which earlier versions cannot connect to.
 
 On Windows, run **Frames-VERSION-windows-x86_64-setup.exe**. It installs Frames for your account, adds a Start menu shortcut and an Installed Apps entry, and includes an uninstaller. The default installation directory supports automatic updates without administrator access. The ZIP is also available for portable use.
 
 ## Connect
 
-Launch Frames, choose **Start sharing** under **Share this device** on the host, and enter the address it shows under **Connect to a device** on the client. Nearby discovery works on the local network. Rename this device in Settings. Device cards show names, online/offline status, and screenshots shared privately with trusted devices; recent devices without trust show a blurred image from their last session. Click a card's preview or **Connect** to connect; **Remove** forgets a trusted device. The Sessions tab shows each connection's live progress (connecting, waiting for pairing approval, connected), and a failed connection explains what to check next. Both computers must approve the same pairing code on first connection. Incoming requests offer Decline connection, Accept and trust, or Accept for this session only. You can also trust a previously accepted device from Recent. A device you **Accept and trust** reconnects without a prompt while you share from the launcher. Unattended reconnection (sharing at login, the Windows service) also requires turning on **Unattended access** before trusting the device. Open the chevron on Connect to choose connection mode and host audio; Frames remembers these per device, along with live view and image-quality choices.
+Launch Frames and choose **Start sharing** under **Share this device** on the host. On the other computer, pick it under **Devices** (computers sharing on the same network appear there), or enter the **device ID** the host shows under **Connect to a device**; an IP address of a computer sharing on this network also works. Rename this device in Settings. **Remove** stops trusting a device. The Sessions tab shows each connection's progress (connecting, waiting for approval with the pairing code, connected), and a failed connection explains what to check next.
 
-Frames connects directly over LAN or VPN on UDP **47990**. Allow that port through the host firewall. There is no relay or NAT traversal service.
+The first time a device connects, the host shows its name and a pairing code: allow it only if the other device shows the same code. **Accept and trust** lets it connect again without asking, **Accept this time** lets it in for this sharing session, and **Decline** refuses it. Devices trusted with Frames 0.4 or earlier are trusted again automatically on their first connection. Open the chevron on Connect to choose the view (application windows or full desktop) and host audio; Frames remembers these per device, along with the image quality.
+
+Connections are end-to-end encrypted. Frames finds a direct path across networks and NATs where it can and otherwise relays through public relay servers (n0's, at about 8-10 Mbps); a relayed connection is marked as such. No ports need opening.
 
 On macOS, open the Frames DMG, drag Frames.app to Applications, and open it in the logged-in desktop session. Allow Local Network, Screen Recording, and Accessibility in System Settings > Privacy & Security. Accessibility is named Device Control and Data Access on newer macOS versions. A locked Mac must be unlocked locally before application control can continue.
 
 ## Remote windows
 
-The Frames menu controls desktop/window mode, sizing, keyboard mapping, cursor visibility, and file transfers. The host application's exposed menus appear alongside it. Custom application menus remain accessible in the video. **Ctrl+Alt+F12** releases remote input and minimizes the client window. **Ctrl+Alt+F10** (Control+Option+F10 on Mac) or **Show debug overlay** in the Frames menu toggles a per-window panel with codec, frame rate, bitrate, loss, latency and decoder state, plus frame-time and bitrate graphs; set `FRAMES_DEBUG_OVERLAY=1` to start with it on.
+**Application windows** (the default view) opens each of the host's application windows in its own local window, titled like the remote one; windows appear and close as they do on the host. When a remote window is resized, the local one follows in the same shape, and resizing a local window keeps the picture's shape, so no bars appear around it. **Full desktop** shows the whole remote screen. Closing a local window stops showing that remote window; the session ends when all are closed.
 
-Per-window capture excludes standard system chrome when its geometry can be verified. Custom headers remain intact. **Show remote window header** changes the host capture while keeping the local title bar on both Mac and Windows clients. Full desktop view includes every visible application, including applications excluded from per-window sharing.
+**Control+Option+F11** (Ctrl+Alt+F11 on Windows) holds the pointer for games (relative mouse); **Ctrl+Alt+F12** gives it back. Cross-platform sessions swap Control and Command. Text and PNG clipboard sync is on by default.
 
-Closing a remote application window requests closing the actual host window. Closing a desktop-view window disconnects. Quitting the launcher stops the sessions it started. On Windows, closing its window asks whether to hide to the tray or quit. Remember your choice, or change it in Settings. A separately configured sharing login item continues independently.
-
-Cross-platform sessions swap Control and Command by default. Shift and Alt/Option keep their meaning. Choose the physical-key profile for terminals or literal key positions. Focus loss, profile changes, and disconnect release held remote input.
-
-Text and PNG clipboard synchronization is enabled by default. Regular files can be dropped into remote windows or fetched from a path within the host user's home folder. Completed transfers are checksum verified and never overwrite existing files. Receive files default to `~/Downloads/Frames`; interrupted uploads can resume. Folder trees and dragging arbitrary files out of captured Finder/Explorer pixels are not supported.
-
-The optional Android ADB bridge forwards the client's existing ADB server over the paired connection. Start `adb start-server` on the client, enable the bridge in Frames, then use `adb -H 127.0.0.1 -P 15037 devices` on the host. It exposes all devices available to that ADB server. Standard USB/Bluetooth gamepads can be forwarded to a Windows host through Devices > Gamepads. Wired USB passthrough is available between Windows computers with optional USB/IP drivers. USB audio/video and Mac receiving are excluded from this release; device compatibility needs physical validation. See [device forwarding and setup](docs/DEVICE_FORWARDING.md).
+Not yet on the current engine (they were in Frames 0.4): the host's application menus and the Frames menu in remote windows, closing a host window from its local window, the debug overlay, dropping files into remote windows (`frames next connect ID --send FILE` sends one), device preview images on device cards, gamepad and USB forwarding, and isolated input for One window sharing. See [docs/V2_PARITY.md](docs/V2_PARITY.md).
 
 ## Sharing scopes
 
-Use **Start sharing** with **Everything** (default), **Selected windows**, or **One window**. The window modes open a searchable preview grid; select one or several windows and press **Share**. On Windows, One window uses experimental isolated input for eligible x64 applications and games, leaving your mouse and keyboard available. Its viewer scales locally and closing it disconnects. Selected windows retains normal remote control. Scoped sharing disables desktop access, clipboard/files, and device forwarding.
-
-Any technically eligible game can be tried as **Untested**. The initial catalog has no verified games; compatibility requires exact build and adapter/profile matching. See [sharing scopes and isolated input](docs/SHARED_GAME.md), [compatibility records](docs/GAME_COMPATIBILITY.md), and [validation limits](docs/SHARED_GAME_VALIDATION.md).
+Use **Start sharing** with **Everything** (default), **Selected windows**, or **One window**. The window modes open a searchable preview grid; select windows and press **Share**. Viewers then see only those windows.
 
 ## Command line
 
 ```sh
-frames host --pair
-frames host --pair --unattended
-frames connect 192.168.1.10:47990 --audio
-frames connect 192.168.1.10:47990 --view desktop --codec h264
-frames send 192.168.1.10:47990 report.pdf
-frames get 192.168.1.10:47990 Downloads/report.pdf
-frames discover
+frames host                      # share until stopped; new devices are approved here
+frames connect DEVICE_ID         # application windows (--view desktop for the screen)
+frames connect DEVICE_ID --audio --view desktop --codec hevc
+frames discover                  # computers sharing on this network
+frames peers                     # this device's ID and its trusted devices
+frames revoke DEVICE_ID
 frames doctor
-frames peers
-frames revoke CERTIFICATE_FINGERPRINT
 frames update --check
 frames update
 ```
 
-Use `--no-clipboard` on host or client to disable clipboard sharing. Automatic codec selection probes working implementations; `--codec` accepts h264, hevc, av1, or vp9. Run `frames --help` for all options.
+`--no-clipboard` turns clipboard sharing off. On a Windows host, `--encoder nvenc|amf|qsv|mf|software` prefers an encoder. `frames next ...` reaches every Frames Next option (`frames next connect ID --send FILE`, `--get PATH`, `--relay-only`, ...). Run `frames --help` for all options.
 
 Official builds check for signed updates in the background every six hours. Use **Settings > Check for updates** to download manually, including during a session. **Restart to update** asks you to confirm disconnecting active sessions and file transfers before restarting Frames. Automatic downloads defer while a remote session is active and never interrupt sessions. Verified packages install after all Frames processes using that installation close. Updates require write access to the installation directory. See [release setup](docs/RELEASES.md), including migration from the previous bundle identifier.
 
@@ -72,20 +63,18 @@ open dist/macos/Frames.app
 
 Mac builds reuse the previous signing identity or select a unique Developer ID/Apple Development certificate. Set `FRAMES_SIGN_IDENTITY` to choose one explicitly. Ad-hoc signing (`-`) can reset privacy grants after rebuilds. `FRAMES_MAC_HELPER` selects a development helper; Mac builds prepare a minimal LGPL codec runtime with Homebrew build dependencies. Windows builds fetch a checksum-pinned LGPL SDK. Run `python scripts/prepare_media.py` before direct Cargo commands on Windows, or `bash scripts/prepare_media_macos.sh` on Mac.
 
-An optional Windows service installs with `frames service install` from an Administrator terminal after unattended pairing. It uses machine-scoped protected credentials and an interactive-console agent. Uninstall with `frames service uninstall`. Secure-desktop support and Mac prelogin/FileVault access need further validation; see [validation](docs/VALIDATION.md).
+An optional Windows service installs with `frames service install` from an Administrator terminal. It shares the signed-in desktop with this device's ID and trusted devices (copied when it is installed; new devices cannot be approved there). Uninstall with `frames service uninstall`. The service, secure desktop and Mac prelogin/FileVault access need further validation; see [validation](docs/VALIDATION.md).
 
 [Transport and latency](docs/LATENCY_REVIEW.md) ? [Launcher development](docs/LAUNCHER.md) ? [Validation](docs/VALIDATION.md)
 
-Choose **Settings > Image quality** for saved connection defaults, or change **Image quality** live from the dropdown in a remote window's title bar.
+Choose **Settings > Image quality** for saved connection defaults: it caps what the host sends, which rate control adapts to the network below that.
 
-| Preset | Resolution / frame rate | 1080p encoder budget before protection |
-| --- | --- | --- |
-| High (default) | Native resolution, up to 60 fps; congestion keeps native resolution | 50 Mbps |
-| Medium | Native resolution, up to 60 fps; may reduce resolution under congestion | 12 Mbps |
-| Low | Starts at 75% resolution and up to 30 fps | 4 Mbps |
+| Preset | Most the viewer receives |
+| --- | --- |
+| High (default) | 50 Mbps |
+| Medium | 12 Mbps |
+| Low | 4 Mbps |
 
-Larger source displays scale the budget by pixel count, up to 200/64/24 Mbps respectively. A custom **Settings > Bandwidth limit** of **1-200 Mbps** caps the preset's total connection traffic, shared across video, protection, and audio. Automatic uses the preset budget. Saved defaults apply to new connections; title-bar preset changes apply immediately to that connection. CLI: `frames connect ADDRESS --quality high --bandwidth-mbps 50` (`0` means Automatic). Both peers need the protocol-11 build.
+A custom **Settings > Bandwidth limit** of **1-200 Mbps** lowers that cap. Saved defaults apply to new connections. CLI: `frames connect DEVICE_ID --quality medium --bandwidth-mbps 20` (`0` means Automatic).
 
-On Windows, **Settings > Video encoder** chooses the encoder used while sharing: Automatic (the first that works, in the order NVIDIA NVENC, Intel Quick Sync, AMD AMF, Windows Media Foundation, then software AV1/VP9), or one of them. A chosen encoder that does not work on the PC is ignored and Frames selects automatically, so sharing still starts. It applies the next time sharing starts. CLI: `frames host --encoder nvenc|amf|qsv|mf|software`. `frames next host` has the same `--encoder` option.
-
-The title-bar dropdown replaces each connection's Windows tray icon and the old eye-slash header button. It retains window options, view, devices, remote cursor, and disconnect controls. Choose **Ignore / hide this window** to hide a local proxy without closing the remote application. Restore individual windows under **Windows**, or choose **Show all windows**. When all windows are hidden on Windows, a small connection window provides restore and menu controls. On Mac, the same controls remain in the Frames menu and existing Dock entries can restore hidden windows. The launcher's single tray icon is unchanged.
+On Windows, **Settings > Video encoder** chooses the encoder used while sharing: Automatic (the first that works: the NVIDIA, AMD or Intel encoder of the GPUs present, then Windows Media Foundation, then software AV1), or one of them. A chosen encoder that does not work on the PC is skipped and the next one in that order is tried, so sharing still starts. It applies the next time sharing starts. NVIDIA encoding needs driver 522 or newer. CLI: `frames host --encoder nvenc|amf|qsv|mf|software`.

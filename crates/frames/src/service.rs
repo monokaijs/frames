@@ -36,14 +36,13 @@ pub fn install() -> anyhow::Result<()> {
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )
     .context("run service install from an Administrator terminal")?;
-    let store = frames_core::trust::TrustStore::load()?;
+    // The service cannot ask anyone: only devices already trusted for
+    // control (with Accept and trust) can connect to it.
     anyhow::ensure!(
-        store
-            .peers
-            .values()
-            .any(|p| p.unattended && p.allow_control),
-        "pair at least one device using host --pair --unattended before installing the service"
+        frames_next::directory::trusted()?.iter().any(|d| d.control),
+        "trust at least one device for control (share, and choose Accept and trust) before installing the service"
     );
+    let user_config = frames_core::trust::config_dir()?;
     let dir = installation();
     let data = config();
     anyhow::ensure!(
@@ -78,6 +77,12 @@ pub fn install() -> anyhow::Result<()> {
         std::fs::copy(&current, &executable)?;
     }
     frames_core::trust::Identity::load()?.install_service_identity(&data)?;
+    // Frames Next: the same device ID and trusted devices as this account,
+    // so viewers reach the service as this device.
+    for file in ["device-v2.key", "trusted-v2.json"] {
+        std::fs::copy(user_config.join(file), data.join(file))
+            .with_context(|| format!("copying {file} for the service"))?;
+    }
     let info = ServiceInfo {
         name: NAME.into(),
         display_name: "Frames".into(),

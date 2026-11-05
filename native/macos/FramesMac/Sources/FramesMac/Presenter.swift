@@ -23,6 +23,8 @@ final class Presenter: @unchecked Sendable {
     /// Where the window's input goes (set by the Rust viewer).
     let input = InputRelay()
     private var inputView: InputView?
+    /// Set once the user closes the window (ABI 4).
+    let closed = CloseWatcher()
 
     init?(width: Int, height: Int, windowed: Bool) {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { return nil }
@@ -67,14 +69,24 @@ final class Presenter: @unchecked Sendable {
         }
         var refresh = 60.0
         let input = self.input
+        let closed = self.closed
         let makeWindow = { @MainActor () -> (NSWindow?, Double, InputView) in
             let hz = Double(NSScreen.main?.maximumFramesPerSecond ?? 60)
             let scale = NSScreen.main?.backingScaleFactor ?? 2
-            let frame = NSRect(x: 80, y: 80, width: CGFloat(width) / scale, height: CGFloat(height) / scale)
+            // Pixels to points, shrunk to fit the screen when larger.
+            var size = NSSize(width: CGFloat(width) / scale, height: CGFloat(height) / scale)
+            if let screen = NSScreen.main?.visibleFrame.size {
+                let fit = min(1, screen.width * 0.9 / size.width, screen.height * 0.9 / size.height)
+                size = NSSize(width: size.width * fit, height: size.height * fit)
+            }
+            let frame = NSRect(x: 80, y: 80, width: size.width, height: size.height)
             let window = NSWindow(
                 contentRect: frame, styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
             window.title = "Frames presenter"
             window.isReleasedWhenClosed = false
+            window.delegate = closed
+            // Resizing keeps the picture's shape: no bars around it.
+            window.contentAspectRatio = NSSize(width: CGFloat(width), height: CGFloat(height))
             let view = InputView(frame: frame, relay: input)
             view.wantsLayer = true
             view.layer = layer
@@ -100,6 +112,31 @@ final class Presenter: @unchecked Sendable {
         guard let inputView else { return }
         let apply = { @MainActor in
             inputView.setHostCursor(shape.flatMap(cursorImage), hotspot: shape?.hotspot ?? .zero, visible: visible)
+        }
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { apply() }
+        } else {
+            DispatchQueue.main.async { MainActor.assumeIsolated { apply() } }
+        }
+    }
+
+    /// The stream's new size (ABI 4): the drawable follows it, and the
+    /// window takes its shape at the window's current scale, within the
+    /// screen.
+    func resize(width: Int, height: Int) {
+        layer.drawableSize = CGSize(width: width, height: height)
+        guard let window else { return }
+        let apply = { @MainActor in
+            let current = window.contentLayoutRect.size
+            let old = window.contentAspectRatio
+            let scale = old.width > 0 ? current.width / old.width : 0.5
+            var size = NSSize(width: CGFloat(width) * scale, height: CGFloat(height) * scale)
+            if let screen = (window.screen ?? NSScreen.main)?.visibleFrame.size {
+                let fit = min(1, screen.width / size.width, screen.height / size.height)
+                size = NSSize(width: size.width * fit, height: size.height * fit)
+            }
+            window.contentAspectRatio = NSSize(width: CGFloat(width), height: CGFloat(height))
+            window.setContentSize(size)
         }
         if Thread.isMainThread {
             MainActor.assumeIsolated { apply() }
@@ -252,6 +289,36 @@ final class PresentedTime: @unchecked Sendable {
         defer { lock.unlock() }
         return value
     }
+}
+
+/// Notices the user closing a presenter window; read from any thread.
+final class CloseWatcher: NSObject, NSWindowDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    @MainActor func windowWillClose(_ notification: Notification) {
+        lock.lock()
+        value = true
+        lock.unlock()
+    }
+
+    var isClosed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
+@_cdecl("frames_mac_presenter_resize")
+public func framesMacPresenterResize(_ handle: UnsafeMutableRawPointer?, _ width: UInt32, _ height: UInt32) {
+    guard let handle else { return }
+    borrowed(handle, as: Presenter.self).resize(width: Int(width), height: Int(height))
+}
+
+@_cdecl("frames_mac_presenter_closed")
+public func framesMacPresenterClosed(_ handle: UnsafeMutableRawPointer?) -> Bool {
+    guard let handle else { return false }
+    return borrowed(handle, as: Presenter.self).closed.isClosed
 }
 
 @_cdecl("frames_mac_presenter_new")

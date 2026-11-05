@@ -156,6 +156,9 @@ pub struct MacInjector {
     buttons: Vec<Button>,
     position: (u16, u16),
     pub applied: u64,
+    /// Where positions land, in global points: one shared window's frame,
+    /// or the main display when unset.
+    area: Option<CGRect>,
 }
 
 // The event source is only used from the owning thread.
@@ -173,7 +176,21 @@ impl MacInjector {
             buttons: Vec::new(),
             position: (0, 0),
             applied: 0,
+            area: None,
         }
+    }
+
+    /// Maps positions onto this rectangle (global points, top-left origin),
+    /// a shared window's frame, instead of the main display.
+    pub fn set_area(&mut self, x: f64, y: f64, width: f64, height: f64) {
+        self.area = Some(CGRect {
+            origin: CGPoint { x, y },
+            size: CGSize { width, height },
+        });
+    }
+
+    fn bounds(&self) -> CGRect {
+        self.area.unwrap_or_else(Self::display)
     }
 
     /// Whether macOS lets this process post input (Accessibility).
@@ -234,7 +251,7 @@ impl MacInjector {
             return true;
         }
         let (kind, button) = move_event(&self.buttons);
-        let at = relative_target(Self::display(), Self::location(), dx, dy);
+        let at = relative_target(self.bounds(), Self::location(), dx, dy);
         // SAFETY: creates an event; fields set on the live event, then
         // posted and released by `post`.
         unsafe {
@@ -251,7 +268,7 @@ impl MacInjector {
 
     fn move_to(&self, x: u16, y: u16) {
         let (kind, button) = move_event(&self.buttons);
-        let at = point(Self::display(), x, y);
+        let at = point(self.bounds(), x, y);
         // SAFETY: creates an event; posted and released by `post`.
         Self::post(unsafe { CGEventCreateMouseEvent(self.source, kind, at, button) });
     }
@@ -292,7 +309,7 @@ impl MacInjector {
                     Self::location()
                 } else {
                     self.position = (x, y);
-                    point(Self::display(), x, y)
+                    point(self.bounds(), x, y)
                 };
                 // SAFETY: creates an event; posted and released by `post`.
                 let created = unsafe { CGEventCreateMouseEvent(self.source, kind, at, cg_button) };

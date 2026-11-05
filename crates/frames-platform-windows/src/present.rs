@@ -277,9 +277,19 @@ impl State {
 }
 
 /// Largest rectangle with the source's aspect ratio centred in `target`.
+/// Within 1% of the target's shape (rounding of window and picture sizes)
+/// it fills the target, so no thin bar shows at an edge.
 fn fit(source: (u32, u32), target: (u32, u32)) -> RECT {
     let (sw, sh) = (u64::from(source.0.max(1)), u64::from(source.1.max(1)));
     let (tw, th) = (u64::from(target.0), u64::from(target.1));
+    if (tw * sh).abs_diff(th * sw) * 100 <= th * sw {
+        return RECT {
+            left: 0,
+            top: 0,
+            right: tw as i32,
+            bottom: th as i32,
+        };
+    }
     let (w, h) = if tw * sh <= th * sw {
         (tw, tw * sh / sw)
     } else {
@@ -437,5 +447,20 @@ impl Presenter for D3D11Presenter {
             frame: frame.frame,
             presented_us: self.clock.now_us(),
         })
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::fit;
+
+    #[test]
+    fn near_shapes_fill_the_window_and_others_are_centred() {
+        let full = |r: windows::Win32::Foundation::RECT| (r.left, r.top, r.right, r.bottom);
+        // A window one pixel off the picture's shape: filled, no thin bar.
+        assert_eq!(full(fit((1920, 1080), (1280, 721))), (0, 0, 1280, 721));
+        // A different shape is letterboxed (only seen if the window lost
+        // its shape lock).
+        assert_eq!(full(fit((1920, 1080), (1280, 1000))), (0, 140, 1280, 860));
     }
 }

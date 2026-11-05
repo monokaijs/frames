@@ -2,8 +2,8 @@
 
 use crate::lane::InputLane;
 use crate::stats::Samples;
-use crate::{Options, receive_info, win};
-use anyhow::{Context, Result};
+use crate::{Options, win};
+use anyhow::Result;
 use frames_codec::ffmpeg::FfmpegDecoder;
 use frames_media::api::{MediaClock, MediaTransport, PresentMode, Presenter};
 use frames_media::client::{ClientConfig, ClientSession};
@@ -15,23 +15,17 @@ use std::time::{Duration, Instant};
 use windows::core::w;
 
 pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
-    // A host seeing this device for the first time asks its user (60 s).
-    println!("waiting for the host (it may be asking to approve this device)");
-    let info = tokio::time::timeout(Duration::from_secs(90), receive_info(&session))
-        .await
-        .context("the host did not start the stream within 90 s")??;
-    println!(
-        "stream: {:?} {}x{} at {} fps",
-        info.codec, info.width, info.height, info.fps
-    );
+    let info = crate::await_stream(&session).await?;
     // The host's cursor shape and visibility, applied on the viewer thread.
     let (cursor_tx, cursor_rx) = std::sync::mpsc::channel();
+    let (sizes_tx, sizes) = std::sync::mpsc::channel();
     let cursor_reader = {
         let session = session.clone();
         let (cursor_streams, mut cursor_incoming) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(crate::streams::route_viewer(
             session.clone(),
             cursor_streams,
+            sizes_tx,
             o.adb.then_some(o.adb_server),
         ));
         tokio::spawn(async move {
@@ -73,7 +67,11 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     };
     let audio = crate::audio::Receiver::start(o.audio).await?;
     let result = tokio::task::spawn_blocking(move || {
-        view(&session, info, &o, lane, cursor_rx, clipboard, audio)
+        let updates = crate::streams::HostUpdates {
+            cursor: cursor_rx,
+            sizes,
+        };
+        view(&session, info, &o, lane, updates, clipboard, audio)
     })
     .await?;
     let _ = writer.await;
@@ -135,7 +133,7 @@ fn view(
     info: crate::StreamInfo,
     o: &Options,
     mut lane: InputLane,
-    cursor_rx: std::sync::mpsc::Receiver<frames_input::cursor::CursorMessage>,
+    updates: crate::streams::HostUpdates,
     mut clipboard: Option<crate::clip::ClipboardLink>,
     audio: Option<crate::audio::Receiver>,
 ) -> Result<()> {
@@ -144,22 +142,32 @@ fn view(
     let _timer = TimerResolution::one_millisecond();
     let clock = SystemClock::new();
     let shared: Arc<dyn MediaClock> = Arc::new(clock);
-    // Half size keeps the viewer beside the source on one screen.
-    let viewer = win::window(
-        w!("Frames Next"),
-        win::Kind::Viewer,
-        200,
-        (info.width / 2).max(320),
-        (info.height / 2).max(180),
-    )?;
+    // The picture at its own size when it fits, else as large as fits on
+    // the screen, always in its own shape.
+    let mut stream_size = (info.width, info.height);
+    let screen = win::work_area();
+    let (width, height) = crate::resize::window_size(
+        stream_size,
+        stream_size,
+        stream_size,
+        (screen.0 * 9 / 10, screen.1 * 9 / 10),
+    );
+    let viewer = win::window(w!("Frames Next"), win::Kind::Viewer, 200, width, height)?;
+    win::set_aspect(info.width, info.height);
+    win::set_title(viewer, &crate::viewer_title(o, &info));
     win::pump();
-    let mut decoder = match FfmpegDecoder::new(info.codec.into(), info.width, info.height, true) {
-        Ok(decoder) => decoder,
-        Err(error) => {
-            println!("hardware decode unavailable ({error}); decoding in software");
-            FfmpegDecoder::new(info.codec.into(), info.width, info.height, false)?
-        }
+    let open_decoder = |(width, height): (u32, u32)| -> Result<FfmpegDecoder> {
+        Ok(
+            match FfmpegDecoder::new(info.codec.into(), width, height, true) {
+                Ok(decoder) => decoder,
+                Err(error) => {
+                    println!("hardware decode unavailable ({error}); decoding in software");
+                    FfmpegDecoder::new(info.codec.into(), width, height, false)?
+                }
+            },
+        )
     };
+    let mut decoder = open_decoder(stream_size)?;
     let mut presenter = D3D11Presenter::new(viewer, shared);
     let media = session.media();
     let mut config = ClientConfig::new(1, 1);
@@ -213,7 +221,20 @@ fn view(
             synthetic.tick();
         }
         let mut cursor_updates = 0u64;
-        while let Ok(message) = cursor_rx.try_recv() {
+        // The host window resized: a decoder for the new size, and this
+        // window in the new shape at its current scale.
+        while let Ok(size) = updates.sizes.try_recv() {
+            println!("stream resized to {}x{}", size.0, size.1);
+            decoder = open_decoder(size)?;
+            let screen = win::work_area();
+            let (width, height) =
+                crate::resize::window_size(win::client_size(viewer), stream_size, size, screen);
+            win::set_aspect(size.0, size.1);
+            win::set_client_size(viewer, width, height);
+            stream_size = size;
+            client.request_keyframe();
+        }
+        while let Ok(message) = updates.cursor.try_recv() {
             win::apply_cursor(&message);
             cursor_updates += 1;
         }
@@ -264,8 +285,10 @@ fn view(
         if started.elapsed() >= next_report {
             let stats = client.stats();
             let (n, p50, p95) = latency.take_window();
-            let title = crate::stats::window_title(n, p50, p95, &path, stats.frames_lost);
-            win::set_title(viewer, &title);
+            if o.stats_title {
+                let title = crate::stats::window_title(n, p50, p95, &path, stats.frames_lost);
+                win::set_title(viewer, &title);
+            }
             println!(
                 "client t={:>3}s presented {n:>3}/s clean {:>3} lost {} | capture to present p50 {p50:>5.2} p95 {p95:>5.2} ms | recoveries {} nacks {} | {:?} rtt {:.1} ms",
                 next_report.as_secs(),

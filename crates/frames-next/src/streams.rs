@@ -13,6 +13,10 @@ pub const CURSOR: u8 = 10;
 /// One forwarded ADB connection (host 127.0.0.1:15037 → the viewer's
 /// ADB server).
 pub const ADB: u8 = 11;
+/// The host's shared windows, one JSON list per line (`crate::catalog`).
+pub const CATALOG: u8 = 12;
+/// The stream's new size when the shared window resizes (`crate::resize`).
+pub const RESIZE: u8 = 13;
 
 pub type Streams = (iroh::endpoint::SendStream, iroh::endpoint::RecvStream);
 
@@ -70,11 +74,13 @@ pub async fn route(session: frames_net::Session, routes: Routes) {
 }
 
 /// Viewer: accepts the host's streams after its stream description: the
-/// cursor stream goes to `cursor`; ADB streams are piped to `adb` (the
-/// viewer's ADB server) when the viewer turned the bridge on.
+/// cursor stream goes to `cursor`; size changes go to `sizes`; ADB streams
+/// are piped to `adb` (the viewer's ADB server) when the viewer turned the
+/// bridge on.
 pub async fn route_viewer(
     session: frames_net::Session,
     cursor: tokio::sync::mpsc::UnboundedSender<iroh::endpoint::RecvStream>,
+    sizes: std::sync::mpsc::Sender<(u32, u32)>,
     adb: Option<std::net::SocketAddr>,
 ) {
     loop {
@@ -89,6 +95,9 @@ pub async fn route_viewer(
             (CURSOR, _) => {
                 let _ = cursor.send(recv);
             }
+            (RESIZE, _) => {
+                tokio::spawn(crate::resize::receive(recv, sizes.clone()));
+            }
             (ADB, Some(server)) => {
                 tokio::spawn(async move {
                     match tokio::net::TcpStream::connect(server).await {
@@ -100,6 +109,13 @@ pub async fn route_viewer(
             _ => {}
         }
     }
+}
+
+/// Viewer: what the host sends besides media, for the viewer thread.
+pub struct HostUpdates {
+    pub cursor: std::sync::mpsc::Receiver<frames_input::cursor::CursorMessage>,
+    /// The stream's new size when the host window resizes.
+    pub sizes: std::sync::mpsc::Receiver<(u32, u32)>,
 }
 
 /// Copies both ways between a TCP connection and a stream until either

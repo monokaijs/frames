@@ -10,7 +10,9 @@ struct Package {
     sha256: String,
 }
 
-pub fn launch(target: &str) -> anyhow::Result<()> {
+/// Runs this setup again elevated (Windows asks for administrator rights).
+#[cfg(windows)]
+fn launch(target: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         ["gamepad", "usb-export", "usb-host"].contains(&target),
         "Unknown device setup target"

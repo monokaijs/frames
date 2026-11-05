@@ -11,6 +11,8 @@ use std::path::Path;
 
 const STATUS_PREFIX: &str = "Frames status: ";
 const ERROR_PREFIX: &str = "Frames: ";
+/// v2 sessions (`frames next`) end with this instead.
+const NEXT_ERROR_PREFIX: &str = "Frames Next: ";
 /// Phases and the final error are always near the end of the log.
 const TAIL_BYTES: u64 = 16 * 1024;
 
@@ -83,7 +85,10 @@ pub fn explain_failure(name: &str, log: &str, phase: Phase) -> String {
     let Some(raw) = log
         .lines()
         .rev()
-        .find_map(|line| line.strip_prefix(ERROR_PREFIX))
+        .find_map(|line| {
+            line.strip_prefix(ERROR_PREFIX)
+                .or_else(|| line.strip_prefix(NEXT_ERROR_PREFIX))
+        })
         .map(str::trim)
     else {
         return format!(
@@ -100,6 +105,21 @@ pub fn explain_failure(name: &str, log: &str, phase: Phase) -> String {
         } else {
             format!("Couldn't reach {name}. {}", reach_hint())
         };
+    }
+    if has("refused this device") {
+        return format!(
+            "{name} didn't approve this device. Ask the person there to accept it when Frames shows the pairing code."
+        );
+    }
+    if has("did not start the stream") {
+        return format!(
+            "{name} didn't answer in time. Make sure someone there accepts the connection, then connect again."
+        );
+    }
+    if has("no single nearby device") || has("not a device id") {
+        return format!(
+            "Couldn't find {name}. Check the device ID, and that Frames is sharing on that device."
+        );
     }
     if has("connection declined") {
         return format!("{name} declined the connection.");
@@ -166,6 +186,14 @@ mod tests {
             "Waiting for the other device to approve"
         );
         assert_eq!(session_detail(Phase::Starting, ""), "Starting…");
+    }
+
+    #[test]
+    fn v2_session_errors_are_explained() {
+        let log = "Frames status: waiting\nFrames Next: the host refused this device (not approved there)\n";
+        assert!(explain_failure("Mac", log, Phase::Waiting).starts_with("Mac didn't approve"));
+        let log = "Frames Next: not a device id, and no single nearby device starts with it\n";
+        assert!(explain_failure("Mac", log, Phase::Connecting).starts_with("Couldn't find Mac."));
     }
 
     #[test]

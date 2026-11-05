@@ -2,9 +2,11 @@
 //!
 //! The host lets a device in when the trust list says so, or after the
 //! person at the host compares the pairing code shown on both screens and
-//! approves it here. A host without a terminal rejects unknown devices unless
-//! it was started with `--approve view|control`, which is for unattended
-//! test runs only and says so when used.
+//! approves it here, or in the Frames launcher that started the host
+//! (`--ask-launcher`, see `crate::launcher`). Otherwise a host without a
+//! terminal rejects unknown devices unless it was started with
+//! `--approve view|control`, which is for unattended test runs only and says
+//! so when used.
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -78,6 +80,22 @@ struct Hello {
     /// Which of the host's shared windows this session shows (0-based).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window: Option<u32>,
+    /// The viewer's device name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    /// Whether the viewer wants host audio (absent: older viewers, which
+    /// took it whenever the host offered it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audio: Option<bool>,
+    /// The most the viewer wants to receive, in Mbps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_mbps: Option<u32>,
+    /// This session lists the host's windows instead of streaming.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    catalog: bool,
+    /// The host window this session streams, by catalog id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     v1_certificate: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,6 +104,24 @@ struct Hello {
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
+/// What a viewer tells the host about itself and its session.
+pub struct Asks {
+    /// Codecs it decodes, best first.
+    pub decoders: Vec<crate::Codec>,
+    /// The host's shared window to show (0-based).
+    pub window: Option<u32>,
+    /// Its device name.
+    pub name: String,
+    /// It wants host audio.
+    pub audio: bool,
+    /// The most it wants to receive, in Mbps.
+    pub max_mbps: Option<u32>,
+    /// Lists the host's windows instead of streaming (`crate::catalog`).
+    pub catalog: bool,
+    /// The host window to stream, by catalog id.
+    pub window_id: Option<u64>,
+}
+
 /// Viewer: always opens the hello stream first (it fixes the order of the
 /// viewer's streams); with `migrate`, it carries a proof made with this
 /// device's v1 key, bound to this connection and this device's v2 id.
@@ -93,12 +129,16 @@ pub async fn send_hello(
     session: &frames_net::Session,
     own_id: &iroh::EndpointId,
     migrate: bool,
-    decoders: Vec<crate::Codec>,
-    window: Option<u32>,
+    asks: Asks,
 ) -> Result<()> {
     let mut hello = Hello {
-        decoders,
-        window,
+        decoders: asks.decoders,
+        window: asks.window,
+        name: Some(asks.name),
+        audio: Some(asks.audio),
+        max_mbps: asks.max_mbps,
+        catalog: asks.catalog,
+        window_id: asks.window_id,
         ..Hello::default()
     };
     if migrate {
@@ -153,6 +193,14 @@ pub struct Admitted {
     pub decoders: Vec<crate::Codec>,
     /// The shared window the viewer asked for.
     pub window: Option<u32>,
+    /// The viewer wants host audio.
+    pub audio: bool,
+    /// The viewer's bitrate cap, in Mbps.
+    pub max_mbps: Option<u32>,
+    /// The viewer asks for the window catalog.
+    pub catalog: bool,
+    /// The host window the viewer asks for.
+    pub window_id: Option<u64>,
 }
 
 /// Host: a device that proves it is a v1-trusted device gets that trust
@@ -200,28 +248,70 @@ fn migrate(
 }
 
 /// Whether to stream to this device, and how.
+/// `launcher`: the Frames launcher started this host and asks its user.
+/// `approved`: devices let in for this session only, earlier while this
+/// host runs, with whether they may control; they are not asked again (a
+/// viewer of several windows opens a session for each). Trusted devices
+/// are checked against the trust list every time, so removing one takes
+/// effect at once.
 pub async fn decide(
     config: &std::path::Path,
     session: &frames_net::Session,
     preset: Option<Approve>,
+    launcher: bool,
+    approved: &mut std::collections::HashMap<iroh::EndpointId, bool>,
 ) -> Result<Option<Admitted>> {
     let hello = receive_hello(session).await;
-    let decoders = hello.decoders.clone();
-    let window = hello.window;
-    let admit = |control| Admitted {
-        control,
-        decoders: decoders.clone(),
-        window,
+    let control = match approved.get(&session.remote()) {
+        Some(&control) => control,
+        None => {
+            let Some(control) = admit_device(config, session, preset, launcher, &hello).await?
+            else {
+                return Ok(None);
+            };
+            let list = TrustList::load(&TrustList::path_in(config))?;
+            if list.get(&session.remote()).is_none() {
+                approved.insert(session.remote(), control);
+            }
+            control
+        }
     };
-    Ok(admit_device(config, session, preset, &hello)
-        .await?
-        .map(admit))
+    let name = hello.name.clone().unwrap_or_default();
+    crate::launcher::report(
+        "viewer",
+        &serde_json::json!({
+            "device": session.remote().to_string(),
+            "name": name,
+            "control": control,
+        }),
+    );
+    Ok(Some(Admitted {
+        control,
+        decoders: hello.decoders,
+        window: hello.window,
+        audio: hello.audio.unwrap_or(true),
+        max_mbps: hello.max_mbps.map(|cap| cap.max(1)),
+        catalog: hello.catalog,
+        window_id: hello.window_id,
+    }))
+}
+
+/// The name to save for a device: what it calls itself, else its id.
+fn saved_name(hello: &Hello, device: &iroh::EndpointId) -> String {
+    hello
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| name.chars().take(250).collect())
+        .unwrap_or_else(|| format!("device {}", short(device)))
 }
 
 async fn admit_device(
     config: &std::path::Path,
     session: &frames_net::Session,
     preset: Option<Approve>,
+    launcher: bool,
     hello: &Hello,
 ) -> Result<Option<bool>> {
     let path = TrustList::path_in(config);
@@ -229,10 +319,21 @@ async fn admit_device(
     let device = session.remote();
     let proof = proof(hello);
     if let Admission::Trusted { control } = admission(&list, &device) {
-        let name = list
+        let mut name = list
             .get(&device)
             .map(|d| d.name.clone())
             .unwrap_or_default();
+        // Keep the saved name current when the device was renamed.
+        let current = saved_name(hello, &device);
+        if hello.name.is_some()
+            && current != name
+            && let Some(mut entry) = list.get(&device).cloned()
+        {
+            entry.name = current.clone();
+            list.insert(&device, entry);
+            list.save(&path)?;
+            name = current;
+        }
         println!(
             "trusted device {name} ({}): {}",
             short(&device),
@@ -250,8 +351,9 @@ async fn admit_device(
         return Ok(Some(control));
     }
     let code = session.pairing_code()?;
+    let name = saved_name(hello, &device);
     println!(
-        "new device {} wants to connect. Pairing code {} {} (it must match the viewer's).",
+        "new device {name} ({}) wants to connect. Pairing code {} {} (it must match the viewer's).",
         short(&device),
         &code[..4],
         &code[4..]
@@ -264,6 +366,7 @@ async fn admit_device(
             );
             Some(choice)
         }
+        None if launcher => crate::launcher::ask_pairing(&device, &name, &code).await,
         None if std::io::stdin().is_terminal() => ask().await,
         None => {
             println!("refused: no terminal to approve it here (see --approve)");
@@ -281,7 +384,7 @@ async fn admit_device(
     list.insert(
         &device,
         TrustedDevice {
-            name: format!("device {}", short(&device)),
+            name,
             allow_control: control,
             legacy_fingerprint: None,
         },

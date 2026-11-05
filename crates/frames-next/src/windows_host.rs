@@ -59,15 +59,17 @@ fn first_frame(capture: &mut WgcCapture, clock: &SystemClock) -> Result<VideoFra
 /// each hardware encoder whose GPU is present (discrete first), then Media
 /// Foundation and software AV1, so a missing or outdated driver (NVENC
 /// needs API 12.0, driver 522+) falls back instead of failing.
+/// `--prefer-encoder` moves one to the front of that order.
 pub fn backends(o: &Options) -> Vec<&'static str> {
+    let named = |name: &str| match name {
+        "nvenc" => "nvenc",
+        "amf" => "amf",
+        "qsv" => "qsv",
+        "mf" => "mf",
+        _ => "software",
+    };
     if o.encoder_explicit {
-        return vec![match o.encoder.as_str() {
-            "nvenc" => "nvenc",
-            "amf" => "amf",
-            "qsv" => "qsv",
-            "mf" => "mf",
-            _ => "software",
-        }];
+        return vec![named(&o.encoder)];
     }
     let vendors: Vec<u32> = adapters()
         .map(|list| list.iter().map(|a| a.vendor).collect())
@@ -79,6 +81,11 @@ pub fn backends(o: &Options) -> Vec<&'static str> {
         }
     }
     out.extend(["mf", "software"]);
+    if let Some(preferred) = &o.prefer_encoder {
+        let preferred = named(preferred);
+        out.retain(|backend| *backend != preferred);
+        out.insert(0, preferred);
+    }
     out
 }
 
@@ -148,7 +155,7 @@ fn encode_params(o: &Options, width: u32, height: u32) -> EncodeParams {
         width,
         height,
         fps: o.fps,
-        bitrate_bps: o.mbps * 1_000_000,
+        bitrate_bps: o.start_mbps() * 1_000_000,
         vbv_frames: 1.0,
         gop: Gop::Infinite,
         intra_refresh_frames: Some(6),
@@ -343,15 +350,25 @@ fn stream(
     } else {
         None
     };
-    // One window (--window), the QA source, or the whole primary monitor.
-    let shared_window = match &o.window {
-        Some(needle) => {
+    // One window (by catalog id, or --window), the QA source, or the whole
+    // primary monitor.
+    let shared_window = match (o.window_id, &o.window) {
+        (Some(id), _) => {
+            let hwnd = windows::Win32::Foundation::HWND(id as usize as *mut _);
+            let (_, title) = win::shareable_windows()
+                .into_iter()
+                .find(|(h, _)| *h == hwnd)
+                .context("that window is no longer shared")?;
+            println!("sharing one window: {title}");
+            Some(hwnd)
+        }
+        (None, Some(needle)) => {
             let (hwnd, title) = win::find_window(needle)
                 .with_context(|| format!("no window whose title contains {needle:?}"))?;
             println!("sharing one window: {title}");
             Some(hwnd)
         }
-        None => None,
+        (None, None) => None,
     };
     let source = qa.as_ref().map(|qa| qa.hwnd()).or(shared_window);
     // Capture on the encoder's GPU: hardware encoders only accept textures
@@ -433,6 +450,7 @@ fn stream(
         height,
         fps: o.fps,
         platform: crate::platform().into(),
+        name: crate::device_name(o),
     };
     handle
         .block_on(send_info(session, info))
@@ -469,8 +487,8 @@ fn stream(
     let media = session.media();
     let rate = RateConfig {
         min_bps: 2_000_000,
-        max_bps: (o.mbps * 2).max(20) * 1_000_000,
-        start_bps: o.mbps * 1_000_000,
+        max_bps: o.max_mbps() * 1_000_000,
+        start_bps: o.start_mbps() * 1_000_000,
     };
     let mut config = HostConfig::new(1, 1, rate);
     if let Some(pacing) = o.pacing {
@@ -498,6 +516,8 @@ fn stream(
     let mut last_encode_us = 0u64;
     let frame_interval_us = 1_000_000 / u64::from(o.fps.max(1));
     let mut pending = Some(first);
+    let mut follower = crate::resize::Follower::new((width, height));
+    let mut resize_stream = None;
     let mut frames = 0u64;
     let mut encode_us = Vec::new();
     loop {
@@ -530,9 +550,8 @@ fn stream(
             None => match capture.next(clock.now_us() + 500) {
                 Ok(CaptureEvent::Frame(frame)) => Some(frame),
                 Ok(CaptureEvent::Lost) => bail!("the capture source went away"),
-                Ok(CaptureEvent::Resized { width, height }) => {
-                    bail!("the source resized to {width}x{height}; restart the host")
-                }
+                // Frames follow at the new size (`crate::resize`).
+                Ok(CaptureEvent::Resized { .. }) => None,
                 Ok(CaptureEvent::Timeout) => None,
                 Err(error) => bail!("capture failed: {error}"),
             },
@@ -571,7 +590,19 @@ fn stream(
             }
             None => None,
         };
-        if let Some(frame) = frame {
+        let sized = frame.map(|frame| {
+            let size = frame.surface.size();
+            (frame, size)
+        });
+        if let crate::resize::Step::Encode(frame, resized) = follower.step(sized, Instant::now()) {
+            if let Some(size) = resized {
+                let mut params = encode_params(o, size.0, size.1);
+                params.bitrate_bps = host.target_bps();
+                encoder.control(EncoderControl::Reconfigure(params))?;
+                encoder.control(EncoderControl::ForceKeyframe)?;
+                println!("source resized to {}x{}", size.0, size.1);
+                crate::resize::announce(handle, session, &mut resize_stream, size)?;
+            }
             let before = clock.now_us();
             last_encode_us = before;
             host.encode(before, encoder.as_mut(), &frame)?;

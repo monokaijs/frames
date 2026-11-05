@@ -3,10 +3,10 @@
 //! Input from the window goes to the host on the shared input lane, and the
 //! host's cursor shape is shown over the video by the window itself.
 
+use crate::Options;
 use crate::lane::{Captured, InputLane};
 use crate::stats::Samples;
-use crate::{Options, receive_info};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use frames_input::{Button, Event, keys};
 use frames_media::api::{MediaClock, MediaTransport, PresentMode, Presenter};
 use frames_media::client::{ClientConfig, ClientSession};
@@ -18,23 +18,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
-    // A host seeing this device for the first time asks its user (60 s).
-    println!("waiting for the host (it may be asking to approve this device)");
-    let info = tokio::time::timeout(Duration::from_secs(90), receive_info(&session))
-        .await
-        .context("the host did not start the stream within 90 s")??;
-    println!(
-        "stream: {:?} {}x{} at {} fps",
-        info.codec, info.width, info.height, info.fps
-    );
+    let info = crate::await_stream(&session).await?;
     // The host's cursor shape and visibility, applied on the viewer thread.
     let (cursor_tx, cursor_rx) = std::sync::mpsc::channel();
+    let (sizes_tx, sizes) = std::sync::mpsc::channel();
     let drain = {
         let session = session.clone();
         let (cursor_streams, mut cursor_incoming) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(crate::streams::route_viewer(
             session.clone(),
             cursor_streams,
+            sizes_tx,
             o.adb.then_some(o.adb_server),
         ));
         tokio::spawn(async move {
@@ -75,7 +69,11 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     };
     let audio = crate::audio::Receiver::start(o.audio).await?;
     let result = tokio::task::spawn_blocking(move || {
-        view(&session, info, &o, lane, cursor_rx, clipboard, audio)
+        let updates = crate::streams::HostUpdates {
+            cursor: cursor_rx,
+            sizes,
+        };
+        view(&session, info, &o, lane, updates, clipboard, audio)
     })
     .await?;
     let _ = writer.await;
@@ -139,7 +137,7 @@ fn view(
     info: crate::StreamInfo,
     o: &Options,
     lane: InputLane,
-    cursor_rx: std::sync::mpsc::Receiver<frames_input::cursor::CursorMessage>,
+    updates: crate::streams::HostUpdates,
     mut clipboard: Option<crate::clip::ClipboardLink>,
     audio: Option<crate::audio::Receiver>,
 ) -> Result<()> {
@@ -148,7 +146,10 @@ fn view(
     let clock = SystemClock::new();
     let mut decoder = MacDecoder::new(info.codec.into())?;
     // The window needs NSApplication on the main thread (frames-next runs it).
-    let mut presenter = MacPresenter::new(info.width / 2, info.height / 2, true)?;
+    // The picture at its own size when it fits (FramesMac fits it to the
+    // screen), in its own shape.
+    let mut presenter = MacPresenter::new(info.width, info.height, true)?;
+    presenter.set_title(&crate::viewer_title(o, &info));
     // Events are sent from the main thread as they arrive: the viewer loop
     // can wait up to a frame for a drawable, which would delay input.
     let lane = Arc::new(Mutex::new(lane));
@@ -197,7 +198,7 @@ fn view(
     let mut superseded = 0u64;
     let mut reported_clean = 0u64;
     loop {
-        if o.deadline().is_some_and(|d| started.elapsed() >= d) {
+        if o.deadline().is_some_and(|d| started.elapsed() >= d) || presenter.closed() {
             break;
         }
         if session.is_closed() {
@@ -213,7 +214,15 @@ fn view(
             }
         }
         lane.lock().unwrap().tick(&media, clock.now_us());
-        while let Ok(message) = cursor_rx.try_recv() {
+        // The host window resized: a decoder for the new size, and the
+        // window in the new shape at its current scale.
+        while let Ok((width, height)) = updates.sizes.try_recv() {
+            println!("stream resized to {width}x{height}");
+            decoder = MacDecoder::new(info.codec.into())?;
+            presenter.resize(width, height);
+            client.request_keyframe();
+        }
+        while let Ok(message) = updates.cursor.try_recv() {
             match message {
                 frames_input::cursor::CursorMessage::Shape {
                     width,
@@ -268,8 +277,10 @@ fn view(
         if started.elapsed() >= next_report {
             let stats = client.stats();
             let (n, p50, p95) = latency.take_window();
-            let title = crate::stats::window_title(n, p50, p95, &path, stats.frames_lost);
-            presenter.set_title(&title);
+            if o.stats_title {
+                let title = crate::stats::window_title(n, p50, p95, &path, stats.frames_lost);
+                presenter.set_title(&title);
+            }
             println!(
                 "client t={:>3}s presented {n:>3}/s clean {:>3} lost {} | capture to present p50 {p50:>5.2} p95 {p95:>5.2} ms | recoveries {} nacks {} | {:?} rtt {:.1} ms offset {:.1} ms",
                 next_report.as_secs(),
