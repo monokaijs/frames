@@ -132,8 +132,53 @@ pub fn window_size(
     )
 }
 
+/// Viewer: the last picture shown, kept to draw again when the window's
+/// drawing area changes (a menu row added, a move to another screen). A
+/// still picture (a sheet, a dialog) sends no new frame that would redraw
+/// it, so without this it stays blank or stretched.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct Redraw<F> {
+    last: Option<(F, (u32, u32))>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl<F: Clone> Redraw<F> {
+    pub fn new() -> Self {
+        Self { last: None }
+    }
+
+    /// `frame` was just shown in a drawing area of `size`.
+    pub fn shown(&mut self, frame: F, size: (u32, u32)) {
+        self.last = Some((frame, size));
+    }
+
+    /// The picture to show again: the drawing area is `size` now and no
+    /// newer frame came.
+    pub fn due(&self, size: (u32, u32)) -> Option<F> {
+        match &self.last {
+            Some((frame, shown_at)) if *shown_at != size && size.0 > 0 && size.1 > 0 => {
+                Some(frame.clone())
+            }
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_still_picture_is_drawn_again_when_its_window_changes() {
+        let mut redraw = Redraw::new();
+        assert_eq!(redraw.due((260, 154)), None, "nothing shown yet");
+        redraw.shown("sheet", (260, 154));
+        assert_eq!(redraw.due((260, 154)), None, "same area: nothing to do");
+        // A menu row took 20 pixels: draw it again in the new area, once.
+        assert_eq!(redraw.due((260, 134)), Some("sheet"));
+        redraw.shown("sheet", (260, 134));
+        assert_eq!(redraw.due((260, 134)), None);
+        assert_eq!(redraw.due((0, 0)), None, "minimized");
+    }
     use super::*;
 
     #[test]

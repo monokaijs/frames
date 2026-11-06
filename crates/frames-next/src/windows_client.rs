@@ -287,6 +287,7 @@ fn view(
     let mut next_report = Duration::from_secs(1);
     let mut latency = Samples::new(30);
     let mut presented = 0u64;
+    let mut redraw = crate::resize::Redraw::new();
     let mut superseded = 0u64;
     let mut errors = 0u64;
     let mut reported_clean = 0u64;
@@ -354,7 +355,12 @@ fn view(
         while let Ok(items) = updates.menus.try_recv() {
             println!("host menus: {}", crate::menus::summary(&items));
             crate::control::set_window_details(o.menu_id, None, Some(!items.is_empty()));
-            win::set_host_menu(viewer, &items);
+            // A popup (menu, tooltip, sheet) is the picture alone: a menu
+            // row on it would push the picture down (its app's menus are
+            // on its main window).
+            if !popup {
+                win::set_host_menu(viewer, &items);
+            }
         }
         // The menus changed: this window's entry, the statistics, a notice.
         if crate::control::version() != menu_version {
@@ -543,10 +549,25 @@ fn view(
             win::set_aspect(size.0, size.1);
             win::register_viewer(o.menu_id, viewer, stream_size);
         }
+        // No new frame, but the drawing area changed: show the last one
+        // again (a still picture would otherwise stay blank).
+        let area = win::client_size(viewer);
+        let again = if newest.is_none() {
+            redraw.due(area)
+        } else {
+            None
+        };
+        if let Some(frame) = again {
+            if presenter.present(frame.clone(), mode).is_ok() {
+                redraw.shown(frame, area);
+            }
+        }
         if let Some(frame) = newest {
             let captured = frame.captured_us;
+            let kept = frame.clone();
             match presenter.present(frame, mode) {
                 Ok(stamp) => {
+                    redraw.shown(kept, area);
                     presented += 1;
                     let measured = stamp.presented_us.saturating_sub(captured);
                     latency.push(measured);
