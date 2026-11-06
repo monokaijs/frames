@@ -15,7 +15,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F10, VK_F11, VK_F12};
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F9, VK_F10, VK_F11, VK_F12};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
@@ -109,6 +109,7 @@ thread_local! {
     /// Relative mouse: `Some(locked)` while on; `locked` when the pointer is
     /// confined and hidden (not in unattended tests).
     static RELATIVE: Cell<Option<bool>> = const { Cell::new(None) };
+    static LOCAL_SHORTCUT_KEYS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Turns relative mouse (games) on or off, as Ctrl+Alt+F11 does, and tells
@@ -172,11 +173,21 @@ pub fn set_relative(hwnd: HWND, on: bool, lock: bool) {
         RELATIVE.with(|r| r.set(None));
     }
     let at_us = SystemClock::new().now_us();
+    // Changing keyboard modes must not leave gameplay keys or the shortcut's
+    // modifiers held on the host.
+    FORWARDED.with(|keys| keys.borrow_mut().clear());
+    SURROGATE.with(|s| s.set(None));
     CAPTURED.with(|c| {
-        c.borrow_mut().push(Captured::Event {
-            event: Event::Mode { relative: on },
-            at_us,
-        })
+        c.borrow_mut().extend([
+            Captured::Event {
+                event: Event::ReleaseAll,
+                at_us,
+            },
+            Captured::Event {
+                event: Event::Mode { relative: on },
+                at_us,
+            },
+        ])
     });
 }
 
@@ -438,6 +449,22 @@ fn position(hwnd: HWND, l: LPARAM) -> (u16, u16) {
 
 fn viewer_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<Captured> {
     let at_us = SystemClock::new().now_us();
+    if matches!(message, WM_KEYUP | WM_SYSKEYUP) {
+        let local = LOCAL_SHORTCUT_KEYS.with(|keys| {
+            let mut keys = keys.borrow_mut();
+            let local = keys.contains(&w.0);
+            keys.retain(|key| *key != w.0);
+            local
+        });
+        if local {
+            return None;
+        }
+    }
+    if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN)
+        && LOCAL_SHORTCUT_KEYS.with(|keys| keys.borrow().contains(&w.0))
+    {
+        return None;
+    }
     let button = |button, down| {
         let (x, y) = position(hwnd, l);
         Some(Captured::Event {
@@ -490,16 +517,21 @@ fn viewer_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<Captur
         // Ctrl+Alt+F10: live statistics on or off (v1's debug overlay
         // shortcut); never sent.
         WM_KEYDOWN | WM_SYSKEYDOWN if w.0 == usize::from(VK_F10.0) && release_shortcut_held() => {
+            LOCAL_SHORTCUT_KEYS.with(|keys| keys.borrow_mut().push(w.0));
             if (l.0 >> 30) & 1 == 0 {
                 crate::control::send(crate::control::Command::Stats);
             }
             None
         }
         WM_KEYDOWN | WM_SYSKEYDOWN if w.0 == usize::from(VK_F11.0) && release_shortcut_held() => {
-            set_relative(hwnd, !relative(), true);
+            LOCAL_SHORTCUT_KEYS.with(|keys| keys.borrow_mut().push(w.0));
+            if (l.0 >> 30) & 1 == 0 {
+                set_relative(hwnd, !relative(), true);
+            }
             None
         }
         WM_KEYDOWN | WM_SYSKEYDOWN if w.0 == usize::from(VK_F12.0) && release_shortcut_held() => {
+            LOCAL_SHORTCUT_KEYS.with(|keys| keys.borrow_mut().push(w.0));
             set_relative(hwnd, false, true);
             unsafe {
                 let _ = ShowWindow(hwnd, SW_MINIMIZE);
@@ -520,7 +552,7 @@ fn viewer_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<Captur
                 GetKeyState(i32::from(key.0)) < 0
             };
             let shortcut = (held(VK_CONTROL) || held(VK_MENU)) && !held(VK_RMENU);
-            if PHYSICAL.with(Cell::get) || shortcut {
+            if PHYSICAL.with(Cell::get) || relative() || shortcut {
                 return None;
             }
             let unit = w.0 as u16;
@@ -582,7 +614,7 @@ fn key_input(message: u32, w: WPARAM, l: LPARAM, at_us: u64) -> Option<Captured>
         event: Event::Key { usage, down },
         at_us,
     };
-    if PHYSICAL.with(Cell::get) {
+    if PHYSICAL.with(Cell::get) || relative() {
         return Some(key(usage, down));
     }
     if usage == 0xe6 {
@@ -1839,3 +1871,7 @@ pub fn initial_size(stream: (u32, u32)) -> (u32, u32) {
         ((h * fit).round() as u32).max(1),
     )
 }
+
+#[cfg(test)]
+#[path = "win_input_tests.rs"]
+mod input_tests;
