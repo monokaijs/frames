@@ -64,6 +64,10 @@ final class Presenter: @unchecked Sendable {
         // Letterboxed ("fit"): the picture keeps its shape inside the view.
         layer.contentsGravity = .resizeAspect
         layer.backgroundColor = CGColor(gray: 0, alpha: 1)
+        // This layer is created on the render worker, which has no run
+        // loop to commit Core Animation's implicit transaction. Commit its
+        // setup before handing it to AppKit or presented drawables stay black.
+        CATransaction.flush()
         self.layer = layer
         self.windowed = windowed
         // Offscreen presenters never touch the main thread (it may not be
