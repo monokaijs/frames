@@ -222,6 +222,7 @@ impl Follow {
         }
     }
 
+    #[cfg(test)]
     pub fn placed(&self) -> bool {
         self.placed.is_some()
     }
