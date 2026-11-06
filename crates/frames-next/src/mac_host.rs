@@ -214,6 +214,7 @@ fn stream(
     // captured alpha on its first frame and at each new size (a sheet's or
     // menu's rounded corners); the viewer clips its popup window to it.
     let mut shape_sent: Option<crate::resize::Shape> = None;
+    let mut logged_area = None;
     let mut shape_size: Option<(u32, u32)> = None;
     let (mut frames, mut pointers) = (0u64, 0u64);
     // QA runs have no injector: relative motion is summed here instead, so
@@ -252,6 +253,14 @@ fn stream(
         // Input maps to what is captured: the window without its title bar,
         // as the capture reports it, else the window's frame.
         let area = capture.geometry().or(*bounds.lock().unwrap());
+        if area != logged_area {
+            // Diagnostics: where the captured picture is, each time it moves
+            // or changes size (popup placement on the viewer follows it).
+            if let Some((x, y, width, height)) = area {
+                println!("captured area {x:.0},{y:.0} {width:.0}x{height:.0}");
+            }
+            logged_area = area;
+        }
         if let Some(injector) = &mut injector
             && let Some((x, y, width, height)) = area
         {

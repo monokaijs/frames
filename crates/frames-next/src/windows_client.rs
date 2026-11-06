@@ -163,6 +163,7 @@ fn view(
     // size within v1's limits.
     let window_info = o.window_info.clone();
     let popup = window_info.as_ref().is_some_and(|w| w.is_popup());
+    let placement_log = std::cell::RefCell::new(String::new());
     // Where the parent's viewer shows this window now, if it is there.
     // Both as the host lists them now (they move and resize on the host),
     // else as they were when this window opened.
@@ -178,6 +179,18 @@ fn view(
                     (x, y, scale),
                     stream_size,
                 );
+                // Diagnostics: every input of a placement that differs from
+                // the last one (popups that move after opening).
+                let inputs = format!(
+                    "window {:.0},{:.0} {:.0}x{:.0}, parent {:.0},{:.0} {:.0}x{:.0}, parent picture {}x{} at {},{} scale {:.3}, picture {}x{} -> at {},{} size {}x{}",
+                    window.x, window.y, window.width, window.height,
+                    parent.x, parent.y, parent.width, parent.height,
+                    parent_stream.0, parent_stream.1, x, y, scale,
+                    stream_size.0, stream_size.1, at.0, at.1, size.0, size.1
+                );
+                if placement_log.replace(inputs.clone()) != inputs {
+                    println!("placement: {inputs}");
+                }
                 (owner, at, size)
             })
         }
@@ -393,14 +406,19 @@ fn view(
         // or the window or picture changes size.
         let mut reshape = false;
         while let Ok(new) = updates.shapes.try_recv() {
-            println!(
-                "picture shape: {}",
-                if new.is_some() {
-                    "transparent corners"
-                } else {
-                    "rectangle"
-                }
-            );
+            // Diagnostics: the bands as received (rows, left, right).
+            match &new {
+                Some(s) => println!(
+                    "picture shape: transparent corners, top {:?}, bottom {:?} (picture {}x{})",
+                    s.top, s.bottom, stream_size.0, stream_size.1
+                ),
+                None => println!("picture shape: rectangle"),
+            }
+            // A/B check: FRAMES_SHAPE=off keeps popups rectangular.
+            if std::env::var("FRAMES_SHAPE").is_ok_and(|v| v == "off") {
+                println!("picture shape not applied (FRAMES_SHAPE=off)");
+                continue;
+            }
             shape = new;
             reshape = true;
         }

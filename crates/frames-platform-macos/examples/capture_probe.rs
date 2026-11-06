@@ -18,6 +18,11 @@ fn main() {
     let id: u32 = args[1].parse().expect("window id");
     let path = args[2].clone();
     let immediate = args.iter().any(|arg| arg == "--immediate");
+    let delay_us = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--delay-ms="))
+        .map(|value| value.parse::<u64>().expect("sample delay in milliseconds") * 1_000)
+        .unwrap_or(if immediate { 0 } else { 500_000 });
     let worker = std::thread::spawn(move || {
         let clock = SystemClock::new();
         let mut capture = MacCapture::window(id, 30).expect("capture");
@@ -29,11 +34,15 @@ fn main() {
             .unwrap();
         capture.set_options(false, false);
         let stop = clock.now_us() + 5_000_000;
-        let ready = clock.now_us() + if immediate { 0 } else { 500_000 };
+        let ready = clock.now_us() + delay_us;
         let mut saved = false;
+        let mut latest = None;
         while clock.now_us() < stop {
-            if let Ok(CaptureEvent::Frame(frame)) = capture.next(clock.now_us() + 50_000)
-                && clock.now_us() >= ready
+            if let Ok(CaptureEvent::Frame(frame)) = capture.next(clock.now_us() + 50_000) {
+                latest = Some(frame);
+            }
+            if clock.now_us() >= ready
+                && let Some(frame) = latest.take()
             {
                 let (bytes, width, height) = PixelBuffer::from_surface(&frame.surface)
                     .unwrap()
