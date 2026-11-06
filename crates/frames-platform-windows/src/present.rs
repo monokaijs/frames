@@ -150,7 +150,7 @@ impl D3D11Presenter {
             let swap: IDXGISwapChain2 =
                 unsafe { factory.CreateSwapChainForHwnd(&device, self.hwnd, &desc, None, None) }
                     .and_then(|s| s.cast())
-                    .map_err(backend)?;
+                    .map_err(|error| MediaError::Backend(format!("create swap chain: {error}")))?;
             unsafe { swap.SetMaximumFrameLatency(1) }.map_err(backend)?;
             let waitable = unsafe { swap.GetFrameLatencyWaitableObject() };
             let video: ID3D11VideoDevice = device.cast().map_err(backend)?;
@@ -209,7 +209,9 @@ impl State {
                 ..Default::default()
             };
             let enumerator =
-                unsafe { self.video.CreateVideoProcessorEnumerator(&desc) }.map_err(backend)?;
+                unsafe { self.video.CreateVideoProcessorEnumerator(&desc) }.map_err(|error| {
+                    MediaError::Backend(format!("create video processor enumerator: {error}"))
+                })?;
             let processor =
                 unsafe { self.video.CreateVideoProcessor(&enumerator, 0) }.map_err(backend)?;
             unsafe {
@@ -432,20 +434,39 @@ impl Presenter for D3D11Presenter {
                     },
                     Some(&mut input_view),
                 )
-                .map_err(backend)?;
+                .map_err(|error| {
+                    MediaError::Backend(format!("create video input view: {error}"))
+                })?;
             // YCbCr matrix bit 2, nominal range bits 4-5 (1 = studio, 2 = full).
             let colour = D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
                 _bitfield: (u32::from(matrix_709) << 2) | (if full_range { 2 } else { 1 } << 4),
             };
             let target = picture_rect(input, size, self_fill);
+            // Hardware decoder textures are aligned (HEVC commonly to 128
+            // pixels). The valid picture is smaller than that allocation.
+            // Sampling the whole texture shrinks it into the top-left and
+            // introduces black padding along the right and bottom edges.
+            let source = RECT {
+                left: 0,
+                top: 0,
+                right: input.0 as i32,
+                bottom: input.1 as i32,
+            };
             let vc = &state.video_context;
+            vc.VideoProcessorSetStreamSourceRect(&video_processor, 0, true, Some(&source));
             vc.VideoProcessorSetStreamColorSpace(&video_processor, 0, &colour);
             vc.VideoProcessorSetOutputColorSpace(
                 &video_processor,
                 &D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: 0 },
             );
             vc.VideoProcessorSetStreamDestRect(&video_processor, 0, true, Some(&target));
-            vc.VideoProcessorSetOutputTargetRect(&video_processor, true, None);
+            let output_rect = RECT {
+                left: 0,
+                top: 0,
+                right: size.0 as i32,
+                bottom: size.1 as i32,
+            };
+            vc.VideoProcessorSetOutputTargetRect(&video_processor, true, Some(&output_rect));
             let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
                 Enable: TRUE,
                 pInputSurface: ManuallyDrop::new(input_view),
@@ -458,7 +479,7 @@ impl Presenter for D3D11Presenter {
                 std::slice::from_ref(&stream),
             );
             ManuallyDrop::drop(&mut stream.pInputSurface);
-            result.map_err(backend)?;
+            result.map_err(|error| MediaError::Backend(format!("process picture: {error}")))?;
             let (interval, flags) = match mode {
                 PresentMode::Immediate if state.tearing => (0, DXGI_PRESENT_ALLOW_TEARING),
                 PresentMode::Immediate => (0, DXGI_PRESENT(0)),
