@@ -120,6 +120,10 @@ pub struct Snapshot {
     pub usb_error: Option<String>,
     /// The last thing worth telling the user (a fetched file, an error).
     pub notice: Option<String>,
+    /// The host's Quick App this connection is for, and whether only its
+    /// windows are shared (then the desktop view is refused).
+    pub quick_app: Option<String>,
+    pub only_app: bool,
     /// One window with isolated input (games): v1's "Window compatibility"
     /// text. The menus offer it, relative mouse, and keys stay physical.
     pub compatibility: Option<String>,
@@ -406,7 +410,9 @@ pub fn send(command: Command) {
         }
         Command::CancelTransfers => CANCEL_TRANSFERS.notify_waiters(),
         Command::View { view } => {
-            if snapshot().view != view {
+            if view == View::Desktop && snapshot().only_app {
+                notice("Only this app is shared on this connection: the desktop view is off.");
+            } else if snapshot().view != view {
                 update(|s| s.view = view);
                 SWITCHING.store(true, Ordering::Relaxed);
                 WINDOWS_WAKE.notify_one();

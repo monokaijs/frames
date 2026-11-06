@@ -519,9 +519,26 @@ fn view(
         // Every ready frame is decoded (later ones reference it), but only
         // the newest is shown: after a stall (the window opening, a slow
         // drawable) the older ones are already late.
-        let mut decoded = client.poll(clock.now_us(), &mut decoder);
-        superseded += decoded.len().saturating_sub(1) as u64;
-        if let Some(frame) = decoded.pop() {
+        // Older frames of a burst go back to the decoder's surface pool as
+        // soon as a newer one decodes.
+        let (newest, skipped) = client.poll_latest(clock.now_us(), &mut decoder);
+        superseded += skipped;
+        // Pointer mapping, the overlay and the window's shape follow the
+        // pictures themselves when they differ from the announced size.
+        if let Some(size) = newest.as_ref().map(|f| f.surface.size())
+            && size != stream_size
+            && size.0 > 0
+            && size.1 > 0
+        {
+            println!(
+                "pictures are {}x{}, not the announced {}x{}: following them",
+                size.0, size.1, stream_size.0, stream_size.1
+            );
+            stream_size = size;
+            win::set_aspect(size.0, size.1);
+            win::register_viewer(o.menu_id, viewer, stream_size);
+        }
+        if let Some(frame) = newest {
             let captured = frame.captured_us;
             match presenter.present(frame, mode) {
                 Ok(stamp) => {

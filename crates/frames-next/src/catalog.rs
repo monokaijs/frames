@@ -47,6 +47,10 @@ pub struct Window {
     /// The application's icon, a PNG of at most 64x64, base64 (Windows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// Its process (Quick Apps' identity, `crate::quick_apps`); hosts keep it
+    /// to themselves.
+    #[serde(default, skip_serializing)]
+    pub pid: u32,
     /// It blocks its parent until it closes (a modal dialog or a sheet):
     /// the viewer sends input for the parent to it instead (v1).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -88,10 +92,19 @@ fn secure_desktop() -> bool {
 /// The windows this host shares now, at most `limit` (`--max-windows`):
 /// with `--window` given, only windows whose title contains one of those
 /// texts.
-pub fn shared(filters: &[String], limit: usize) -> Vec<Window> {
+///
+/// Within one Quick App when `scope` is given ("Only stream this app"):
+/// only its windows, dialogs and popups, within the host's own `--window`
+/// limits.
+pub fn shared_in(
+    filters: &[String],
+    limit: usize,
+    scope: Option<&crate::quick_apps::QuickApp>,
+) -> Vec<Window> {
     if secure_desktop() {
         #[cfg(windows)]
-        if frames_platform_windows::secure::privileged() && filters.is_empty() {
+        // Never inside a Quick App: the secure desktop is the whole screen.
+        if frames_platform_windows::secure::privileged() && filters.is_empty() && scope.is_none() {
             return vec![Window {
                 id: SECURE_DESKTOP,
                 title: "Windows login / secure desktop".into(),
@@ -104,6 +117,7 @@ pub fn shared(filters: &[String], limit: usize) -> Vec<Window> {
                 width: 0.0,
                 height: 0.0,
                 icon: None,
+                pid: 0,
                 modal: false,
             }];
         }
@@ -111,6 +125,8 @@ pub fn shared(filters: &[String], limit: usize) -> Vec<Window> {
     }
     let filters: Vec<String> = filters.iter().map(|f| f.to_lowercase()).collect();
     let all = platform_windows();
+    // Who owns what, once per listing (Quick Apps).
+    let processes = scope.map(|_| crate::quick_apps::Processes::now());
     let chosen = |w: &Window| {
         filters.is_empty() || {
             let title = w.title.to_lowercase();
@@ -135,15 +151,25 @@ pub fn shared(filters: &[String], limit: usize) -> Vec<Window> {
                         }
                     })
         })
+        .filter(|w| match (scope, &processes) {
+            (Some(app), Some(processes)) => app.owns(w, processes),
+            _ => true,
+        })
         .cloned()
         .collect();
     windows.truncate(limit.min(MAX_WINDOWS));
     windows
 }
 
-/// Whether `id` is one of the windows this host shares now.
-pub fn is_shared(filters: &[String], limit: usize, id: u64) -> bool {
-    shared(filters, limit).iter().any(|w| w.id == id)
+/// Whether `id` is one of the windows this host shares now (within
+/// `scope`, see [`shared_in`]).
+pub fn is_shared(
+    filters: &[String],
+    limit: usize,
+    id: u64,
+    scope: Option<&crate::quick_apps::QuickApp>,
+) -> bool {
+    shared_in(filters, limit, scope).iter().any(|w| w.id == id)
 }
 
 #[cfg(windows)]
@@ -240,6 +266,7 @@ fn platform_windows() -> Vec<Window> {
                 icon: (role == "window" || role == "dialog")
                     .then(|| crate::win::icon_png(hwnd, &app))
                     .flatten(),
+                pid,
                 // v1: an owned dialog whose owner is disabled is modal.
                 modal: role == "dialog"
                     && !owner.is_invalid()
@@ -277,21 +304,67 @@ fn platform_windows() -> Vec<Window> {
 }
 
 /// Host: sends the shared windows to a catalog viewer until it leaves.
-pub async fn serve(session: frames_net::Session, filters: Vec<String>, limit: usize) -> Result<()> {
+/// A Quick App a catalog session is for (`crate::quick_apps`): only its
+/// windows are listed when `only`, and an empty list says why.
+pub struct Scope {
+    pub app: crate::quick_apps::QuickApp,
+    pub only: bool,
+    /// The host started it for this viewer (else it was not allowed to).
+    pub launched: Option<std::time::Instant>,
+}
+
+impl Scope {
+    /// Why nothing of it is listed yet.
+    fn waiting(&self) -> String {
+        match self.launched {
+            Some(at) if at.elapsed() < LAUNCH_WAIT => format!("Starting {}…", self.app.name),
+            Some(_) => format!("{} did not open a window.", self.app.name),
+            None => format!(
+                "{} is not running on the host. Connecting with control starts it.",
+                self.app.name
+            ),
+        }
+    }
+}
+
+/// How long a started Quick App has to open its first window.
+const LAUNCH_WAIT: Duration = Duration::from_secs(20);
+
+pub async fn serve(
+    session: frames_net::Session,
+    filters: Vec<String>,
+    limit: usize,
+    scope: Option<Scope>,
+) -> Result<()> {
+    let scope = scope.map(std::sync::Arc::new);
     let (mut send, _recv) = crate::streams::open(&session, crate::streams::CATALOG).await?;
     let mut last: Option<Vec<Window>> = None;
-    let mut last_problem: Option<&'static str> = None;
+    let mut last_problem: Option<String> = None;
     loop {
         if session.is_closed() {
             return Ok(());
         }
         let filters = filters.clone();
-        let (now, problem) =
-            tokio::task::spawn_blocking(move || (shared(&filters, limit), session_problem()))
-                .await?;
-        // Why there is nothing to share (a locked Mac), as v1 said it.
+        let scope = scope.clone();
+        let (now, problem) = tokio::task::spawn_blocking(move || {
+            let scope = scope.as_deref();
+            let now = shared_in(&filters, limit, scope.filter(|s| s.only).map(|s| &s.app));
+            // Why there is nothing to share (a locked Mac, as v1 said it), or
+            // why the Quick App is not listed yet.
+            let problem = session_problem().map(str::to_string).or_else(|| {
+                let scope = scope?;
+                let open = if scope.only {
+                    !now.is_empty()
+                } else {
+                    !shared_in(&filters, limit, Some(&scope.app)).is_empty()
+                };
+                (!open).then(|| scope.waiting())
+            });
+            (now, problem)
+        })
+        .await?;
         if problem != last_problem {
-            if let Some(reason) = problem {
+            if let Some(reason) = &problem {
                 let mut line = serde_json::to_vec(&serde_json::json!({ "reason": reason }))?;
                 line.push(b'\n');
                 if send.write_all(&line).await.is_err() {
@@ -393,6 +466,9 @@ pub async fn view(
         window_id,
         password: o.password.clone(),
         preview: false,
+        app: o.quick_app.clone(),
+        only_app: o.only_app,
+        quick_apps: false,
     };
     let catalog = node.connect(target.clone()).await?;
     crate::admit::send_hello(&catalog, &node.id(), o.migrate_v1, asks(true, None, false)).await?;

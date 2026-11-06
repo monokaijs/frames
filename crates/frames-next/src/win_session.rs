@@ -555,14 +555,19 @@ impl Builder {
             },
             per_window,
         );
-        self.command(
-            view,
-            "Full desktop view",
-            Command::View {
-                view: View::Desktop,
-            },
-            !per_window,
-        );
+        // "Only stream this app" (a Quick App): the host refuses the desktop.
+        if snapshot.only_app {
+            self.item(view, "Full desktop view", None, false);
+        } else {
+            self.command(
+                view,
+                "Full desktop view",
+                Command::View {
+                    view: View::Desktop,
+                },
+                !per_window,
+            );
+        }
         self.submenu(menu, "View", view);
         let devices = self.devices(snapshot);
         self.submenu(menu, "Devices", devices);

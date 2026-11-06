@@ -372,6 +372,38 @@ impl ClientSession {
     /// Decodes every frame that is ready, in order.
     pub fn poll(&mut self, now_us: u64, decoder: &mut dyn VideoDecoder) -> Vec<DecodedFrame> {
         let mut out = Vec::new();
+        self.poll_with(now_us, decoder, |frame| out.push(frame));
+        out
+    }
+
+    /// [`Self::poll`] for a viewer that shows only the newest frame: older
+    /// ones decoded in the same poll (a backlog after a stall) are dropped
+    /// as soon as a newer one is decoded, so a hardware decoder's surface
+    /// pool gets them back during the burst, not after it. Returns the
+    /// newest frame and how many were decoded but not kept.
+    pub fn poll_latest(
+        &mut self,
+        now_us: u64,
+        decoder: &mut dyn VideoDecoder,
+    ) -> (Option<DecodedFrame>, u64) {
+        let mut latest = None;
+        let mut superseded = 0;
+        self.poll_with(now_us, decoder, |frame| {
+            if latest.replace(frame).is_some() {
+                superseded += 1;
+            }
+        });
+        (latest, superseded)
+    }
+
+    /// [`Self::poll`], handing each decoded frame to `on_frame` as soon as
+    /// it is decoded.
+    pub fn poll_with(
+        &mut self,
+        now_us: u64,
+        decoder: &mut dyn VideoDecoder,
+        mut on_frame: impl FnMut(DecodedFrame),
+    ) {
         let timeout = self.frame_timeout_us();
         while let Some(frame) = self.next_frame {
             let ready = self.frames.get(&frame).is_some_and(FrameAssembly::complete);
@@ -455,7 +487,7 @@ impl ClientSession {
                             self.stats.recovery_us.push(now_us.saturating_sub(since));
                         }
                     }
-                    out.push(decoded);
+                    on_frame(decoded);
                 }
                 Ok(Decoded::BrokenReference { .. }) | Err(_) => {
                     self.stats.decoder_broken += 1;
@@ -464,7 +496,6 @@ impl ClientSession {
                 Ok(Decoded::Pending) => {}
             }
         }
-        out
     }
 
     /// Asks the host for a keyframe until one is decoded: for a viewer

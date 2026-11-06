@@ -109,6 +109,40 @@ pub fn access_password_set() -> bool {
     admit::config_dir(None).is_ok_and(|config| crate::password::is_set(&config))
 }
 
+/// This device's Quick Apps (`crate::quick_apps`), as the launcher's
+/// Settings edit them.
+pub use crate::quick_apps::{Listed as RemoteQuickApp, QuickApp};
+
+pub fn quick_apps() -> Result<Vec<QuickApp>> {
+    crate::quick_apps::load(&admit::config_dir(None)?)
+}
+
+/// Replaces this device's Quick Apps (ids, names and paths are checked).
+pub fn save_quick_apps(apps: &[QuickApp]) -> Result<()> {
+    crate::quick_apps::save(&admit::config_dir(None)?, apps)
+}
+
+/// A trusted host's Quick Apps (untrusted devices are refused without
+/// anyone being asked). Gives up after `wait`.
+pub async fn remote_quick_apps(id: &str, wait: Duration) -> Result<Vec<RemoteQuickApp>> {
+    crate::quick_apps::remote(id, wait).await
+}
+
+/// Where to reach host `id` (a full id or an unambiguous start of one):
+/// its LAN addresses when it is nearby, else by id (relay and discovery).
+pub async fn target(id: &str) -> Result<iroh::EndpointAddr> {
+    Ok(
+        match frames_net::local::find(id, Duration::from_millis(1500))
+            .await
+            .ok()
+            .flatten()
+        {
+            Some(nearby) => nearby.addr,
+            None => endpoint(id)?.into(),
+        },
+    )
+}
+
 /// A PNG preview of a trusted host's screen (`crate::preview`); the host
 /// refuses devices it does not trust. Gives up after `wait`.
 pub async fn preview(id: &str, wait: Duration) -> Result<Vec<u8>> {
@@ -116,16 +150,7 @@ pub async fn preview(id: &str, wait: Duration) -> Result<Vec<u8>> {
     let key = admit::device_key(&config)?;
     let fetch = async {
         let node = frames_net::Node::bind(&key, frames_net::NodeConfig::default()).await?;
-        let target: iroh::EndpointAddr =
-            match frames_net::local::find(id, Duration::from_millis(1500))
-                .await
-                .ok()
-                .flatten()
-            {
-                Some(nearby) => nearby.addr,
-                None => endpoint(id)?.into(),
-            };
-        let session = node.connect(target).await?;
+        let session = node.connect(target(id).await?).await?;
         admit::send_hello(
             &session,
             &node.id(),
@@ -140,6 +165,9 @@ pub async fn preview(id: &str, wait: Duration) -> Result<Vec<u8>> {
                 window_id: None,
                 password: None,
                 preview: true,
+                app: None,
+                only_app: false,
+                quick_apps: false,
             },
         )
         .await?;

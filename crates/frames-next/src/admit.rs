@@ -103,6 +103,15 @@ struct Hello {
     /// Asks for a preview image only (`crate::preview`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     preview: bool,
+    /// The host's Quick App this connection is for (`crate::quick_apps`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    app: Option<String>,
+    /// Only that app's windows ("Only stream this app").
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    only_app: bool,
+    /// Asks for the host's Quick Apps list only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    quick_apps: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     v1_certificate: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -131,6 +140,12 @@ pub struct Asks {
     pub password: Option<String>,
     /// Asks for a preview image only (`crate::preview`).
     pub preview: bool,
+    /// The host's Quick App this connection is for, and whether only its
+    /// windows are shared (`crate::quick_apps`).
+    pub app: Option<String>,
+    pub only_app: bool,
+    /// Asks for the host's Quick Apps list only.
+    pub quick_apps: bool,
 }
 
 /// Viewer: always opens the hello stream first (it fixes the order of the
@@ -151,6 +166,9 @@ pub async fn send_hello(
         catalog: asks.catalog,
         window_id: asks.window_id,
         preview: asks.preview,
+        app: asks.app,
+        only_app: asks.only_app,
+        quick_apps: asks.quick_apps,
         ..Hello::default()
     };
     if let Some(password) = &asks.password {
@@ -218,6 +236,11 @@ pub struct Admitted {
     pub window_id: Option<u64>,
     /// The viewer asks for a preview image only.
     pub preview: bool,
+    /// The Quick App the viewer asks for, and whether only its windows.
+    pub app: Option<String>,
+    pub only_app: bool,
+    /// The viewer asks for the Quick Apps list only.
+    pub quick_apps: bool,
     /// Let in by the trust list: removing it there ends the session
     /// ([`watch_trust`]).
     pub trusted: bool,
@@ -319,8 +342,9 @@ pub async fn decide(
     state: &mut HostState,
 ) -> Result<std::result::Result<Admitted, &'static str>> {
     let hello = receive_hello(session).await;
-    // Previews go to trusted devices only, and nobody is asked for them.
-    if hello.preview
+    // Previews and the Quick Apps list go to trusted devices only, and
+    // nobody is asked for them.
+    if (hello.preview || hello.quick_apps)
         && !matches!(
             admission(
                 &TrustList::load(&TrustList::path_in(config))?,
@@ -351,8 +375,8 @@ pub async fn decide(
         .get(&session.remote())
         .is_some();
     let name = hello.name.clone().unwrap_or_default();
-    // A preview is not a connection to announce.
-    if !hello.preview {
+    // A preview or the Quick Apps list is not a connection to announce.
+    if !hello.preview && !hello.quick_apps {
         crate::launcher::report(
             "viewer",
             &serde_json::json!({
@@ -371,6 +395,9 @@ pub async fn decide(
         catalog: hello.catalog,
         window_id: hello.window_id,
         preview: hello.preview,
+        app: hello.app,
+        only_app: hello.only_app,
+        quick_apps: hello.quick_apps,
         trusted,
     }))
 }

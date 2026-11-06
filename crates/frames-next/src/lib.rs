@@ -45,6 +45,7 @@ mod pacing;
 mod pads;
 pub mod password;
 mod preview;
+mod quick_apps;
 mod resize;
 mod services;
 mod stats;
@@ -162,6 +163,10 @@ pub struct Options {
     /// Viewer: open each of the host's application windows in its own
     /// window (`crate::catalog`), instead of one view of its screen.
     pub apps: bool,
+    /// Viewer: the host's Quick App to start and show (`--app ID`), and
+    /// whether only its windows are shared (`--only-app`).
+    pub quick_app: Option<String>,
+    pub only_app: bool,
     /// Host: the most application windows one viewer is offered.
     pub max_windows: usize,
     /// Viewer: how many of the host's shared windows to open.
@@ -279,6 +284,8 @@ impl Options {
             window: None,
             window_id: None,
             apps: false,
+            quick_app: None,
+            only_app: false,
             max_windows: catalog::MAX_WINDOWS,
             open_windows: 1,
             adb: false,
@@ -392,6 +399,12 @@ impl Options {
                 "--ask-launcher" => o.ask_launcher = true,
                 "--title" => o.title = Some(value()?.to_string()),
                 "--apps" => o.apps = true,
+                // A Quick App opens in per-window view.
+                "--app" => {
+                    o.quick_app = Some(value()?.to_string());
+                    o.apps = true;
+                }
+                "--only-app" => o.only_app = true,
                 "--max-windows" => o.max_windows = value()?.parse::<usize>()?.clamp(1, 32),
                 "--stats-title" => o.stats_title = true,
                 "--physical-keys" => o.physical_keys = true,
@@ -557,22 +570,83 @@ async fn host(o: Options) -> Result<()> {
             sessions.spawn(preview::serve(session));
             continue;
         }
+        if admitted.quick_apps {
+            sessions.spawn(quick_apps::serve_list(
+                session,
+                config.clone(),
+                o.windows.clone(),
+                o.max_windows,
+            ));
+            continue;
+        }
+        // A Quick App: only one this host lists.
+        let quick_app = match &admitted.app {
+            Some(id) => {
+                match quick_apps::load(&config).map(|apps| quick_apps::find(&apps, id).cloned()) {
+                    Ok(Some(app)) => Some(app),
+                    Ok(None) => {
+                        session.close("no such Quick App");
+                        continue;
+                    }
+                    Err(error) => {
+                        println!("Quick Apps unreadable: {error:#}");
+                        session.close("no such Quick App");
+                        continue;
+                    }
+                }
+            }
+            None => None,
+        };
+        let only_app = quick_app.as_ref().filter(|_| admitted.only_app).cloned();
         if admitted.catalog {
-            sessions.spawn(catalog::serve(session, o.windows.clone(), o.max_windows));
+            let scope = match quick_app {
+                Some(app) => Some(catalog::Scope {
+                    launched: quick_apps::start_if_needed(
+                        &app,
+                        admitted.control,
+                        o.windows.clone(),
+                        o.max_windows,
+                    )
+                    .await,
+                    only: admitted.only_app,
+                    app,
+                }),
+                None => None,
+            };
+            sessions.spawn(catalog::serve(
+                session,
+                o.windows.clone(),
+                o.max_windows,
+                scope,
+            ));
             continue;
         }
         if let Some(id) = admitted.window_id {
-            // Only a window this host shares, by its current catalog.
+            // Only a window this host shares, by its current catalog (and
+            // within the Quick App with "Only stream this app"); its other
+            // windows' sessions never start it again.
             let filters = o.windows.clone();
             let limit = o.max_windows;
-            if !tokio::task::spawn_blocking(move || catalog::is_shared(&filters, limit, id)).await?
+            let scope = only_app.clone();
+            if !tokio::task::spawn_blocking(move || {
+                catalog::is_shared(&filters, limit, id, scope.as_ref())
+            })
+            .await?
             {
-                session.close("no such window");
+                session.close(if only_app.is_some() {
+                    "not part of the Quick App"
+                } else {
+                    "no such window"
+                });
                 continue;
             }
             // The secure desktop streams the screen (`catalog::SECURE_DESKTOP`).
             session_options.window_id = (id != catalog::SECURE_DESKTOP).then_some(id);
             session_options.window = None;
+        } else if only_app.is_some() {
+            // "Only stream this app": never the desktop.
+            session.close("only the Quick App is shared");
+            continue;
         } else {
             let index = admitted.window.unwrap_or(0) as usize;
             session_options.window = match (o.windows.get(index), o.windows.is_empty()) {
@@ -593,7 +667,7 @@ async fn host(o: Options) -> Result<()> {
             audio::Mode::Off
         };
         let audio_free = audio_free.clone();
-        let audio_source = audio_source(&o, &config);
+        let audio_source = audio_source(&o, &config, only_app.as_ref());
         sessions.spawn(async move {
             let audio = tokio::spawn({
                 let session = session.clone();
@@ -678,7 +752,11 @@ async fn connect(id: &str, o: Options) -> Result<()> {
         control::View::Desktop
     };
     control::start(&target.id.to_string(), &peer, view, quality, o.adb, &config);
-    control::update(|s| s.remote_cursor = o.remote_cursor);
+    control::update(|s| {
+        s.remote_cursor = o.remote_cursor;
+        s.quick_app = o.quick_app.clone();
+        s.only_app = o.only_app && o.quick_app.is_some();
+    });
     for (at, json) in o.qa_commands.clone() {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs_f64(at)).await;
@@ -741,6 +819,9 @@ async fn desktop(
                 window_id: o.window_id,
                 password: o.password.clone(),
                 preview: false,
+                app: o.quick_app.clone(),
+                only_app: o.only_app,
+                quick_apps: false,
             },
         )
         .await?;
@@ -804,70 +885,54 @@ async fn desktop(
 
 /// Host: whose audio a session gets. Sharing selected windows (or one)
 /// sends only their application's, when they are all one process (v1);
-/// otherwise none, since everything else stays private.
+/// otherwise none, since everything else stays private. Within a Quick App
+/// ("Only stream this app") it is that app's process tree's or nothing,
+/// never the whole computer's.
 fn audio_source(
     o: &Options,
     config: &std::path::Path,
-) -> std::result::Result<audio::Source, &'static str> {
-    if o.windows.is_empty() {
+    scope: Option<&quick_apps::QuickApp>,
+) -> std::result::Result<audio::Source, String> {
+    if o.windows.is_empty() && scope.is_none() {
         return Ok(audio::Source::System);
     }
-    #[cfg(windows)]
-    {
-        use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
-        let pids: Vec<u32> = catalog::shared(&o.windows, o.max_windows)
-            .iter()
-            .map(|w| {
-                let mut pid = 0;
-                unsafe {
-                    GetWindowThreadProcessId(
-                        windows::Win32::Foundation::HWND(w.id as usize as *mut _),
-                        Some(&mut pid),
-                    )
-                };
-                pid
-            })
-            .collect();
-        one_application(pids, config)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let shared: Vec<u64> = catalog::shared(&o.windows, o.max_windows)
-            .iter()
-            .map(|w| w.id)
-            .collect();
-        let listed: Vec<serde_json::Value> =
-            serde_json::from_str(&frames_platform_macos::capture::windows_json())
-                .unwrap_or_default();
-        let pids: Vec<u32> = listed
-            .iter()
-            .filter(|w| w["id"].as_u64().is_some_and(|id| shared.contains(&id)))
-            .filter_map(|w| w["pid"].as_u64().map(|pid| pid as u32))
-            .collect();
-        one_application(pids, config)
-    }
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        let _ = config;
-        Err("selected-window audio needs a Windows or macOS host")
-    }
+    let pids: Vec<u32> = catalog::shared_in(&o.windows, o.max_windows, scope)
+        .iter()
+        .map(|w| w.pid)
+        .collect();
+    let processes = quick_apps::Processes::now();
+    choose_audio(scope, pids, &processes).map(|pid| audio::Source::Process {
+        pid,
+        dir: config.to_path_buf(),
+    })
 }
 
-/// The application whose audio a selected-window share sends: the shared
-/// windows' one process, or v1's message when they belong to several.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
-fn one_application(
+/// The process whose audio (with its children's) a restricted share
+/// sends: the shared windows' one process, or within a Quick App the one
+/// that all its windows' processes descend from.
+fn choose_audio(
+    scope: Option<&quick_apps::QuickApp>,
     mut pids: Vec<u32>,
-    config: &std::path::Path,
-) -> std::result::Result<audio::Source, &'static str> {
+    processes: &quick_apps::Processes,
+) -> std::result::Result<u32, String> {
+    pids.retain(|&pid| pid != 0);
     pids.sort_unstable();
     pids.dedup();
-    match pids.as_slice() {
-        [pid] if *pid != 0 => Ok(audio::Source::Process {
-            pid: *pid,
-            dir: config.to_path_buf(),
+    match (scope, pids.as_slice()) {
+        (Some(app), []) => Err(format!(
+            "{}'s audio is off: none of its windows is open yet",
+            app.name
+        )),
+        (_, [pid]) => Ok(*pid),
+        (Some(app), _) => processes.common_root(&pids).ok_or_else(|| {
+            format!(
+                "{}'s audio is off: its windows come from unrelated processes",
+                app.name
+            )
         }),
-        _ => Err("Selected-window audio is unavailable for this combination of applications"),
+        (None, _) => {
+            Err("Selected-window audio is unavailable for this combination of applications".into())
+        }
     }
 }
 
@@ -1148,6 +1213,7 @@ async fn run(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         Some("doctor") => doctor::run(Options::parse(&args[1..])?).await,
+        Some("quick-apps") => quick_apps::cli(&args[1..]).await,
         Some("discover") => {
             for device in frames_net::local::browse(Duration::from_secs(3)).await? {
                 let addrs: Vec<String> = device.addr.ip_addrs().map(ToString::to_string).collect();
@@ -1198,6 +1264,9 @@ async fn run(args: Vec<String>) -> Result<()> {
         }
         Some("connect") => {
             let id = args.get(1).context("connect needs an endpoint id")?;
+            if args.iter().any(|a| a == "--only-app") && !args.iter().any(|a| a == "--app") {
+                bail!("--only-app needs --app ID (the host's Quick App)");
+            }
             let o = Options::parse(&args[2..])?;
             tokio::select! {
                 result = connect(id, o) => result,
@@ -1220,20 +1289,53 @@ mod codec_tests {
 
     #[test]
     fn selected_windows_send_their_one_applications_audio() {
-        let dir = std::path::Path::new("/tmp");
-        assert!(matches!(
-            one_application(vec![42, 42], dir),
-            Ok(audio::Source::Process { pid: 42, .. })
-        ));
+        let none = quick_apps::Processes::with_parents(&[]);
+        assert_eq!(choose_audio(None, vec![42, 42], &none), Ok(42));
         for mixed in [vec![42, 7], vec![], vec![0]] {
             assert_eq!(
-                one_application(mixed, dir).unwrap_err(),
+                choose_audio(None, mixed, &none).unwrap_err(),
                 "Selected-window audio is unavailable for this combination of applications"
             );
         }
         // Sharing everything sends everything.
         let o = Options::parse(&[]).unwrap();
-        assert!(matches!(audio_source(&o, dir), Ok(audio::Source::System)));
+        assert!(matches!(
+            audio_source(&o, std::path::Path::new("/tmp"), None),
+            Ok(audio::Source::System)
+        ));
+    }
+
+    #[test]
+    fn only_this_app_never_sends_the_computers_audio() {
+        let app = quick_apps::QuickApp {
+            id: "game".into(),
+            name: "Game".into(),
+            command: "/x/game".into(),
+            args: Vec::new(),
+            path: "/x/game".into(),
+        };
+        // 10 the app, 11 and 12 its children, 20 a stranger.
+        let processes = quick_apps::Processes::with_parents(&[(11, 10), (12, 11), (20, 1)]);
+        // A Quick App on a host with no --window filters: still only the
+        // app, and nothing while it has no window.
+        let o = Options::parse(&[]).unwrap();
+        assert!(o.windows.is_empty());
+        assert!(
+            !matches!(
+                audio_source(&o, std::path::Path::new("/tmp"), Some(&app)),
+                Ok(audio::Source::System)
+            ),
+            "never the whole computer's audio"
+        );
+        assert!(choose_audio(Some(&app), vec![], &processes).is_err());
+        assert_eq!(
+            choose_audio(Some(&app), vec![12, 10, 11], &processes),
+            Ok(10)
+        );
+        assert!(
+            choose_audio(Some(&app), vec![10, 20], &processes).is_err(),
+            "unrelated processes: no audio rather than a guess"
+        );
     }
 
     fn options(decoders: Vec<Codec>) -> Options {

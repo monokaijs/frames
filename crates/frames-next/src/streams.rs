@@ -29,6 +29,8 @@ pub const MENU: u8 = 15;
 /// Host: a line of text for the viewer's window title, such as why input
 /// did not reach the shared window (v1's host input errors).
 pub const NOTICE: u8 = 16;
+/// Host: its Quick Apps, one JSON list (`crate::quick_apps`).
+pub const QUICK_APPS: u8 = 17;
 
 /// Host: tells the viewer `text` (at most once every 5 s per text), in the
 /// background.

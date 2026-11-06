@@ -81,11 +81,13 @@ unsafe extern "C" {
     #[cfg(windows)]
     pub(crate) fn frames_surface_release(surface: *mut c_void);
     #[cfg(windows)]
-    fn frames_decoder_receive_surface(
+    fn frames_decoder_receive_surface_sized(
         context: *mut c_void,
         lease: *mut *mut c_void,
         texture: *mut *mut c_void,
         subresource: *mut i32,
+        width: *mut i32,
+        height: *mut i32,
         matrix: *mut i32,
         full: *mut i32,
         error: *mut c_char,
@@ -675,13 +677,16 @@ impl Context {
             loop {
                 let (mut lease, mut texture) = (std::ptr::null_mut(), std::ptr::null_mut());
                 let (mut subresource, mut matrix, mut full) = (0, 0, 0);
+                let (mut width, mut height) = (0, 0);
                 if check(
                     unsafe {
-                        frames_decoder_receive_surface(
+                        frames_decoder_receive_surface_sized(
                             self.pointer,
                             &mut lease,
                             &mut texture,
                             &mut subresource,
+                            &mut width,
+                            &mut height,
                             &mut matrix,
                             &mut full,
                             error.as_mut_ptr(),
@@ -701,9 +706,12 @@ impl Context {
                 }
                 .ok_or_else(|| anyhow::anyhow!("missing hardware texture"))?
                 .clone();
+                // The frame's own size, not the one the decoder was opened
+                // with (they differ around a resize, or when the stream's
+                // announced size is not what it carries).
                 latest = Some(crate::media::RawFrame {
-                    width: self.width,
-                    height: self.height,
+                    width: width as u32,
+                    height: height as u32,
                     bgra: bytes::Bytes::new(),
                     captured_at: std::time::Instant::now(),
                     frame_number: 0,

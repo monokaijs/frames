@@ -471,6 +471,11 @@ Media *frames_decoder_open(const char *name, int width, int height, int hardware
             snprintf(error,capacity,"Hardware decode unavailable"); frames_media_close(m); return NULL;
         }
         c->opaque=m; c->get_format=select_format;
+        /* D3D11VA decodes into a fixed pool. Frames the viewer still holds
+           (being presented, or decoded in a burst after a stall) are pool
+           surfaces too; without headroom: "Static surface pool size
+           exceeded". */
+        c->extra_hw_frames=8;
     }
     int result=p_avcodec_open2(c,codec,NULL);
     if (result<0) { failure(result,error,capacity); frames_media_close(m); return NULL; }
@@ -509,21 +514,27 @@ int frames_decoder_receive(Media *m, uint8_t *bgra, char *error, int capacity) {
 
 /* The AVFrame reference pins the decoder pool surface until presentation releases it. */
 void frames_surface_release(void *surface) { AVFrame *f=surface;p_av_frame_free(&f); }
-int frames_decoder_receive_surface(Media *m,void **lease,void **texture,int *subresource,int *matrix,int *full,char *error,int capacity) {
+/* The frame's own visible size goes out with it (`width`, `height`: FFmpeg
+   applies the stream's right/bottom crop to hardware frames' size). The
+   pool texture is aligned larger; presenting the size the decoder was
+   opened with instead shows padding when the two differ. Named `_sized` so
+   an archive built before the size arguments fails to link instead of
+   writing the colour flags where the size is read. */
+int frames_decoder_receive_surface_sized(Media *m,void **lease,void **texture,int *subresource,int *width,int *height,int *matrix,int *full,char *error,int capacity) {
 #ifdef _WIN32
     p_av_frame_unref(m->frame);
     int result=p_avcodec_receive_frame(m->ctx,m->frame);
     if(result==AVERROR(EAGAIN)||result==AVERROR_EOF)return 0;
     if(result<0)return failure(result,error,capacity);
     AVFrame *f=m->frame;
-    if(f->format!=AV_PIX_FMT_D3D11 || f->width<m->width || f->height<m->height || f->width>8192 || f->height>8192) {
+    if(f->format!=AV_PIX_FMT_D3D11 || f->width<=0 || f->height<=0 || f->width>8192 || f->height>8192) {
         snprintf(error,capacity,"Hardware surface format/dimensions changed");return -1;
     }
     AVFrame *ref=p_av_frame_clone(f);if(!ref)return failure(AVERROR(ENOMEM),error,capacity);
-    *lease=ref;*texture=f->data[0];*subresource=(int)(intptr_t)f->data[1];
+    *lease=ref;*texture=f->data[0];*subresource=(int)(intptr_t)f->data[1];*width=f->width;*height=f->height;
     *matrix=f->colorspace==AVCOL_SPC_BT709;*full=f->color_range==AVCOL_RANGE_JPEG;return 1;
 #else
-    (void)m;(void)lease;(void)texture;(void)subresource;(void)matrix;(void)full;(void)error;(void)capacity;return -1;
+    (void)m;(void)lease;(void)texture;(void)subresource;(void)width;(void)height;(void)matrix;(void)full;(void)error;(void)capacity;return -1;
 #endif
 }
 

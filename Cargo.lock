@@ -2395,6 +2395,7 @@ dependencies = [
  "hmac",
  "image",
  "iroh",
+ "libc",
  "pbkdf2",
  "serde",
  "serde_json",

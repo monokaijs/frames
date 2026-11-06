@@ -57,6 +57,15 @@ a snapshot the platforms build menus from, and commands they send back.
 | Devices menu (gamepads, USB, ADB during a session) | **Done** in code; gamepads only while a viewer window has focus. |
 | One window (games): Relative mouse, Window compatibility, physical keys | **Done**: compatibility from v1's bundled catalog by the executable's SHA-256. |
 
+## Fixes from cross-machine QA (2026-11-06, after 0.6.0)
+
+| Issue | Status |
+|---|---|
+| Windows viewer: picture shrunk to the top left with black right/bottom bars | **Fixed, reference-probe verified**. The presenter now sets the video processor's source rect, and each decoded frame carries its own visible size (`frames_decoder_receive_surface_sized`) instead of the size the decoder was opened with. A Mac VideoToolbox decode and a PC2 render of the same captured frame match within 0.92/255 mean RGB at 440x320. Not yet verified in live sessions from a Mac host. |
+| "Static surface pool size exceeded" after stalls | **Fixed in code, tested**: viewers keep only the newest frame of a burst (`ClientSession::poll_latest`), and the decoder pool has 8 spare surfaces. Test: crates/frames-testkit/tests/decoded_surfaces.rs. |
+| Mac host: one missed VideoToolbox callback ended the session | **Fixed in code, tested**: the frame is dropped and recovery uses a keyframe, or a new session after three in a row; late outputs are matched to their call. Unit tests only. |
+| Quick Apps (new) | **Backend done**: allowlisted host apps by install location (path/bundle and process ancestry), `--app ID [--only-app]`, start only for viewers allowed to control, only-app scope for windows, popups, audio and the desktop view. Launcher UI wired by the UI pass. End-to-end log tests pending. |
+
 ## Streaming
 
 | v1 feature | v2 status |

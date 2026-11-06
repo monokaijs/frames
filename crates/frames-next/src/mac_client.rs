@@ -520,9 +520,11 @@ fn view(
         // Every ready frame is decoded (later ones reference it), but only
         // the newest is shown: after a stall (the window opening, a slow
         // drawable) the older ones are already late.
-        let mut decoded = client.poll(clock.now_us(), &mut decoder);
-        superseded += decoded.len().saturating_sub(1) as u64;
-        if let Some(frame) = decoded.pop() {
+        // Older frames of a burst go back to the decoder's surface pool as
+        // soon as a newer one decodes.
+        let (newest, skipped) = client.poll_latest(clock.now_us(), &mut decoder);
+        superseded += skipped;
+        if let Some(frame) = newest {
             let captured = frame.captured_us;
             match presenter.present(frame, mode) {
                 Ok(stamp) => {
