@@ -38,8 +38,11 @@ final class ViewerMenuImageTests: XCTestCase {
             let image = item?.image
             XCTAssertNotNil(image, "Missing menu image: \(title)")
             XCTAssertTrue(image?.isValid == true, "Invalid menu image: \(title)")
-            if #available(macOS 27.0, *) {
-                XCTAssertEqual(item?.preferredImageVisibility, .visible, "Hidden menu image: \(title)")
+            let selector = NSSelectorFromString("preferredImageVisibility")
+            if let item, item.responds(to: selector) {
+                typealias Visibility = @convention(c) (AnyObject, Selector) -> Int
+                let visibility = unsafeBitCast(item.method(for: selector), to: Visibility.self)
+                XCTAssertEqual(visibility(item, selector), 1, "Hidden menu image: \(title)")
             }
         }
     }

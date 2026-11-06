@@ -387,11 +387,16 @@ private func submenu(_ menu: NSMenu, _ title: String, _ child: NSMenu) {
 
 @MainActor
 private func showingMenuImages(_ menu: NSMenu) -> NSMenu {
-    if #available(macOS 27.0, *) {
-        for item in menu.items {
-            if item.image != nil { item.preferredImageVisibility = .visible }
-            if let submenu = item.submenu { _ = showingMenuImages(submenu) }
+    // Use the runtime setter so this also builds with SDKs predating the
+    // property. #available alone cannot hide a symbol absent from an SDK.
+    let selector = NSSelectorFromString("setPreferredImageVisibility:")
+    typealias SetVisibility = @convention(c) (AnyObject, Selector, Int) -> Void
+    for item in menu.items {
+        if item.image != nil, item.responds(to: selector) {
+            let set = unsafeBitCast(item.method(for: selector), to: SetVisibility.self)
+            set(item, selector, 1) // NSMenuItemImageVisibilityVisible
         }
+        if let submenu = item.submenu { _ = showingMenuImages(submenu) }
     }
     return menu
 }
