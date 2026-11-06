@@ -30,6 +30,9 @@ struct Output {
     data: Vec<u8>,
     keyframe: bool,
     token: i64,
+    /// When the Swift side submitted the frame (uptime ns): which encode
+    /// call this output answers.
+    submitted_ns: u64,
     completed_ns: u64,
     status: i32,
 }
@@ -40,13 +43,71 @@ struct Shared {
     ready: Condvar,
 }
 
+impl Shared {
+    /// The output of the encode call that started at `started_ns`, waiting
+    /// up to `timeout`. Outputs submitted before it are late answers to
+    /// earlier calls that timed out: they are dropped, never taken for this
+    /// frame (each call encodes one frame and waits for it).
+    fn take_for(&self, started_ns: u64, timeout: Duration) -> Option<Output> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut outputs = self.outputs.lock().unwrap();
+        loop {
+            while let Some(output) = outputs.pop_front() {
+                if output.submitted_ns >= started_ns {
+                    return Some(output);
+                }
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            outputs = self.ready.wait_timeout(outputs, left).unwrap().0;
+        }
+    }
+}
+
+/// What to do when VideoToolbox does not answer an encode in time.
+#[derive(Debug, PartialEq, Eq)]
+enum Stall {
+    /// Drop this frame; the next one is a keyframe (the missing frame may
+    /// still be encoded and referenced, but the receiver never got it).
+    Keyframe,
+    /// Several in a row: open a new session (its first frame is a keyframe).
+    Restart,
+}
+
+/// Consecutive encodes VideoToolbox did not answer before the session is
+/// replaced.
+const STALLS_BEFORE_RESTART: u32 = 3;
+
+#[derive(Default)]
+struct Stalls {
+    consecutive: u32,
+}
+
+impl Stalls {
+    fn timed_out(&mut self) -> Stall {
+        self.consecutive += 1;
+        if self.consecutive >= STALLS_BEFORE_RESTART {
+            self.consecutive = 0;
+            Stall::Restart
+        } else {
+            Stall::Keyframe
+        }
+    }
+
+    fn answered(&mut self) {
+        self.consecutive = 0;
+    }
+}
+
 unsafe extern "C" fn on_encoded(
     context: *mut c_void,
     data: *const u8,
     length: usize,
     flags: u32,
     token: i64,
-    _submitted_ns: u64,
+    submitted_ns: u64,
     completed_ns: u64,
     status: i32,
 ) {
@@ -62,6 +123,7 @@ unsafe extern "C" fn on_encoded(
         data,
         keyframe: flags & ffi::ENCODED_KEYFRAME != 0,
         token,
+        submitted_ns,
         completed_ns,
         status,
     });
@@ -90,6 +152,7 @@ pub struct MacEncoder {
     use_long_term: Option<u8>,
     slots: [Option<Slot>; SLOTS],
     acknowledge: Vec<i64>,
+    stalls: Stalls,
 }
 
 // SAFETY: the Swift encoder is safe to call from any thread; this wrapper is
@@ -137,6 +200,7 @@ impl MacEncoder {
             use_long_term: None,
             slots: [None; SLOTS],
             acknowledge: Vec::new(),
+            stalls: Stalls::default(),
         };
         encoder.open()?;
         Ok(encoder)
@@ -176,15 +240,9 @@ impl MacEncoder {
         Ok(())
     }
 
-    fn wait_output(&self) -> Option<Output> {
+    fn wait_output(&self, started_ns: u64) -> Option<Output> {
         let timeout = Duration::from_millis(if self.first { 1_000 } else { 500 });
-        let outputs = self.shared.outputs.lock().unwrap();
-        let (mut outputs, _) = self
-            .shared
-            .ready
-            .wait_timeout_while(outputs, timeout, |o| o.is_empty())
-            .unwrap();
-        outputs.pop_front()
+        self.shared.take_for(started_ns, timeout)
     }
 }
 
@@ -266,6 +324,9 @@ impl VideoEncoder for MacEncoder {
             options |= ffi::ENCODE_FORCE_LTR_REFRESH;
         }
         let acknowledge = std::mem::take(&mut self.acknowledge);
+        // Outputs from now on answer this call (the Swift side stamps them
+        // with its submission time, taken after this).
+        let started_ns = ffi::uptime_ns();
         // SAFETY: live session; the buffer and token array outlive the call.
         let status = unsafe {
             ffi::frames_mac_encoder_encode(
@@ -282,9 +343,23 @@ impl VideoEncoder for MacEncoder {
                 "VideoToolbox encode failed ({status})"
             )));
         }
-        let output = self
-            .wait_output()
-            .ok_or_else(|| MediaError::Backend("VideoToolbox produced no output".into()))?;
+        let Some(output) = self.wait_output(started_ns) else {
+            // A transient stall (seen during network recoveries): drop the
+            // frame rather than the session, and recover with a keyframe,
+            // or a new session after several in a row.
+            match self.stalls.timed_out() {
+                Stall::Keyframe => {
+                    eprintln!("VideoToolbox did not answer in time; next frame is a keyframe");
+                    self.force_keyframe = true;
+                }
+                Stall::Restart => {
+                    eprintln!("VideoToolbox stopped answering; restarting the encoder");
+                    self.open()?;
+                }
+            }
+            return Ok(());
+        };
+        self.stalls.answered();
         self.first = false;
         if output.status != 0 || output.data.is_empty() {
             // A dropped picture: nothing to send; the next frame continues
@@ -359,5 +434,70 @@ impl Drop for MacEncoder {
             // before `shared` is dropped.
             unsafe { ffi::frames_mac_encoder_free(self.handle) };
         }
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+
+    fn output(submitted_ns: u64) -> Output {
+        Output {
+            data: vec![submitted_ns as u8],
+            keyframe: false,
+            token: -1,
+            submitted_ns,
+            completed_ns: submitted_ns,
+            status: 0,
+        }
+    }
+
+    #[test]
+    fn a_late_output_is_never_taken_for_the_next_frame() {
+        let shared = Shared::default();
+        // The answer to an earlier call that timed out arrives late...
+        shared.outputs.lock().unwrap().push_back(output(100));
+        // ...and this call (started at 200) gets only its own.
+        assert!(shared.take_for(200, Duration::from_millis(20)).is_none());
+        shared.outputs.lock().unwrap().push_back(output(90));
+        shared.outputs.lock().unwrap().push_back(output(250));
+        let taken = shared.take_for(200, Duration::from_millis(20)).unwrap();
+        assert_eq!(taken.submitted_ns, 250);
+        assert!(
+            shared.outputs.lock().unwrap().is_empty(),
+            "the late one is dropped"
+        );
+    }
+
+    #[test]
+    fn an_output_arriving_while_waiting_is_taken() {
+        let shared = std::sync::Arc::new(Shared::default());
+        let callback = shared.clone();
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            callback.outputs.lock().unwrap().push_back(output(50));
+            callback.ready.notify_one();
+            std::thread::sleep(Duration::from_millis(30));
+            callback.outputs.lock().unwrap().push_back(output(300));
+            callback.ready.notify_one();
+        });
+        // A stale one wakes the wait; it keeps waiting for its own.
+        let taken = shared.take_for(200, Duration::from_millis(500)).unwrap();
+        assert_eq!(taken.submitted_ns, 300);
+        late.join().unwrap();
+    }
+
+    #[test]
+    fn stalls_recover_with_a_keyframe_then_a_new_session() {
+        let mut stalls = Stalls::default();
+        assert_eq!(stalls.timed_out(), Stall::Keyframe);
+        assert_eq!(stalls.timed_out(), Stall::Keyframe);
+        assert_eq!(stalls.timed_out(), Stall::Restart);
+        // An answered encode resets the count.
+        assert_eq!(stalls.timed_out(), Stall::Keyframe);
+        stalls.answered();
+        assert_eq!(stalls.timed_out(), Stall::Keyframe);
+        assert_eq!(stalls.timed_out(), Stall::Keyframe);
+        assert_eq!(stalls.timed_out(), Stall::Restart);
     }
 }
