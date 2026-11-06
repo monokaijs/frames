@@ -528,7 +528,7 @@ pub async fn cli(args: &[String]) -> Result<()> {
         Some("list") => {
             if apps.is_empty() {
                 println!(
-                    "no Quick Apps (add one with: quick-apps add --id ID --name NAME --app APP --command PATH)"
+                    "no Quick Apps (add one with: quick-apps add --id ID --name NAME --command PATH [--path APP] [--arg A]...)"
                 );
             }
             for app in &apps {
