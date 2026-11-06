@@ -110,7 +110,82 @@ thread_local! {
     /// Relative mouse: `Some(locked)` while on; `locked` when the pointer is
     /// confined and hidden (not in unattended tests).
     static RELATIVE: Cell<Option<bool>> = const { Cell::new(None) };
+    /// A visible, absolute pointer confined to the picture, independently
+    /// of relative mouse mode. This is local to the active viewer window.
+    static MOUSE_CLAMPED: Cell<bool> = const { Cell::new(false) };
     static LOCAL_SHORTCUT_KEYS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn mouse_clamped() -> bool {
+    MOUSE_CLAMPED.with(Cell::get)
+}
+
+/// Refresh confinement after a move, resize, stream size or fit/fill change.
+fn update_mouse_clamp(hwnd: HWND) -> bool {
+    if !mouse_clamped() {
+        return false;
+    }
+    unsafe {
+        if GetForegroundWindow() != hwnd || IsIconic(hwnd).as_bool() {
+            set_mouse_clamped(hwnd, false);
+            return false;
+        }
+        let client = client_extent(hwnd);
+        let layout = LAYOUT.with(Cell::get);
+        let picture = frames_platform_windows::present::picture_rect(
+            layout.source.unwrap_or(client),
+            client,
+            layout.fill,
+        );
+        // Fill may crop the source; only the visible picture is usable.
+        let mut corners = [
+            POINT {
+                x: picture.left.max(0),
+                y: picture.top.max(0),
+            },
+            POINT {
+                x: picture.right.min(client.0 as i32),
+                y: picture.bottom.min(client.1 as i32),
+            },
+        ];
+        if corners[1].x <= corners[0].x
+            || corners[1].y <= corners[0].y
+            || !ClientToScreen(hwnd, &mut corners[0]).as_bool()
+            || !ClientToScreen(hwnd, &mut corners[1]).as_bool()
+        {
+            set_mouse_clamped(hwnd, false);
+            return false;
+        }
+        let rect = RECT {
+            left: corners[0].x,
+            top: corners[0].y,
+            right: corners[1].x,
+            bottom: corners[1].y,
+        };
+        if ClipCursor(Some(&rect)).is_err() {
+            set_mouse_clamped(hwnd, false);
+            return false;
+        }
+    }
+    true
+}
+
+/// Clamp normal absolute input without hiding the cursor or telling the host
+/// to use relative mouse. Focus loss and Ctrl+Alt+F12 always release it.
+pub fn set_mouse_clamped(hwnd: HWND, on: bool) {
+    if on == mouse_clamped() {
+        return;
+    }
+    if on {
+        set_relative(hwnd, false, true);
+        MOUSE_CLAMPED.with(|c| c.set(true));
+        update_mouse_clamp(hwnd);
+    } else {
+        MOUSE_CLAMPED.with(|c| c.set(false));
+        unsafe {
+            let _ = ClipCursor(None);
+        }
+    }
 }
 
 /// Turns relative mouse (games) on or off, as Ctrl+Alt+F11 does, and tells
@@ -131,6 +206,7 @@ pub fn set_relative(hwnd: HWND, on: bool, lock: bool) {
     };
     let size = std::mem::size_of::<RAWINPUTDEVICE>() as u32;
     if on {
+        set_mouse_clamped(hwnd, false);
         if lock {
             // SAFETY: plain Win32 calls on this thread's window.
             unsafe {
@@ -482,6 +558,13 @@ fn viewer_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<Captur
         button(which, down)
     };
     match message {
+        WM_KEYDOWN | WM_SYSKEYDOWN if w.0 == usize::from(VK_F9.0) && release_shortcut_held() => {
+            LOCAL_SHORTCUT_KEYS.with(|keys| keys.borrow_mut().push(w.0));
+            if (l.0 >> 30) & 1 == 0 {
+                set_mouse_clamped(hwnd, !mouse_clamped());
+            }
+            None
+        }
         WM_INPUT if relative() => {
             let (dx, dy) = raw_motion(l)?;
             Some(Captured::Motion { dx, dy, at_us })
@@ -533,6 +616,7 @@ fn viewer_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<Captur
         }
         WM_KEYDOWN | WM_SYSKEYDOWN if w.0 == usize::from(VK_F12.0) && release_shortcut_held() => {
             LOCAL_SHORTCUT_KEYS.with(|keys| keys.borrow_mut().push(w.0));
+            set_mouse_clamped(hwnd, false);
             set_relative(hwnd, false, true);
             unsafe {
                 let _ = ShowWindow(hwnd, SW_MINIMIZE);
@@ -576,6 +660,7 @@ fn viewer_input(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<Captur
         }
         WM_KILLFOCUS => {
             // Leaving the window gives the pointer back.
+            set_mouse_clamped(hwnd, false);
             set_relative(hwnd, false, true);
             Some(Captured::Event {
                 event: Event::ReleaseAll,
@@ -682,6 +767,12 @@ unsafe extern "system" fn viewer_procedure(
     w: WPARAM,
     l: LPARAM,
 ) -> LRESULT {
+    if matches!(
+        message,
+        WM_CLOSE | WM_DESTROY | WM_ENTERSIZEMOVE | WM_ENTERMENULOOP
+    ) {
+        set_mouse_clamped(hwnd, false);
+    }
     // Over the video, show the host's cursor (or none) instead of the arrow.
     if message == WM_SETCURSOR && (l.0 & 0xffff) as u32 == HTCLIENT {
         let cursor = CURSOR.with(|c| *c.borrow());
@@ -724,6 +815,7 @@ unsafe extern "system" fn viewer_procedure(
         session::layout_button(hwnd, HIDE_CAPTION.with(Cell::get));
         if message == WM_ACTIVATE && (w.0 & 0xffff) as u32 == WA_INACTIVE {
             let at_us = SystemClock::new().now_us();
+            set_mouse_clamped(hwnd, false);
             set_relative(hwnd, false, true);
             CAPTURED.with(|c| {
                 c.borrow_mut().push(Captured::Event {
@@ -732,6 +824,7 @@ unsafe extern "system" fn viewer_procedure(
                 })
             });
         }
+        update_mouse_clamp(hwnd);
         refresh_cursor(hwnd);
         return result;
     }
@@ -803,6 +896,7 @@ unsafe extern "system" fn viewer_procedure(
                 Some(None)
             }
             MENU_RELEASE => {
+                set_mouse_clamped(hwnd, false);
                 set_relative(hwnd, false, true);
                 unsafe {
                     let _ = ShowWindow(hwnd, SW_MINIMIZE);
@@ -1052,6 +1146,7 @@ fn choose_files(hwnd: HWND) {
 /// (remote input is released first: the menu takes the keyboard).
 fn connection_menu(hwnd: HWND) {
     let at_us = SystemClock::new().now_us();
+    set_mouse_clamped(hwnd, false);
     set_relative(hwnd, false, true);
     CAPTURED.with(|c| {
         c.borrow_mut().push(Captured::Event {
@@ -1119,6 +1214,8 @@ pub fn take_user_resize() -> bool {
 
 /// Closes a viewer window (its thread may live on in a pool).
 pub fn destroy(hwnd: HWND) {
+    set_mouse_clamped(hwnd, false);
+    set_relative(hwnd, false, true);
     unsafe {
         let hide = HIDE_CAPTION.with(|c| c.replace(HWND::default()));
         if !hide.is_invalid() {
@@ -1696,6 +1793,7 @@ static VIEWERS: std::sync::Mutex<Vec<Placement>> = std::sync::Mutex::new(Vec::ne
 /// Records where viewer window `hwnd` (host window `id`, streaming
 /// `stream` pixels) shows its picture now.
 pub fn register_viewer(id: u64, hwnd: HWND, stream: (u32, u32)) {
+    update_mouse_clamp(hwnd);
     refresh_cursor(hwnd);
     let client = client_size(hwnd);
     let fill = LAYOUT.with(Cell::get).fill;

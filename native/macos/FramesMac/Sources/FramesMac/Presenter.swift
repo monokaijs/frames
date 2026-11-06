@@ -262,6 +262,7 @@ final class Presenter: @unchecked Sendable {
         // already removed, so the host is not told twice).
         let view = inputView
         let close = { @MainActor in
+            view?.setMouseClamped(false)
             view?.setRelative(false)
             window.close()
         }
@@ -403,6 +404,7 @@ final class CloseWatcher: NSObject, NSWindowDelegate, @unchecked Sendable {
     }
 
     @MainActor func windowWillClose(_ notification: Notification) {
+        view?.releaseKeys()
         view?.focusOwner()
         lock.lock()
         value = true
@@ -697,6 +699,11 @@ final class InputView: NSView {
     private var heldLock: (any PointerLock)?
     /// Relative mouse (games): motion goes as deltas, not positions.
     private(set) var relative = false
+    /// Normal absolute mouse, confined to this view (Control+Option+F9).
+    var mouseClamp: any MouseClamp = SystemMouseClamp()
+    private var heldClamp: (any MouseClamp)?
+    private(set) var mouseClampPoint: NSPoint?
+    var mouseClamped: Bool { heldClamp != nil }
     /// Sub-point motion not sent yet.
     private var remainder = CGPoint.zero
     private var tracking: NSTrackingArea?
@@ -718,6 +725,8 @@ final class InputView: NSView {
     private(set) var physicalKeys = false
     /// Keys whose press went as text (their release is not sent).
     private var textKeys: Set<UInt16> = []
+    /// Releases of local shortcuts stay here even if modifiers lift first.
+    private var localShortcutKeys: Set<UInt16> = []
     /// Option keys held here, and those the host was told about.
     private var heldOptions: Set<UInt16> = []
     private var sentOptions: Set<UInt16> = []
@@ -795,6 +804,7 @@ final class InputView: NSView {
 
     /// The view or the picture changed size.
     func pictureChanged() {
+        if let point = mouseClampPoint { moveClampedMouse(to: point) }
         refreshCursor()
         layoutOverlay()
     }
@@ -924,12 +934,41 @@ final class InputView: NSView {
             owner: self, userInfo: nil)
         addTrackingArea(area)
         tracking = area
+        if let point = mouseClampPoint { moveClampedMouse(to: point) }
     }
 
     /// Normalized position over the picture (where it is drawn), origin top
     /// left; outside it, clamped to its edge.
     private func position(_ event: NSEvent) -> (Int32, Int32) {
-        normalized(convert(event.locationInWindow, from: nil))
+        normalized(mouseClampPoint ?? convert(event.locationInWindow, from: nil))
+    }
+
+    /// Clamp without changing the host's input mode or hiding its cursor.
+    func setMouseClamped(_ on: Bool) {
+        guard on != mouseClamped else { return }
+        if on {
+            guard let window, pictureRect.width > 0, pictureRect.height > 0 else { return }
+            setRelative(false)
+            guard mouseClamp.begin() else { NSSound.beep(); return }
+            heldClamp = mouseClamp
+            moveClampedMouse(to: convert(window.mouseLocationOutsideOfEventStream, from: nil))
+        } else {
+            heldClamp?.end()
+            heldClamp = nil
+            mouseClampPoint = nil
+        }
+        refreshViewerMenus()
+    }
+
+    private func moveClampedMouse(to point: NSPoint) {
+        guard let window, let heldClamp else { return }
+        let point = clampedMousePoint(point, in: pictureRect, scale: window.backingScaleFactor)
+        mouseClampPoint = point
+        let screen = window.convertPoint(toScreen: convert(point, to: nil))
+        // AppKit's origin is bottom left; Quartz's is the main display's
+        // top left. Other displays may have negative coordinates.
+        let height = CGDisplayBounds(CGMainDisplayID()).height
+        heldClamp.move(to: CGPoint(x: screen.x, y: height - screen.y))
     }
 
     func normalized(_ point: NSPoint) -> (Int32, Int32) {
@@ -944,6 +983,7 @@ final class InputView: NSView {
     func setRelative(_ on: Bool, lockPointer: Bool = true, at seconds: TimeInterval = 0) {
         guard on != relative else { return }
         if on {
+            setMouseClamped(false)
             let lock: any PointerLock = lockPointer ? pointerLock : NoPointerLock()
             guard lock.lock() else { return }
             heldLock = lock
@@ -970,6 +1010,9 @@ final class InputView: NSView {
             // NSEvent deltas are points, positive right and down.
             motion(dx: event.deltaX, dy: event.deltaY, at: event.timestamp)
             return
+        }
+        if let point = mouseClampPoint {
+            moveClampedMouse(to: NSPoint(x: point.x + event.deltaX, y: point.y - event.deltaY))
         }
         let (x, y) = position(event)
         relay.send(Int32(FRAMES_MAC_INPUT_MOVE), x, y, at: event.timestamp)
@@ -1015,6 +1058,7 @@ final class InputView: NSView {
 
     /// Gives the pointer and keys back (a menu opens, for example).
     func releaseKeys() {
+        setMouseClamped(false)
         setRelative(false)
         modifiersDown.removeAll()
         clearTyping()
@@ -1023,6 +1067,7 @@ final class InputView: NSView {
 
     /// Gives the pointer and keys back and minimizes the window.
     func releaseInput(at timestamp: TimeInterval) {
+        setMouseClamped(false)
         setRelative(false, at: timestamp)
         modifiersDown.removeAll()
         relay.send(Int32(FRAMES_MAC_INPUT_FOCUS_LOST), 0, at: timestamp)
@@ -1030,6 +1075,13 @@ final class InputView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        // Control+Option+F9: clamp / release without minimizing. Repeats
+        // never toggle it again, and neither half goes to the host.
+        if event.keyCode == 101, event.modifierFlags.contains([.control, .option]) {
+            if !event.isARepeat { setMouseClamped(!mouseClamped) }
+            localShortcutKeys.insert(event.keyCode)
+            return
+        }
         // Control+Option+F12 (kVK_F12 = 111): release remote input and
         // minimize, as in v1; the shortcut never reaches the host.
         if event.keyCode == 111, event.modifierFlags.contains([.control, .option]) {
@@ -1062,6 +1114,7 @@ final class InputView: NSView {
     }
 
     override func keyUp(with event: NSEvent) {
+        if localShortcutKeys.remove(event.keyCode) != nil { return }
         if textKeys.remove(event.keyCode) != nil { return }
         sendKey(event.keyCode, down: false, at: event.timestamp)
     }
@@ -1123,6 +1176,7 @@ final class InputView: NSView {
     }
 
     override func resignFirstResponder() -> Bool {
+        setMouseClamped(false)
         setRelative(false)
         modifiersDown.removeAll()
         clearTyping()
@@ -1132,13 +1186,17 @@ final class InputView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        if window == nil { setMouseClamped(false) }
         // Leaving the window gives the pointer back and releases input.
         let weak = WeakInputView()
         weak.view = self
         NotificationCenter.default.addObserver(
             forName: NSWindow.didResignKeyNotification, object: window, queue: .main
         ) { [relay] _ in
-            MainActor.assumeIsolated { weak.view?.setRelative(false) }
+            MainActor.assumeIsolated {
+                weak.view?.setMouseClamped(false)
+                weak.view?.setRelative(false)
+            }
             relay.send(Int32(FRAMES_MAC_INPUT_FOCUS_LOST), 1, at: 0)
         }
         // The host raises its window and reads its menus (v1's focus).

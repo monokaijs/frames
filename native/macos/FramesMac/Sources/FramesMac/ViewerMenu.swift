@@ -206,6 +206,15 @@ func framesMenu(for view: InputView?) -> NSMenu {
             "Hide all windows", ["command": "show_all", "shown": false],
             enabled: list.contains { flag($0["shown"]) }))
     let current = entry(for: view)
+    if let view {
+        let clamp = NSMenuItem(
+            title: "Clamp mouse to view (Control+Option+F9)",
+            action: #selector(InputView.toggleMouseClamp(_:)), keyEquivalent: "")
+        clamp.target = view
+        clamp.state = view.mouseClamped ? .on : .off
+        clamp.image = menuSymbol("cursorarrow")
+        menu.addItem(clamp)
+    }
     if let current, let id = number(current["id"]), !flag(current["desktop"]) {
         menu.addItem(item("Ignore / hide this window", ["command": "show", "id": id, "shown": false]))
     }
@@ -568,6 +577,11 @@ func addConnectionButton(_ window: NSWindow, view: InputView) {
 }
 
 extension InputView {
+    @objc func toggleMouseClamp(_ sender: NSMenuItem) {
+        // Opening a menu releases the pointer; use the displayed choice.
+        setMouseClamped(sender.state != .on)
+    }
+
     @objc func hideThisWindow(_ button: NSButton) {
         guard let current = entry(for: self), let id = number(current["id"]), !flag(current["desktop"]) else { return }
         releaseKeys()
@@ -587,8 +601,9 @@ extension InputView {
 @MainActor
 final class MenuTarget: NSObject, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
-        if menusOpen == 0 { frontView()?.releaseKeys() }
+        let first = menusOpen == 0
         menusOpen += 1
+        if first { frontView()?.releaseKeys() }
     }
 
     func menuDidClose(_ menu: NSMenu) {

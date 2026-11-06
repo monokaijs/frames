@@ -37,6 +37,8 @@ pub enum Choice {
     Fetch(u64),
     /// "Window compatibility": the shared game's record (one window).
     Compatibility(String),
+    /// A local pointer clamp for the window opening this menu.
+    MouseClamp(bool),
 }
 
 /// What the menu knows about the window it opens from.
@@ -105,7 +107,9 @@ impl Glyph {
             "This window" | "Window options" => Self::Settings,
             "Fill window" | "Resize remote app" | "Stretch locally" | "Image quality" | "View"
             | "Full desktop view" => Self::Display,
-            "Relative mouse · Ctrl+Alt+F11" | "Show remote cursor" => Self::Cursor,
+            "Relative mouse · Ctrl+Alt+F11"
+            | "Show remote cursor"
+            | "Clamp mouse to view · Ctrl+Alt+F9" => Self::Cursor,
             "Swap Control / Command" | "Physical keys" => Self::Keyboard,
             "Refresh application menus" | "Refresh devices" => Self::Refresh,
             "Fetch remote file…" => Self::Folder,
@@ -587,6 +591,26 @@ impl Builder {
             },
             snapshot.remote_cursor,
         );
+        if context.window.is_some() {
+            self.item(
+                menu,
+                "Relative mouse · Ctrl+Alt+F11",
+                context.window.map(|id| {
+                    Choice::Command(Command::Window {
+                        id,
+                        action: WindowAction::ToggleRelative,
+                    })
+                }),
+                crate::win::relative(),
+            );
+            let clamped = crate::win::mouse_clamped();
+            self.item(
+                menu,
+                "Clamp mouse to view · Ctrl+Alt+F9",
+                Some(Choice::MouseClamp(!clamped)),
+                clamped,
+            );
+        }
         Self::separator(menu);
         self.command(menu, "Disconnect", Command::Disconnect, false);
         menu
@@ -683,6 +707,7 @@ pub fn show_menu(owner: HWND, at: POINT, context: &Context) -> Option<Choice> {
 pub fn run(choice: Choice, owner: HWND) {
     match choice {
         Choice::Command(command) => crate::control::send(command),
+        Choice::MouseClamp(on) => crate::win::set_mouse_clamped(owner, on),
         Choice::Fetch(id) => prompt_fetch(owner, id),
         // On its own thread: a message box on this one would stall video.
         Choice::Compatibility(text) => {
@@ -748,7 +773,11 @@ fn create_caption_button(parent: HWND, hide: bool) -> HWND {
         let Ok(button) = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
             w!("FramesNextCaptionButton"),
-            w!("Connection menu"),
+            if hide {
+                w!("Hide this window")
+            } else {
+                w!("Connection menu")
+            },
             WS_POPUP,
             0,
             0,
@@ -775,7 +804,11 @@ fn create_caption_button(parent: HWND, hide: bool) -> HWND {
             None,
             None,
         ) {
-            let text = wide("Connection menu");
+            let text = wide(if hide {
+                "Hide this window"
+            } else {
+                "Connection menu"
+            });
             let tool = TTTOOLINFOW {
                 cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
                 uFlags: TTF_IDISHWND | TTF_SUBCLASS,
