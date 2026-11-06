@@ -49,6 +49,8 @@ pub struct InputInjector {
     /// Why input may not have reached the shared window (for the viewer's
     /// title, as v1 said), until taken.
     problem: std::cell::Cell<Option<&'static str>>,
+    injection_blocked: std::cell::Cell<bool>,
+    rejected: std::cell::Cell<u64>,
 }
 
 // The HWND is only used with thread-safe message posting.
@@ -76,6 +78,8 @@ impl InputInjector {
             position: (0, 0),
             applied: 0,
             problem: std::cell::Cell::new(None),
+            injection_blocked: std::cell::Cell::new(false),
+            rejected: std::cell::Cell::new(0),
         }
     }
 
@@ -101,7 +105,7 @@ impl InputInjector {
             return false;
         };
         if (dx, dy) != (0, 0) && !matches!(self.target, InputTarget::Window(_)) {
-            send(&[mouse(MOUSEEVENTF_MOVE, dx, dy, 0)]);
+            self.inject(&[mouse(MOUSEEVENTF_MOVE, dx, dy, 0)]);
         }
         self.applied += 1;
         true
@@ -275,7 +279,7 @@ impl InputInjector {
                 };
                 let dx = ((i64::from(px - vx) * 65535) / i64::from(vw - 1)) as i32;
                 let dy = ((i64::from(py - vy) * 65535) / i64::from(vh - 1)) as i32;
-                send(&[mouse(
+                self.inject(&[mouse(
                     MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                     dx,
                     dy,
@@ -316,7 +320,7 @@ impl InputInjector {
                     (Button::Forward, true) => (MOUSEEVENTF_XDOWN, XBUTTON_FORWARD as i32),
                     (Button::Forward, false) => (MOUSEEVENTF_XUP, XBUTTON_FORWARD as i32),
                 };
-                send(&[mouse(flags, 0, 0, data)]);
+                self.inject(&[mouse(flags, 0, 0, data)]);
             }
         }
     }
@@ -340,10 +344,10 @@ impl InputInjector {
             }
             InputTarget::Desktop(_) | InputTarget::WindowArea { .. } => {
                 if dy != 0 {
-                    send(&[mouse(MOUSEEVENTF_WHEEL, 0, 0, i32::from(dy))]);
+                    self.inject(&[mouse(MOUSEEVENTF_WHEEL, 0, 0, i32::from(dy))]);
                 }
                 if dx != 0 {
-                    send(&[mouse(MOUSEEVENTF_HWHEEL, 0, 0, i32::from(dx))]);
+                    self.inject(&[mouse(MOUSEEVENTF_HWHEEL, 0, 0, i32::from(dx))]);
                 }
             }
         }
@@ -378,7 +382,7 @@ impl InputInjector {
                         })
                     })
                     .collect();
-                send(&inputs);
+                self.inject(&inputs);
             }
         }
     }
@@ -406,7 +410,7 @@ impl InputInjector {
                 if !down {
                     flags |= KEYEVENTF_KEYUP;
                 }
-                send(&[INPUT {
+                self.inject(&[INPUT {
                     r#type: INPUT_KEYBOARD,
                     Anonymous: INPUT_0 {
                         ki: KEYBDINPUT {
@@ -417,6 +421,46 @@ impl InputInjector {
                     },
                 }]);
             }
+        }
+    }
+
+    pub fn rejected(&self) -> u64 {
+        self.rejected.get()
+    }
+
+    fn inject(&self, inputs: &[INPUT]) {
+        if inputs.is_empty() {
+            return;
+        }
+        // Clear the thread's previous error: UIPI can reject SendInput
+        // without setting a Win32 error. Never report a stale error as its cause.
+        let (sent, error) = unsafe {
+            windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(0));
+            let sent = SendInput(inputs, std::mem::size_of::<INPUT>() as i32);
+            (sent, windows::Win32::Foundation::GetLastError().0)
+        };
+        let blocked = sent as usize != inputs.len();
+        if blocked && !self.injection_blocked.get() {
+            tracing::warn!(
+                sent,
+                expected = inputs.len(),
+                error,
+                "Windows rejected remote input"
+            );
+        }
+        self.record_injection(blocked);
+    }
+
+    fn record_injection(&self, blocked: bool) {
+        if blocked {
+            self.rejected.set(self.rejected.get().saturating_add(1));
+        }
+        if self.injection_blocked.replace(blocked) != blocked {
+            self.problem.set(Some(if blocked {
+                "Windows rejected remote input; check the host's desktop and application permissions"
+            } else {
+                "Remote input resumed"
+            }));
         }
     }
 }
@@ -433,13 +477,6 @@ fn mouse(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: i32) -> INPUT {
                 ..Default::default()
             },
         },
-    }
-}
-
-fn send(inputs: &[INPUT]) {
-    let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
-    if sent as usize != inputs.len() {
-        tracing::debug!("SendInput applied {sent} of {} inputs", inputs.len());
     }
 }
 
@@ -491,4 +528,34 @@ pub fn captured_rect(hwnd: HWND, header: bool) -> RECT {
     rect.right = rect.left + ((rect.right - rect.left).max(0) & !1);
     rect.bottom = rect.top + ((rect.bottom - rect.top).max(0) & !1);
     rect
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_rejection_and_recovery_are_reported_once_per_transition() {
+        let input = InputInjector::new(InputTarget::Window(HWND::default()));
+        input.record_injection(false);
+        assert_eq!(input.take_problem(), None);
+        input.record_injection(true);
+        assert!(
+            input
+                .take_problem()
+                .unwrap()
+                .contains("Windows rejected remote input")
+        );
+        input.record_injection(true);
+        assert_eq!(
+            input.take_problem(),
+            None,
+            "do not spam every rejected pointer move"
+        );
+        assert_eq!(input.rejected(), 2);
+        input.record_injection(false);
+        assert_eq!(input.take_problem(), Some("Remote input resumed"));
+        input.record_injection(false);
+        assert_eq!(input.take_problem(), None);
+    }
 }

@@ -1012,10 +1012,12 @@ fn stream(
                 }
             } else if global_input {
                 injector.event(event);
-                if let Some(problem) = injector.take_problem() {
-                    notices.send(problem);
-                }
             }
+        }
+        // Pointer-only failures matter too: otherwise a blocked desktop
+        // looks connected until the viewer next clicks or types.
+        if let Some(problem) = injector.take_problem() {
+            notices.send(problem);
         }
         if started.elapsed() >= next_report {
             if next_report.as_secs() == 2 {
@@ -1040,6 +1042,16 @@ fn stream(
                 path.rtt_us as f64 / 1e3,
             );
             encode_us.clear();
+            if qa.is_none() && global_input {
+                println!(
+                    "host input: received {} events, applied {}, rejected SendInput {}",
+                    services
+                        .event_count
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    injector.applied,
+                    injector.rejected(),
+                );
+            }
             if qa.is_some() {
                 let counts = &win::QA_INPUT;
                 let load =
