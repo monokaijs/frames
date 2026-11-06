@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use slint::winit_030::{
     EventResult as WinitEventResult, WinitWindowAccessor, winit::event::WindowEvent,
 };
-use slint::{ComponentHandle, Model, ModelRc, VecModel};
+use slint::{ComponentHandle, ModelRc, VecModel};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     net::IpAddr,
     path::PathBuf,
@@ -19,6 +19,11 @@ use std::{
 
 #[path = "device_catalog.rs"]
 mod device_catalog;
+#[path = "launcher_models.rs"]
+mod launcher_models;
+#[path = "launcher_quick_apps.rs"]
+mod launcher_quick_apps;
+use launcher_models::{device_filter, device_key, refresh_rows};
 #[path = "launcher_close.rs"]
 mod launcher_close;
 #[path = "launcher_instance.rs"]
@@ -271,30 +276,6 @@ impl From<Device> for DeviceRow {
 fn model<T: Clone + 'static>(rows: Vec<T>) -> ModelRc<T> {
     Rc::new(VecModel::from(rows)).into()
 }
-/// Updates a list the user may be clicking in place. Replacing the model
-/// recreated every card, and each window focus triggers a refresh: the first
-/// click on an unfocused launcher hit a card that no longer existed, so
-/// Connect (and Disconnect) needed a second click. Unchanged rows are left
-/// alone and changed rows patched; only a change in length rebuilds the list.
-fn refresh_rows<T: Clone + PartialEq + 'static>(
-    current: ModelRc<T>,
-    rows: Vec<T>,
-    replace: impl FnOnce(ModelRc<T>),
-) {
-    let Some(list) = current.as_any().downcast_ref::<VecModel<T>>() else {
-        replace(model(rows));
-        return;
-    };
-    if list.row_count() != rows.len() {
-        list.set_vec(rows);
-        return;
-    }
-    for (index, row) in rows.into_iter().enumerate() {
-        if list.row_data(index).as_ref() != Some(&row) {
-            list.set_row_data(index, row);
-        }
-    }
-}
 fn recent_rows(prefs: &Preferences) -> Vec<Device> {
     prefs
         .recent
@@ -342,7 +323,8 @@ enum Action {
     LoadShareWindows(u64),
     CancelWindowPicker,
     ShareWindows(i32, Vec<String>),
-    Connect(String, String, bool, bool),
+    Connect(String, String, bool, bool, Option<(String, bool)>),
+    LoadQuickApps(String, u64, mpsc::Sender<launcher_quick_apps::Reply>),
     SaveConnectionChoices(String, String, bool, bool),
     RestartUpdate,
     ToggleSharing,
@@ -522,6 +504,7 @@ struct Worker {
     pairing: Option<String>,
     /// The access password for the next connection started (never saved).
     next_password: Option<String>,
+    quick_app_retries: BTreeMap<String, (String, bool)>,
 }
 impl Worker {
     fn close_pairing(&mut self) {
@@ -811,7 +794,19 @@ impl Worker {
                 )?;
                 self.notice("Sharing started with the windows you selected.", false);
             }
-            Action::Connect(value, expected_id, audio, desktop) => {
+            Action::LoadQuickApps(value, request, reply) => {
+                match next_sessions::target(&value, &self.devices) {
+                    Ok(target) => launcher_quick_apps::fetch(request, value, target, reply),
+                    Err(error) => {
+                        let _ = reply.send(launcher_quick_apps::Reply::Remote(
+                            request,
+                            value,
+                            Err(format!("{error:#}")),
+                        ));
+                    }
+                }
+            }
+            Action::Connect(value, expected_id, audio, desktop, quick_app) => {
                 let target = if frames_next::directory::is_device_id(&expected_id) {
                     expected_id.clone()
                 } else {
@@ -831,7 +826,20 @@ impl Worker {
                 if let Some(saved) = &saved {
                     options.quality = saved.quality;
                 }
+                if quick_app.is_some() {
+                    options.desktop = false;
+                }
                 let mut args = options.connection_args(&target);
+                if let Some((app, only)) = &quick_app {
+                    args.extend(["--app".into(), app.clone()]);
+                    if *only {
+                        args.push("--only-app".into());
+                    }
+                    self.quick_app_retries
+                        .insert(target.clone(), (app.clone(), *only));
+                } else {
+                    self.quick_app_retries.remove(&target);
+                }
                 if saved.is_some_and(|s| s.remote_cursor) {
                     args.push("--remote-cursor".into());
                 }
@@ -1001,7 +1009,9 @@ impl Worker {
                     self.preferences.options.audio,
                     self.preferences.options.desktop,
                 );
-                let result = self.handle(Action::Connect(target.clone(), target, audio, desktop));
+                let app = self.quick_app_retries.get(&target).cloned();
+                let result =
+                    self.handle(Action::Connect(target.clone(), target, audio, desktop, app));
                 self.next_password = None;
                 result?;
             }
@@ -1304,18 +1314,7 @@ pub fn run() -> Result<()> {
     #[cfg(any(windows, target_os = "macos"))]
     let mut tray = launcher_tray::LauncherTray::new()?;
     ui.set_app_version(env!("CARGO_PKG_VERSION").into());
-    ui.on_filter_devices(|rows, query| {
-        let query = query.trim().to_lowercase();
-        model(
-            rows.iter()
-                .filter(|row| {
-                    format!("{} {} {}", row.name, row.address, row.fingerprint)
-                        .to_lowercase()
-                        .contains(&query)
-                })
-                .collect(),
-        )
-    });
+    ui.on_filter_devices(device_filter());
     ui.set_mac(cfg!(target_os = "macos"));
     ui.set_device_name(frames_native::device_name().into());
     ui.set_device_name_edit(
@@ -1412,6 +1411,7 @@ pub fn run() -> Result<()> {
         let _ = update_requests.send(());
     });
     bind_update_restart(&ui, actions.clone());
+    let _quick_apps_timer = launcher_quick_apps::bind(&ui, actions.clone());
     let worker = std::thread::spawn(move || {
         let (discovery_tx, discovery_done) = mpsc::channel();
         let mut worker = Worker {
@@ -1430,6 +1430,7 @@ pub fn run() -> Result<()> {
             discovery_done,
             pairing: None,
             next_password: None,
+            quick_app_retries: BTreeMap::new(),
         };
         worker.refresh();
         loop {
@@ -1464,6 +1465,7 @@ pub fn run() -> Result<()> {
                 String::new(),
                 ui.get_audio(),
                 ui.get_desktop(),
+                None,
             ));
         }
     });
@@ -1480,6 +1482,7 @@ pub fn run() -> Result<()> {
                 id.to_string(),
                 audio,
                 desktop,
+                None,
             ));
         }
     });
@@ -1668,15 +1671,15 @@ pub fn run() -> Result<()> {
                     ui.set_notice_error(true);
                 }
                 Event::Recent(rows) => {
-                    refresh_rows(ui.get_recent(), rows.into_iter().map(Into::into).collect(), |m| ui.set_recent(m));
+                    refresh_rows(ui.get_recent(), rows.into_iter().map(Into::into).collect(), device_key, |m| ui.set_recent(m));
                     ui.invoke_connection_address_edited();
                 }
-                Event::Trusted(rows) => refresh_rows(ui.get_trusted(), rows.into_iter().map(Into::into).collect(), |m| ui.set_trusted(m)),
+                Event::Trusted(rows) => refresh_rows(ui.get_trusted(), rows.into_iter().map(Into::into).collect(), device_key, |m| ui.set_trusted(m)),
                 Event::Nearby(result) => {
                     ui.set_discovering(false);
                     match result {
                         Ok(rows) => {
-                            refresh_rows(ui.get_nearby(), rows.into_iter().map(Into::into).collect(), |m| ui.set_nearby(m));
+                            refresh_rows(ui.get_nearby(), rows.into_iter().map(Into::into).collect(), device_key, |m| ui.set_nearby(m));
                         }
                         Err(error) => { ui.set_notice(format!("Network discovery failed: {error}").into()); ui.set_notice_error(true); }
                     }
@@ -1756,7 +1759,7 @@ pub fn run() -> Result<()> {
                 Event::Sessions(rows) => {
                     if rows.iter().any(|row| !row.3) { ui.set_connection_tab(1); }
                     ui.set_sharing(rows.iter().any(|s| s.3));
-                    refresh_rows(ui.get_sessions(), rows.into_iter().map(|(id, name, detail, hosting)| SessionRow { id, name: name.into(), detail: detail.into(), hosting }).collect(), |m| ui.set_sessions(m));
+                    refresh_rows(ui.get_sessions(), rows.into_iter().map(|(id, name, detail, hosting)| SessionRow { id, name: name.into(), detail: detail.into(), hosting }).collect(), |row| row.id, |m| ui.set_sessions(m));
                 }
             }
         }
@@ -1776,6 +1779,7 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slint::Model;
 
     #[test]
     fn updating_with_active_sessions_requires_explicit_confirmation() {

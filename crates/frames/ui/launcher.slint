@@ -4,6 +4,7 @@ import { Theme, Glyph, AppButton, AppSwitch, AppCheckBox, NavItem, TabItem, Badg
 
 export struct DeviceRow { name: string, address: string, detail: string, fingerprint: string, trusted: bool, online: bool, can-trust: bool, preview: image, preview-live: bool, connection-audio: bool, connection-desktop: bool }
 export struct SessionRow { id: int, name: string, detail: string, hosting: bool }
+export struct QuickAppRow { id: string, name: string, command: string, icon: image }
 export struct UsbRow { id: string, name: string, detail: string, selected: bool }
 export struct ShareWindowRow { id: string, title: string, app: string, detail: string, preview: image, selected: bool, available: bool }
 
@@ -47,6 +48,7 @@ component DeviceGrid inherits Rectangle {
     callback options-edited(string, string, bool, bool);
     callback trust(string);
     callback revoke(string, string);
+    callback quick-apps(string);
     // Three columns from the launcher's minimum width, so a card's actions
     // stay visible without scrolling.
     private property <int> columns: root.width > 640px ? 3 : root.width > 440px ? 2 : 1;
@@ -76,7 +78,9 @@ component DeviceGrid inherits Rectangle {
             }
             Rectangle {
                 x: 0px; y: 0px; width: parent.width; height: parent.height;
-                background: @linear-gradient(0deg, #10151df0 0%, #10151d90 35%, #10151d00 80%);
+                // One continuous fade: intermediate translucent stops leave
+                // a visible seam in the software renderer over the title.
+                background: @linear-gradient(0deg, #10151df0 0%, #10151d00 100%);
             }
             VerticalLayout {
                 x: 12px; y: parent.height - 56px; width: parent.width - 24px; height: 44px;
@@ -116,6 +120,7 @@ component DeviceGrid inherits Rectangle {
                     audio: device.connection-audio; desktop: device.connection-desktop;
                     connect => { root.connect(device.address, device.fingerprint, self.audio, self.desktop); }
                     options-edited => { root.options-edited(device.address, device.fingerprint, self.audio, self.desktop); }
+                    quick-apps => { root.quick-apps(device.fingerprint != "" ? device.fingerprint : device.address); }
                 }
                 Rectangle { horizontal-stretch: 1; }
                 if device.can-trust: AppButton { label: "Trust device"; quiet: true; clicked => { root.trust(device.fingerprint); } }
@@ -175,8 +180,13 @@ component PermissionRow inherits Rectangle {
 
 component SettingsSection inherits VerticalLayout {
     in property <string> title;
+    in property <image> icon;
     spacing: 8px;
-    SectionTitle { text: root.title; height: 22px; font-size: 13px; font-weight: 600; }
+    HorizontalLayout {
+        height: 22px; spacing: 8px;
+        Glyph { source: root.icon; width: 16px; }
+        SectionTitle { text: root.title; font-size: 13px; font-weight: 600; }
+    }
     Card {
         VerticalLayout {
             padding-left: 18px; padding-right: 18px; spacing: 0px;
@@ -188,10 +198,12 @@ component SettingsSection inherits VerticalLayout {
 component SettingRow inherits Rectangle {
     in property <string> title;
     in property <string> detail;
+    in property <image> icon;
     in property <bool> divider: true;
     min-height: 66px;
     HorizontalLayout {
-        spacing: 24px;
+        spacing: 16px;
+        if root.icon.width > 0: Glyph { source: root.icon; width: 18px; }
         VerticalLayout {
             horizontal-stretch: 1; alignment: center; spacing: 4px;
             Text { text: root.title; color: Theme.ink; font-size: 13px; }
@@ -203,6 +215,30 @@ component SettingRow inherits Rectangle {
 }
 
 export component Launcher inherits Window {
+    in-out property <[QuickAppRow]> local-quick-apps;
+    in-out property <[QuickAppRow]> remote-quick-apps;
+    in-out property <bool> quick-apps-open: false;
+    in-out property <bool> quick-app-editor-open: false;
+    in-out property <bool> quick-apps-busy: false;
+    in-out property <bool> quick-app-saving: false;
+    in-out property <bool> quick-app-only: true;
+    in-out property <string> quick-app-target;
+    in-out property <string> quick-app-selected;
+    in-out property <string> quick-app-name;
+    in-out property <string> quick-app-command;
+    in-out property <string> quick-app-error;
+    in-out property <string> quick-app-editor-error;
+    callback load-quick-apps(string);
+    callback launch-quick-app(string, string, bool);
+    callback save-quick-app(string, string);
+    callback remove-quick-app(string);
+    function open-quick-apps(target: string) {
+        root.quick-app-target = target;
+        root.quick-app-selected = "";
+        root.quick-app-error = "";
+        root.quick-apps-open = true;
+        root.load-quick-apps(target);
+    }
     in property <bool> design-preview: false;
     title: root.design-preview ? "Frames — visual preview" : "Frames";
     icon: @image-url("../../../assets/icons/Frames.png");
@@ -337,7 +373,7 @@ export component Launcher inherits Window {
     callback confirm-restart-update();
 
     FocusScope {
-        enabled: root.revoke-id == "" && !root.permissions-open && !root.close-prompt-open && !root.window-picker-open && !root.pairing-open && !root.password-prompt-open && !root.usb-open;
+        enabled: root.revoke-id == "" && !root.permissions-open && !root.close-prompt-open && !root.window-picker-open && !root.pairing-open && !root.password-prompt-open && !root.usb-open && !root.quick-apps-open && !root.quick-app-editor-open;
         HorizontalLayout {
             spacing: 0px;
             Rectangle { width: 56px; }
@@ -356,7 +392,7 @@ export component Launcher inherits Window {
                 ScrollView {
                     horizontal-stretch: 1; vertical-stretch: 1;
                     VerticalLayout {
-                        padding: 24px; spacing: 20px;
+                        padding: 20px; spacing: 20px;
                         if root.notice != "" && root.notice-error: Rectangle {
                             min-height: 44px; background: #fff5f5; border-radius: 5px;
                             HorizontalLayout {
@@ -366,7 +402,7 @@ export component Launcher inherits Window {
                             }
                         }
                         if root.page == 0: VerticalLayout {
-                            spacing: 20px;
+                            spacing: 16px;
                             HorizontalLayout {
                                 spacing: 8px;
                                 TabItem { label: "Connect"; selected: root.connection-tab == 0; clicked => { root.connection-tab = 0; } }
@@ -374,11 +410,11 @@ export component Launcher inherits Window {
                                 Rectangle { horizontal-stretch: 1; }
                             }
                             if root.connection-tab == 0: VerticalLayout {
-                                spacing: 24px;
+                                spacing: 16px;
                                 Card {
-                                    height: 156px;
+                                    height: 148px;
                                     HorizontalLayout {
-                                        padding: 20px; spacing: 24px;
+                                        padding: 16px; spacing: 20px;
                                         VerticalLayout {
                                             min-width: 250px; horizontal-stretch: 1; spacing: 10px;
                                             SectionTitle { text: "Share this device"; }
@@ -419,6 +455,7 @@ export component Launcher inherits Window {
                                                 LineEdit { height: 32px; horizontal-stretch: 1; text <=> root.address; placeholder-text: "Code such as 9710-3C89, device ID, or IP"; accessible-label: "Code or device ID of the other device"; edited => { root.connection-address-edited(); } accepted => { if root.address != "" { root.connect(root.address); } } }
                                                 ConnectionButton {
                                                     primary: true; enabled: root.address != "";
+                                                    align-options-right: true;
                                                     audio <=> root.audio; desktop <=> root.desktop;
                                                     connect => { root.connect(root.address); }
                                                     options-edited => {
@@ -426,6 +463,7 @@ export component Launcher inherits Window {
                                                         root.settings-edited();
                                                         root.connection-options-edited(root.address, "", root.audio, root.desktop);
                                                     }
+                                                    quick-apps => { root.open-quick-apps(root.address); }
                                                 }
                                             }
                                         }
@@ -434,7 +472,7 @@ export component Launcher inherits Window {
                                 VerticalLayout {
                                     spacing: 0px;
                                     HorizontalLayout {
-                                        height: 36px; spacing: 8px;
+                                        height: 32px; spacing: 8px;
                                         SectionTitle { text: "Nearby"; font-size: 13px; }
                                         Rectangle { horizontal-stretch: 1; }
                                         AppButton { label: root.discovering ? "Scanning…" : ""; icon: @image-url("icons/refresh.svg"); a11y-label: "Scan nearby devices"; quiet: true; enabled: !root.discovering; clicked => { root.discover(); } }
@@ -451,6 +489,7 @@ export component Launcher inherits Window {
                                         options-edited(address, id, audio, desktop) => { root.connection-options-edited(address, id, audio, desktop); }
                                         trust(id) => { root.trust(id); }
                                         revoke(id, name) => { root.revoke-id = id; root.revoke-name = name; }
+                                        quick-apps(target) => { root.open-quick-apps(target); }
                                     }
                                 }
                             }
@@ -496,13 +535,14 @@ export component Launcher inherits Window {
                                 options-edited(address, id, audio, desktop) => { root.connection-options-edited(address, id, audio, desktop); }
                                 trust(id) => { root.trust(id); }
                                 revoke(id, name) => { root.revoke-id = id; root.revoke-name = name; }
+                                quick-apps(target) => { root.open-quick-apps(target); }
                             }
                         }
                         if root.page == 2: VerticalLayout {
                             spacing: 24px;
                             if root.settings-status != "": Text { text: root.settings-status; color: root.settings-error ? #a84d55 : Theme.muted; font-size: 12px; wrap: word-wrap; }
                             SettingsSection {
-                                title: "General";
+                                title: "General"; icon: @image-url("icons/settings.svg");
                                 SettingRow { title: "Device name"; detail: "Shown to other devices. Leave blank to use the system name."; divider: !root.mac;
                                     LineEdit { width: 250px; text <=> root.device-name-edit; placeholder-text: root.system-device-name; edited => { root.device-name-edited(); } accessible-label: "Device name"; }
                                 }
@@ -511,7 +551,7 @@ export component Launcher inherits Window {
                                 }
                             }
                             SettingsSection {
-                                title: "Connections";
+                                title: "Connections"; icon: @image-url("icons/connections.svg");
                                 SettingRow { title: "Default view"; detail: "Open individual apps or the full remote desktop.";
                                     ComboBox { width: 180px; model: ["Application windows", "Full desktop"]; current-index: root.default-desktop ? 1 : 0; selected(value) => { root.default-desktop = self.current-index == 1; root.settings-edited(); } accessible-label: "Default connection view"; }
                                 }
@@ -548,8 +588,8 @@ export component Launcher inherits Window {
                                 }
                             }
                             SettingsSection {
-                                title: "Sharing";
-                                SettingRow { title: "Access password"; detail: root.access-password-set ? "Set. Devices that enter it connect without anyone approving them here." : "Lets devices that know it connect without anyone approving them here (unattended access). At least 8 characters.";
+                                title: "Sharing"; icon: @image-url("icons/display.svg");
+                                SettingRow { title: "Access password"; icon: @image-url("icons/lock.svg"); detail: root.access-password-set ? "Set. Devices that enter it connect without anyone approving them here." : "Lets devices that know it connect without anyone approving them here (unattended access). At least 8 characters.";
                                     HorizontalLayout { spacing: 8px; alignment: end;
                                         LineEdit { width: 160px; input-type: password; text <=> root.access-password-edit; placeholder-text: root.access-password-set ? "New password" : "Password"; accessible-label: "Access password"; accepted => { if root.access-password-edit != "" { root.set-access-password(root.access-password-edit); } } }
                                         AppButton { label: "Set"; quiet: true; enabled: root.access-password-edit != ""; clicked => { root.set-access-password(root.access-password-edit); } }
@@ -562,12 +602,34 @@ export component Launcher inherits Window {
                                 if !root.mac: SettingRow { title: "Video encoder"; detail: root.encoder == 0 ? "Automatic uses the fastest encoder that works on this PC." : "Used when sharing starts. If it does not work on this PC, Frames picks one automatically."; divider: false;
                                     ComboBox { width: 180px; model: ["Automatic", "NVIDIA NVENC", "AMD AMF", "Intel Quick Sync", "Windows Media Foundation", "Software"]; current-index <=> root.encoder; selected(value) => { root.settings-edited(); } accessible-label: "Video encoder"; }
                                 }
-                                if root.mac: SettingRow { title: "Sharing at login"; detail: root.background-sharing-registered ? "Enabled. Sharing starts when you sign in." : "Manage background sharing on this Mac."; divider: false;
+                                if root.mac: SettingRow { title: "Sharing at login"; icon: @image-url("icons/power.svg"); detail: root.background-sharing-registered ? "Enabled. Sharing starts when you sign in." : "Manage background sharing on this Mac."; divider: false;
                                     AppButton { label: "Manage"; a11y-label: "Manage sharing at login"; quiet: true; clicked => { root.login-settings(); } }
                                 }
                             }
                             SettingsSection {
-                                title: "Updates";
+                                title: "Quick Apps"; icon: @image-url("icons/folder.svg");
+                                VerticalLayout {
+                                    padding-top: 16px; padding-bottom: 16px; spacing: 12px;
+                                    MutedText { text: "Applications trusted devices can open on this computer. Choose Quick Apps from a device’s Connect menu to open one remotely."; font-size: 11px; }
+                                    for app in root.local-quick-apps: Rectangle {
+                                        height: 50px;
+                                        HorizontalLayout { spacing: 12px;
+                                            Glyph { source: @image-url("icons/folder.svg"); width: 18px; }
+                                            VerticalLayout { alignment: center; spacing: 4px;
+                                                Text { text: app.name; color: Theme.ink; font-size: 12px; overflow: elide; }
+                                                Text { text: app.command; color: Theme.muted; font-size: 11px; overflow: elide; }
+                                            }
+                                            AppButton { label: "Remove"; a11y-label: "Remove Quick App " + app.name; quiet: true; danger: true; enabled: !root.quick-app-saving; clicked => { root.remove-quick-app(app.id); } }
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        AppButton { label: "Add application"; icon: @image-url("icons/folder.svg"); clicked => { root.quick-app-name = ""; root.quick-app-command = ""; root.quick-app-editor-error = ""; root.quick-app-editor-open = true; } }
+                                        Rectangle { horizontal-stretch: 1; }
+                                    }
+                                }
+                            }
+                            SettingsSection {
+                                title: "Updates"; icon: @image-url("icons/refresh.svg");
                                 Rectangle {
                                     min-height: 108px;
                                     VerticalLayout {
@@ -617,6 +679,72 @@ export component Launcher inherits Window {
                 Rectangle { vertical-stretch: 1; }
                 NavItem { label: "Permissions"; icon: @image-url("icons/shield.svg"); selected: root.permissions-open; badge: root.mac && (root.screen-permission == 0 || root.control-permission == 0) ? "!" : ""; clicked => { root.show-permissions(); } }
                 NavItem { label: "Settings"; icon: @image-url("icons/settings.svg"); selected: root.page == 2; clicked => { root.page = 2; } }
+            }
+        }
+    }
+    if root.quick-apps-open: ModalFocus {
+        key-pressed(event) => { if event.text == Key.Escape { root.quick-apps-open = false; return accept; } return reject; }
+        Rectangle { background: #00000066; }
+        TouchArea { }
+        Card {
+            width: min(540px, parent.width - 48px); height: min(430px, parent.height - 48px);
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            VerticalLayout { padding: 24px; spacing: 14px;
+                HorizontalLayout {
+                    SectionTitle { text: "Quick Apps"; font-size: 18px; horizontal-stretch: 1; }
+                    AppButton { icon: @image-url("icons/close.svg"); quiet: true; a11y-label: "Close Quick Apps"; clicked => { root.quick-apps-open = false; } }
+                }
+                MutedText { text: "Open an application on the other computer and connect to it."; }
+                if root.quick-apps-busy: MutedText { text: "Loading applications…"; }
+                if root.quick-app-error != "": MutedText { text: root.quick-app-error; color: #a84d55; }
+                if !root.quick-apps-busy && root.quick-app-error == "" && root.remote-quick-apps.length == 0: MutedText { text: "No Quick Apps yet. Add applications in Settings on the other computer."; }
+                ListView { vertical-stretch: 1;
+                    for app in root.remote-quick-apps: Rectangle {
+                        height: 52px; border-radius: 5px;
+                        background: root.quick-app-selected == app.id ? #f0f2f6 : select-touch.has-hover || select-focus.has-focus ? #f8f9fb : white;
+                        HorizontalLayout { padding: 12px; spacing: 12px;
+                            if app.icon.width > 0: Image { source: app.icon; width: 24px; height: 24px; image-fit: contain; }
+                            if app.icon.width == 0: Glyph { source: @image-url("icons/folder.svg"); width: 20px; }
+                            Text { text: app.name; color: Theme.ink; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                            if root.quick-app-selected == app.id: Glyph { source: @image-url("icons/check.svg"); width: 16px; }
+                        }
+                        select-focus := FocusScope { focus-on-click: false; key-pressed(event) => { if event.text == " " || event.text == Key.Return { root.quick-app-selected = app.id; return accept; } return reject; } }
+                        select-touch := TouchArea { mouse-cursor: pointer; clicked => { select-focus.focus(); root.quick-app-selected = app.id; } }
+                        accessible-role: button; accessible-label: app.name; accessible-checkable: true; accessible-checked: root.quick-app-selected == app.id;
+                        accessible-action-default => { root.quick-app-selected = app.id; }
+                    }
+                }
+                AppCheckBox { text: "Only stream this application"; checked <=> root.quick-app-only; }
+                MutedText { text: root.quick-app-only ? "Includes its windows and dialogs. Other applications stay hidden." : "Opens the app and shows the host’s shared application windows."; font-size: 11px; }
+                HorizontalLayout { spacing: 8px;
+                    AppButton { label: "Refresh"; icon: @image-url("icons/refresh.svg"); quiet: true; enabled: !root.quick-apps-busy; clicked => { root.load-quick-apps(root.quick-app-target); } }
+                    Rectangle { horizontal-stretch: 1; }
+                    AppButton { label: "Cancel"; clicked => { root.quick-apps-open = false; } }
+                    AppButton { label: "Open & connect"; icon: @image-url("icons/arrow.svg"); primary: true; enabled: !root.quick-apps-busy && root.quick-app-selected != ""; clicked => { root.launch-quick-app(root.quick-app-target, root.quick-app-selected, root.quick-app-only); } }
+                }
+            }
+        }
+    }
+    if root.quick-app-editor-open: ModalFocus {
+        key-pressed(event) => { if event.text == Key.Escape && !root.quick-app-saving { root.quick-app-editor-open = false; return accept; } return reject; }
+        Rectangle { background: #00000066; }
+        TouchArea { }
+        Card {
+            width: min(500px, parent.width - 48px); height: root.quick-app-editor-error == "" ? 310px : 350px;
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            VerticalLayout { padding: 24px; spacing: 12px;
+                SectionTitle { text: "Add Quick App"; font-size: 18px; }
+                MutedText { text: "Trusted devices can open this application on this computer."; }
+                Text { text: "Name"; color: Theme.ink; font-size: 12px; }
+                LineEdit { text <=> root.quick-app-name; placeholder-text: "Application name"; accessible-label: "Quick App name"; enabled: !root.quick-app-saving; }
+                Text { text: "Application"; color: Theme.ink; font-size: 12px; }
+                LineEdit { text <=> root.quick-app-command; placeholder-text: root.mac ? "/Applications/Example.app" : "C:\\Program Files\\Example\\Example.exe"; accessible-label: "Quick App application path"; enabled: !root.quick-app-saving; }
+                if root.quick-app-editor-error != "": MutedText { text: root.quick-app-editor-error; color: #a84d55; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout { alignment: end; spacing: 8px;
+                    AppButton { label: "Cancel"; enabled: !root.quick-app-saving; clicked => { root.quick-app-editor-open = false; } }
+                    AppButton { label: root.quick-app-saving ? "Saving…" : "Add application"; primary: true; enabled: !root.quick-app-saving && root.quick-app-name != "" && root.quick-app-command != ""; clicked => { root.save-quick-app(root.quick-app-name, root.quick-app-command); } }
+                }
             }
         }
     }

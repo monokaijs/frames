@@ -1,8 +1,11 @@
 //! Isolated design fixture: never starts sessions or reads real trust/history.
 //! cargo run -p frames --example launcher_preview -- connections /tmp/connections.png
 use slint::{ComponentHandle, ModelRc, VecModel};
+use std::cell::Cell;
 use std::rc::Rc;
 
+#[path = "../src/launcher_models.rs"]
+mod launcher_models;
 #[path = "../src/window_style.rs"]
 mod window_style;
 
@@ -70,6 +73,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.set_update_status("Frames 0.2.4 is ready. Restart to install the update.".into());
     }
     ui.set_design_preview(true);
+    let quick_apps = || {
+        rows(vec![
+            QuickAppRow {
+                id: "editor".into(),
+                name: "Code editor".into(),
+                command: "/Applications/Code.app".into(),
+                ..Default::default()
+            },
+            QuickAppRow {
+                id: "notes".into(),
+                name: "Notes".into(),
+                command: "/Applications/Notes.app".into(),
+                ..Default::default()
+            },
+            QuickAppRow {
+                id: "game".into(),
+                name: "Game library".into(),
+                command: "/Applications/Games.app".into(),
+                ..Default::default()
+            },
+        ])
+    };
+    ui.set_local_quick_apps(quick_apps());
+    if args.get(1).map(String::as_str) == Some("quick-apps") {
+        ui.set_quick_apps_open(true);
+        ui.set_quick_app_target("fixture-host".into());
+        if !args.iter().any(|arg| arg == "--empty") {
+            ui.set_remote_quick_apps(quick_apps());
+        }
+        ui.set_quick_apps_busy(args.iter().any(|arg| arg == "--loading"));
+        if args.iter().any(|arg| arg == "--error") {
+            ui.set_quick_app_error(
+                "This device is not trusted yet. Connect and trust it first, then refresh.".into(),
+            );
+        }
+    }
+    if args.get(1).map(String::as_str) == Some("quick-app-editor") {
+        ui.set_quick_app_editor_open(true);
+        if args.iter().any(|arg| arg == "--error") {
+            ui.set_quick_app_editor_error(
+                "Choose the full path of an application on this computer.".into(),
+            );
+        }
+    }
     if args.iter().any(|arg| arg == "--update-confirm") {
         ui.set_update_ready(true);
         ui.set_update_prompt_open(true);
@@ -139,6 +186,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_system_device_name("Studio Mac".into());
     ui.set_device_name_edit("Studio Mac".into());
     ui.set_local_address("192.168.1.24:47990".into());
+    ui.set_device_code("Code 8782-19A1".into());
+    ui.set_local_ip("192.168.1.24".into());
     ui.set_screen_permission(1);
     ui.set_control_permission(0);
     ui.set_address("192.168.1.18:47990".into());
@@ -154,6 +203,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     if args.iter().any(|arg| arg == "--no-matches") {
         ui.set_search("Unmatched device".into());
+    }
+    if let Some(query) = args.iter().find_map(|arg| arg.strip_prefix("--search=")) {
+        ui.set_search(query.into());
     }
     ui.set_permissions_open(args.get(1).map(String::as_str) == Some("permissions"));
     ui.set_close_prompt_open(args.get(1).map(String::as_str) == Some("close"));
@@ -261,18 +313,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.set_mac(false);
     }
     use slint::Model;
-    ui.on_filter_devices(|data, query| {
-        let q = query.to_lowercase();
-        rows(
-            data.iter()
-                .filter(|d| {
-                    format!("{} {} {}", d.name, d.address, d.fingerprint)
-                        .to_lowercase()
-                        .contains(&q)
-                })
-                .collect(),
-        )
-    });
+    ui.on_filter_devices(launcher_models::device_filter());
     // Design fixtures must never masquerade as the functional application.
     fn preview_notice(weak: &slint::Weak<Launcher>) {
         if let Some(ui) = weak.upgrade() {
@@ -282,10 +323,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let weak = ui.as_weak();
     ui.on_refresh(move || preview_notice(&weak));
+    let connects = Rc::new(Cell::new(0usize));
     let weak = ui.as_weak();
-    ui.on_connect(move |_| preview_notice(&weak));
+    let count = connects.clone();
+    ui.on_connect(move |_| {
+        count.set(count.get() + 1);
+        preview_notice(&weak);
+    });
     let weak = ui.as_weak();
-    ui.on_connect_device(move |_, _, _, _| preview_notice(&weak));
+    let count = connects.clone();
+    ui.on_connect_device(move |_, _, _, _| {
+        count.set(count.get() + 1);
+        preview_notice(&weak);
+    });
+    let weak = ui.as_weak();
+    let count = connects.clone();
+    ui.on_launch_quick_app(move |_, _, _| {
+        count.set(count.get() + 1);
+        if let Some(ui) = weak.upgrade() {
+            ui.set_quick_apps_open(false);
+        }
+        preview_notice(&weak);
+    });
+    ui.on_load_quick_apps(move |_| {});
+    let weak = ui.as_weak();
+    ui.on_save_quick_app(move |_, _| preview_notice(&weak));
+    let weak = ui.as_weak();
+    ui.on_remove_quick_app(move |_| preview_notice(&weak));
     let weak = ui.as_weak();
     ui.on_toggle_sharing(move || preview_notice(&weak));
     let weak = ui.as_weak();
@@ -320,7 +384,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         // Exercise production popups in a headless snapshot.
         for arg in &args {
-            if let Some(point) = arg.strip_prefix("--click=") {
+            if arg == "--refresh-devices" || arg == "--append-device" {
+                for data in [ui.get_nearby(), ui.get_recent(), ui.get_trusted()] {
+                    let mut refreshed: Vec<_> = data.iter().collect();
+                    if arg == "--append-device" {
+                        refreshed.push(DeviceRow {
+                            name: "New arrival".into(),
+                            address: "192.168.1.80".into(),
+                            ..Default::default()
+                        });
+                    } else {
+                        for row in &mut refreshed {
+                            row.detail = "Refreshed while the pointer is down".into();
+                        }
+                    }
+                    launcher_models::refresh_rows(
+                        data,
+                        refreshed,
+                        launcher_models::device_key,
+                        |_| panic!("fixture has a VecModel"),
+                    );
+                }
+            } else if let Some(point) = arg
+                .strip_prefix("--press=")
+                .or_else(|| arg.strip_prefix("--release="))
+            {
+                let (x, y) = point
+                    .split_once(',')
+                    .ok_or("Use --press=x,y or --release=x,y")?;
+                let position = slint::LogicalPosition::new(x.parse()?, y.parse()?);
+                ui.window().dispatch_event(if arg.starts_with("--press=") {
+                    slint::platform::WindowEvent::PointerPressed {
+                        position,
+                        button: slint::platform::PointerEventButton::Left,
+                    }
+                } else {
+                    slint::platform::WindowEvent::PointerReleased {
+                        position,
+                        button: slint::platform::PointerEventButton::Left,
+                    }
+                });
+            } else if let Some(point) = arg.strip_prefix("--click=") {
                 let (x, y) = point.split_once(',').ok_or("Use --click=x,y")?;
                 let position = slint::LogicalPosition::new(x.parse()?, y.parse()?);
                 ui.window()
@@ -352,6 +456,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             window.draw_if_needed(|renderer| {
                 renderer.render(&mut pixels, size.width as usize);
             });
+        }
+        if let Some(expected) = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--expect-connect="))
+        {
+            let expected: usize = expected.parse()?;
+            assert_eq!(
+                connects.get(),
+                expected,
+                "Connect must fire exactly once per completed click"
+            );
         }
         let bytes: Vec<u8> = pixels.iter().flat_map(|p| [p.r, p.g, p.b]).collect();
         image::save_buffer(

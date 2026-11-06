@@ -12,6 +12,12 @@ Discovery, permission helpers, trust changes, and session supervision run outsid
 
 Per-device client choices live in `connection-preferences.json`, keyed by certificate fingerprint so they survive address changes. Remote-cursor visibility also survives reconnects; existing native per-application preferences retain sizing and keyboard choices. Trust and connection approval are separate: the host must enable Unattended access and accept a device with **Accept and trust** while it is enabled to allow reconnecting without a prompt. Trusting an outgoing host does not grant it incoming control.
 
+## Quick Apps
+
+On the computer hosting applications, open **Settings → Quick Apps → Add application** and enter its name and full executable or macOS `.app` path. The list is stored in `quick-apps.json` next to the launcher preferences.
+
+On a viewer, enter a device address or use its device card, then choose **Connect ▾ → Quick Apps**. Select an application and click **Open & connect**. **Only stream this application** is checked by default: the session shows that application's windows and dialogs, and full-desktop view is unavailable. Clear it to launch the application while sharing the host's other available windows. The host still approves access normally; an unknown device must connect and become trusted before it can read the application list.
+
 ## Preview
 
 The launcher uses GPU-accelerated FemtoVG with Slint 1.16.1's Swash glyph
@@ -32,6 +38,8 @@ SLINT_BACKEND=winit-software cargo run -p frames --example launcher_preview -- c
 
 Options include `--empty`, `--active`, `--stress`, `--error`, and `--windows`. The minimum window size is 820 by 540 logical pixels. Permission checks refresh on focus; repeated setup actions open Settings after the first prompt. Keep the signing identity stable to preserve macOS privacy grants.
 
+Use `launcher_preview quick-apps` for the remote application chooser or `launcher_preview quick-app-editor` for the host's add dialog. The chooser supports `--empty`, `--loading`, and `--error` fixtures.
+
 PNG previews also accept `--click=x,y` (logical coordinates) and `--key=Escape`, `Tab`, `Down`, or `Return`. Repeating these exercises menu selection, keyboard access, and dismissal before saving the snapshot.
 
 For text-rendering checks, run `launcher_preview close --windows --compact`
@@ -41,3 +49,12 @@ odd window dimensions. A PNG output argument selects the headless software
 renderer and does not validate GPU text. `SLINT_DEBUG_PERFORMANCE=refresh_full_speed,console`
 forces continuous redraws and prints throughput for performance comparisons;
 unset it when checking normal idle CPU usage.
+
+Connect click regression checks use the same device models as the launcher. The pointer can stay down while discovery updates or adds a device:
+
+```sh
+cargo build --release -p frames --example launcher_preview
+target/release/examples/launcher_preview devices /tmp/first-click.png --compact --click=125,281 --expect-connect=1
+target/release/examples/launcher_preview devices /tmp/refresh-click.png --compact --search=Design --press=125,281 --refresh-devices --release=125,281 --expect-connect=1
+target/release/examples/launcher_preview devices /tmp/arrival-click.png --compact --press=125,281 --append-device --release=125,281 --expect-connect=1
+```
