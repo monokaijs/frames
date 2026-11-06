@@ -31,6 +31,39 @@ final class SheetContentTests: XCTestCase {
 
 final class ViewerMenuImageTests: XCTestCase {
     @MainActor
+    func testCaptionHideOnlyTargetsItsOwnRemoteWindow() throws {
+        final class Box: @unchecked Sendable { var commands: [[String: Any]] = [] }
+        _ = NSApplication.shared
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 200), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        let view = InputView(frame: window.contentLayoutRect, relay: InputRelay())
+        window.contentView = view
+        view.menuID = 7
+        addConnectionButton(window, view: view)
+        let box = Box()
+        framesMacViewerSetCommandHandler(Unmanaged.passUnretained(box).toOpaque(), { context, bytes, count in
+            guard let context, let bytes,
+                  let command = try? JSONSerialization.jsonObject(with: Data(bytes: bytes, count: count)) as? [String: Any] else { return }
+            Unmanaged<Box>.fromOpaque(context).takeUnretainedValue().commands.append(command)
+        })
+        defer { framesMacViewerSetCommandHandler(nil, nil); viewerState = [:]; window.close() }
+        viewerState = ["windows": [["id": 7, "desktop": false], ["id": 8, "desktop": true]]]
+        refreshViewerMenus()
+        let button = try XCTUnwrap(view.hideWindowButton)
+        XCTAssertFalse(button.isHidden)
+        view.hideThisWindow(button)
+        XCTAssertEqual(box.commands.count, 1)
+        XCTAssertEqual(box.commands[0]["command"] as? String, "show")
+        XCTAssertEqual((box.commands[0]["id"] as? NSNumber)?.uint64Value, 7)
+        XCTAssertEqual(box.commands[0]["shown"] as? Bool, false)
+        view.menuID = 8
+        refreshViewerMenus()
+        XCTAssertTrue(button.isHidden)
+        view.hideThisWindow(button)
+        XCTAssertEqual(box.commands.count, 1, "Desktop mode must not send a per-window hide")
+    }
+
+    @MainActor
     func testConnectionActionsKeepTheirMenuImages() {
         let menu = framesMenu(for: nil)
         for title in ["Image quality", "Show all windows", "Hide all windows", "Full desktop view", "Send File…", "Disconnect"] {

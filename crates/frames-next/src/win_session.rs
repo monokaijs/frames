@@ -24,6 +24,8 @@ use windows::core::{BOOL, PCWSTR, PWSTR, w};
 
 /// The WM_COMMAND id the caption button sends its window.
 pub const MENU_BUTTON: usize = 0xA009;
+pub const HIDE_BUTTON: usize = 0xA00A;
+const HIDE_ROLE: isize = 0x100;
 
 /// What a menu item does.
 #[derive(Clone, Debug)]
@@ -724,6 +726,14 @@ pub fn menu_point(button: HWND) -> POINT {
 /// A chevron left of the window's minimize button: a non-activating owned
 /// layered window, so the native caption stays untouched (v1).
 pub fn create_button(parent: HWND) -> HWND {
+    create_caption_button(parent, false)
+}
+
+pub fn create_hide_button(parent: HWND) -> HWND {
+    create_caption_button(parent, true)
+}
+
+fn create_caption_button(parent: HWND, hide: bool) -> HWND {
     unsafe {
         let Ok(instance) = GetModuleHandleW(None) else {
             return HWND::default();
@@ -781,6 +791,9 @@ pub fn create_button(parent: HWND) -> HWND {
                 Some(LPARAM((&tool as *const TTTOOLINFOW) as isize)),
             );
         }
+        if hide {
+            SetWindowLongPtrW(button, GWLP_USERDATA, HIDE_ROLE);
+        }
         layout_button(parent, button);
         button
     }
@@ -816,7 +829,13 @@ pub fn layout_button(parent: HWND, button: HWND) {
         let _ = SetWindowPos(
             button,
             None,
-            minimize.left - width,
+            minimize.left
+                - width
+                    * if GetWindowLongPtrW(button, GWLP_USERDATA) & HIDE_ROLE != 0 {
+                        2
+                    } else {
+                        1
+                    },
             minimize.top,
             width,
             minimize.bottom - minimize.top,
@@ -865,9 +884,18 @@ unsafe fn draw_icon(hwnd: HWND, owner: HWND) {
         let y = (height - unit(18)) / 2;
         let pen = CreatePen(PS_SOLID, unit(2), COLORREF(0xffffff));
         let old_pen = SelectObject(dc, pen.into());
-        let _ = MoveToEx(dc, x + unit(4), y + unit(6), None);
-        let _ = LineTo(dc, x + unit(9), y + unit(11));
-        let _ = LineTo(dc, x + unit(14), y + unit(6));
+        if GetWindowLongPtrW(hwnd, GWLP_USERDATA) & HIDE_ROLE != 0 {
+            let _ = MoveToEx(dc, x + unit(2), y + unit(9), None);
+            for (dx, dy) in [(6, 5), (12, 5), (16, 9), (12, 13), (6, 13), (2, 9)] {
+                let _ = LineTo(dc, x + unit(dx), y + unit(dy));
+            }
+            let _ = MoveToEx(dc, x + unit(3), y + unit(2), None);
+            let _ = LineTo(dc, x + unit(15), y + unit(16));
+        } else {
+            let _ = MoveToEx(dc, x + unit(4), y + unit(6), None);
+            let _ = LineTo(dc, x + unit(9), y + unit(11));
+            let _ = LineTo(dc, x + unit(14), y + unit(6));
+        }
         SelectObject(dc, old_pen);
         let _ = DeleteObject(pen.into());
         let mut dark = BOOL(0);
@@ -974,7 +1002,16 @@ unsafe extern "system" fn button_procedure(
                 let x = l.0 as u16 as i16 as i32;
                 let y = (l.0 >> 16) as u16 as i16 as i32;
                 if pressed && x >= 0 && y >= 0 && x < rect.right && y < rect.bottom {
-                    let _ = PostMessageW(Some(owner), WM_COMMAND, WPARAM(MENU_BUTTON), LPARAM(0));
+                    let _ = PostMessageW(
+                        Some(owner),
+                        WM_COMMAND,
+                        WPARAM(if state & HIDE_ROLE != 0 {
+                            HIDE_BUTTON
+                        } else {
+                            MENU_BUTTON
+                        }),
+                        LPARAM(0),
+                    );
                 }
                 return LRESULT(0);
             }

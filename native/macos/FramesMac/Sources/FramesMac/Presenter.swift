@@ -711,6 +711,8 @@ final class InputView: NSView {
     private static let blank = NSCursor(image: NSImage(size: NSSize(width: 1, height: 1)), hotSpot: .zero)
     /// The window's entry in the connection menus (ABI 5).
     var menuID: UInt64 = 0
+    weak var hideWindowButton: NSButton?
+    weak var connectionMenuButton: NSButton?
     /// Every key goes as a key (terminals); otherwise printable keys go as
     /// text composed here.
     private(set) var physicalKeys = false

@@ -95,6 +95,14 @@ private let commands = CommandSink()
 /// The state changed: rebuild the menu bar (after open menus close).
 @MainActor
 func refreshViewerMenus() {
+    for window in NSApp.windows {
+        guard let view = window.contentView as? InputView, let hide = view.hideWindowButton else { continue }
+        let current = entry(for: view)
+        let canHide = current != nil && !flag(current?["desktop"])
+        hide.isHidden = !canHide
+        view.connectionMenuButton?.frame.origin.x = canHide ? 32 : 4
+        hide.superview?.frame.size.width = canHide ? 64 : 36
+    }
     guard NSApp.mainMenu != nil, NSApp.activationPolicy() == .regular else { return }
     installViewerMenu()
 }
@@ -543,6 +551,16 @@ func addConnectionButton(_ window: NSWindow, view: InputView) {
     let container = NSView(frame: NSRect(x: 0, y: 0, width: 36, height: 22))
     button.frame.origin = NSPoint(x: 4, y: 0)
     container.addSubview(button)
+    view.connectionMenuButton = button
+    let hide = NSButton(
+        image: NSImage(systemSymbolName: "eye.slash", accessibilityDescription: "Hide this window") ?? NSImage(),
+        target: view, action: #selector(InputView.hideThisWindow(_:)))
+    hide.isBordered = false
+    hide.toolTip = "Hide this window"
+    hide.frame = NSRect(x: 4, y: 0, width: 28, height: 22)
+    hide.isHidden = true
+    view.hideWindowButton = hide
+    container.addSubview(hide)
     let accessory = NSTitlebarAccessoryViewController()
     accessory.view = container
     accessory.layoutAttribute = .right
@@ -550,6 +568,12 @@ func addConnectionButton(_ window: NSWindow, view: InputView) {
 }
 
 extension InputView {
+    @objc func hideThisWindow(_ button: NSButton) {
+        guard let current = entry(for: self), let id = number(current["id"]), !flag(current["desktop"]) else { return }
+        releaseKeys()
+        sendViewerCommand(["command": "show", "id": id, "shown": false])
+    }
+
     @objc func openConnectionMenu(_ button: NSButton) {
         releaseKeys()
         let menu = connectionMenu(for: self)

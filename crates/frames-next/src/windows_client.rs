@@ -239,6 +239,7 @@ fn view(
     win::set_aspect(info.width, info.height);
     win::set_title(viewer, &crate::viewer_title(o, &info));
     win::set_menu_context(o.menu_id, &info.platform);
+    win::set_hide_button(viewer, o.window_id.is_some() && o.menu_id != 0 && !popup);
     win::session::start_connection_window();
     win::pump();
     // The connection menu's choices for this window (`crate::control`).

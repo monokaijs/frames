@@ -54,6 +54,7 @@ thread_local! {
     };
     /// The connection menu's chevron beside the minimize button.
     static CAPTION: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
+    static HIDE_CAPTION: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
     /// What the connection menu shows for this thread's viewer window.
     static MENU_CONTEXT: RefCell<session::Context> = RefCell::new(session::Context::default());
     /// The user is dragging the window's frame.
@@ -693,6 +694,12 @@ unsafe extern "system" fn viewer_procedure(
             return LRESULT(1);
         }
     }
+    if message == WM_COMMAND && w.0 & 0xffff == session::HIDE_BUTTON && l.0 == 0 {
+        if let Some(id) = MENU_CONTEXT.with(|context| context.borrow().window) {
+            crate::control::send(crate::control::Command::Show { id, shown: false });
+        }
+        return LRESULT(0);
+    }
     // The caption chevron, or "Connection menu" in the window menu.
     if message == WM_COMMAND && w.0 & 0xffff == session::MENU_BUTTON && l.0 == 0 {
         connection_menu(hwnd);
@@ -714,6 +721,7 @@ unsafe extern "system" fn viewer_procedure(
             USER_RESIZED.with(|r| r.set(true));
         }
         session::layout_button(hwnd, CAPTION.with(Cell::get));
+        session::layout_button(hwnd, HIDE_CAPTION.with(Cell::get));
         if message == WM_ACTIVATE && (w.0 & 0xffff) as u32 == WA_INACTIVE {
             let at_us = SystemClock::new().now_us();
             set_relative(hwnd, false, true);
@@ -757,6 +765,7 @@ unsafe extern "system" fn viewer_procedure(
             );
         }
         session::layout_button(hwnd, CAPTION.with(Cell::get));
+        session::layout_button(hwnd, HIDE_CAPTION.with(Cell::get));
         return LRESULT(0);
     }
     // An item of the host application's menus (`set_host_menu`).
@@ -1071,6 +1080,18 @@ fn connection_menu(hwnd: HWND) {
 
 /// This thread's viewer window is `window` in the connection menus, of a
 /// host on `host_platform`.
+pub fn set_hide_button(hwnd: HWND, enabled: bool) {
+    HIDE_CAPTION.with(|button| {
+        if enabled && button.get().is_invalid() {
+            button.set(session::create_hide_button(hwnd));
+        } else if !enabled && !button.get().is_invalid() {
+            unsafe {
+                let _ = DestroyWindow(button.replace(HWND::default()));
+            }
+        }
+    });
+}
+
 pub fn set_menu_context(window: u64, host_platform: &str) {
     MENU_CONTEXT.with(|context| {
         let mut context = context.borrow_mut();
@@ -1099,6 +1120,10 @@ pub fn take_user_resize() -> bool {
 /// Closes a viewer window (its thread may live on in a pool).
 pub fn destroy(hwnd: HWND) {
     unsafe {
+        let hide = HIDE_CAPTION.with(|c| c.replace(HWND::default()));
+        if !hide.is_invalid() {
+            let _ = DestroyWindow(hide);
+        }
         let caption = CAPTION.with(|c| c.replace(HWND::default()));
         if !caption.is_invalid() {
             let _ = DestroyWindow(caption);
