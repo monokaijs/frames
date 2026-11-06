@@ -287,7 +287,7 @@ fn view(
     let mut next_report = Duration::from_secs(1);
     let mut latency = Samples::new(30);
     let mut presented = 0u64;
-    let mut redraw = crate::resize::Redraw::new();
+    let mut redraw = crate::resize::Redraw::<frames_media::api::DecodedFrame>::new();
     let mut superseded = 0u64;
     let mut errors = 0u64;
     let mut reported_clean = 0u64;
