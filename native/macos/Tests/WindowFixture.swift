@@ -95,7 +95,8 @@ import AppKit
                 visibilityFixtures.append(window)
             }
         }
-        Timer.scheduledTimer(withTimeInterval:300,repeats:false){_ in NSApp.terminate(nil)}
+        let seconds = min(1800, max(10, Double(ProcessInfo.processInfo.environment["FRAMES_QA_SECONDS"] ?? "300") ?? 300))
+        Timer.scheduledTimer(withTimeInterval:seconds,repeats:false){_ in NSApp.terminate(nil)}
     }
     @objc func mark(){source.title="Frames QA source marked";cover.orderOut(nil)}
     @objc func clicked(){clicks+=1;source.backgroundColor=clicks.isMultiple(of:2) ? NSColor(srgbRed:0.85,green:0.05,blue:0.05,alpha:1):NSColor(srgbRed:0.05,green:0.85,blue:0.05,alpha:1);source.title="Frames QA source clicked";source.makeFirstResponder(input)}

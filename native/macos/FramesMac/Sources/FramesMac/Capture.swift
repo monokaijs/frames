@@ -2,10 +2,19 @@ import AppKit
 import ApplicationServices
 import CFramesMac
 import CoreGraphics
+import CoreImage
 import CoreMedia
 import CoreVideo
 import Foundation
 @preconcurrency import ScreenCaptureKit  // SCStream is not Sendable
+
+/// CLI viewers are named `frames` / `frames-next`, while the signed app
+/// is `Frames`. Never offer another viewer back to its host: bidirectional
+/// connections otherwise recapture themselves and create more windows forever.
+func isFramesApplication(owner: String, bundleID: String?) -> Bool {
+    if ["frames", "frames-next", "frameshelper"].contains(owner.lowercased()) { return true }
+    return ["dev.creaton.frames", "dev.creaton.frames.helper", "app.frames"].contains(bundleID ?? "")
+}
 
 /// ScreenCaptureKit capture of the main display, or of one window (ABI 4),
 /// delivering IOSurface-backed BGRA buffers straight to Rust (zero copy).
@@ -23,6 +32,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     private var timer: DispatchSourceTimer?
     private var pool: CVPixelBufferPool?
     private var tick: UInt64 = 0
+    private var describedFrame = false
     private var scale = 1.0
     private var displayOrigin = CGPoint.zero
     private var lastCursor: (Double, Double, Bool)?
@@ -39,6 +49,10 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     private var windowFrame = CGRect.zero
     private var contentFrame = CGRect.zero
     private var crop = TitleBarCrop()
+    private var pixelRegion = CGRect.zero
+    private var cropPool: CVPixelBufferPool?
+    private var cropPoolSize = CGSize.zero
+    private lazy var cropContext = CIContext(options: [.cacheIntermediates: false])
 
     init(fps: UInt32, windowID: CGWindowID = 0, callbacks: Callbacks) {
         self.fps = Int32(max(1, min(fps, 240)))
@@ -71,33 +85,49 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
                 }
                 let configuration = SCStreamConfiguration()
                 let pointScale = Double(filter.pointPixelScale)
-                // Even sizes: the encoders work on 4:2:0 pictures.
-                configuration.width = (Int(frame.width * pointScale) + 1) & ~1
-                configuration.height = (Int(frame.height * pointScale) + 1) & ~1
+                configuration.width = max(2, Int((frame.width * pointScale).rounded()))
+                configuration.height = max(2, Int((frame.height * pointScale).rounded()))
                 configuration.minimumFrameInterval = CMTime(value: 1, timescale: fps)
                 configuration.queueDepth = 3
                 configuration.showsCursor = false
+                // Each owned surface has its own stream and viewer window.
+                if #available(macOS 14.2, *) { configuration.includeChildWindows = false }
+                if ProcessInfo.processInfo.environment["FRAMES_CAPTURE_DEBUG"] != nil {
+                    FileHandle.standardError.write("capture \(windowID): window=\(frame), filter=\(filter.contentRect), scale=\(filter.pointPixelScale)\n".data(using: .utf8)!)
+                }
                 if windowID != 0 {
-                    configuration.sourceRect = CGRect(origin: .zero, size: frame.size)
+                    // Match v1: a native window's pixels, without the shadow
+                    // or clipping caused by its location on the host display.
+                    configuration.ignoreShadowsSingleWindow = true
+                    configuration.ignoreGlobalClipSingleWindow = true
+                    if #available(macOS 14.2, *) { filter.includeMenuBar = false }
                 }
                 configuration.pixelFormat = kCVPixelFormatType_32BGRA
                 configuration.colorSpaceName = CGColorSpace.sRGB
                 let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
                 try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
-                try await stream.startCapture()
-                let origin = frame.origin
-                queue.async {
+                if windowID != 0 { TitleBarCrop.prepare() }
+                // SCK can deliver the only complete frame of a static window
+                // before startCapture returns. Its crop must already exist.
+                queue.sync {
                     self.stream = stream
                     self.scale = pointScale
-                    self.displayOrigin = origin
+                    self.displayOrigin = frame.origin
                     self.configuration = configuration
                     if self.windowID != 0 {
                         self.windowFrame = frame
-                        self.contentFrame = frame
+                        self.contentFrame = self.crop.content(of: frame, window: self.windowID, showHeader: self.showHeader)
+                        self.displayOrigin = self.contentFrame.origin
+                        self.pixelRegion = windowPixelRegion(frame: frame, content: self.contentFrame, scale: pointScale)
                         self.applied = (
                             CGSize(width: configuration.width, height: configuration.height),
-                            configuration.sourceRect, false
+                            self.pixelRegion, configuration.showsCursor
                         )
+                    }
+                }
+                try await stream.startCapture()
+                queue.async {
+                    if self.windowID != 0 {
                         self.startGeometry()
                     } else {
                         self.applyOptions()
@@ -163,25 +193,25 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     private func refreshGeometry() {
         guard let stream, let configuration, let frame = windowBounds(windowID) else { return }
         windowFrame = frame
-        let content = showHeader ? frame : crop.content(of: frame, window: windowID)
-        let source = CGRect(
-            x: content.minX - frame.minX, y: content.minY - frame.minY, width: content.width, height: content.height)
-        // Even sizes: the encoders work on 4:2:0 pictures.
+        let content = crop.content(of: frame, window: windowID, showHeader: showHeader)
+        let source = windowPixelRegion(frame: frame, content: content, scale: scale)
+        pixelRegion = source
+        // Capture the full window at native resolution. Independent-window
+        // streams ignore sourceRect; reducing the SCK output size scales the
+        // whole window and its chrome instead of cropping it (v1 Host.swift).
         let size = CGSize(
-            width: (Int(content.width * scale) + 1) & ~1, height: (Int(content.height * scale) + 1) & ~1)
+            width: max(2, Int((frame.width * scale).rounded())), height: max(2, Int((frame.height * scale).rounded())))
         if content != contentFrame {
             contentFrame = content
             displayOrigin = content.origin
             reportGeometry()
         }
         guard size.width >= 2, size.height >= 2 else { return }
-        if let (oldSize, oldSource, oldCursor) = applied, oldSize == size, oldSource == source, oldCursor == showCursor {
-            return
-        }
+        let needsUpdate = applied.map { $0.0 != size || $0.2 != showCursor } ?? true
         applied = (size, source, showCursor)
+        guard needsUpdate else { return }
         configuration.width = Int(size.width)
         configuration.height = Int(size.height)
-        configuration.sourceRect = source
         configuration.showsCursor = showCursor
         stream.updateConfiguration(configuration) { [callbacks] error in
             if let error { callbacks.event(Int32(FRAMES_MAC_EVENT_LOG), "capture update failed: \(error)") }
@@ -226,6 +256,12 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen, let buffer = sample.imageBuffer else { return }
+        if !describedFrame {
+            describedFrame = true
+            if ProcessInfo.processInfo.environment["FRAMES_CAPTURE_DEBUG"] != nil {
+                FileHandle.standardError.write("capture \(windowID) buffer \(CVPixelBufferGetWidth(buffer))x\(CVPixelBufferGetHeight(buffer)), crop \(pixelRegion), applied \(String(describing: applied?.0)), attachments \(String(describing: CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)))\n".data(using: .utf8)!)
+            }
+        }
         reportCursor()
         // Only `.complete` frames carry new pixels; idle frames are skipped.
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
@@ -237,7 +273,44 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         }
         let pts = sample.presentationTimeStamp
         let captured = pts.isValid ? UInt64(max(0, pts.seconds) * 1_000_000_000) : uptimeNanos()
-        callbacks.frame(buffer, capturedNanos: captured)
+        if windowID != 0 {
+            guard let picture = cropWindow(buffer) else { return }
+            callbacks.frame(picture, capturedNanos: captured)
+        } else {
+            callbacks.frame(buffer, capturedNanos: captured)
+        }
+    }
+
+    /// Crop verified chrome on the GPU into another IOSurface. The encoder
+    /// receives exactly the content pixels; no CPU readback or scaled title bar.
+    private func cropWindow(_ buffer: CVPixelBuffer) -> CVPixelBuffer? {
+        let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
+        guard let applied, Int(applied.0.width) == width, Int(applied.0.height) == height,
+            pixelRegion.width >= 2, pixelRegion.height >= 2,
+            pixelRegion.minX >= 0, pixelRegion.minY >= 0,
+            pixelRegion.maxX <= CGFloat(width), pixelRegion.maxY <= CGFloat(height)
+        else { return nil }
+        if pixelRegion == CGRect(x: 0, y: 0, width: width, height: height) { return buffer }
+        if cropPool == nil || cropPoolSize != pixelRegion.size {
+            let attributes: [CFString: Any] = [
+                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey: Int(pixelRegion.width),
+                kCVPixelBufferHeightKey: Int(pixelRegion.height),
+                kCVPixelBufferMetalCompatibilityKey: true,
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+            ]
+            cropPool = nil
+            guard CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &cropPool) == kCVReturnSuccess else { return nil }
+            cropPoolSize = pixelRegion.size
+        }
+        guard let pool = cropPool else { return nil }
+        var result: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &result) == kCVReturnSuccess, let result else { return nil }
+        let region = CGRect(x: pixelRegion.minX, y: CGFloat(height) - pixelRegion.maxY, width: pixelRegion.width, height: pixelRegion.height)
+        let image = CIImage(cvPixelBuffer: buffer).cropped(to: region)
+            .transformed(by: CGAffineTransform(translationX: -region.minX, y: -region.minY))
+        cropContext.render(image, to: result, bounds: CGRect(origin: .zero, size: region.size), colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
+        return result
     }
 
     func stream(_ stream: SCStream, didStopWithError error: any Error) {
@@ -319,6 +392,7 @@ public func framesMacWindows(_ buffer: UnsafeMutablePointer<UInt8>?, _ capacity:
         let owner: String
     }
     var entries: [Entry] = []
+    var excludedApps: [Int32: Bool] = [:]
     for entry in info {
         guard let layer = entry[kCGWindowLayer as String] as? Int,
             let id = entry[kCGWindowNumber as String] as? UInt32,
@@ -329,7 +403,10 @@ public func framesMacWindows(_ buffer: UnsafeMutablePointer<UInt8>?, _ capacity:
             layer == 0 || (layer > 0 && layer <= 30) || layer == menuLevel || layer == helpLevel
         else { continue }
         let owner = entry[kCGWindowOwnerName as String] as? String ?? ""
-        if owner == "Frames" || owner == "Window Server" || owner == "Dock" { continue }
+        let excluded = excludedApps[pid] ?? isFramesApplication(
+            owner: owner, bundleID: NSRunningApplication(processIdentifier: pid)?.bundleIdentifier)
+        excludedApps[pid] = excluded
+        if excluded || owner == "Window Server" || owner == "Dock" { continue }
         entries.append(
             Entry(id: id, pid: pid, layer: layer, bounds: bounds, name: entry[kCGWindowName as String] as? String ?? "",
                 owner: owner))
@@ -357,9 +434,9 @@ public func framesMacWindows(_ buffer: UnsafeMutablePointer<UInt8>?, _ capacity:
                     && $0.bounds.width > entry.bounds.width
             })
         {
-            // An untitled window inside another of its application's: a
-            // sheet or a panel attached to it.
-            role = "sheet"
+            // A modeless panel may also be untitled and inside its owner.
+            // Only a verified AX sheet should block input to that owner.
+            role = sheetContentBounds(entry.id, frame: entry.bounds, processID: entry.pid) == nil ? "dialog" : "sheet"
             parentID = owner.id
         }
         if role == "window" {
@@ -374,10 +451,11 @@ public func framesMacWindows(_ buffer: UnsafeMutablePointer<UInt8>?, _ capacity:
             entry.name.isEmpty
             ? entry.owner : (entry.owner.isEmpty || entry.name.contains(entry.owner) ? entry.name : "\(entry.name) — \(entry.owner)")
         if title.isEmpty { continue }
+        let shown = role == "sheet" ? sheetContentBounds(entry.id, frame: entry.bounds, processID: entry.pid) ?? entry.bounds : entry.bounds
         var window: [String: Any] = [
             "id": entry.id, "title": title, "app": entry.owner, "pid": entry.pid,
-            "x": entry.bounds.origin.x, "y": entry.bounds.origin.y,
-            "width": entry.bounds.width, "height": entry.bounds.height,
+            "x": shown.origin.x, "y": shown.origin.y,
+            "width": shown.width, "height": shown.height,
         ]
         if let parentID {
             window["role"] = role
@@ -417,6 +495,14 @@ func windowBounds(_ windowID: CGWindowID) -> CGRect? {
 /// when Accessibility finds the window's title buttons inside AppKit's
 /// standard title bar. Custom chrome, toolbars and full screen windows stay
 /// whole. Insets are kept across Accessibility failures (moves, resizes).
+func windowPixelRegion(frame: CGRect, content: CGRect, scale: CGFloat) -> CGRect {
+    let left = ((content.minX - frame.minX) * scale).rounded()
+    let top = ((content.minY - frame.minY) * scale).rounded()
+    let width = Int((content.width * scale).rounded()) & ~1
+    let height = Int((content.height * scale).rounded()) & ~1
+    return CGRect(x: left, y: top, width: CGFloat(width), height: CGFloat(height))
+}
+
 struct TitleBarCrop {
     private var top: CGFloat?
 
@@ -425,17 +511,22 @@ struct TitleBarCrop {
 
     static func prepare() {
         guard header.get() == nil else { return }
-        DispatchQueue.main.async {
-            MainActor.assumeIsolated {
-                let frame = NSRect(x: 0, y: 0, width: 800, height: 600)
-                let content = NSWindow.contentRect(
-                    forFrameRect: frame, styleMask: [.titled, .closable, .miniaturizable, .resizable])
-                header.set(frame.maxY - content.maxY)
-            }
+        let measure = { @MainActor in
+            let frame = NSRect(x: 0, y: 0, width: 800, height: 600)
+            let content = NSWindow.contentRect(
+                forFrameRect: frame, styleMask: [.titled, .closable, .miniaturizable, .resizable])
+            header.set(frame.maxY - content.maxY)
+        }
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { measure() }
+        } else {
+            DispatchQueue.main.sync { MainActor.assumeIsolated { measure() } }
         }
     }
 
-    mutating func content(of frame: CGRect, window windowID: CGWindowID) -> CGRect {
+    mutating func content(of frame: CGRect, window windowID: CGWindowID, showHeader: Bool = false) -> CGRect {
+        if let sheet = sheetContentBounds(windowID, frame: frame) { return sheet }
+        if showHeader { return frame }
         if let measured = measure(frame: frame, window: windowID) {
             top = measured
         }

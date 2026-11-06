@@ -5,6 +5,30 @@ import XCTest
 
 @testable import FramesMac
 
+final class CatalogApplicationTests: XCTestCase {
+    func testFramesViewersAreExcludedRegardlessOfLaunchName() {
+        for owner in ["Frames", "frames", "FRAMES", "frames-next", "FramesHelper"] {
+            XCTAssertTrue(isFramesApplication(owner: owner, bundleID: nil))
+        }
+        XCTAssertTrue(isFramesApplication(owner: "Renamed viewer", bundleID: "dev.creaton.frames"))
+        XCTAssertFalse(isFramesApplication(owner: "Frames QA Fixture", bundleID: "dev.frames.qa.fixture"))
+        XCTAssertFalse(isFramesApplication(owner: "Safari", bundleID: "com.apple.Safari"))
+    }
+}
+
+final class SheetContentTests: XCTestCase {
+    func testOnlyVerifiedSymmetricSheetPaddingIsRemoved() {
+        let frame = CGRect(x: 135, y: 592, width: 410, height: 304)
+        let sheet = CGRect(x: 210, y: 667, width: 260, height: 154)
+        XCTAssertEqual(verifiedSheetContent(frame: frame, candidates: [sheet]), sheet)
+        XCTAssertNil(verifiedSheetContent(frame: frame, candidates: [sheet.offsetBy(dx: 10, dy: 0)]))
+        XCTAssertNil(verifiedSheetContent(frame: frame, candidates: [CGRect(x: 210, y: 657, width: 260, height: 174)]))
+        XCTAssertNil(verifiedSheetContent(frame: frame, candidates: [frame]))
+        XCTAssertNil(verifiedSheetContent(frame: frame, candidates: [.zero]))
+        XCTAssertNil(verifiedSheetContent(frame: frame, candidates: []))
+    }
+}
+
 /// Encoder output collected from the C callback.
 private final class Sink: @unchecked Sendable {
     struct Unit {
