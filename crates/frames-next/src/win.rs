@@ -1630,6 +1630,38 @@ pub fn popup_window(owner: Option<HWND>, x: i32, y: i32, width: u32, height: u32
     }
 }
 
+/// Owns `hwnd` (a [`popup_window`]) by `owner` and puts its client area
+/// at screen `(x, y)`, `width` x `height`, showing it without the focus.
+pub fn place_popup(hwnd: HWND, owner: HWND, x: i32, y: i32, width: u32, height: u32) {
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner.0 as isize);
+        let mut rect = RECT {
+            left: x,
+            top: y,
+            right: x + width as i32,
+            bottom: y + height as i32,
+        };
+        let _ = AdjustWindowRectEx(&mut rect, WS_POPUP | WS_BORDER, false, WS_EX_TOOLWINDOW);
+        // Above its owner (owned windows stay so), never activated.
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+    }
+}
+
+/// Hides a window (a popup waiting for its parent's viewer).
+pub fn hide(hwnd: HWND) {
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+}
+
 /// Makes a viewer window owned by another (a host dialog above its owner)
 /// and puts its client area's top left at screen `(x, y)`.
 pub fn own_and_place(hwnd: HWND, owner: Option<HWND>, at: Option<(i32, i32)>) {

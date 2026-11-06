@@ -160,31 +160,45 @@ fn view(
     // size within v1's limits.
     let window_info = o.window_info.clone();
     let popup = window_info.as_ref().is_some_and(|w| w.is_popup());
-    let placement = match (&window_info, &o.parent_info) {
+    // Where the parent's viewer shows this window now, if it is there.
+    let parent_placement = |stream_size: (u32, u32)| match (&window_info, &o.parent_info) {
         (Some(window), Some(parent)) => {
-            let until = Instant::now() + Duration::from_secs(1);
-            let mut found = win::viewer_placement(parent.id);
-            while found.is_none() && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(20));
-                found = win::viewer_placement(parent.id);
-            }
-            found.map(|(owner, x, y, scale)| {
-                let at = (
-                    x + ((window.x - parent.x) * scale).round() as i32,
-                    y + ((window.y - parent.y) * scale).round() as i32,
-                );
-                let size = (
-                    ((f64::from(stream_size.0) * scale).round() as u32).max(1),
-                    ((f64::from(stream_size.1) * scale).round() as u32).max(1),
+            win::viewer_placement(parent.id).map(|(owner, x, y, scale)| {
+                let (at, size) = crate::resize::popup_place(
+                    (window.x, window.y),
+                    (parent.x, parent.y),
+                    (x, y, scale),
+                    stream_size,
                 );
                 (owner, at, size)
             })
         }
         _ => None,
     };
+    let until = Instant::now() + Duration::from_secs(1);
+    let mut placement = parent_placement(stream_size);
+    while placement.is_none() && o.parent_info.is_some() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+        placement = parent_placement(stream_size);
+    }
+    // A popup follows its parent's picture (`crate::resize::Follow`): it
+    // waits hidden until the parent's viewer is placed, then moves with it.
+    let mut follow = crate::resize::Follow::default();
+    // An owned dialog whose parent's viewer was not there yet is placed
+    // over it once it is (then the user may move it).
+    let mut place_dialog = placement.is_none() && o.parent_info.is_some() && !popup;
     let viewer = match placement {
         Some((owner, at, size)) if popup => {
+            follow.update(Some((at, size)));
             win::popup_window(Some(owner), at.0, at.1, size.0, size.1)?
+        }
+        // Always frameless, even before its parent's viewer exists.
+        None if popup => {
+            let (width, height) = stream_size;
+            let hwnd = win::popup_window(None, 0, 0, width.max(1), height.max(1))?;
+            win::hide(hwnd);
+            println!("popup waits for its window's viewer to place it");
+            hwnd
         }
         _ => {
             let (width, height) = match placement {
@@ -416,6 +430,19 @@ fn view(
         if last_placement.elapsed() >= Duration::from_millis(100) {
             last_placement = Instant::now();
             win::register_viewer(o.menu_id, viewer, stream_size);
+            let now = parent_placement(stream_size);
+            if popup {
+                let owner = now.map(|(owner, _, _)| owner);
+                if let (Some(owner), Some((at, size))) =
+                    (owner, follow.update(now.map(|(_, at, size)| (at, size))))
+                {
+                    win::place_popup(viewer, owner, at.0, at.1, size.0, size.1);
+                    redraw.invalidate();
+                }
+            } else if place_dialog && let Some((owner, at, _)) = now {
+                win::own_and_place(viewer, Some(owner), Some(at));
+                place_dialog = false;
+            }
         }
         while let Ok(size) = updates.sizes.try_recv() {
             println!("stream resized to {}x{}", size.0, size.1);

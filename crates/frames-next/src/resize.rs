@@ -152,6 +152,14 @@ impl<F: Clone> Redraw<F> {
         self.last = Some((frame, size));
     }
 
+    /// Show the last picture again on the next check (its window was just
+    /// shown or moved, which a still picture would not otherwise redraw).
+    pub fn invalidate(&mut self) {
+        if let Some((_, size)) = &mut self.last {
+            *size = (0, 0);
+        }
+    }
+
     /// The picture to show again: the drawing area is `size` now and no
     /// newer frame came.
     pub fn due(&self, size: (u32, u32)) -> Option<F> {
@@ -164,8 +172,95 @@ impl<F: Clone> Redraw<F> {
     }
 }
 
+/// Viewer: where a host popup (menu, tooltip, sheet) goes on this screen:
+/// at its offset from its parent window on the host, at the scale the
+/// parent's picture is shown, from that picture's top left (`view`: screen
+/// x, y and scale). Returns its client area's top left and size.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn popup_place(
+    window: (f64, f64),
+    parent: (f64, f64),
+    view: (i32, i32, f64),
+    stream: (u32, u32),
+) -> ((i32, i32), (u32, u32)) {
+    let (x, y, scale) = view;
+    (
+        (
+            x + ((window.0 - parent.0) * scale).round() as i32,
+            y + ((window.1 - parent.1) * scale).round() as i32,
+        ),
+        (
+            ((f64::from(stream.0) * scale).round() as u32).max(1),
+            ((f64::from(stream.1) * scale).round() as u32).max(1),
+        ),
+    )
+}
+
+/// Viewer: a popup follows its parent's picture. It waits (hidden) until
+/// the parent's viewer is placed, then moves with it when the parent's
+/// window moves or rescales; nothing is done while nothing changed.
+#[derive(Default)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct Follow {
+    placed: Option<((i32, i32), (u32, u32))>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl Follow {
+    /// The placement to apply now, given where the parent puts it (`None`
+    /// while the parent's viewer is not there yet).
+    pub fn update(
+        &mut self,
+        now: Option<((i32, i32), (u32, u32))>,
+    ) -> Option<((i32, i32), (u32, u32))> {
+        match now {
+            Some(place) if self.placed != Some(place) => {
+                self.placed = Some(place);
+                Some(place)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn placed(&self) -> bool {
+        self.placed.is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_popup_waits_for_its_parent_then_follows_it() {
+        // A sheet 90 points right and 22 down of its window, whose picture
+        // shows at (400, 300) at half scale.
+        let place = |view| popup_place((190.0, 122.0), (100.0, 100.0), view, (260, 154));
+        assert_eq!(place((400, 300, 0.5)), ((445, 311), (130, 77)));
+        let mut follow = Follow::default();
+        assert_eq!(follow.update(None), None, "parent not there yet");
+        assert!(!follow.placed());
+        assert_eq!(
+            follow.update(Some(place((400, 300, 0.5)))),
+            Some(((445, 311), (130, 77)))
+        );
+        assert_eq!(
+            follow.update(Some(place((400, 300, 0.5)))),
+            None,
+            "unchanged"
+        );
+        // The parent's window moved, then was shown at full scale.
+        assert_eq!(
+            follow.update(Some(place((500, 320, 0.5)))),
+            Some(((545, 331), (130, 77)))
+        );
+        assert_eq!(
+            follow.update(Some(place((500, 320, 1.0)))),
+            Some(((590, 342), (260, 154)))
+        );
+        // The parent's viewer went away for a moment: stay where it was.
+        assert_eq!(follow.update(None), None);
+        assert!(follow.placed());
+    }
 
     #[test]
     fn a_still_picture_is_drawn_again_when_its_window_changes() {
@@ -178,6 +273,9 @@ mod tests {
         redraw.shown("sheet", (260, 134));
         assert_eq!(redraw.due((260, 134)), None);
         assert_eq!(redraw.due((0, 0)), None, "minimized");
+        // Shown again after it was placed: once more at the same size.
+        redraw.invalidate();
+        assert_eq!(redraw.due((260, 134)), Some("sheet"));
     }
     use super::*;
 
