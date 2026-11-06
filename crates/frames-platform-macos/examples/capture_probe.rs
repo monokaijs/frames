@@ -41,6 +41,17 @@ fn main() {
                     .unwrap();
                 let mut out = std::fs::File::create(&path).unwrap();
                 write!(out, "P6\n{width} {height}\n255\n").unwrap();
+                let alpha: Vec<_> = bytes.chunks_exact(4).map(|pixel| pixel[3]).collect();
+                println!(
+                    "source alpha min/max {:?}/{:?}; top-row nontransparent span {:?}..{:?}",
+                    alpha.iter().min(),
+                    alpha.iter().max(),
+                    alpha[..width as usize].iter().position(|&a| a >= 128),
+                    alpha[..width as usize].iter().rposition(|&a| a >= 128)
+                );
+                let mut mask = std::fs::File::create(format!("{path}.alpha.pgm")).unwrap();
+                write!(mask, "P5\n{width} {height}\n255\n").unwrap();
+                mask.write_all(&alpha).unwrap();
                 let rgb: Vec<u8> = bytes
                     .chunks_exact(4)
                     .flat_map(|p| [p[2], p[1], p[0]])

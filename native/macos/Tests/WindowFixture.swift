@@ -9,6 +9,29 @@ import AppKit
     }
 }
 
+/// Deliberately unlike a standard sheet: 8-point top-left corner,
+/// 64-point top-right corner and square bottom corners. The window server
+/// may clip it further; capture must carry
+/// this actual outline rather than guessing a common system radius.
+@MainActor final class ShapeFixtureView: NSView {
+    override var isOpaque: Bool { false }
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        let w = bounds.width, h = bounds.height
+        let outline = CGMutablePath()
+        outline.move(to: .zero)
+        outline.addLine(to: CGPoint(x: w, y: 0))
+        outline.addLine(to: CGPoint(x: w, y: h - 64))
+        outline.addQuadCurve(to: CGPoint(x: w - 64, y: h), control: CGPoint(x: w, y: h))
+        outline.addLine(to: CGPoint(x: 8, y: h))
+        outline.addQuadCurve(to: CGPoint(x: 0, y: h - 8), control: CGPoint(x: 0, y: h))
+        outline.closeSubpath()
+        context.setFillColor(NSColor.darkGray.cgColor)
+        context.addPath(outline)
+        context.fillPath()
+    }
+}
+
 @MainActor final class Fixture: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
     var source: NSWindow!
     var cover: NSWindow!
@@ -101,7 +124,21 @@ import AppKit
     @objc func mark(){source.title="Frames QA source marked";cover.orderOut(nil)}
     @objc func clicked(){clicks+=1;source.backgroundColor=clicks.isMultiple(of:2) ? NSColor(srgbRed:0.85,green:0.05,blue:0.05,alpha:1):NSColor(srgbRed:0.05,green:0.85,blue:0.05,alpha:1);source.title="Frames QA source clicked";source.makeFirstResponder(input)}
     @objc func quit(){NSApp.terminate(nil)}
-    @objc func showSheet(){let alert=NSAlert();alert.messageText="Frames QA sheet";alert.informativeText="The source window must be blocked; the second window stays usable.";alert.addButton(withTitle:"Done");alert.addButton(withTitle:"Cancel");alert.beginSheetModal(for:source)}
+    @objc func showSheet(){
+        if ProcessInfo.processInfo.environment["FRAMES_QA_CUSTOM_SHAPE"] == "1" {
+            let sheet=NSWindow(contentRect:NSRect(x:0,y:0,width:320,height:200),styleMask:.borderless,backing:.buffered,defer:false)
+            sheet.title="";sheet.isOpaque=false;sheet.backgroundColor = .clear;sheet.hasShadow=false;sheet.isReleasedWhenClosed=false
+            let view=ShapeFixtureView(frame:NSRect(x:0,y:0,width:320,height:200));sheet.contentView=view
+            let label=NSTextField(labelWithString:"Custom asymmetric outline")
+            label.frame=NSRect(x:20,y:90,width:280,height:24);view.addSubview(label)
+            let done=NSButton(title:"Done",target:self,action:#selector(endCustomSheet(_:)))
+            done.frame=NSRect(x:100,y:30,width:120,height:32);view.addSubview(done)
+            panels.append(sheet);source.beginSheet(sheet)
+            return
+        }
+        let alert=NSAlert();alert.messageText="Frames QA sheet";alert.informativeText="The source window must be blocked; the second window stays usable.";alert.addButton(withTitle:"Done");alert.addButton(withTitle:"Cancel");alert.beginSheetModal(for:source)
+    }
+    @objc func endCustomSheet(_ sender:NSButton){if let sheet=sender.window{source.endSheet(sheet);sheet.orderOut(nil)}}
     @objc func showAppModal(){let alert=NSAlert();alert.messageText="Frames QA app-modal alert";alert.informativeText="Both source windows must be blocked until this alert closes.";alert.addButton(withTitle:"Done");_ = alert.runModal()}
     @objc func showDialog(){
         let dialog=NSPanel(contentRect:NSRect(x:250,y:250,width:300,height:160),styleMask:[.titled,.closable],backing:.buffered,defer:false)
