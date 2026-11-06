@@ -67,6 +67,20 @@ pub fn advertise(node: &crate::Node, name: &str) -> Result<Advertisement> {
     Ok(Advertisement { daemon })
 }
 
+/// Whether an advertised address can be dialed from another machine. IPv6
+/// link-local addresses (`fe80::/10`) come without the interface they
+/// belong to, so they cannot. A Mac advertises a dozen of them, and dialing
+/// them along with the usable addresses kept the connection from forming.
+/// The IPv4 and unique-local or global IPv6 addresses reach the same host.
+fn dialable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_unspecified() && !v4.is_multicast(),
+        IpAddr::V6(v6) => {
+            (v6.segments()[0] & 0xffc0) != 0xfe80 && !v6.is_unspecified() && !v6.is_multicast()
+        }
+    }
+}
+
 /// A device seen on the local network.
 #[derive(Clone, Debug)]
 pub struct Nearby {
@@ -118,8 +132,9 @@ async fn browse_until(duration: Duration, done: impl Fn(&Nearby) -> bool) -> Res
         let addrs: Vec<TransportAddr> = info
             .get_addresses()
             .iter()
+            .map(|ip| ip.to_ip_addr())
+            .filter(|ip| dialable(*ip))
             .filter_map(|ip| {
-                let ip: IpAddr = ip.to_ip_addr();
                 let port = if ip.is_ipv4() {
                     Some(info.get_port())
                 } else {
@@ -145,4 +160,34 @@ async fn browse_until(duration: Duration, done: impl Fn(&Nearby) -> bool) -> Res
     }
     let _ = daemon.shutdown();
     Ok(found.into_values().collect())
+}
+
+#[cfg(test)]
+mod dial_tests {
+    use super::dialable;
+
+    #[test]
+    fn link_local_ipv6_is_not_dialed_but_the_lan_addresses_are() {
+        for usable in [
+            "192.168.0.169",
+            "192.168.0.131",
+            "127.0.0.1",
+            "169.254.10.20",
+            "fd67:7ef9:5384:4ee7:1c0f:36a6:44b2:ee81",
+            "2001:db8::1",
+            "::1",
+        ] {
+            assert!(dialable(usable.parse().unwrap()), "{usable}");
+        }
+        for unusable in [
+            "fe80::1",
+            "fe80::1449:4e94:c775:d0a8",
+            "febf::1",
+            "::",
+            "0.0.0.0",
+            "ff02::fb",
+        ] {
+            assert!(!dialable(unusable.parse().unwrap()), "{unusable}");
+        }
+    }
 }
