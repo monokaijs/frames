@@ -464,6 +464,49 @@ pub async fn receive(
 /// Viewer (`--apps`): opens each of the host's windows in its own window
 /// as the host's catalog lists them, closes them as they go away, and ends
 /// when the host does or the user has closed every window.
+/// How long a window whose session did not connect waits to try again.
+const RETRY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A window's viewer options, placed against the host's current list.
+fn window_options(
+    o: &crate::Options,
+    window: &Window,
+    current: &[Window],
+    audio: bool,
+) -> crate::Options {
+    let mut options = o.clone();
+    options.window_info = Some(window.clone());
+    options.parent_info = window
+        .parent
+        .and_then(|p| current.iter().find(|w| w.id == p))
+        .or_else(|| {
+            window
+                .is_popup()
+                .then(|| {
+                    current
+                        .iter()
+                        .find(|w| !w.is_popup() && w.app == window.app)
+                })
+                .flatten()
+        })
+        .cloned();
+    options.title = Some(window.title.clone());
+    options.window_id = Some(window.id);
+    options.app = Some(window.app.clone());
+    options.menu_id = window.id;
+    // A popup (not an owned dialog, which is a window of its own) is placed
+    // over its window's picture.
+    options.popup = options
+        .parent_info
+        .clone()
+        .filter(|_| window.is_popup())
+        .map(|parent| (window.clone(), parent));
+    if !audio {
+        options.audio = crate::audio::Mode::Off;
+    }
+    options
+}
+
 pub async fn view(
     node: &frames_net::Node,
     target: iroh::EndpointAddr,
@@ -505,6 +548,13 @@ pub async fn view(
     let mut open: HashMap<u64, frames_net::Session> = HashMap::new();
     let mut hidden: HashSet<u64> = HashSet::new();
     let mut viewers = tokio::task::JoinSet::new();
+    // Window sessions being connected, each on its own task so the menus,
+    // the list and the other windows never wait for one (a host busy with
+    // another viewer, or a path that does not work).
+    let mut connecting = tokio::task::JoinSet::new();
+    let mut pending: HashMap<u64, bool> = HashMap::new();
+    // Windows whose session failed to connect, with when to try again.
+    let mut retry: HashMap<u64, tokio::time::Instant> = HashMap::new();
     let mut audio_given = false;
     let mut transfers_started = !first;
     // The window whose session carries the devices (gamepads, USB).
@@ -587,6 +637,41 @@ pub async fn view(
                     hidden.insert(id);
                 }
             }
+            Some(done) = connecting.join_next(), if !connecting.is_empty() => {
+                let (id, connected): (u64, Result<frames_net::Session>) = done?;
+                let audio = pending.remove(&id).unwrap_or(false);
+                let window = current.iter().find(|w| w.id == id).cloned();
+                match (connected, window) {
+                    (Ok(session), Some(window)) if !hidden.contains(&id) => {
+                        // Files go with the first window's session (the
+                        // host serves them on streaming sessions).
+                        if !transfers_started {
+                            crate::start_transfers(&session, o);
+                            transfers_started = true;
+                        }
+                        println!("opening window {}: {}", window.id, window.title);
+                        let options = window_options(o, &window, &current, audio);
+                        open.insert(id, session.clone());
+                        viewers.spawn(async move { (id, crate::run_client(session, options).await) });
+                    }
+                    (Ok(session), _) => {
+                        // Hidden, or gone from the host, meanwhile.
+                        session.close("hidden by the viewer");
+                        audio_given &= !audio;
+                    }
+                    (Err(error), _) => {
+                        println!("window {id} did not connect: {error:#}; trying again in {RETRY:?}");
+                        audio_given &= !audio;
+                        retry.insert(id, tokio::time::Instant::now() + RETRY);
+                    }
+                }
+            }
+            () = tokio::time::sleep_until(
+                retry.values().min().copied().unwrap_or_else(tokio::time::Instant::now)
+            ), if !retry.is_empty() => {
+                let now = tokio::time::Instant::now();
+                retry.retain(|_, at| *at > now);
+            }
         }
         if crate::control::ending() {
             continue;
@@ -595,6 +680,8 @@ pub async fn view(
         let windows_first = current.iter().filter(|w| w.parent.is_none());
         for window in windows_first.chain(current.iter().filter(|w| w.parent.is_some())) {
             if open.contains_key(&window.id)
+                || pending.contains_key(&window.id)
+                || retry.contains_key(&window.id)
                 || hidden.contains(&window.id)
                 || window
                     .parent
@@ -603,55 +690,18 @@ pub async fn view(
                 continue;
             }
             let audio = !audio_given && o.audio != crate::audio::Mode::Off;
-            let session = node.connect(target.clone()).await?;
-            crate::admit::send_hello(
-                &session,
-                &node.id(),
-                false,
-                asks(false, Some(window.id), audio),
-            )
-            .await?;
-            // Files go with the first window's session (the host serves
-            // them on streaming sessions).
-            if !transfers_started {
-                crate::start_transfers(&session, o);
-                transfers_started = true;
-            }
             audio_given |= audio;
-            println!("opening window {}: {}", window.id, window.title);
-            let mut options = o.clone();
-            options.window_info = Some(window.clone());
-            options.parent_info = window
-                .parent
-                .and_then(|p| current.iter().find(|w| w.id == p))
-                .or_else(|| {
-                    window
-                        .is_popup()
-                        .then(|| {
-                            current
-                                .iter()
-                                .find(|w| !w.is_popup() && w.app == window.app)
-                        })
-                        .flatten()
-                })
-                .cloned();
-            options.title = Some(window.title.clone());
-            options.window_id = Some(window.id);
-            options.app = Some(window.app.clone());
-            options.menu_id = window.id;
-            // A popup (not an owned dialog, which is a window of its own)
-            // is placed over its window's picture.
-            options.popup = options
-                .parent_info
-                .clone()
-                .filter(|_| window.is_popup())
-                .map(|parent| (window.clone(), parent));
-            if !audio {
-                options.audio = crate::audio::Mode::Off;
-            }
-            open.insert(window.id, session.clone());
-            let id = window.id;
-            viewers.spawn(async move { (id, crate::run_client(session, options).await) });
+            pending.insert(window.id, audio);
+            let (node, target, id) = (node.clone(), target.clone(), window.id);
+            let hello = asks(false, Some(id), audio);
+            connecting.spawn(async move {
+                let connected = async {
+                    let session = node.connect(target).await?;
+                    crate::admit::send_hello(&session, &node.id(), false, hello).await?;
+                    anyhow::Ok(session)
+                };
+                (id, connected.await)
+            });
         }
         // Devices move to another window's session when theirs is hidden.
         if devices_on.is_none_or(|id| !open.contains_key(&id))
@@ -679,6 +729,7 @@ pub async fn view(
                 .collect(),
         );
     }
+    connecting.shutdown().await;
     for session in open.values() {
         session.close("viewer left");
     }

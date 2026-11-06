@@ -59,6 +59,9 @@ impl Default for NodeConfig {
     }
 }
 
+/// Cheap to clone: clones share the endpoint (a viewer connects its
+/// windows' sessions from their own tasks).
+#[derive(Clone)]
 pub struct Node {
     endpoint: Endpoint,
     alpn: Vec<u8>,
@@ -67,7 +70,7 @@ pub struct Node {
     /// session at a time (as v1 allows one controlling device). Outgoing
     /// connections each get their own target.
     accepted_target: MediaTarget,
-    _timer: TimerResolution,
+    _timer: Arc<TimerResolution>,
 }
 
 /// Windows timers tick every 15.6 ms by default. QUIC paces datagrams with
@@ -137,7 +140,7 @@ impl Node {
             endpoint,
             alpn: config.alpn,
             accepted_target,
-            _timer: TimerResolution::raise(),
+            _timer: Arc::new(TimerResolution::raise()),
         })
     }
 
@@ -179,23 +182,45 @@ impl Node {
 
     /// The next incoming session, or `None` once the node is closed.
     pub async fn accept(&self) -> Option<Result<Session>> {
-        let incoming = self.endpoint.accept().await?;
-        Some(
-            incoming
-                .await
-                .map(|connection| {
-                    let session = Session::new(connection, self.accepted_target.clone());
-                    session.send_heartbeats();
-                    session
-                })
-                .map_err(|error| anyhow!("accepting: {error}")),
-        )
+        Some(self.incoming().await?.session().await)
+    }
+
+    /// The next connection attempt, before its handshake. Hosts finish each
+    /// one on its own task ([`Incoming::session`]): a handshake that stalls
+    /// (a peer whose path does not work) must not hold up the others.
+    pub async fn incoming(&self) -> Option<Incoming> {
+        Some(Incoming {
+            accept: self.endpoint.accept().await?,
+            target: self.accepted_target.clone(),
+        })
     }
 
     pub async fn close(&self) {
         self.endpoint.close().await;
     }
 }
+
+/// A connection attempt whose handshake has not finished.
+pub struct Incoming {
+    accept: iroh::endpoint::Incoming,
+    target: MediaTarget,
+}
+
+impl Incoming {
+    /// Finishes the handshake, giving up after [`HANDSHAKE_TIMEOUT`].
+    pub async fn session(self) -> Result<Session> {
+        let connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.accept)
+            .await
+            .map_err(|_| anyhow!("accepting: no handshake within {HANDSHAKE_TIMEOUT:?}"))?
+            .map_err(|error| anyhow!("accepting: {error}"))?;
+        let session = Session::new(connection, self.target);
+        session.send_heartbeats();
+        Ok(session)
+    }
+}
+
+/// How long an incoming connection has to finish its handshake.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// One authenticated connection to a peer.
 #[derive(Clone)]

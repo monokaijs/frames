@@ -311,8 +311,9 @@ fn migrate(
     Ok(Some(peer.allow_control))
 }
 
-/// Whether to stream to this device, and how.
-/// What a host remembers between admissions while it runs.
+/// What a host remembers between admissions while it runs. Admissions run
+/// side by side (one task per incoming connection), so it is shared behind
+/// a lock: see [`decide`].
 #[derive(Default)]
 pub struct HostState {
     /// Devices let in for this session only, with whether they may
@@ -332,14 +333,20 @@ pub struct HostState {
 pub const NOT_APPROVED: &str = "not approved";
 pub const WRONG_PASSWORD: &str = "wrong password";
 
+/// Whether to stream to this device, and how.
 /// `launcher`: the Frames launcher started this host and asks its user.
 /// `Err` (inside `Ok`) is the reason a device was refused.
+///
+/// Devices already let in (trusted, or approved earlier in this run) never
+/// wait: `state` is locked only to look them up, or for a new device's
+/// whole admission (its prompt, password check and trust-list write), so
+/// new devices are asked about one at a time.
 pub async fn decide(
     config: &std::path::Path,
     session: &frames_net::Session,
     preset: Option<Approve>,
     launcher: bool,
-    state: &mut HostState,
+    state: &tokio::sync::Mutex<HostState>,
 ) -> Result<std::result::Result<Admitted, &'static str>> {
     let hello = receive_hello(session).await;
     // Previews and the Quick Apps list go to trusted devices only, and
@@ -355,21 +362,37 @@ pub async fn decide(
     {
         return Ok(Err(NOT_APPROVED));
     }
-    let control = match state.approved.get(&session.remote()) {
-        Some(&control) => control,
-        None => {
-            state.by_password = false;
-            let control =
-                match admit_device(config, session, preset, launcher, &hello, state).await? {
-                    Ok(control) => control,
-                    Err(reason) => return Ok(Err(reason)),
-                };
-            let list = TrustList::load(&TrustList::path_in(config))?;
-            if list.get(&session.remote()).is_none() && !state.by_password {
-                state.approved.insert(session.remote(), control);
+    let device = session.remote();
+    let remembered = state.lock().await.approved.get(&device).copied();
+    let control = match remembered {
+        Some(control) => control,
+        None => match trusted(config, &device, &hello)? {
+            Some(control) => control,
+            None => {
+                let mut state = state.lock().await;
+                // Approved while this one waited its turn (another window
+                // of the same viewer).
+                match state.approved.get(&device).copied() {
+                    Some(control) => control,
+                    None => {
+                        state.by_password = false;
+                        let control = match admit_device(
+                            config, session, preset, launcher, &hello, &mut state,
+                        )
+                        .await?
+                        {
+                            Ok(control) => control,
+                            Err(reason) => return Ok(Err(reason)),
+                        };
+                        let list = TrustList::load(&TrustList::path_in(config))?;
+                        if list.get(&device).is_none() && !state.by_password {
+                            state.approved.insert(device, control);
+                        }
+                        control
+                    }
+                }
             }
-            control
-        }
+        },
     };
     let trusted = TrustList::load(&TrustList::path_in(config))?
         .get(&session.remote())
@@ -413,18 +436,16 @@ fn saved_name(hello: &Hello, device: &iroh::EndpointId) -> String {
         .unwrap_or_else(|| format!("device {}", short(device)))
 }
 
-async fn admit_device(
+/// A trusted device's control permission, keeping its saved name current;
+/// `None` when it is not trusted.
+fn trusted(
     config: &std::path::Path,
-    session: &frames_net::Session,
-    preset: Option<Approve>,
-    launcher: bool,
+    device: &iroh::EndpointId,
     hello: &Hello,
-    state: &mut HostState,
-) -> Result<std::result::Result<bool, &'static str>> {
+) -> Result<Option<bool>> {
     let path = TrustList::path_in(config);
     let mut list = TrustList::load(&path)?;
-    let device = session.remote();
-    let proof = proof(hello);
+    let device = *device;
     if let Admission::Trusted { control } = admission(&list, &device) {
         let mut name = list
             .get(&device)
@@ -450,8 +471,24 @@ async fn admit_device(
                 "view only"
             }
         );
-        return Ok(Ok(control));
+        return Ok(Some(control));
     }
+    Ok(None)
+}
+
+/// A device that is not trusted: v1 trust, the access password, or asking.
+async fn admit_device(
+    config: &std::path::Path,
+    session: &frames_net::Session,
+    preset: Option<Approve>,
+    launcher: bool,
+    hello: &Hello,
+    state: &mut HostState,
+) -> Result<std::result::Result<bool, &'static str>> {
+    let path = TrustList::path_in(config);
+    let mut list = TrustList::load(&path)?;
+    let device = session.remote();
+    let proof = proof(hello);
     if let Some(proof) = &proof
         && let Some(control) = migrate(session, proof, &mut list, &path)?
     {

@@ -525,40 +525,64 @@ async fn host(o: Options) -> Result<()> {
     // One session at a time carries host audio; it is free again when that
     // session ends.
     let audio_free = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let mut admission = admit::HostState::default();
+    let admission = std::sync::Arc::new(tokio::sync::Mutex::new(admit::HostState::default()));
+    // Connections being accepted: each handshake and admission runs on its
+    // own, so a peer whose handshake stalls, or a new device waiting for
+    // its approval, holds up nobody else (other viewers, or another window
+    // of the same viewer).
+    let mut arriving = tokio::task::JoinSet::new();
     loop {
-        let session = tokio::select! {
+        let (session, admitted) = tokio::select! {
             () = launcher::gone() => {
                 println!("stopped sharing: the launcher is gone");
                 return Ok(());
             }
-            accepted = node.accept() => accepted.context("node closed")??,
+            incoming = node.incoming() => {
+                let incoming = incoming.context("node closed")?;
+                let (config, admission) = (config.clone(), admission.clone());
+                let (approve, ask_launcher) = (o.approve, o.ask_launcher);
+                arriving.spawn(async move {
+                    let session = match incoming.session().await {
+                        Ok(session) => session,
+                        Err(error) => {
+                            println!("{error:#}");
+                            return None;
+                        }
+                    };
+                    // One device's admission failing (say, the trust list
+                    // cannot be written) refuses that device, not every
+                    // later one.
+                    match admit::decide(&config, &session, approve, ask_launcher, &admission).await {
+                        Ok(Ok(admitted)) => Some((session, admitted)),
+                        Ok(Err(reason)) => {
+                            session.close(reason);
+                            None
+                        }
+                        Err(error) => {
+                            println!("could not admit {}: {error:#}", session.remote());
+                            session.close(admit::NOT_APPROVED);
+                            None
+                        }
+                    }
+                });
+                continue;
+            }
+            Some(arrived) = arriving.join_next(), if !arriving.is_empty() => {
+                match arrived {
+                    Ok(Some(admitted)) => admitted,
+                    _ => continue,
+                }
+            }
             Some(done) = sessions.join_next(), if !sessions.is_empty() => {
                 if let Ok(Err(error)) = done {
                     println!("session ended: {error:#}");
                 }
-                if sessions.is_empty() && !o.stay {
+                if sessions.is_empty() && arriving.is_empty() && !o.stay {
                     return Ok(());
                 }
                 continue;
             }
         };
-        // One device's admission failing (say, the trust list cannot be
-        // written) refuses that device, not every later one.
-        let admitted =
-            match admit::decide(&config, &session, o.approve, o.ask_launcher, &mut admission).await
-            {
-                Ok(Ok(admitted)) => admitted,
-                Ok(Err(reason)) => {
-                    session.close(reason);
-                    continue;
-                }
-                Err(error) => {
-                    println!("could not admit {}: {error:#}", session.remote());
-                    session.close(admit::NOT_APPROVED);
-                    continue;
-                }
-            };
         if admitted.trusted {
             tokio::spawn(admit::watch_trust(config.clone(), session.clone()));
         }
@@ -599,47 +623,30 @@ async fn host(o: Options) -> Result<()> {
         };
         let only_app = quick_app.as_ref().filter(|_| admitted.only_app).cloned();
         if admitted.catalog {
-            let scope = match quick_app {
-                Some(app) => Some(catalog::Scope {
-                    launched: quick_apps::start_if_needed(
-                        &app,
-                        admitted.control,
-                        o.windows.clone(),
-                        o.max_windows,
-                    )
-                    .await,
-                    only: admitted.only_app,
-                    app,
-                }),
-                None => None,
-            };
-            sessions.spawn(catalog::serve(
-                session,
-                o.windows.clone(),
-                o.max_windows,
-                scope,
-            ));
+            let (filters, limit) = (o.windows.clone(), o.max_windows);
+            sessions.spawn(async move {
+                let scope = match quick_app {
+                    Some(app) => Some(catalog::Scope {
+                        launched: quick_apps::start_if_needed(
+                            &app,
+                            admitted.control,
+                            filters.clone(),
+                            limit,
+                        )
+                        .await,
+                        only: admitted.only_app,
+                        app,
+                    }),
+                    None => None,
+                };
+                catalog::serve(session, filters, limit, scope).await
+            });
             continue;
         }
+        // Checked on the session's own task (below), never in this loop.
+        let mut shared_check = None;
         if let Some(id) = admitted.window_id {
-            // Only a window this host shares, by its current catalog (and
-            // within the Quick App with "Only stream this app"); its other
-            // windows' sessions never start it again.
-            let filters = o.windows.clone();
-            let limit = o.max_windows;
-            let scope = only_app.clone();
-            if !tokio::task::spawn_blocking(move || {
-                catalog::is_shared(&filters, limit, id, scope.as_ref())
-            })
-            .await?
-            {
-                session.close(if only_app.is_some() {
-                    "not part of the Quick App"
-                } else {
-                    "no such window"
-                });
-                continue;
-            }
+            shared_check = Some((id, only_app.clone()));
             // The secure desktop streams the screen (`catalog::SECURE_DESKTOP`).
             session_options.window_id = (id != catalog::SECURE_DESKTOP).then_some(id);
             session_options.window = None;
@@ -658,17 +665,35 @@ async fn host(o: Options) -> Result<()> {
                 }
             };
         }
-        let audio_mode = if admitted.audio
-            && o.audio != audio::Mode::Off
-            && audio_free.swap(false, std::sync::atomic::Ordering::AcqRel)
-        {
-            o.audio
-        } else {
-            audio::Mode::Off
-        };
+        let wants_audio = admitted.audio && o.audio != audio::Mode::Off;
         let audio_free = audio_free.clone();
         let audio_source = audio_source(&o, &config, only_app.as_ref());
+        let (filters, limit, host_audio) = (o.windows.clone(), o.max_windows, o.audio);
         sessions.spawn(async move {
+            if let Some((id, scope)) = shared_check {
+                // Only a window this host shares, by its current catalog
+                // (and within the Quick App with "Only stream this app");
+                // its other windows' sessions never start it again.
+                let only = scope.is_some();
+                let shared = tokio::task::spawn_blocking(move || {
+                    catalog::is_shared(&filters, limit, id, scope.as_ref())
+                })
+                .await?;
+                if !shared {
+                    session.close(if only {
+                        "not part of the Quick App"
+                    } else {
+                        "no such window"
+                    });
+                    return Ok(());
+                }
+            }
+            let audio_mode =
+                if wants_audio && audio_free.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    host_audio
+                } else {
+                    audio::Mode::Off
+                };
             let audio = tokio::spawn({
                 let session = session.clone();
                 async move {

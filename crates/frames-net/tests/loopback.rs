@@ -171,3 +171,46 @@ async fn the_media_engine_streams_over_real_quic() {
     };
     assert!(latency_p95 <= bound_us, "p95 {latency_p95} µs");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unfinished_handshake_does_not_hold_up_the_next_connection() {
+    let host = Node::bind(&DeviceKey::generate(), local()).await.unwrap();
+    let port = host
+        .bound_sockets()
+        .into_iter()
+        .find(SocketAddr::is_ipv4)
+        .unwrap()
+        .port();
+    let address =
+        EndpointAddr::new(host.id()).with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+    let first = Node::bind(&DeviceKey::generate(), local()).await.unwrap();
+    let second = Node::bind(&DeviceKey::generate(), local()).await.unwrap();
+    // The first attempt arrives and its handshake is left unfinished (a
+    // peer whose path stalls, or a host busy admitting someone).
+    let stalled = tokio::spawn({
+        let address = address.clone();
+        async move { first.connect(address).await }
+    });
+    let held = tokio::time::timeout(Duration::from_secs(5), host.incoming())
+        .await
+        .unwrap()
+        .unwrap();
+    // The next one is accepted all the same.
+    let (outgoing, incoming) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(second.connect(address), async {
+            host.incoming().await.unwrap().session().await
+        })
+    })
+    .await
+    .expect("the second connection waited for the first");
+    let (at_client, at_host) = (outgoing.unwrap(), incoming.unwrap());
+    assert_eq!(at_host.remote(), second.id());
+    assert_eq!(
+        at_host.pairing_code().unwrap(),
+        at_client.pairing_code().unwrap()
+    );
+    // The held one still completes when its turn comes.
+    let late = held.session().await.unwrap();
+    assert!(stalled.await.unwrap().is_ok());
+    late.close("done");
+}

@@ -212,6 +212,9 @@ pub async fn start_if_needed(
         println!("Quick App {}: not started for a view-only viewer", app.id);
         return None;
     }
+    // Sessions are admitted side by side: one check-then-start at a time.
+    static STARTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _one = STARTING.lock().await;
     let check = app.clone();
     let running = tokio::task::spawn_blocking(move || {
         !crate::catalog::shared_in(&filters, limit, Some(&check)).is_empty()

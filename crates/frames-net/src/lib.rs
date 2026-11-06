@@ -30,4 +30,4 @@ pub mod trust;
 pub const N0_RELAY_MAX_BPS: u32 = 6_000_000;
 
 pub use identity::DeviceKey;
-pub use node::{MediaChannel, Node, NodeConfig, Relays, Session};
+pub use node::{Incoming, MediaChannel, Node, NodeConfig, Relays, Session};

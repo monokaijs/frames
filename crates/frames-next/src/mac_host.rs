@@ -141,11 +141,15 @@ fn stream(
     if o.adb && o.control && o.windows.is_empty() {
         handle.spawn(crate::streams::adb_listener(session.clone(), o.adb_listen));
     }
-    handle.spawn(async move {
-        let mut bytes = Vec::new();
-        frames_input::cursor::CursorMessage::Visible(true).encode(&mut bytes);
-        let _ = cursor_stream.write_all(&bytes).await;
-        std::future::pending::<()>().await;
+    handle.spawn({
+        let session = session.clone();
+        async move {
+            let mut bytes = Vec::new();
+            frames_input::cursor::CursorMessage::Visible(true).encode(&mut bytes);
+            let _ = cursor_stream.write_all(&bytes).await;
+            // Keeps the stream open for the session, and no longer.
+            session.closed().await;
+        }
     });
 
     let params = EncodeParams {
