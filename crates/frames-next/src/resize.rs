@@ -172,35 +172,43 @@ impl<F: Clone> Redraw<F> {
     }
 }
 
-/// Viewer: where a host popup (menu, tooltip, sheet) goes on this screen.
-/// `window` is the popup's top left and `parent` its window's frame
-/// (x, y, width, height), both in the host's catalog units. `parent_stream`
-/// is the parent's picture in pixels, which can be cropped (the title bar
-/// left out at the top, as Mac hosts do by default) and scaled (a Retina
-/// host's pixels per point). `view` is where the parent's viewer shows that
-/// picture: its screen x, y and screen pixels per picture pixel.
-/// Returns the popup's client area's top left and size.
+/// What a window's picture (`stream`, in pixels) leaves out at the top of
+/// its catalog frame (`frame`: x, y, width, height), in catalog units, and
+/// the picture's pixels per catalog unit (from the uncropped width; a
+/// Retina host's are 2). A frame the catalog already lists cropped (a
+/// sheet's content), or an unknown one, crops nothing.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn cropped_top(frame: (f64, f64, f64, f64), stream: (u32, u32)) -> (f64, f64) {
+    if frame.2 <= 0.0 || stream.0 == 0 {
+        return (0.0, 1.0);
+    }
+    let density = f64::from(stream.0) / frame.2;
+    ((frame.3 - f64::from(stream.1) / density).max(0.0), density)
+}
+
+/// Viewer: where a host popup or owned dialog goes on this screen.
+/// `window` and `parent` are their frames (x, y, width, height) in the
+/// host's catalog units, and `stream` and `parent_stream` their pictures
+/// in pixels. A picture can leave the title bar out (Mac hosts do by
+/// default) and have more pixels than catalog units (Retina hosts), so the
+/// offset is taken between the two pictures' tops. `view` is where the
+/// parent's viewer shows its picture: screen x, y and screen pixels per
+/// picture pixel. Returns the window's client area's top left and size.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn popup_place(
-    window: (f64, f64),
+    window: (f64, f64, f64, f64),
     parent: (f64, f64, f64, f64),
     parent_stream: (u32, u32),
     view: (i32, i32, f64),
     stream: (u32, u32),
 ) -> ((i32, i32), (u32, u32)) {
     let (x, y, scale) = view;
-    // Picture pixels per catalog unit, from the uncropped width.
-    let density = if parent.2 > 0.0 {
-        f64::from(parent_stream.0) / parent.2
-    } else {
-        1.0
-    };
-    // What the picture leaves out at the top (in catalog units).
-    let cropped_top = (parent.3 - f64::from(parent_stream.1) / density).max(0.0);
+    let (parent_crop, density) = cropped_top(parent, parent_stream);
+    let (own_crop, _) = cropped_top(window, stream);
     (
         (
             x + ((window.0 - parent.0) * density * scale).round() as i32,
-            y + ((window.1 - parent.1 - cropped_top) * density * scale).round() as i32,
+            y + ((window.1 + own_crop - parent.1 - parent_crop) * density * scale).round() as i32,
         ),
         (
             ((f64::from(stream.0) * scale).round() as u32).max(1),
@@ -250,7 +258,7 @@ mod tests {
         // title bar (440x320), and a sheet whose top is 22 points below the
         // content's top.
         let parent = (100.0, 100.0, 440.0, 352.0);
-        let sheet = (190.0, 154.0);
+        let sheet = (190.0, 154.0, 260.0, 154.0);
         assert_eq!(
             popup_place(sheet, parent, (440, 320), (400, 300, 1.0), (260, 154)),
             ((490, 322), (260, 154)),
@@ -269,12 +277,41 @@ mod tests {
     }
 
     #[test]
+    fn an_owned_dialogs_own_title_bar_crop_counts_too() {
+        // A dialog frame 300x232 points whose picture also leaves its
+        // 32-point title bar out (300x200): its picture's top is 72 points
+        // below the parent's frame top, 40 below the parent picture's.
+        let parent = (100.0, 100.0, 440.0, 352.0);
+        let dialog = (150.0, 140.0, 300.0, 232.0);
+        assert_eq!(
+            popup_place(dialog, parent, (440, 320), (400, 300, 1.0), (300, 200)),
+            ((450, 340), (300, 200))
+        );
+        // Retina at half scale: the same place on screen.
+        assert_eq!(
+            popup_place(dialog, parent, (880, 640), (400, 300, 0.5), (600, 400)),
+            ((450, 340), (300, 200))
+        );
+        // Unknown frame size: no crop assumed for it.
+        assert_eq!(
+            popup_place(
+                (150.0, 140.0, 0.0, 0.0),
+                parent,
+                (440, 320),
+                (400, 300, 1.0),
+                (300, 200)
+            ),
+            ((450, 308), (300, 200))
+        );
+    }
+
+    #[test]
     fn a_popup_waits_for_its_parent_then_follows_it() {
         // A sheet 90 points right and 22 down of its window, whose picture
         // (uncropped) shows at (400, 300) at half scale.
         let place = |view| {
             popup_place(
-                (190.0, 122.0),
+                (190.0, 122.0, 260.0, 154.0),
                 (100.0, 100.0, 440.0, 320.0),
                 (440, 320),
                 view,

@@ -169,7 +169,7 @@ fn view(
             let parent = crate::catalog::latest(parent.id).unwrap_or_else(|| parent.clone());
             win::viewer_placement(parent.id).map(|(owner, x, y, scale, parent_stream)| {
                 let (at, size) = crate::resize::popup_place(
-                    (window.x, window.y),
+                    (window.x, window.y, window.width, window.height),
                     (parent.x, parent.y, parent.width, parent.height),
                     parent_stream,
                     (x, y, scale),
