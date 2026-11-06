@@ -129,6 +129,11 @@ impl SyntheticInput {
             // Scan code 0x1e ("A") in bits 16-23.
             self.post(WM_KEYDOWN, 0x41, 1 | (0x1e << 16));
             self.post(WM_KEYUP, 0x41, 1 | (0x1e << 16) | (3 << 30));
+            // Every other second an accented character, as an input method
+            // or dead key delivers it (text input checks).
+            if self.seconds.is_multiple_of(2) {
+                self.post(WM_CHAR, 0xE9, 1);
+            }
         }
     }
 }
