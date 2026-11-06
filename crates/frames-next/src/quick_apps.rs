@@ -49,10 +49,11 @@ pub struct Listed {
 }
 
 /// The processes running now: their parents, and their identity (as
-/// [`QuickApp::path`]) looked up when needed.
+/// [`QuickApp::path`]) and start time looked up when needed.
 pub struct Processes {
     parents: std::collections::HashMap<u32, u32>,
     identities: std::cell::RefCell<std::collections::HashMap<u32, Option<String>>>,
+    started: std::cell::RefCell<std::collections::HashMap<u32, Option<u64>>>,
 }
 
 impl Processes {
@@ -60,7 +61,30 @@ impl Processes {
         Self {
             parents: parents(),
             identities: Default::default(),
+            started: Default::default(),
         }
+    }
+
+    /// `pid`'s parent. Windows keeps the id of a parent that exited, and a
+    /// later process can be given that id: a "parent" started after its
+    /// child is not its parent (macOS hands orphans to launchd instead).
+    fn parent(&self, pid: u32) -> Option<u32> {
+        let parent = *self.parents.get(&pid)?;
+        if parent == pid {
+            return None;
+        }
+        match (self.started(parent), self.started(pid)) {
+            (Some(parent_started), Some(started)) if parent_started > started => None,
+            _ => Some(parent),
+        }
+    }
+
+    fn started(&self, pid: u32) -> Option<u64> {
+        *self
+            .started
+            .borrow_mut()
+            .entry(pid)
+            .or_insert_with(|| process_started(pid))
     }
 
     /// The one of `pids` that all the others descend from, if any (its
@@ -73,9 +97,9 @@ impl Processes {
                     if at == root {
                         return true;
                     }
-                    match self.parents.get(&at) {
-                        Some(&parent) if parent != at => at = parent,
-                        _ => return false,
+                    match self.parent(at) {
+                        Some(parent) => at = parent,
+                        None => return false,
                     }
                 }
                 false
@@ -89,6 +113,7 @@ impl Processes {
         Self {
             parents: parents.iter().copied().collect(),
             identities: Default::default(),
+            started: Default::default(),
         }
     }
 
@@ -121,8 +146,10 @@ fn normalize(path: &str) -> String {
     }
 }
 
-/// Processes this host started for each Quick App, by app id.
-static LAUNCHED: std::sync::Mutex<Vec<(String, u32)>> = std::sync::Mutex::new(Vec::new());
+/// Processes this host started for each Quick App: app id, process id and
+/// its start time (an id alone could since be another process's).
+static LAUNCHED: std::sync::Mutex<Vec<(String, u32, Option<u64>)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// How far up a window's process ancestry its app is looked for.
 const ANCESTRY: usize = 16;
@@ -131,24 +158,29 @@ impl QuickApp {
     /// Whether `window` belongs to this application (see the module).
     pub fn owns(&self, window: &crate::catalog::Window, processes: &Processes) -> bool {
         let identity = normalize(&self.path);
-        let launched: Vec<u32> = LAUNCHED
+        let launched: Vec<(u32, Option<u64>)> = LAUNCHED
             .lock()
             .unwrap()
             .iter()
-            .filter(|(id, _)| *id == self.id)
-            .map(|(_, pid)| *pid)
+            .filter(|(id, _, _)| *id == self.id)
+            .map(|&(_, pid, started)| (pid, started))
             .collect();
+        let started_for_it = |pid: u32| {
+            launched.iter().any(|&(launched, started)| {
+                launched == pid && (started.is_none() || started == processes.started(pid))
+            })
+        };
         let mut pid = window.pid;
         for _ in 0..ANCESTRY {
             if pid == 0 {
                 return false;
             }
-            if launched.contains(&pid) || processes.identity(pid).as_deref() == Some(&identity) {
+            if started_for_it(pid) || processes.identity(pid).as_deref() == Some(&identity) {
                 return true;
             }
-            match processes.parents.get(&pid) {
-                Some(&parent) if parent != pid => pid = parent,
-                _ => return false,
+            match processes.parent(pid) {
+                Some(parent) => pid = parent,
+                None => return false,
             }
         }
         false
@@ -193,7 +225,11 @@ impl QuickApp {
                 .with_context(|| format!("starting {} ({})", self.name, self.command))?;
             // Its windows count even if it is a launcher whose child shows
             // them under another executable.
-            LAUNCHED.lock().unwrap().push((self.id.clone(), child.id()));
+            LAUNCHED.lock().unwrap().push((
+                self.id.clone(),
+                child.id(),
+                process_started(child.id()),
+            ));
             Ok(())
         }
     }
@@ -348,7 +384,9 @@ fn parents() -> std::collections::HashMap<u32, u32> {
 #[cfg(target_os = "macos")]
 fn parents() -> std::collections::HashMap<u32, u32> {
     let mut parents = std::collections::HashMap::new();
-    let mut pids = vec![0i32; 4096];
+    // Room for every process now and some started meanwhile.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    let mut pids = vec![0i32; count.max(0) as usize + 256];
     let bytes = unsafe {
         libc::proc_listallpids(
             pids.as_mut_ptr().cast(),
@@ -380,6 +418,49 @@ fn parents() -> std::collections::HashMap<u32, u32> {
 #[cfg(not(any(windows, target_os = "macos")))]
 fn parents() -> std::collections::HashMap<u32, u32> {
     Default::default()
+}
+
+/// When a process started (comparable between processes of this computer).
+#[cfg(windows)]
+fn process_started(pid: u32) -> Option<u64> {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        let read = GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user);
+        let _ = CloseHandle(process);
+        read.ok()?;
+        Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_started(pid: u32) -> Option<u64> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (read == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn process_started(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// A process's executable.
@@ -646,6 +727,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             identities: std::cell::RefCell::new(identities),
+            started: Default::default(),
         }
     }
 
@@ -666,9 +748,81 @@ mod tests {
         // A launcher this host started (its child shows the window, under
         // another executable, after the launcher exited).
         assert!(!app.owns(&window(40), &processes));
-        LAUNCHED.lock().unwrap().push(("notes".into(), 39));
+        LAUNCHED.lock().unwrap().push(("notes".into(), 39, None));
         assert!(app.owns(&window(40), &processes));
-        LAUNCHED.lock().unwrap().retain(|(id, _)| id != "notes");
+        LAUNCHED.lock().unwrap().retain(|(id, _, _)| id != "notes");
+    }
+
+    /// Process ids are reused: neither a process that took the id of the
+    /// app's exited parent, nor one that took the id of a process this
+    /// host started, makes a stranger's windows the app's.
+    #[test]
+    fn reused_process_ids_do_not_make_strangers_the_apps() {
+        // Its own id: tests run in parallel and share the started list.
+        let app = QuickApp {
+            id: "reused".into(),
+            ..notes()
+        };
+        let processes = processes();
+        // 50: a stranger whose parent exited; the app (10) later got that
+        // id. Started before its "parent", so it is not its child.
+        let mut processes = Processes {
+            parents: processes.parents.into_iter().chain([(50, 10)]).collect(),
+            ..processes
+        };
+        processes
+            .identities
+            .get_mut()
+            .insert(50, Some("/x/stranger".into()));
+        processes.started = std::cell::RefCell::new(
+            [(10, Some(500)), (50, Some(100)), (11, Some(600))]
+                .into_iter()
+                .collect(),
+        );
+        assert!(
+            !app.owns(&window(50), &processes),
+            "an orphan is not the app's"
+        );
+        assert!(app.owns(&window(11), &processes), "a real child still is");
+        // 30 has the id of a process this host started earlier, which
+        // exited: another start time, another process.
+        processes.started.get_mut().insert(30, Some(900));
+        LAUNCHED
+            .lock()
+            .unwrap()
+            .push(("reused".into(), 30, Some(200)));
+        assert!(!app.owns(&window(30), &processes));
+        LAUNCHED.lock().unwrap().retain(|(id, _, _)| id != "reused");
+    }
+
+    /// The real process table: a child of this test is found with its
+    /// parent, its executable and a start time after its parent's.
+    #[test]
+    #[cfg(any(windows, target_os = "macos"))]
+    fn a_real_child_process_is_found_by_its_executable_and_parent() {
+        #[cfg(windows)]
+        let (program, args) = (r"C:\Windows\System32\PING.EXE", ["-n", "6", "127.0.0.1"]);
+        #[cfg(target_os = "macos")]
+        let (program, args) = ("/bin/sleep", ["6", "", ""]);
+        let mut child = std::process::Command::new(program)
+            .args(args.iter().filter(|a| !a.is_empty()))
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let processes = Processes::now();
+        let pid = child.id();
+        assert_eq!(processes.parents.get(&pid), Some(&std::process::id()));
+        assert_eq!(processes.parent(pid), Some(std::process::id()));
+        assert_eq!(processes.identity(pid), Some(normalize(program)));
+        assert!(processes.started(pid) >= processes.started(std::process::id()));
+        let app = QuickApp {
+            path: program.into(),
+            ..notes()
+        };
+        assert!(app.owns(&window(pid), &processes));
+        assert!(!notes().owns(&window(pid), &processes));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
