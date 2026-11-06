@@ -129,7 +129,21 @@ fn complete(listing: Listing, prefix: &str, hidden: bool) -> Vec<FileSuggestion>
         .collect()
 }
 
-type SharedClient = Arc<Mutex<Option<Arc<Client>>>>;
+struct ActiveClient {
+    client: Client,
+    // Keep automatic downloads deferred until the connection and any
+    // in-flight operation have released their last reference.
+    _lease: Option<std::fs::File>,
+}
+
+impl std::ops::Deref for ActiveClient {
+    type Target = Client;
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+
+type SharedClient = Arc<Mutex<Option<Arc<ActiveClient>>>>;
 
 pub(super) struct Binding {
     _timer: slint::Timer,
@@ -297,7 +311,7 @@ fn load(
     display(ui, state, side);
 }
 
-fn client(shared: &SharedClient) -> anyhow::Result<Arc<Client>> {
+fn client(shared: &SharedClient) -> anyhow::Result<Arc<ActiveClient>> {
     shared
         .lock()
         .unwrap()
@@ -336,12 +350,16 @@ fn work(incoming: mpsc::Receiver<Job>, reply: mpsc::Sender<Reply>, shared: Share
                 if let Some(old) = shared.lock().unwrap().take() {
                     runtime.block_on(old.close());
                 }
-                let result = runtime
-                    .block_on(Client::connect(&id, Duration::from_secs(20)))
-                    .map(|client| {
-                        *shared.lock().unwrap() = Some(Arc::new(client));
-                    })
-                    .map_err(|error| format!("{error:#}"));
+                let result = (|| -> anyhow::Result<()> {
+                    let lease = crate::update::session_lease()?;
+                    let client = runtime.block_on(Client::connect(&id, Duration::from_secs(20)))?;
+                    *shared.lock().unwrap() = Some(Arc::new(ActiveClient {
+                        client,
+                        _lease: lease,
+                    }));
+                    Ok(())
+                })()
+                .map_err(|error| format!("{error:#}"));
                 let _ = reply.send(Reply::Connected(result));
             }
             Job::List(side, path, generation) => {
