@@ -133,24 +133,8 @@ pub fn shared_in(
             filters.iter().any(|f| title.contains(f))
         }
     };
-    // A selected window's own menus and tooltips come with it (untitled,
-    // so no filter matches them): by their parent, or for ownerless menus
-    // by their application.
-    let mut windows: Vec<Window> = all
-        .iter()
-        .filter(|w| {
-            chosen(w)
-                || (w.is_popup()
-                    && match w.parent {
-                        Some(p) => all.iter().any(|o| o.id == p && chosen(o)),
-                        None => {
-                            !w.app.is_empty()
-                                && all
-                                    .iter()
-                                    .any(|o| !o.is_popup() && chosen(o) && o.app == w.app)
-                        }
-                    })
-        })
+    let mut windows: Vec<Window> = with_their_own(&all, chosen)
+        .into_iter()
         .filter(|w| match (scope, &processes) {
             (Some(app), Some(processes)) => app.owns(w, processes),
             _ => true,
@@ -159,6 +143,37 @@ pub fn shared_in(
         .collect();
     windows.truncate(limit.min(MAX_WINDOWS));
     windows
+}
+
+/// The chosen windows with what belongs to them, which no title filter
+/// matches (untitled): every surface naming a chosen window, or one of
+/// those, as its parent (its menus, tooltips, sheets, dialogs, a dialog's
+/// own menus), and ownerless menus of a chosen window's application.
+fn with_their_own(all: &[Window], chosen: impl Fn(&Window) -> bool) -> Vec<&Window> {
+    fn included(all: &[Window], w: &Window, chosen: &dyn Fn(&Window) -> bool, depth: u8) -> bool {
+        if chosen(w) {
+            return true;
+        }
+        match w.parent {
+            Some(parent) => {
+                depth > 0
+                    && all
+                        .iter()
+                        .find(|o| o.id == parent)
+                        .is_some_and(|o| included(all, o, chosen, depth - 1))
+            }
+            None => {
+                w.is_popup()
+                    && !w.app.is_empty()
+                    && all
+                        .iter()
+                        .any(|o| !o.is_popup() && o.parent.is_none() && chosen(o) && o.app == w.app)
+            }
+        }
+    }
+    all.iter()
+        .filter(|w| included(all, w, &chosen, 8))
+        .collect()
 }
 
 /// Whether `id` is one of the windows this host shares now (within
@@ -814,5 +829,32 @@ mod tests {
         // Older hosts send only id and title.
         let old: Vec<super::Window> = serde_json::from_str(r#"[{"id":3,"title":"A"}]"#).unwrap();
         assert_eq!((old[0].x, old[0].width, old[0].parent), (0.0, 0.0, None));
+    }
+
+    /// A shared window (`--window Source`) brings its own untitled
+    /// surfaces: a modeless dialog naming it as parent, that dialog's menu,
+    /// its sheet, and its app's ownerless menu. Another window of the same
+    /// app, its dialog, and other apps stay out.
+    #[test]
+    fn a_chosen_window_brings_its_dialogs_and_their_menus_only() {
+        let list: Vec<super::Window> = serde_json::from_str(
+            r#"[{"id":1,"title":"Source","app":"QA"},
+                {"id":2,"title":"","app":"QA","role":"dialog","parent":1},
+                {"id":3,"title":"","app":"QA","role":"menu","parent":2},
+                {"id":4,"title":"","app":"QA","role":"sheet","parent":1},
+                {"id":5,"title":"","app":"QA","role":"menu"},
+                {"id":6,"title":"Second","app":"QA"},
+                {"id":7,"title":"","app":"QA","role":"dialog","parent":6},
+                {"id":8,"title":"","app":"QA","role":"dialog"},
+                {"id":9,"title":"","app":"Other","role":"menu"}]"#,
+        )
+        .unwrap();
+        let ids: Vec<u64> = super::with_their_own(&list, |w| w.title.contains("Source"))
+            .iter()
+            .map(|w| w.id)
+            .collect();
+        assert_eq!(ids, [1, 2, 3, 4, 5]);
+        // Without a filter everything is chosen anyway.
+        assert_eq!(super::with_their_own(&list, |_| true).len(), list.len());
     }
 }
