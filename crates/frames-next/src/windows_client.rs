@@ -557,10 +557,10 @@ fn view(
         } else {
             None
         };
-        if let Some(frame) = again {
-            if presenter.present(frame.clone(), mode).is_ok() {
-                redraw.shown(frame, area);
-            }
+        if let Some(frame) = again
+            && presenter.present(frame.clone(), mode).is_ok()
+        {
+            redraw.shown(frame, area);
         }
         if let Some(frame) = newest {
             let captured = frame.captured_us;
