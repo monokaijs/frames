@@ -464,6 +464,20 @@ pub async fn receive(
 /// Viewer (`--apps`): opens each of the host's windows in its own window
 /// as the host's catalog lists them, closes them as they go away, and ends
 /// when the host does or the user has closed every window.
+/// The host's newest list, for window sessions placing popups over their
+/// parents as those move and resize on the host (`latest`).
+static LATEST: std::sync::Mutex<Vec<Window>> = std::sync::Mutex::new(Vec::new());
+
+fn remember(list: &[Window]) {
+    *LATEST.lock().unwrap() = list.to_vec();
+}
+
+/// Host window `id` as the host listed it last, if it is listed.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn latest(id: u64) -> Option<Window> {
+    LATEST.lock().unwrap().iter().find(|w| w.id == id).cloned()
+}
+
 /// How long a window whose session did not connect waits to try again.
 const RETRY: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -599,6 +613,7 @@ pub async fn view(
                     keep
                 });
                 hidden.retain(|id| list.iter().any(|w| w.id == *id));
+                remember(&list);
                 current = list;
             }
             () = crate::control::windows_changed() => {

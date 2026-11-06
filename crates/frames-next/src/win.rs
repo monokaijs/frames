@@ -1553,8 +1553,9 @@ pub fn set_app_id(hwnd: HWND, host: &str, app: &str) {
 
 /// Where each viewer window of this process shows its picture, by host
 /// window id: `(id, hwnd, picture x, picture y on screen, screen pixels per
-/// host pixel)`. Owned popups and dialogs are placed by their owner's.
-type Placement = (u64, usize, i32, i32, f64);
+/// host pixel, the picture's size in host pixels)`. Owned popups and
+/// dialogs are placed by their owner's.
+type Placement = (u64, usize, i32, i32, f64, (u32, u32));
 static VIEWERS: std::sync::Mutex<Vec<Placement>> = std::sync::Mutex::new(Vec::new());
 
 /// Records where viewer window `hwnd` (host window `id`, streaming
@@ -1573,21 +1574,21 @@ pub fn register_viewer(id: u64, hwnd: HWND, stream: (u32, u32)) {
     let scale = f64::from(picture.right - picture.left) / f64::from(stream.0.max(1));
     let mut viewers = VIEWERS.lock().unwrap();
     viewers.retain(|v| v.0 != id);
-    viewers.push((id, hwnd.0 as usize, origin.x, origin.y, scale));
+    viewers.push((id, hwnd.0 as usize, origin.x, origin.y, scale, stream));
 }
 
 pub fn unregister_viewer(id: u64) {
     VIEWERS.lock().unwrap().retain(|v| v.0 != id);
 }
 
-/// A viewer window's picture placement: `(hwnd, x, y, scale)`.
-pub fn viewer_placement(id: u64) -> Option<(HWND, i32, i32, f64)> {
+/// A viewer window's picture placement: `(hwnd, x, y, scale, picture size)`.
+pub fn viewer_placement(id: u64) -> Option<(HWND, i32, i32, f64, (u32, u32))> {
     VIEWERS
         .lock()
         .unwrap()
         .iter()
         .find(|v| v.0 == id)
-        .map(|v| (HWND(v.1 as *mut _), v.2, v.3, v.4))
+        .map(|v| (HWND(v.1 as *mut _), v.2, v.3, v.4, v.5))
 }
 
 /// A frameless window for a host menu, tooltip or owned popup (v1): no

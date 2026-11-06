@@ -172,22 +172,35 @@ impl<F: Clone> Redraw<F> {
     }
 }
 
-/// Viewer: where a host popup (menu, tooltip, sheet) goes on this screen:
-/// at its offset from its parent window on the host, at the scale the
-/// parent's picture is shown, from that picture's top left (`view`: screen
-/// x, y and scale). Returns its client area's top left and size.
+/// Viewer: where a host popup (menu, tooltip, sheet) goes on this screen.
+/// `window` is the popup's top left and `parent` its window's frame
+/// (x, y, width, height), both in the host's catalog units. `parent_stream`
+/// is the parent's picture in pixels, which can be cropped (the title bar
+/// left out at the top, as Mac hosts do by default) and scaled (a Retina
+/// host's pixels per point). `view` is where the parent's viewer shows that
+/// picture: its screen x, y and screen pixels per picture pixel.
+/// Returns the popup's client area's top left and size.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn popup_place(
     window: (f64, f64),
-    parent: (f64, f64),
+    parent: (f64, f64, f64, f64),
+    parent_stream: (u32, u32),
     view: (i32, i32, f64),
     stream: (u32, u32),
 ) -> ((i32, i32), (u32, u32)) {
     let (x, y, scale) = view;
+    // Picture pixels per catalog unit, from the uncropped width.
+    let density = if parent.2 > 0.0 {
+        f64::from(parent_stream.0) / parent.2
+    } else {
+        1.0
+    };
+    // What the picture leaves out at the top (in catalog units).
+    let cropped_top = (parent.3 - f64::from(parent_stream.1) / density).max(0.0);
     (
         (
-            x + ((window.0 - parent.0) * scale).round() as i32,
-            y + ((window.1 - parent.1) * scale).round() as i32,
+            x + ((window.0 - parent.0) * density * scale).round() as i32,
+            y + ((window.1 - parent.1 - cropped_top) * density * scale).round() as i32,
         ),
         (
             ((f64::from(stream.0) * scale).round() as u32).max(1),
@@ -232,10 +245,42 @@ impl Follow {
 mod tests {
 
     #[test]
+    fn a_popup_is_placed_below_its_parents_cropped_title_bar() {
+        // A Mac window 440x352 points whose picture leaves out the 32-point
+        // title bar (440x320), and a sheet whose top is 22 points below the
+        // content's top.
+        let parent = (100.0, 100.0, 440.0, 352.0);
+        let sheet = (190.0, 154.0);
+        assert_eq!(
+            popup_place(sheet, parent, (440, 320), (400, 300, 1.0), (260, 154)),
+            ((490, 322), (260, 154)),
+            "from the picture's top, not the window's"
+        );
+        // A Retina host: twice the pixels, shown at half scale.
+        assert_eq!(
+            popup_place(sheet, parent, (880, 640), (400, 300, 0.5), (520, 308)),
+            ((490, 322), (260, 154))
+        );
+        // The viewer chose to show the title bar: nothing is cropped.
+        assert_eq!(
+            popup_place(sheet, parent, (440, 352), (400, 300, 1.0), (260, 154)),
+            ((490, 354), (260, 154))
+        );
+    }
+
+    #[test]
     fn a_popup_waits_for_its_parent_then_follows_it() {
         // A sheet 90 points right and 22 down of its window, whose picture
-        // shows at (400, 300) at half scale.
-        let place = |view| popup_place((190.0, 122.0), (100.0, 100.0), view, (260, 154));
+        // (uncropped) shows at (400, 300) at half scale.
+        let place = |view| {
+            popup_place(
+                (190.0, 122.0),
+                (100.0, 100.0, 440.0, 320.0),
+                (440, 320),
+                view,
+                (260, 154),
+            )
+        };
         assert_eq!(place((400, 300, 0.5)), ((445, 311), (130, 77)));
         let mut follow = Follow::default();
         assert_eq!(follow.update(None), None, "parent not there yet");

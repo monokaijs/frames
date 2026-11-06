@@ -161,12 +161,17 @@ fn view(
     let window_info = o.window_info.clone();
     let popup = window_info.as_ref().is_some_and(|w| w.is_popup());
     // Where the parent's viewer shows this window now, if it is there.
+    // Both as the host lists them now (they move and resize on the host),
+    // else as they were when this window opened.
     let parent_placement = |stream_size: (u32, u32)| match (&window_info, &o.parent_info) {
         (Some(window), Some(parent)) => {
-            win::viewer_placement(parent.id).map(|(owner, x, y, scale)| {
+            let window = crate::catalog::latest(window.id).unwrap_or_else(|| window.clone());
+            let parent = crate::catalog::latest(parent.id).unwrap_or_else(|| parent.clone());
+            win::viewer_placement(parent.id).map(|(owner, x, y, scale, parent_stream)| {
                 let (at, size) = crate::resize::popup_place(
                     (window.x, window.y),
-                    (parent.x, parent.y),
+                    (parent.x, parent.y, parent.width, parent.height),
+                    parent_stream,
                     (x, y, scale),
                     stream_size,
                 );
