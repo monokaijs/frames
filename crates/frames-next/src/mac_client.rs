@@ -22,6 +22,7 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     // The host's cursor shape and visibility, applied on the viewer thread.
     let (cursor_tx, cursor_rx) = std::sync::mpsc::channel();
     let (sizes_tx, sizes) = std::sync::mpsc::channel();
+    let (shapes_tx, shapes) = std::sync::mpsc::channel();
     let (menus_tx, menus) = std::sync::mpsc::channel();
     let drain = {
         let session = session.clone();
@@ -30,6 +31,7 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
             session.clone(),
             cursor_streams,
             sizes_tx,
+            shapes_tx,
             menus_tx,
             o.adb_server,
         ));
@@ -77,6 +79,7 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
         let updates = crate::streams::HostUpdates {
             cursor: cursor_rx,
             sizes,
+            shapes,
             menus,
         };
         view(&session, info, &o, lane, updates, clipboard, audio)

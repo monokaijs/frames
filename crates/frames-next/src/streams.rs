@@ -139,6 +139,7 @@ pub async fn route_viewer(
     session: frames_net::Session,
     cursor: tokio::sync::mpsc::UnboundedSender<iroh::endpoint::RecvStream>,
     sizes: std::sync::mpsc::Sender<(u32, u32)>,
+    shapes: std::sync::mpsc::Sender<Option<crate::resize::Shape>>,
     menus: std::sync::mpsc::Sender<Vec<crate::menus::Item>>,
     adb: std::net::SocketAddr,
 ) {
@@ -156,7 +157,7 @@ pub async fn route_viewer(
                 let _ = cursor.send(recv);
             }
             (RESIZE, _) => {
-                tokio::spawn(crate::resize::receive(recv, sizes.clone()));
+                tokio::spawn(crate::resize::receive(recv, sizes.clone(), shapes.clone()));
             }
             (MENU, _) => {
                 tokio::spawn(crate::menus::receive(recv, menus.clone()));
@@ -195,6 +196,10 @@ pub struct HostUpdates {
     pub cursor: std::sync::mpsc::Receiver<frames_input::cursor::CursorMessage>,
     /// The stream's new size when the host window resizes.
     pub sizes: std::sync::mpsc::Receiver<(u32, u32)>,
+    /// The picture's transparent-corner shape, when the host measures one
+    /// (`None`: a rectangle again). FramesMac windows are not clipped yet.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub shapes: std::sync::mpsc::Receiver<Option<crate::resize::Shape>>,
     /// The shared window's application menus, when they change.
     pub menus: std::sync::mpsc::Receiver<Vec<crate::menus::Item>>,
 }

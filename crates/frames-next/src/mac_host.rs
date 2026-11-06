@@ -210,6 +210,11 @@ fn stream(
     // A shared application window's menus, for the viewer's window.
     let mut host_menus = o.window_id.map(crate::menus::HostMenus::start);
     let mut resize_stream = None;
+    // The shared window's transparent-corner shape, measured from its
+    // captured alpha on its first frame and at each new size (a sheet's or
+    // menu's rounded corners); the viewer clips its popup window to it.
+    let mut shape_sent: Option<crate::resize::Shape> = None;
+    let mut shape_size: Option<(u32, u32)> = None;
     let (mut frames, mut pointers) = (0u64, 0u64);
     // QA runs have no injector: relative motion is summed here instead, so
     // a run can check that all of it arrived once.
@@ -316,6 +321,24 @@ fn stream(
                 encoder.control(EncoderControl::ForceKeyframe)?;
                 println!("source resized to {}x{}", size.0, size.1);
                 crate::resize::announce(handle, session, &mut resize_stream, size)?;
+            }
+            let size = frame.surface.size();
+            if o.window_id.is_some() && shape_size != Some(size) {
+                shape_size = Some(size);
+                let shape = PixelBuffer::from_surface(&frame.surface)
+                    .and_then(PixelBuffer::bgra)
+                    .and_then(|(bgra, width, height)| {
+                        crate::resize::Shape::measure(&bgra, width, height)
+                    });
+                if shape != shape_sent {
+                    crate::resize::announce_shape(
+                        handle,
+                        session,
+                        &mut resize_stream,
+                        shape.as_ref(),
+                    )?;
+                    shape_sent = shape;
+                }
             }
             let before = clock.now_us();
             last_encode_us = before;

@@ -21,6 +21,7 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
     // The host's cursor shape and visibility, applied on the viewer thread.
     let (cursor_tx, cursor_rx) = std::sync::mpsc::channel();
     let (sizes_tx, sizes) = std::sync::mpsc::channel();
+    let (shapes_tx, shapes) = std::sync::mpsc::channel();
     let (menus_tx, menus) = std::sync::mpsc::channel();
     let cursor_reader = {
         let session = session.clone();
@@ -29,6 +30,7 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
             session.clone(),
             cursor_streams,
             sizes_tx,
+            shapes_tx,
             menus_tx,
             o.adb_server,
         ));
@@ -74,6 +76,7 @@ pub async fn run(session: frames_net::Session, o: Options) -> Result<()> {
         let updates = crate::streams::HostUpdates {
             cursor: cursor_rx,
             sizes,
+            shapes,
             menus,
         };
         view(&session, info, &o, lane, updates, clipboard, audio)
@@ -221,6 +224,10 @@ fn view(
         // The picture is exactly the window.
         win::set_layout(true, false);
     }
+    // The host's measured outline of this popup's picture (transparent
+    // corners), applied to its window whenever it or the window changes.
+    let mut shape: Option<crate::resize::Shape> = None;
+    let mut shaped_area = ((0, 0), (0, 0));
     if let Some(window) = &window_info {
         if let Some(icon) = &window.icon {
             win::set_icon(viewer, icon);
@@ -380,6 +387,26 @@ fn view(
             if !popup {
                 win::set_host_menu(viewer, &items);
             }
+        }
+        // A popup's outline: clipped again when the host measures a new one
+        // or the window or picture changes size.
+        let mut reshape = false;
+        while let Ok(new) = updates.shapes.try_recv() {
+            println!(
+                "picture shape: {}",
+                if new.is_some() {
+                    "transparent corners"
+                } else {
+                    "rectangle"
+                }
+            );
+            shape = new;
+            reshape = true;
+        }
+        let shaping = (win::client_size(viewer), stream_size);
+        if popup && (reshape || (shape.is_some() && shaping != shaped_area)) {
+            win::shape_window(viewer, shape.as_ref(), stream_size);
+            shaped_area = shaping;
         }
         // The menus changed: this window's entry, the statistics, a notice.
         if crate::control::version() != menu_version {

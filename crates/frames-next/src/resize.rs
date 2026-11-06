@@ -90,8 +90,154 @@ pub fn announce(
     Ok(())
 }
 
-/// Viewer: the host's size changes, from its `RESIZE` stream.
-pub async fn receive(recv: iroh::endpoint::RecvStream, sizes: std::sync::mpsc::Sender<(u32, u32)>) {
+/// A window picture's outline where its corners are transparent (a macOS
+/// sheet's or menu's rounded corners), measured from the captured alpha:
+/// how many pixels of each row are transparent at the left and right, from
+/// the top and from the bottom, with equal rows in one band. A picture whose
+/// edges are all opaque has none (a plain rectangle).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Shape {
+    /// Bands from the top row down: `(rows, left, right)`.
+    pub top: Vec<(u32, u32, u32)>,
+    /// Bands from the bottom row up.
+    pub bottom: Vec<(u32, u32, u32)>,
+}
+
+impl Shape {
+    /// Measures `bgra` (packed, `width` x `height`). Transparent is below
+    /// half the picture's own opaque level (the most opaque alpha of its
+    /// middle row), so a translucent body still counts as inside. `None`
+    /// when nothing is transparent at the edges or the alpha says nothing
+    /// (an opaque or unknown picture stays a rectangle).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn measure(bgra: &[u8], width: u32, height: u32) -> Option<Shape> {
+        let (w, h) = (width as usize, height as usize);
+        if w == 0 || h == 0 || bgra.len() != w * h * 4 {
+            return None;
+        }
+        let alpha = |x: usize, y: usize| bgra[(y * w + x) * 4 + 3];
+        let opaque = (0..w).map(|x| alpha(x, h / 2)).max().unwrap_or(0);
+        if opaque < 32 {
+            return None;
+        }
+        let threshold = opaque / 2;
+        let row = |y: usize| -> (u32, u32) {
+            match (0..w).position(|x| alpha(x, y) >= threshold) {
+                None => (width, 0),
+                Some(left) => {
+                    let right = (0..w)
+                        .rev()
+                        .position(|x| alpha(x, y) >= threshold)
+                        .unwrap_or(0);
+                    (left as u32, right as u32)
+                }
+            }
+        };
+        let bands = |rows: &mut dyn Iterator<Item = usize>| {
+            let mut bands: Vec<(u32, u32, u32)> = Vec::new();
+            for y in rows {
+                let (left, right) = row(y);
+                if (left, right) == (0, 0) {
+                    break;
+                }
+                match bands.last_mut() {
+                    Some(band) if (band.1, band.2) == (left, right) => band.0 += 1,
+                    _ => bands.push((1, left, right)),
+                }
+            }
+            bands
+        };
+        let top = bands(&mut (0..h));
+        let covered: u32 = top.iter().map(|b| b.0).sum();
+        if covered as usize >= h {
+            return None;
+        }
+        let bottom = bands(&mut (0..h).rev());
+        let shape = Shape { top, bottom };
+        (shape != Shape::default() && shape.fits(width, height)).then_some(shape)
+    }
+
+    /// Whether the shape fits a `width` x `height` picture (a viewer checks
+    /// what a host sent before using it).
+    pub fn fits(&self, width: u32, height: u32) -> bool {
+        let rows = |bands: &[(u32, u32, u32)]| -> Option<u64> {
+            bands.iter().try_fold(0u64, |sum, &(rows, left, right)| {
+                (rows > 0 && u64::from(left) + u64::from(right) <= u64::from(width))
+                    .then(|| sum + u64::from(rows))
+            })
+        };
+        match (rows(&self.top), rows(&self.bottom)) {
+            (Some(top), Some(bottom)) => {
+                top + bottom <= u64::from(height)
+                    && self.top.len() + self.bottom.len() <= height as usize
+            }
+            _ => false,
+        }
+    }
+
+    /// The parts to cut away, as `(x0, y0, x1, y1)` in a client area of
+    /// `client` pixels showing a `stream`-sized picture: a left and a right
+    /// rectangle per band.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn cuts(&self, stream: (u32, u32), client: (u32, u32)) -> Vec<(i32, i32, i32, i32)> {
+        let sx = f64::from(client.0) / f64::from(stream.0.max(1));
+        let sy = f64::from(client.1) / f64::from(stream.1.max(1));
+        let (cw, ch) = (client.0 as i32, client.1 as i32);
+        let x = |v: u32| (f64::from(v) * sx).round() as i32;
+        let y = |v: u32| (f64::from(v) * sy).round() as i32;
+        let mut cuts = Vec::new();
+        let mut band = |y0: i32, y1: i32, left: u32, right: u32| {
+            if y1 > y0 {
+                if left > 0 {
+                    cuts.push((0, y0, x(left).min(cw), y1));
+                }
+                if right > 0 {
+                    cuts.push(((cw - x(right)).max(0), y0, cw, y1));
+                }
+            }
+        };
+        let mut from = 0;
+        for &(rows, left, right) in &self.top {
+            band(y(from), y(from + rows), left, right);
+            from += rows;
+        }
+        let mut from = 0;
+        for &(rows, left, right) in &self.bottom {
+            band(ch - y(from + rows), ch - y(from), left, right);
+            from += rows;
+        }
+        cuts
+    }
+}
+
+/// Host: sends the picture's shape, or `None` (a rectangle again), as its
+/// own line: a size line would make the viewer reopen its decoder, and
+/// viewers without shapes skip lines without a size.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn announce_shape(
+    handle: &tokio::runtime::Handle,
+    session: &frames_net::Session,
+    stream: &mut Option<iroh::endpoint::SendStream>,
+    shape: Option<&Shape>,
+) -> Result<()> {
+    if stream.is_none() {
+        let (send, _) = handle.block_on(crate::streams::open(session, crate::streams::RESIZE))?;
+        *stream = Some(send);
+    }
+    let mut line = serde_json::to_vec(&serde_json::json!({ "shape": shape }))?;
+    line.push(b'\n');
+    let send = stream.as_mut().expect("opened above");
+    handle.block_on(send.write_all(&line))?;
+    Ok(())
+}
+
+/// Viewer: the host's size changes, from its `RESIZE` stream, and its
+/// picture's shape when it sends one.
+pub async fn receive(
+    recv: iroh::endpoint::RecvStream,
+    sizes: std::sync::mpsc::Sender<(u32, u32)>,
+    shapes: std::sync::mpsc::Sender<Option<Shape>>,
+) {
     let mut lines = tokio::io::BufReader::new(recv);
     let mut line = String::new();
     loop {
@@ -103,6 +249,13 @@ pub async fn receive(recv: iroh::endpoint::RecvStream, sizes: std::sync::mpsc::S
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
             continue;
         };
+        if let Some(shape) = value.get("shape") {
+            // Checked against the picture by the window before it is used.
+            if let Ok(shape) = serde_json::from_value::<Option<Shape>>(shape.clone()) {
+                let _ = shapes.send(shape);
+            }
+            continue;
+        }
         let (Some(width), Some(height)) = (value["width"].as_u64(), value["height"].as_u64())
         else {
             continue;
@@ -251,6 +404,118 @@ impl Follow {
 
 #[cfg(test)]
 mod tests {
+
+    /// A picture whose corners are transparent, with a translucent body.
+    fn picture(width: u32, height: u32, radius: u32, body: u8) -> Vec<u8> {
+        let mut bgra = vec![0u8; (width * height * 4) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let dx = f64::from(radius.saturating_sub(x.min(width - 1 - x)));
+                let dy = f64::from(radius.saturating_sub(y.min(height - 1 - y)));
+                let inside =
+                    dx == 0.0 || dy == 0.0 || dx * dx + dy * dy <= f64::from(radius * radius);
+                bgra[((y * width + x) * 4 + 3) as usize] = if inside { body } else { 8 };
+            }
+        }
+        bgra
+    }
+
+    #[test]
+    fn a_rounded_picture_gives_its_corner_bands_and_an_opaque_one_none() {
+        // A 26-pixel radius on a 260x154 sheet whose body is translucent.
+        let shape = Shape::measure(&picture(260, 154, 26, 200), 260, 154).unwrap();
+        let rows: u32 = shape.top.iter().map(|b| b.0).sum();
+        assert!(rows > 0 && rows <= 26, "{rows}");
+        assert!(
+            shape.top[0].1 > 0 && shape.top[0].1 == shape.top[0].2,
+            "{:?}",
+            shape.top[0]
+        );
+        assert_eq!(shape.top, shape.bottom, "symmetric picture");
+        assert!(
+            shape.top.windows(2).all(|w| w[0].1 >= w[1].1),
+            "insets shrink downwards"
+        );
+        assert!(shape.fits(260, 154));
+        // A large radius is measured whole (no row cap).
+        let big = Shape::measure(&picture(400, 400, 120, 255), 400, 400).unwrap();
+        assert!(big.top.iter().map(|b| b.0).sum::<u32>() > 100);
+        // Opaque, all transparent, or not matching its size: a rectangle.
+        assert_eq!(Shape::measure(&picture(100, 60, 0, 255), 100, 60), None);
+        assert_eq!(Shape::measure(&vec![0u8; 100 * 60 * 4], 100, 60), None);
+        assert_eq!(Shape::measure(&[0u8; 12], 100, 60), None);
+    }
+
+    /// Each corner as it is: 8 top left, 64 top right, a square bottom.
+    #[test]
+    fn an_asymmetric_outline_is_kept_as_measured() {
+        let (width, height) = (300u32, 200u32);
+        let mut bgra = vec![255u8; (width * height * 4) as usize];
+        let corner = |bgra: &mut Vec<u8>, radius: u32, right: bool| {
+            for y in 0..radius {
+                for x in 0..radius {
+                    let (dx, dy) = (f64::from(radius - x), f64::from(radius - y));
+                    if dx * dx + dy * dy > f64::from(radius * radius) {
+                        let px = if right { width - 1 - x } else { x };
+                        bgra[((y * width + px) * 4 + 3) as usize] = 8;
+                    }
+                }
+            }
+        };
+        corner(&mut bgra, 8, false);
+        corner(&mut bgra, 64, true);
+        let shape = Shape::measure(&bgra, width, height).unwrap();
+        assert!(shape.bottom.is_empty(), "square bottom: {:?}", shape.bottom);
+        let rows: u32 = shape.top.iter().map(|b| b.0).sum();
+        assert!(
+            (50..=64).contains(&rows),
+            "the larger corner's rows: {rows}"
+        );
+        let first = shape.top[0];
+        assert!(
+            first.1 <= 8 && first.2 > 30,
+            "left small, right large: {first:?}"
+        );
+        // Below the small corner the left is straight while the right curves on.
+        assert!(shape.top.iter().skip_while(|b| b.1 > 0).any(|b| b.2 > 0));
+    }
+
+    #[test]
+    fn a_shape_from_a_host_is_checked_and_scaled_to_the_window() {
+        let shape = Shape {
+            top: vec![(2, 6, 6), (4, 2, 3)],
+            bottom: vec![(3, 4, 4)],
+        };
+        assert!(shape.fits(100, 50));
+        assert!(!shape.fits(10, 50), "insets wider than the picture");
+        assert!(!shape.fits(100, 8), "more rows than the picture");
+        assert!(
+            !Shape {
+                top: vec![(0, 1, 1)],
+                bottom: vec![]
+            }
+            .fits(100, 50),
+            "empty band"
+        );
+        // Shown at twice its size.
+        assert_eq!(
+            shape.cuts((100, 50), (200, 100)),
+            vec![
+                (0, 0, 12, 4),
+                (188, 0, 200, 4),
+                (0, 4, 4, 12),
+                (194, 4, 200, 12),
+                (0, 94, 8, 100),
+                (192, 94, 200, 100),
+            ]
+        );
+        // On the wire it is optional: null clears it.
+        let line = serde_json::json!({ "shape": shape });
+        let back: Option<Shape> = serde_json::from_value(line["shape"].clone()).unwrap();
+        assert_eq!(back.as_ref(), Some(&shape));
+        let cleared: Option<Shape> = serde_json::from_value(serde_json::Value::Null).unwrap();
+        assert_eq!(cleared, None);
+    }
 
     #[test]
     fn a_popup_is_placed_below_its_parents_cropped_title_bar() {

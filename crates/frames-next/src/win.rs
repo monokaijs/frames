@@ -1665,6 +1665,57 @@ pub fn hide(hwnd: HWND) {
     }
 }
 
+/// Clips a popup window to its picture's shape, as the host measured it
+/// from the captured alpha (a macOS sheet's or menu's rounded corners: the
+/// video carries no alpha, so they would show as black). `None`, or a shape
+/// that does not fit the `stream`-sized picture, makes it a rectangle.
+pub fn shape_window(hwnd: HWND, shape: Option<&crate::resize::Shape>, stream: (u32, u32)) {
+    unsafe {
+        let Some(shape) = shape.filter(|shape| shape.fits(stream.0, stream.1)) else {
+            let _ = SetWindowRgn(hwnd, None, true);
+            return;
+        };
+        let mut window = RECT::default();
+        if GetWindowRect(hwnd, &mut window).is_err() {
+            return;
+        }
+        // The client area's place in the window (its border around it).
+        let mut origin = POINT::default();
+        let _ = ClientToScreen(hwnd, &mut origin);
+        let (left, top) = (origin.x - window.left, origin.y - window.top);
+        let (width, height) = (window.right - window.left, window.bottom - window.top);
+        let client = client_extent(hwnd);
+        let region = CreateRectRgn(0, 0, width, height);
+        if region.0.is_null() {
+            return;
+        }
+        for (x0, y0, x1, y1) in shape.cuts(stream, client) {
+            // A cut along the picture's edge takes the border with it.
+            let x0 = if x0 <= 0 { 0 } else { left + x0 };
+            let x1 = if x1 >= client.0 as i32 {
+                width
+            } else {
+                left + x1
+            };
+            let y0 = if y0 <= 0 { 0 } else { top + y0 };
+            let y1 = if y1 >= client.1 as i32 {
+                height
+            } else {
+                top + y1
+            };
+            let cut = CreateRectRgn(x0, y0, x1, y1);
+            if !cut.0.is_null() {
+                let _ = CombineRgn(Some(region), Some(region), Some(cut), RGN_DIFF);
+                let _ = DeleteObject(cut.into());
+            }
+        }
+        if SetWindowRgn(hwnd, Some(region), true) == 0 {
+            // Windows owns the region on success; otherwise it is ours.
+            let _ = DeleteObject(region.into());
+        }
+    }
+}
+
 /// Makes a viewer window owned by another (a host dialog above its owner)
 /// and puts its client area's top left at screen `(x, y)`.
 pub fn own_and_place(hwnd: HWND, owner: Option<HWND>, at: Option<(i32, i32)>) {
@@ -1678,7 +1729,7 @@ pub fn own_and_place(hwnd: HWND, owner: Option<HWND>, at: Option<(i32, i32)>) {
         }
         if let Some((x, y)) = at {
             let mut window = RECT::default();
-            let mut origin = windows::Win32::Foundation::POINT::default();
+            let mut origin = POINT::default();
             let _ = GetWindowRect(hwnd, &mut window);
             let _ = ClientToScreen(hwnd, &mut origin);
             let _ = SetWindowPos(
