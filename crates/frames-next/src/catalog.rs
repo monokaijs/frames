@@ -172,6 +172,17 @@ pub fn is_shared(
     shared_in(filters, limit, scope).iter().any(|w| w.id == id)
 }
 
+/// Window classes of Frames' own windows (viewers, their menus, prompts
+/// and shelves, the launcher, the tray). The test source (`FramesNextQa`)
+/// stays shareable: it stands in for an application.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn frames_class(class: &str) -> bool {
+    (class.starts_with("FramesNext") && class != "FramesNextQa")
+        || class.starts_with("FramesFile")
+        || class == "FramesLauncher"
+        || class == "FramesTray"
+}
+
 #[cfg(windows)]
 fn platform_windows() -> Vec<Window> {
     use windows::Win32::Foundation::{CloseHandle, RECT};
@@ -236,8 +247,13 @@ fn platform_windows() -> Vec<Window> {
                 }
                 let _ = CloseHandle(process);
             }
-            // Frames' own windows (the launcher, another viewer), as v1.
-            if app.eq_ignore_ascii_case("frames") || app.eq_ignore_ascii_case("frames-next") {
+            // Frames' own windows (the launcher, another viewer), as v1:
+            // by executable, and by window class for copies under another
+            // name (a viewer showing itself multiplies streams).
+            if app.eq_ignore_ascii_case("frames")
+                || app.eq_ignore_ascii_case("frames-next")
+                || frames_class(&class)
+            {
                 return None;
             }
             let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
@@ -498,11 +514,18 @@ pub async fn view(
     // A host seeing this device for the first time asks its user first.
     let first_list = tokio::time::sleep(std::time::Duration::from_secs(150));
     tokio::pin!(first_list);
+    // `--seconds`: the view ends then even with no window open (window
+    // sessions end themselves; an empty list would wait forever).
+    let deadline = o.deadline().map(|d| d.saturating_sub(started.elapsed()));
+    let until_deadline =
+        tokio::time::sleep(deadline.unwrap_or(std::time::Duration::from_secs(86_400 * 365)));
+    tokio::pin!(until_deadline);
     loop {
         if crate::control::ending() || catalog.is_closed() {
             break;
         }
         tokio::select! {
+            () = &mut until_deadline, if deadline.is_some() => break,
             () = &mut first_list, if !listed => {
                 catalog.close("viewer left");
                 receiver.abort();
@@ -673,6 +696,35 @@ pub async fn view(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod class_tests {
+    #[test]
+    fn frames_own_windows_are_never_shared_whatever_the_executable() {
+        for class in [
+            "FramesNextViewer",
+            "FramesNextConnection",
+            "FramesNextPopup",
+            "FramesNextCaptionButton",
+            "FramesNextFetchPrompt",
+            "FramesNextFileShelf",
+            "FramesFileShelf",
+            "FramesFilePrompt",
+            "FramesLauncher",
+            "FramesTray",
+        ] {
+            assert!(super::frames_class(class), "{class}");
+        }
+        for class in [
+            "FramesNextQa",
+            "Notepad",
+            "Chrome_WidgetWin_1",
+            "FramesSharedInputFixture",
+        ] {
+            assert!(!super::frames_class(class), "{class}");
+        }
+    }
 }
 
 #[cfg(test)]
