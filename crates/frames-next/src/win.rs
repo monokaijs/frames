@@ -1582,7 +1582,9 @@ pub fn unregister_viewer(id: u64) {
 }
 
 /// A viewer window's picture placement: `(hwnd, x, y, scale, picture size)`.
-pub fn viewer_placement(id: u64) -> Option<(HWND, i32, i32, f64, (u32, u32))> {
+pub type ViewerPlacement = (HWND, i32, i32, f64, (u32, u32));
+
+pub fn viewer_placement(id: u64) -> Option<ViewerPlacement> {
     VIEWERS
         .lock()
         .unwrap()
