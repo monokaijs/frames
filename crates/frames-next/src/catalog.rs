@@ -340,20 +340,23 @@ fn platform_windows() -> Vec<Window> {
 pub struct Scope {
     pub app: crate::quick_apps::QuickApp,
     pub only: bool,
-    /// The host started it for this viewer (else it was not allowed to).
-    pub launched: Option<std::time::Instant>,
+    /// What became of starting it for this viewer.
+    pub launched: crate::quick_apps::Launch,
 }
 
 impl Scope {
     /// Why nothing of it is listed yet.
     fn waiting(&self) -> String {
-        match self.launched {
-            Some(at) if at.elapsed() < LAUNCH_WAIT => format!("Starting {}…", self.app.name),
-            Some(_) => format!("{} did not open a window.", self.app.name),
-            None => format!(
-                "{} is not running on the host. Connecting with control starts it.",
-                self.app.name
-            ),
+        use crate::quick_apps::Launch;
+        let name = &self.app.name;
+        match &self.launched {
+            Launch::Started(at) if at.elapsed() < LAUNCH_WAIT => format!("Starting {name}…"),
+            Launch::Started(_) => format!("{name} did not open a window."),
+            Launch::Failed(reason) => format!("{name} could not be started on the host: {reason}"),
+            Launch::Running => format!("{name} has no window open on the host."),
+            Launch::NotAllowed => {
+                format!("{name} is not running on the host. Connecting with control starts it.")
+            }
         }
     }
 }
@@ -767,16 +770,25 @@ pub async fn view(
     receiver.abort();
     let reason = catalog.close_reason();
     catalog.close("viewer left");
-    match reason.as_deref() {
+    refusal(reason.as_deref(), o.quick_app.as_deref())
+}
+
+/// The error for a host that closed the catalog to refuse this viewer;
+/// other endings (the host left, the viewer's deadline) are not errors.
+fn refusal(reason: Option<&str>, quick_app: Option<&str>) -> Result<()> {
+    match reason {
         Some(crate::admit::NOT_APPROVED) => {
             anyhow::bail!("the host refused this device (not approved there)")
         }
         Some(crate::admit::WRONG_PASSWORD) => {
             anyhow::bail!("the host refused this device: wrong access password")
         }
-        _ => {}
+        Some(crate::quick_apps::NO_SUCH_APP) => anyhow::bail!(
+            "the host has no Quick App {:?} (its list may have changed)",
+            quick_app.unwrap_or_default()
+        ),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -829,6 +841,51 @@ mod tests {
         // Older hosts send only id and title.
         let old: Vec<super::Window> = serde_json::from_str(r#"[{"id":3,"title":"A"}]"#).unwrap();
         assert_eq!((old[0].x, old[0].width, old[0].parent), (0.0, 0.0, None));
+    }
+
+    /// A host refusing an unknown Quick App id ends the viewer with an
+    /// error that names it, not silently.
+    #[test]
+    fn an_unknown_quick_app_is_an_error_naming_it() {
+        let error = super::refusal(Some(crate::quick_apps::NO_SUCH_APP), Some("nosuch"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no Quick App \"nosuch\""), "{error}");
+        assert!(super::refusal(Some("viewer left"), Some("nosuch")).is_ok());
+        assert!(super::refusal(None, None).is_ok());
+    }
+
+    /// What a Quick App viewer is told while none of the app's windows is
+    /// listed, by what became of starting it.
+    #[test]
+    fn a_quick_app_that_could_not_start_says_why() {
+        use crate::quick_apps::Launch;
+        let scope = |launched| super::Scope {
+            app: crate::quick_apps::QuickApp {
+                id: "missing".into(),
+                name: "Missing App".into(),
+                command: "/x/Missing.app".into(),
+                args: Vec::new(),
+                path: "/x/Missing.app".into(),
+            },
+            only: true,
+            launched,
+        };
+        assert_eq!(
+            scope(Launch::Failed("macOS could not open /x/Missing.app".into())).waiting(),
+            "Missing App could not be started on the host: macOS could not open /x/Missing.app"
+        );
+        assert!(
+            scope(Launch::NotAllowed)
+                .waiting()
+                .contains("Connecting with control starts it")
+        );
+        assert!(
+            scope(Launch::Started(std::time::Instant::now()))
+                .waiting()
+                .starts_with("Starting")
+        );
+        assert!(scope(Launch::Running).waiting().contains("no window open"));
     }
 
     /// A shared window (`--window Source`) brings its own untitled

@@ -248,18 +248,34 @@ impl QuickApp {
     }
 }
 
+/// Why a host closes a session for a Quick App (its close reason).
+pub const NO_SUCH_APP: &str = "no such Quick App";
+pub const NOT_IN_APP: &str = "not part of the Quick App";
+pub const ONLY_THE_APP: &str = "only the Quick App is shared";
+
+/// What became of starting a Quick App for a viewer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Launch {
+    /// A view-only viewer never starts anything.
+    NotAllowed,
+    /// One of its windows was already shared.
+    Running,
+    Started(std::time::Instant),
+    /// The host could not start it (why, for the viewer).
+    Failed(String),
+}
+
 /// Host: starts `app` for a viewer allowed to control when none of its
-/// windows is shared now (a view-only viewer never starts anything); when
-/// it was started.
+/// windows is shared now (a view-only viewer never starts anything).
 pub async fn start_if_needed(
     app: &QuickApp,
     control: bool,
     filters: Vec<String>,
     limit: usize,
-) -> Option<std::time::Instant> {
+) -> Launch {
     if !control {
         println!("Quick App {}: not started for a view-only viewer", app.id);
-        return None;
+        return Launch::NotAllowed;
     }
     // Sessions are admitted side by side: one check-then-start at a time.
     static STARTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -272,19 +288,19 @@ pub async fn start_if_needed(
     .unwrap_or(false);
     if running {
         println!("Quick App {}: already open", app.id);
-        return None;
+        return Launch::Running;
     }
     let start = app.clone();
     match tokio::task::spawn_blocking(move || start.launch()).await {
         Ok(Ok(())) => {
             println!("Quick App {}: started {}", app.id, app.command);
-            Some(std::time::Instant::now())
+            Launch::Started(std::time::Instant::now())
         }
         Ok(Err(error)) => {
             println!("Quick App {}: {error:#}", app.id);
-            None
+            Launch::Failed(format!("{error:#}"))
         }
-        Err(_) => None,
+        Err(error) => Launch::Failed(error.to_string()),
     }
 }
 
@@ -885,6 +901,27 @@ mod tests {
         };
         assert!(!missing.owns(&window(70), &processes));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A configured app that is not there: starting it fails, with the
+    /// reason kept for the viewer.
+    #[tokio::test]
+    #[cfg(any(windows, target_os = "macos"))]
+    async fn a_missing_app_fails_to_start_with_its_reason() {
+        let app = QuickApp {
+            id: "missing".into(),
+            command: "/nonexistent/frames-qa/Missing.app".into(),
+            path: "/nonexistent/frames-qa/Missing.app".into(),
+            ..notes()
+        };
+        assert_eq!(
+            start_if_needed(&app, false, Vec::new(), 8).await,
+            Launch::NotAllowed
+        );
+        match start_if_needed(&app, true, Vec::new(), 8).await {
+            Launch::Failed(reason) => assert!(!reason.is_empty()),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

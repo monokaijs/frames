@@ -609,12 +609,12 @@ async fn host(o: Options) -> Result<()> {
                 match quick_apps::load(&config).map(|apps| quick_apps::find(&apps, id).cloned()) {
                     Ok(Some(app)) => Some(app),
                     Ok(None) => {
-                        session.close("no such Quick App");
+                        session.close(quick_apps::NO_SUCH_APP);
                         continue;
                     }
                     Err(error) => {
                         println!("Quick Apps unreadable: {error:#}");
-                        session.close("no such Quick App");
+                        session.close(quick_apps::NO_SUCH_APP);
                         continue;
                     }
                 }
@@ -652,7 +652,7 @@ async fn host(o: Options) -> Result<()> {
             session_options.window = None;
         } else if only_app.is_some() {
             // "Only stream this app": never the desktop.
-            session.close("only the Quick App is shared");
+            session.close(quick_apps::ONLY_THE_APP);
             continue;
         } else {
             let index = admitted.window.unwrap_or(0) as usize;
@@ -681,7 +681,7 @@ async fn host(o: Options) -> Result<()> {
                 .await?;
                 if !shared {
                     session.close(if only {
-                        "not part of the Quick App"
+                        quick_apps::NOT_IN_APP
                     } else {
                         "no such window"
                     });
