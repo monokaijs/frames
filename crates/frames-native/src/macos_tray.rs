@@ -3,7 +3,7 @@
 //!
 //! AppKit objects are main-thread only: the launcher creates and updates the
 //! tray from its Slint event loop, which runs on the main thread.
-use crate::tray_model::TrayItem;
+use crate::tray_model::{TrayGlyph, TrayItem};
 use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained, runtime::NSObject, sel,
@@ -122,6 +122,39 @@ impl Tray {
             item.setTag(entry.id as isize);
             unsafe { item.setTarget(Some(&self.target)) };
             item.setEnabled(entry.enabled);
+            let symbol = match entry.glyph {
+                TrayGlyph::App => "app",
+                TrayGlyph::Window => "macwindow",
+                TrayGlyph::Show => "eye",
+                TrayGlyph::Hide => "eye.slash",
+                TrayGlyph::Settings => "gearshape",
+                TrayGlyph::Display => "desktopcomputer",
+                TrayGlyph::Cursor => "cursorarrow",
+                TrayGlyph::Keyboard => "keyboard",
+                TrayGlyph::Refresh => "arrow.clockwise",
+                TrayGlyph::Folder => "folder",
+                TrayGlyph::Devices => "desktopcomputer",
+                TrayGlyph::Network => "network",
+                TrayGlyph::Power => "power",
+                TrayGlyph::Info => "info.circle",
+            };
+            if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                &NSString::from_str(symbol),
+                None,
+            ) {
+                image.setTemplate(true);
+                image.setSize(NSSize::new(16.0, 16.0));
+                item.setImage(Some(&image));
+                // macOS 27 hides menu images in automatic mode. Older
+                // systems do not implement this selector.
+                unsafe {
+                    let supported: bool =
+                        msg_send![&*item, respondsToSelector: sel!(setPreferredImageVisibility:)];
+                    if supported {
+                        let _: () = msg_send![&*item, setPreferredImageVisibility: 1isize];
+                    }
+                }
+            }
             item.setState(if entry.checked {
                 NSControlStateValueOn
             } else {

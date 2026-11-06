@@ -140,10 +140,11 @@ private func connectionMenu(for view: InputView) -> NSMenu {
     }
     for item in hosts { menu.insertItem(item, at: menu.items.count - 1) }
     let devicesItem = NSMenuItem(title: "Devices", action: nil, keyEquivalent: "")
+    devicesItem.image = menuSymbol("desktopcomputer")
     devicesItem.submenu = devicesMenu()
     menu.insertItem(devicesItem, at: menu.items.count - 1)
     menu.insertItem(.separator(), at: menu.items.count - 1)
-    return menu
+    return showingMenuImages(menu)
 }
 
 private func number(_ value: Any?) -> UInt64? { (value as? NSNumber)?.uint64Value }
@@ -203,7 +204,7 @@ func framesMenu(for view: InputView?) -> NSMenu {
     menu.addItem(.separator())
     let view = viewerState["view"] as? String ?? "windows"
     menu.addItem(item("Per-window view", ["command": "view", "view": "windows"], checked: view == "windows"))
-    menu.addItem(item("Full desktop view", ["command": "view", "view": "desktop"], checked: view == "desktop"))
+    menu.addItem(item("Full desktop view", ["command": "view", "view": "desktop"], checked: view == "desktop", enabled: !flag(viewerState["only_app"])))
     let cursor = flag(viewerState["remote_cursor"])
     menu.addItem(item("Show remote cursor", ["command": "remote_cursor", "show": !cursor], checked: cursor))
     menu.addItem(
@@ -219,6 +220,7 @@ func framesMenu(for view: InputView?) -> NSMenu {
         let info = NSMenuItem(
             title: "Window compatibility", action: #selector(MenuTarget.showCompatibility(_:)), keyEquivalent: "")
         info.target = menuTarget
+        info.image = menuSymbol("info.circle")
         info.representedObject = compatibility
         menu.addItem(info)
     } else if let current, let id = number(current["id"]) {
@@ -245,12 +247,14 @@ func framesMenu(for view: InputView?) -> NSMenu {
         menu.addItem(item("Refresh application menus", action("refresh_menus"), enabled: !desktop))
         let fetch = NSMenuItem(title: "Fetch remote file...", action: #selector(MenuTarget.fetchFile(_:)), keyEquivalent: "")
         fetch.target = menuTarget
+        fetch.image = menuSymbol("folder")
         fetch.representedObject = NSNumber(value: id)
         menu.addItem(fetch)
     }
     menu.addItem(.separator())
     let send = NSMenuItem(title: "Send File…", action: #selector(MenuTarget.sendFile(_:)), keyEquivalent: "o")
     send.target = menuTarget
+    send.image = menuSymbol("paperplane")
     send.isEnabled = frontView() != nil
     menu.addItem(send)
     menu.addItem(.separator())
@@ -258,7 +262,7 @@ func framesMenu(for view: InputView?) -> NSMenu {
     disconnect.keyEquivalent = "q"
     disconnect.keyEquivalentModifierMask = [.command]
     menu.addItem(disconnect)
-    return menu
+    return showingMenuImages(menu)
 }
 
 @MainActor
@@ -284,6 +288,7 @@ func devicesMenu() -> NSMenu {
         title: "Set up gamepad driver on Windows host...", action: #selector(MenuTarget.gamepadSetup(_:)),
         keyEquivalent: "")
     setup.target = menuTarget
+    setup.image = menuSymbol("gearshape")
     gamepads.addItem(setup)
     submenu(devices, "Gamepads", gamepads)
     let usb = NSMenu()
@@ -308,8 +313,9 @@ func devicesMenu() -> NSMenu {
     let support = NSMenuItem(
         title: "Device forwarding support...", action: #selector(MenuTarget.deviceSupport(_:)), keyEquivalent: "")
     support.target = menuTarget
+    support.image = menuSymbol("info.circle")
     devices.addItem(support)
-    return devices
+    return showingMenuImages(devices)
 }
 
 /// The front window's host application menus, as top-level items.
@@ -359,6 +365,7 @@ private func item(_ title: String, _ command: [String: Any], checked: Bool = fal
     item.representedObject = command as NSDictionary
     item.state = checked ? .on : .off
     item.isEnabled = enabled
+    item.image = commandSymbol(command).flatMap(menuSymbol)
     return item
 }
 
@@ -373,7 +380,52 @@ private func disabled(_ title: String) -> NSMenuItem {
 private func submenu(_ menu: NSMenu, _ title: String, _ child: NSMenu) {
     let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
     item.submenu = child
+    let symbols = ["Image quality": "display", "Windows": "macwindow.on.rectangle", "Gamepads": "gamecontroller", "USB devices": "cable.connector"]
+    item.image = symbols[title].flatMap(menuSymbol)
     menu.addItem(item)
+}
+
+@MainActor
+private func showingMenuImages(_ menu: NSMenu) -> NSMenu {
+    if #available(macOS 27.0, *) {
+        for item in menu.items {
+            if item.image != nil { item.preferredImageVisibility = .visible }
+            if let submenu = item.submenu { _ = showingMenuImages(submenu) }
+        }
+    }
+    return menu
+}
+
+@MainActor
+private func menuSymbol(_ name: String) -> NSImage? {
+    let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)
+    image?.size = NSSize(width: 16, height: 16)
+    image?.isTemplate = true
+    return image
+}
+
+private func commandSymbol(_ command: [String: Any]) -> String? {
+    switch command["command"] as? String {
+    case "quality": return "display"
+    case "show", "show_all": return flag(command["shown"]) ? "eye" : "eye.slash"
+    case "view": return command["view"] as? String == "desktop" ? "desktopcomputer" : "macwindow.on.rectangle"
+    case "remote_cursor": return "cursorarrow"
+    case "stats": return "chart.bar"
+    case "disconnect": return "power"
+    case "gamepad": return "gamecontroller"
+    case "usb": return "cable.connector"
+    case "adb": return "network"
+    case "refresh_devices": return "arrow.clockwise"
+    case "window":
+        switch (command["action"] as? [String: Any])?["action"] as? String {
+        case "toggle_swap", "toggle_physical": return "keyboard"
+        case "refresh_menus": return "arrow.clockwise"
+        case "toggle_relative": return "cursorarrow"
+        case "toggle_header": return "macwindow"
+        default: return "arrow.up.left.and.arrow.down.right"
+        }
+    default: return nil
+    }
 }
 
 /// The front viewer window's input view, if a viewer window is in front.

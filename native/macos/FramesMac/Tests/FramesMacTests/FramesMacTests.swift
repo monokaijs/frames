@@ -29,6 +29,22 @@ final class SheetContentTests: XCTestCase {
     }
 }
 
+final class ViewerMenuImageTests: XCTestCase {
+    @MainActor
+    func testConnectionActionsKeepTheirMenuImages() {
+        let menu = framesMenu(for: nil)
+        for title in ["Image quality", "Show all windows", "Hide all windows", "Full desktop view", "Send File…", "Disconnect"] {
+            let item = menu.items.first { $0.title == title }
+            let image = item?.image
+            XCTAssertNotNil(image, "Missing menu image: \(title)")
+            XCTAssertTrue(image?.isValid == true, "Invalid menu image: \(title)")
+            if #available(macOS 27.0, *) {
+                XCTAssertEqual(item?.preferredImageVisibility, .visible, "Hidden menu image: \(title)")
+            }
+        }
+    }
+}
+
 /// Encoder output collected from the C callback.
 private final class Sink: @unchecked Sendable {
     struct Unit {
