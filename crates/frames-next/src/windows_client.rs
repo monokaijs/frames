@@ -555,7 +555,7 @@ fn view(
             title = wanted;
         }
         while let Ok(message) = updates.cursor.try_recv() {
-            win::apply_cursor(&message);
+            win::apply_cursor(viewer, &message);
             cursor_updates += 1;
         }
         if cursor_updates > 0 && cursor_shapes == 0 {

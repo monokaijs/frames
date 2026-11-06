@@ -19,6 +19,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F10, VK_F11, VK_F12};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
+#[path = "win_cursor_image.rs"]
+mod cursor_image;
 #[path = "win_menus.rs"]
 pub mod menus;
 #[path = "win_session.rs"]
@@ -100,6 +102,10 @@ thread_local! {
     /// The host's cursor as shown over the viewer; `None` hides it.
     static CURSOR: RefCell<Option<HCURSOR>> = const { RefCell::new(None) };
     static CURSOR_SHAPE: RefCell<Option<HCURSOR>> = const { RefCell::new(None) };
+    /// Original host pixels, retained so each resize starts from the source.
+    static CURSOR_IMAGE: RefCell<Option<cursor_image::CursorImage>> = const { RefCell::new(None) };
+    static CURSOR_SIZE: Cell<Option<(u16, u16)>> = const { Cell::new(None) };
+    static CURSOR_VISIBLE: Cell<bool> = const { Cell::new(true) };
     /// Relative mouse: `Some(locked)` while on; `locked` when the pointer is
     /// confined and hidden (not in unattended tests).
     static RELATIVE: Cell<Option<bool>> = const { Cell::new(None) };
@@ -217,7 +223,7 @@ fn raw_motion(l: LPARAM) -> Option<(i32, i32)> {
 }
 
 /// Applies a cursor message from the host (viewer thread only).
-pub fn apply_cursor(message: &frames_input::cursor::CursorMessage) {
+pub fn apply_cursor(hwnd: HWND, message: &frames_input::cursor::CursorMessage) {
     use frames_input::cursor::CursorMessage;
     match message {
         CursorMessage::Shape {
@@ -227,25 +233,88 @@ pub fn apply_cursor(message: &frames_input::cursor::CursorMessage) {
             hotspot_y,
             bgra,
         } => {
-            let Some(cursor) = make_cursor(*width, *height, *hotspot_x, *hotspot_y, bgra) else {
-                eprintln!("could not create a {width}x{height} cursor from the host's shape");
-                return;
-            };
-            let old = CURSOR_SHAPE.with(|c| c.borrow_mut().replace(cursor));
-            CURSOR.with(|c| *c.borrow_mut() = Some(cursor));
-            unsafe {
-                let _ = SetCursor(Some(cursor));
-                if let Some(old) = old {
-                    let _ = DestroyCursor(old);
-                }
-            }
+            CURSOR_IMAGE.with(|c| {
+                *c.borrow_mut() = Some(cursor_image::CursorImage {
+                    width: *width,
+                    height: *height,
+                    hotspot_x: *hotspot_x,
+                    hotspot_y: *hotspot_y,
+                    bgra: bgra.clone(),
+                })
+            });
+            CURSOR_SIZE.with(|s| s.set(None));
+            refresh_cursor(hwnd);
         }
         CursorMessage::Visible(visible) => {
+            CURSOR_VISIBLE.with(|v| v.set(*visible));
             let shape = CURSOR_SHAPE.with(|c| *c.borrow());
             let shown = if *visible { shape } else { None };
             CURSOR.with(|c| *c.borrow_mut() = shown);
-            unsafe {
-                let _ = SetCursor(shown);
+            show_cursor_over_view(hwnd, shown);
+        }
+    }
+}
+
+/// The pointer covers the same fraction of the picture as on the host,
+/// regardless of desktop resolution, window size or the monitor's DPI.
+fn refresh_cursor(hwnd: HWND) {
+    let client = client_extent(hwnd);
+    let layout = LAYOUT.with(Cell::get);
+    let source = layout.source.unwrap_or(client);
+    let picture = frames_platform_windows::present::picture_rect(source, client, layout.fill);
+    let image = CURSOR_IMAGE.with(|image| {
+        let image = image.borrow();
+        let image = image.as_ref()?;
+        let size = image.display_size(
+            source,
+            (
+                (picture.right - picture.left).max(1) as u32,
+                (picture.bottom - picture.top).max(1) as u32,
+            ),
+        );
+        (CURSOR_SIZE.with(Cell::get) != Some(size)).then(|| image.resized(size.0, size.1))
+    });
+    let Some(image) = image else { return };
+    let Some(cursor) = make_cursor(
+        image.width,
+        image.height,
+        image.hotspot_x,
+        image.hotspot_y,
+        &image.bgra,
+    ) else {
+        return;
+    };
+    CURSOR_SIZE.with(|s| s.set(Some((image.width, image.height))));
+    let old = CURSOR_SHAPE.with(|c| c.borrow_mut().replace(cursor));
+    let shown = CURSOR_VISIBLE.with(|v| v.get().then_some(cursor));
+    CURSOR.with(|c| *c.borrow_mut() = shown);
+    show_cursor_over_view(hwnd, shown);
+    if let Some(old) = old {
+        discard_cursor(old);
+    }
+}
+
+fn discard_cursor(cursor: HCURSOR) {
+    unsafe {
+        // DestroyCursor requires the handle to no longer be selected. A
+        // resize can arrive after the pointer has left the viewer.
+        if GetCursor() == cursor {
+            let _ = SetCursor(LoadCursorW(None, IDC_ARROW).ok());
+        }
+        let _ = DestroyCursor(cursor);
+    }
+}
+
+fn show_cursor_over_view(hwnd: HWND, cursor: Option<HCURSOR>) {
+    unsafe {
+        let mut at = POINT::default();
+        if GetCursorPos(&mut at).is_ok()
+            && WindowFromPoint(at) == hwnd
+            && ScreenToClient(hwnd, &mut at).as_bool()
+        {
+            let size = client_extent(hwnd);
+            if at.x >= 0 && at.y >= 0 && at.x < size.0 as i32 && at.y < size.1 as i32 {
+                let _ = SetCursor(cursor);
             }
         }
     }
@@ -583,7 +652,8 @@ unsafe extern "system" fn viewer_procedure(
     // Over the video, show the host's cursor (or none) instead of the arrow.
     if message == WM_SETCURSOR && (l.0 & 0xffff) as u32 == HTCLIENT {
         let cursor = CURSOR.with(|c| *c.borrow());
-        let shape_known = CURSOR_SHAPE.with(|c| c.borrow().is_some());
+        let shape_known =
+            CURSOR_SHAPE.with(|c| c.borrow().is_some()) || !CURSOR_VISIBLE.with(Cell::get);
         if shape_known {
             unsafe {
                 let _ = SetCursor(cursor);
@@ -622,6 +692,7 @@ unsafe extern "system" fn viewer_procedure(
                 })
             });
         }
+        refresh_cursor(hwnd);
         return result;
     }
     match message {
@@ -1001,7 +1072,14 @@ pub fn destroy(hwnd: HWND) {
             let _ = DestroyWindow(caption);
         }
         let _ = DestroyWindow(hwnd);
+        CURSOR.with(|c| *c.borrow_mut() = None);
+        if let Some(cursor) = CURSOR_SHAPE.with(|c| c.borrow_mut().take()) {
+            discard_cursor(cursor);
+        }
     }
+    CURSOR_IMAGE.with(|c| *c.borrow_mut() = None);
+    CURSOR_SIZE.with(|s| s.set(None));
+    CURSOR_VISIBLE.with(|v| v.set(true));
     pump();
 }
 
@@ -1561,6 +1639,7 @@ static VIEWERS: std::sync::Mutex<Vec<Placement>> = std::sync::Mutex::new(Vec::ne
 /// Records where viewer window `hwnd` (host window `id`, streaming
 /// `stream` pixels) shows its picture now.
 pub fn register_viewer(id: u64, hwnd: HWND, stream: (u32, u32)) {
+    refresh_cursor(hwnd);
     let client = client_size(hwnd);
     let fill = LAYOUT.with(Cell::get).fill;
     let picture = frames_platform_windows::present::picture_rect(stream, client, fill);
