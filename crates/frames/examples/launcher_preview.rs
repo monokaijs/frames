@@ -67,10 +67,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let ui = Launcher::new()?;
+    if let Some(scale) = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--scale-factor="))
+    {
+        let scale_factor = scale.parse::<f32>()?;
+        if !scale_factor.is_finite() || scale_factor <= 0. {
+            return Err("Use a positive finite --scale-factor".into());
+        }
+        ui.window()
+            .dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged { scale_factor });
+    }
     ui.set_app_version(env!("CARGO_PKG_VERSION").into());
     if args.iter().any(|arg| arg == "--update-ready") {
         ui.set_update_ready(true);
         ui.set_update_status("Frames 0.2.4 is ready. Restart to install the update.".into());
+    }
+    if args.iter().any(|arg| arg == "--settings-error") {
+        ui.set_settings_status(
+            "Couldn't save settings. Check the application folder and try again.".into(),
+        );
+        ui.set_settings_error(true);
     }
     ui.set_design_preview(true);
     let quick_apps = || {
@@ -101,6 +118,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.set_quick_app_target("fixture-host".into());
         if !args.iter().any(|arg| arg == "--empty") {
             ui.set_remote_quick_apps(quick_apps());
+            if args.iter().any(|arg| arg == "--selected") {
+                ui.set_quick_app_selected("editor".into());
+            }
         }
         ui.set_quick_apps_busy(args.iter().any(|arg| arg == "--loading"));
         if args.iter().any(|arg| arg == "--error") {
@@ -167,26 +187,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect(),
         ));
     }
+    let width = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--width="))
+        .map(str::parse::<f32>)
+        .transpose()?;
+    let height = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--height="))
+        .map(str::parse::<f32>)
+        .transpose()?;
     ui.window().set_size(slint::LogicalSize::new(
-        if args.iter().any(|s| s == "--compact") {
+        width.unwrap_or(if args.iter().any(|s| s == "--compact") {
             820.
         } else {
             960.
-        },
-        if args.iter().any(|s| s == "--tall") {
+        }),
+        height.unwrap_or(if args.iter().any(|s| s == "--tall") {
             1180.
         } else if args.iter().any(|s| s == "--compact") {
             540.
         } else {
             620.
-        },
+        }),
     ));
     ui.set_mac(true);
     ui.set_device_name("Studio Mac".into());
     ui.set_system_device_name("Studio Mac".into());
     ui.set_device_name_edit("Studio Mac".into());
     ui.set_local_address("192.168.1.24:47990".into());
-    ui.set_device_code("Code 8782-19A1".into());
+    ui.set_device_code("8782-19A1".into());
     ui.set_local_ip("192.168.1.24".into());
     ui.set_screen_permission(1);
     ui.set_control_permission(0);
@@ -527,6 +557,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.on_trust(move |_| preview_notice(&weak));
     if let (Some(path), Some(window)) = (snapshot_path, software_window) {
         ui.show()?;
+        slint::platform::update_timers_and_animations();
         let size = ui.window().size();
         let mut pixels =
             vec![slint::Rgb8Pixel::default(); size.width as usize * size.height as usize];
@@ -575,6 +606,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         button: slint::platform::PointerEventButton::Left,
                     }
                 });
+            } else if let Some(wait) = arg.strip_prefix("--wait=") {
+                let until =
+                    std::time::Instant::now() + std::time::Duration::from_millis(wait.parse()?);
+                while std::time::Instant::now() < until {
+                    slint::platform::update_timers_and_animations();
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            } else if let Some(point) = arg.strip_prefix("--move=") {
+                let (x, y) = point.split_once(',').ok_or("Use --move=x,y")?;
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerMoved {
+                        position: slint::LogicalPosition::new(x.parse()?, y.parse()?),
+                    });
             } else if let Some(point) = arg.strip_prefix("--click=") {
                 let (x, y) = point.split_once(',').ok_or("Use --click=x,y")?;
                 let position = slint::LogicalPosition::new(x.parse()?, y.parse()?);
@@ -588,6 +632,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         position,
                         button: slint::platform::PointerEventButton::Left,
                     });
+            } else if let Some(text) = arg.strip_prefix("--type=") {
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::KeyPressed { text: text.into() });
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::KeyReleased {
+                        text: text.into(),
+                    });
             } else if let Some(key) = arg.strip_prefix("--key=") {
                 use slint::platform::{Key, WindowEvent};
                 let text: slint::SharedString = match key {
@@ -595,6 +646,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "Tab" => Key::Tab.into(),
                     "Down" => Key::DownArrow.into(),
                     "Return" => Key::Return.into(),
+                    "End" => Key::End.into(),
                     _ => return Err("Use --key=Escape, Tab, Down or Return".into()),
                 };
                 ui.window()
@@ -604,6 +656,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 continue;
             }
+            slint::platform::update_timers_and_animations();
             window.draw_if_needed(|renderer| {
                 renderer.render(&mut pixels, size.width as usize);
             });
@@ -637,6 +690,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 connects.get(),
                 expected,
                 "Connect must fire exactly once per completed click"
+            );
+        }
+        if let Some(expected) = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--expect-settings-tab="))
+        {
+            assert_eq!(
+                ui.get_settings_tab(),
+                expected.parse::<i32>()?,
+                "Settings tab must respond to its click"
+            );
+        }
+        if let Some(expected) = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--expect-default-audio="))
+        {
+            assert_eq!(
+                ui.get_default_audio(),
+                expected.parse::<bool>()?,
+                "Switching tabs must preserve edited settings"
             );
         }
         let bytes: Vec<u8> = pixels.iter().flat_map(|p| [p.r, p.g, p.b]).collect();

@@ -44,8 +44,7 @@ export component ConnectionButton inherits Rectangle {
     // makes them read as segments; without it the label looked off-centre.
     HorizontalLayout {
         x: 0; width: parent.width - 28px; height: parent.height;
-        alignment: center; spacing: 6px;
-        Glyph { width: 14px; source: @image-url("icons/arrow.svg"); colorize: !root.enabled ? #969ca7 : root.primary ? white : Theme.ink; }
+        alignment: center;
         Text { text: "Connect"; font-size: 12px; font-weight: 500; color: !root.enabled ? #969ca7 : root.primary ? white : Theme.ink; vertical-alignment: center; }
     }
     Rectangle {
@@ -144,8 +143,7 @@ export component SharingButton inherits Rectangle {
     forward-focus: action-focus;
     HorizontalLayout {
         x: 0; width: parent.width - 28px; height: parent.height;
-        alignment: center; spacing: 6px;
-        Glyph { width: 14px; source: root.danger ? @image-url("icons/power.svg") : @image-url("icons/display.svg"); colorize: root.danger ? #b34e54 : white; }
+        alignment: center;
         Text { text: root.label; font-size: 12px; font-weight: 500; color: root.danger ? #b34e54 : white; vertical-alignment: center; }
     }
     Rectangle {

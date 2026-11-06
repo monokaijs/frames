@@ -1338,6 +1338,22 @@ pub fn run() -> Result<()> {
             .into(),
     );
     let weak = ui.as_weak();
+    ui.on_copy_device_code(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        match frames_next::directory::copy_text(ui.get_device_code().as_str()) {
+            Ok(()) => {
+                ui.set_notice(
+                    "Connection code copied. Use it to connect on the same network.".into(),
+                );
+                ui.set_notice_error(false);
+            }
+            Err(error) => {
+                ui.set_notice(format!("Couldn't copy the connection code: {error:#}").into());
+                ui.set_notice_error(true);
+            }
+        }
+    });
+    let weak = ui.as_weak();
     ui.on_copy_device_id(move || {
         let result = frames_next::directory::own_id()
             .and_then(|id| frames_next::directory::copy_text(&id));

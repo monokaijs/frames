@@ -51,10 +51,10 @@ component DeviceGrid inherits Rectangle {
     callback trust(string);
     callback revoke(string, string);
     callback quick-apps(string);
-    // Three columns from the launcher's minimum width, so a card's actions
-    // stay visible without scrolling.
-    private property <int> columns: root.width > 640px ? 3 : root.width > 440px ? 2 : 1;
-    private property <length> card-width: (root.width - (root.columns - 1) * 14px) / root.columns;
+    // Add columns as space becomes available; a sparse list never stretches
+    // its cards across the page. The minimum keeps both actions usable.
+    private property <int> columns: max(1, min(root.devices.length, floor((root.width + 14px) / 236px)));
+    private property <length> card-width: min(260px, (root.width - (root.columns - 1) * 14px) / root.columns);
     private property <length> preview-height: (root.card-width - 2px) * 9 / 16;
     private property <length> card-height: root.preview-height + 58px;
     height: root.devices.length == 0 ? 0px : ceil(root.devices.length / root.columns) * (root.card-height + 14px) - 14px;
@@ -202,16 +202,16 @@ component SettingRow inherits Rectangle {
     in property <string> detail;
     in property <image> icon;
     in property <bool> divider: true;
-    min-height: 66px;
+    min-height: 58px;
     HorizontalLayout {
         spacing: 16px;
         if root.icon.width > 0: Glyph { source: root.icon; width: 18px; }
         VerticalLayout {
-            horizontal-stretch: 1; alignment: center; spacing: 4px;
+            min-width: 0px; horizontal-stretch: 1; alignment: center; spacing: 4px;
             Text { text: root.title; color: Theme.ink; font-size: 13px; }
-            MutedText { text: root.detail; font-size: 11px; }
+            MutedText { text: root.detail; font-size: 11px; min-width: 0px; }
         }
-        VerticalLayout { horizontal-stretch: 0; alignment: center; @children }
+        VerticalLayout { min-width: 40px; horizontal-stretch: 0; alignment: center; @children }
     }
     if root.divider: Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: Theme.line; }
 }
@@ -296,6 +296,7 @@ export component Launcher inherits Window {
 
     in-out property <int> connection-tab: 0;
     in-out property <int> device-tab: 0;
+    in-out property <int> settings-tab: 0;
     in-out property <string> address;
     in-out property <bool> audio: false;
     in-out property <bool> desktop: false;
@@ -361,6 +362,7 @@ export component Launcher inherits Window {
     // address on its network; Copy ID copies the full id (for the internet).
     in property <string> device-code;
     in property <string> local-ip;
+    callback copy-device-code();
     callback copy-device-id();
     in-out property <string> status;
     in-out property <bool> status-error: false;
@@ -435,10 +437,24 @@ export component Launcher inherits Window {
                     }
                     Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: Theme.line; }
                 }
+                if root.page == 2: Rectangle {
+                    height: 48px; vertical-stretch: 0; background: white;
+                    Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: Theme.line; }
+                    HorizontalLayout {
+                        padding-left: 24px; padding-right: 24px; spacing: 8px;
+                        TabItem { height: 48px; label: "General"; selected: root.settings-tab == 0; clicked => { root.settings-tab = 0; } }
+                        TabItem { height: 48px; label: "Streaming"; selected: root.settings-tab == 1; clicked => { root.settings-tab = 1; } }
+                        TabItem { height: 48px; label: "Input & devices"; selected: root.settings-tab == 2; clicked => { root.settings-tab = 2; } }
+                        TabItem { height: 48px; label: "Sharing"; selected: root.settings-tab == 3; clicked => { root.settings-tab = 3; } }
+                        TabItem { height: 48px; label: "Quick Apps"; selected: root.settings-tab == 4; clicked => { root.settings-tab = 4; } }
+                        TabItem { height: 48px; label: "Updates"; selected: root.settings-tab == 5; clicked => { root.settings-tab = 5; } }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                }
                 if root.page != 3: ScrollView {
                     horizontal-stretch: 1; vertical-stretch: 1;
                     VerticalLayout {
-                        padding: 20px; spacing: 20px;
+                        padding: 24px; spacing: 20px;
                         if root.notice != "" && root.notice-error: Rectangle {
                             min-height: 44px; background: #fff5f5; border-radius: 5px;
                             HorizontalLayout {
@@ -456,29 +472,43 @@ export component Launcher inherits Window {
                                 Rectangle { horizontal-stretch: 1; }
                             }
                             if root.connection-tab == 0: VerticalLayout {
-                                spacing: 16px;
+                                spacing: 24px;
                                 Card {
-                                    height: 148px;
+                                    height: 236px;
                                     HorizontalLayout {
-                                        padding: 16px; spacing: 20px;
+                                        padding: 20px; spacing: 24px;
                                         VerticalLayout {
-                                            min-width: 250px; horizontal-stretch: 1; spacing: 10px;
-                                            SectionTitle { text: "Share this device"; }
+                                            min-width: 260px; horizontal-stretch: 1; spacing: 12px;
                                             VerticalLayout {
-                                                spacing: 3px;
-                                                Text { text: root.device-name; font-size: 15px; font-weight: 500; color: Theme.ink; overflow: elide; }
-                                                // One line, one size: code, then address, then a small copy button.
-                                                HorizontalLayout {
-                                                    height: 22px; spacing: 6px; alignment: start;
-                                                    TextInput { text: root.device-code; read-only: true; single-line: true; font-size: 12px; font-weight: 500; color: Theme.ink; vertical-alignment: center; accessible-label: "This device's code. Other devices connect with it."; }
-                                                    if root.local-ip != "": Text { text: "·"; font-size: 12px; color: Theme.muted; vertical-alignment: center; }
-                                                    if root.local-ip != "": TextInput { text: root.local-ip; read-only: true; single-line: true; font-size: 12px; color: Theme.muted; vertical-alignment: center; accessible-label: "This device's address on this network"; }
-                                                    AppButton { icon: @image-url("icons/copy.svg"); quiet: true; min-width: 22px; max-width: 22px; height: 22px; a11y-label: "Copy this device's full ID, for connecting over the internet"; clicked => { root.copy-device-id(); } }
+                                                height: 36px; vertical-stretch: 0; spacing: 4px;
+                                                SectionTitle { text: "Share this device"; }
+                                                Text { text: root.device-name; font-size: 12px; color: Theme.muted; overflow: elide; }
+                                            }
+                                            Rectangle {
+                                                height: 104px; vertical-stretch: 0;
+                                                background: #f8f9fb; border-width: 1px; border-color: Theme.line; border-radius: 6px;
+                                                VerticalLayout {
+                                                    padding: 12px; spacing: 6px;
+                                                    HorizontalLayout {
+                                                        height: 22px; spacing: 8px;
+                                                        Text { text: "Local connection code"; font-size: 11px; color: Theme.muted; vertical-alignment: center; }
+                                                        Rectangle { horizontal-stretch: 1; }
+                                                    }
+                                                    HorizontalLayout {
+                                                        height: 22px; spacing: 8px;
+                                                        TextInput { text: root.device-code; read-only: true; single-line: true; min-width: 0px; font-size: 18px; font-weight: 500; color: Theme.ink; vertical-alignment: center; accessible-label: "This device's connection code for the same local network"; }
+                                                        AppButton { icon: @image-url("icons/copy.svg"); quiet: true; min-width: 22px; max-width: 22px; height: 22px; enabled: root.device-code != ""; a11y-label: "Copy connection code"; clicked => { root.copy-device-code(); } }
+                                                    }
+                                                    Rectangle { height: 1px; background: Theme.line; }
+                                                    HorizontalLayout {
+                                                        height: 16px; spacing: 8px;
+                                                        Text { text: "Local IP"; font-size: 11px; color: Theme.muted; vertical-alignment: center; }
+                                                        TextInput { text: root.local-ip == "" ? "Unavailable" : root.local-ip; read-only: true; single-line: true; min-width: 0px; font-size: 12px; color: root.local-ip == "" ? Theme.muted : Theme.ink; horizontal-alignment: right; vertical-alignment: center; accessible-label: "This device's address on this network"; }
+                                                    }
                                                 }
                                             }
-                                            // Controls sit on the card's bottom edge in both columns so they line up.
-                                            Rectangle { vertical-stretch: 1; }
                                             HorizontalLayout {
+                                                height: 32px;
                                                 spacing: 8px;
                                                 SharingButton {
                                                     label: root.background-sharing-running ? "Manage sharing" : root.sharing ? "Stop sharing" : "Start sharing";
@@ -492,14 +522,24 @@ export component Launcher inherits Window {
                                         }
                                         Rectangle { width: 1px; background: Theme.line; }
                                         VerticalLayout {
-                                            min-width: 290px; horizontal-stretch: 1.1; spacing: 10px;
-                                            SectionTitle { text: "Connect to a device"; }
-                                            MutedText { text: "Enter the code shown on the other device (or its full ID over the internet), or pick it under Devices."; font-size: 11px; }
-                                            Rectangle { vertical-stretch: 1; }
+                                            min-width: 260px; horizontal-stretch: 1; spacing: 12px;
+                                            VerticalLayout {
+                                                height: 36px; vertical-stretch: 0; spacing: 4px;
+                                                SectionTitle { text: "Connect to a device"; }
+                                                Text { text: "Open apps or the full remote desktop."; font-size: 12px; color: Theme.muted; }
+                                            }
+                                            VerticalLayout {
+                                                height: 104px; vertical-stretch: 0; spacing: 8px;
+                                                Text { text: "Local code, device ID or IP address"; font-size: 11px; color: Theme.muted; }
+                                                LineEdit { height: 36px; text <=> root.address; placeholder-text: "Enter the other device's address"; accessible-label: "Code or device ID of the other device"; edited => { root.connection-address-edited(); } accepted => { if root.address != "" { root.connect(root.address); } } }
+                                                MutedText { text: "For an internet connection, enter the full device ID."; font-size: 11px; }
+                                                Rectangle { vertical-stretch: 1; }
+                                            }
                                             HorizontalLayout {
+                                                height: 32px;
                                                 spacing: 8px;
-                                                LineEdit { height: 32px; horizontal-stretch: 1; text <=> root.address; placeholder-text: "Code such as 9710-3C89, device ID, or IP"; accessible-label: "Code or device ID of the other device"; edited => { root.connection-address-edited(); } accepted => { if root.address != "" { root.connect(root.address); } } }
                                                 ConnectionButton {
+                                                    width: 138px;
                                                     primary: true; enabled: root.address != "";
                                                     align-options-right: true;
                                                     audio <=> root.audio; desktop <=> root.desktop;
@@ -511,6 +551,7 @@ export component Launcher inherits Window {
                                                     }
                                                     quick-apps => { root.open-quick-apps(root.address); }
                                                 }
+                                                Rectangle { horizontal-stretch: 1; }
                                             }
                                         }
                                     }
@@ -524,6 +565,7 @@ export component Launcher inherits Window {
                                         AppButton { label: root.discovering ? "Scanning…" : ""; icon: @image-url("icons/refresh.svg"); a11y-label: "Scan nearby devices"; quiet: true; enabled: !root.discovering; clicked => { root.discover(); } }
                                     }
                                     Rectangle { height: 1px; background: Theme.line; }
+                                    Rectangle { height: 12px; }
                                     if root.nearby.length == 0: EmptyState {
                                         icon: @image-url("icons/devices.svg");
                                         title: root.discovering ? "Looking for devices" : "No nearby devices";
@@ -585,9 +627,9 @@ export component Launcher inherits Window {
                             }
                         }
                         if root.page == 2: VerticalLayout {
-                            spacing: 24px;
+                            spacing: 20px;
                             if root.settings-status != "": Text { text: root.settings-status; color: root.settings-error ? #a84d55 : Theme.muted; font-size: 12px; wrap: word-wrap; }
-                            SettingsSection {
+                            if root.settings-tab == 0: SettingsSection {
                                 title: "General"; icon: @image-url("icons/settings.svg");
                                 SettingRow { title: "Device name"; detail: "Shown to other devices. Leave blank to use the system name."; divider: !root.mac;
                                     LineEdit { width: 250px; text <=> root.device-name-edit; placeholder-text: root.system-device-name; edited => { root.device-name-edited(); } accessible-label: "Device name"; }
@@ -596,8 +638,8 @@ export component Launcher inherits Window {
                                     ComboBox { width: 180px; model: ["Ask every time", "Hide to tray", "Quit Frames"]; current-index <=> root.close-behavior; selected(value) => { root.close-behavior-edited(self.current-index); } accessible-label: "When window closes"; }
                                 }
                             }
-                            SettingsSection {
-                                title: "Connections"; icon: @image-url("icons/connections.svg");
+                            if root.settings-tab == 1: SettingsSection {
+                                title: "Streaming"; icon: @image-url("icons/connections.svg");
                                 SettingRow { title: "Default view"; detail: "Open individual apps or the full remote desktop.";
                                     ComboBox { width: 180px; model: ["Application windows", "Full desktop"]; current-index: root.default-desktop ? 1 : 0; selected(value) => { root.default-desktop = self.current-index == 1; root.settings-edited(); } accessible-label: "Default connection view"; }
                                 }
@@ -614,9 +656,12 @@ export component Launcher inherits Window {
                                         Text { text: "Mbps"; color: Theme.muted; vertical-alignment: center; }
                                     }
                                 }
-                                SettingRow { title: "Video codec"; detail: "Automatic selects a working codec for both devices.";
+                                SettingRow { title: "Video codec"; detail: "Automatic selects a working codec for both devices."; divider: false;
                                     ComboBox { width: 180px; model: ["Automatic", "H.264", "HEVC", "AV1", "VP9"]; current-index <=> root.codec; selected(value) => { root.settings-edited(); } accessible-label: "Video codec"; }
                                 }
+                            }
+                            if root.settings-tab == 2: SettingsSection {
+                                title: "Input & devices"; icon: @image-url("icons/cursor.svg");
                                 SettingRow { title: "Keyboard"; detail: root.physical-keys ? "Keys stay in place between Mac and PC (Control is Control), for terminals and games." : "Between Mac and PC, Control and Command trade places, so shortcuts work as on this device.";
                                     ComboBox { width: 180px; model: ["Swap Control and Command", "Physical keys"]; current-index: root.physical-keys ? 1 : 0; selected(value) => { root.physical-keys = self.current-index == 1; root.settings-edited(); } accessible-label: "Keyboard"; }
                                 }
@@ -633,7 +678,7 @@ export component Launcher inherits Window {
                                     AppSwitch { checked <=> root.clipboard; toggled => { root.settings-edited(); } accessible-label: "Clipboard sync"; }
                                 }
                             }
-                            SettingsSection {
+                            if root.settings-tab == 3: SettingsSection {
                                 title: "Sharing"; icon: @image-url("icons/display.svg");
                                 SettingRow { title: "Access password"; icon: @image-url("icons/lock.svg"); detail: root.access-password-set ? "Set. Devices that enter it connect without anyone approving them here." : "Lets devices that know it connect without anyone approving them here (unattended access). At least 8 characters.";
                                     HorizontalLayout { spacing: 8px; alignment: end;
@@ -652,7 +697,7 @@ export component Launcher inherits Window {
                                     AppButton { label: "Manage"; a11y-label: "Manage sharing at login"; quiet: true; clicked => { root.login-settings(); } }
                                 }
                             }
-                            SettingsSection {
+                            if root.settings-tab == 4: SettingsSection {
                                 title: "Quick Apps"; icon: @image-url("icons/folder.svg");
                                 VerticalLayout {
                                     padding-top: 16px; padding-bottom: 16px; spacing: 12px;
@@ -674,7 +719,7 @@ export component Launcher inherits Window {
                                     }
                                 }
                             }
-                            SettingsSection {
+                            if root.settings-tab == 5: SettingsSection {
                                 title: "Updates"; icon: @image-url("icons/refresh.svg");
                                 Rectangle {
                                     min-height: 108px;
@@ -793,7 +838,7 @@ export component Launcher inherits Window {
                     AppButton { label: "Refresh"; icon: @image-url("icons/refresh.svg"); quiet: true; enabled: !root.quick-apps-busy; clicked => { root.load-quick-apps(root.quick-app-target); } }
                     Rectangle { horizontal-stretch: 1; }
                     AppButton { label: "Cancel"; clicked => { root.quick-apps-open = false; } }
-                    AppButton { label: "Open & connect"; icon: @image-url("icons/arrow.svg"); primary: true; enabled: !root.quick-apps-busy && root.quick-app-selected != ""; clicked => { root.launch-quick-app(root.quick-app-target, root.quick-app-selected, root.quick-app-only); } }
+                    AppButton { label: "Open & connect"; primary: true; enabled: !root.quick-apps-busy && root.quick-app-selected != ""; clicked => { root.launch-quick-app(root.quick-app-target, root.quick-app-selected, root.quick-app-only); } }
                 }
             }
         }
