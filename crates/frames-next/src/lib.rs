@@ -525,7 +525,7 @@ async fn host(o: Options) -> Result<()> {
     // One session at a time carries host audio; it is free again when that
     // session ends.
     let audio_free = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let admission = std::sync::Arc::new(tokio::sync::Mutex::new(admit::HostState::default()));
+    let admission = std::sync::Arc::new(admit::HostState::default());
     // Connections being accepted: each handshake and admission runs on its
     // own, so a peer whose handshake stalls, or a new device waiting for
     // its approval, holds up nobody else (other viewers, or another window

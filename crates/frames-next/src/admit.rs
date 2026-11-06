@@ -312,15 +312,22 @@ fn migrate(
 }
 
 /// What a host remembers between admissions while it runs. Admissions run
-/// side by side (one task per incoming connection), so it is shared behind
-/// a lock: see [`decide`].
+/// side by side (one task per incoming connection); see [`decide`].
 #[derive(Default)]
 pub struct HostState {
     /// Devices let in for this session only, with whether they may
     /// control; they are not asked again (a viewer of several windows opens
     /// a session for each). Trusted devices are checked against the trust
-    /// list every time, so removing one takes effect at once.
-    approved: std::collections::HashMap<iroh::EndpointId, bool>,
+    /// list every time, so removing one takes effect at once. Locked only
+    /// to look up or record, never while a device is being asked about.
+    approved: std::sync::Mutex<std::collections::HashMap<iroh::EndpointId, bool>>,
+    /// The one new device being admitted (asked about, its password
+    /// checked, the trust list written): new devices take turns.
+    asking: tokio::sync::Mutex<Asking>,
+}
+
+#[derive(Default)]
+struct Asking {
     /// Recent wrong access passwords.
     attempts: crate::password::Attempts,
     /// The last device was let in by the access password: not remembered,
@@ -338,15 +345,15 @@ pub const WRONG_PASSWORD: &str = "wrong password";
 /// `Err` (inside `Ok`) is the reason a device was refused.
 ///
 /// Devices already let in (trusted, or approved earlier in this run) never
-/// wait: `state` is locked only to look them up, or for a new device's
-/// whole admission (its prompt, password check and trust-list write), so
-/// new devices are asked about one at a time.
+/// wait for a new device's admission; new devices are asked about one at a
+/// time. A viewer that leaves while it waits for its turn or for an answer
+/// gives up its turn at once.
 pub async fn decide(
     config: &std::path::Path,
     session: &frames_net::Session,
     preset: Option<Approve>,
     launcher: bool,
-    state: &tokio::sync::Mutex<HostState>,
+    state: &HostState,
 ) -> Result<std::result::Result<Admitted, &'static str>> {
     let hello = receive_hello(session).await;
     // Previews and the Quick Apps list go to trusted devices only, and
@@ -363,21 +370,29 @@ pub async fn decide(
         return Ok(Err(NOT_APPROVED));
     }
     let device = session.remote();
-    let remembered = state.lock().await.approved.get(&device).copied();
-    let control = match remembered {
+    let approved = |state: &HostState| state.approved.lock().unwrap().get(&device).copied();
+    let control = match approved(state) {
         Some(control) => control,
         None => match trusted(config, &device, &hello)? {
             Some(control) => control,
             None => {
-                let mut state = state.lock().await;
+                let mut asking = tokio::select! {
+                    asking = state.asking.lock() => asking,
+                    () = session.closed() => return Ok(Err(NOT_APPROVED)),
+                };
                 // Approved while this one waited its turn (another window
                 // of the same viewer).
-                match state.approved.get(&device).copied() {
+                match approved(state) {
                     Some(control) => control,
                     None => {
-                        state.by_password = false;
+                        asking.by_password = false;
                         let control = match admit_device(
-                            config, session, preset, launcher, &hello, &mut state,
+                            config,
+                            session,
+                            preset,
+                            launcher,
+                            &hello,
+                            &mut asking,
                         )
                         .await?
                         {
@@ -385,8 +400,8 @@ pub async fn decide(
                             Err(reason) => return Ok(Err(reason)),
                         };
                         let list = TrustList::load(&TrustList::path_in(config))?;
-                        if list.get(&device).is_none() && !state.by_password {
-                            state.approved.insert(device, control);
+                        if list.get(&device).is_none() && !asking.by_password {
+                            state.approved.lock().unwrap().insert(device, control);
                         }
                         control
                     }
@@ -483,7 +498,7 @@ async fn admit_device(
     preset: Option<Approve>,
     launcher: bool,
     hello: &Hello,
-    state: &mut HostState,
+    state: &mut Asking,
 ) -> Result<std::result::Result<bool, &'static str>> {
     let path = TrustList::path_in(config);
     let mut list = TrustList::load(&path)?;
@@ -533,8 +548,26 @@ async fn admit_device(
             );
             Some(choice)
         }
-        None if launcher => crate::launcher::ask_pairing(&device, &name, &code).await,
-        None if std::io::stdin().is_terminal() => ask().await,
+        // A viewer that leaves while it is asked about ends the question
+        // (and frees the turn of the next new device).
+        None if launcher => tokio::select! {
+            choice = crate::launcher::ask_pairing(&device, &name, &code) => choice,
+            () = session.closed() => {
+                println!("{name} ({}) left before an answer", short(&device));
+                crate::launcher::report(
+                    "pairing-done",
+                    &serde_json::json!({"device": device.to_string(), "approved": false}),
+                );
+                None
+            }
+        },
+        None if std::io::stdin().is_terminal() => tokio::select! {
+            choice = ask() => choice,
+            () = session.closed() => {
+                println!("{name} ({}) left before an answer", short(&device));
+                None
+            }
+        },
         None => {
             println!("refused: no terminal to approve it here (see --approve)");
             None
@@ -604,6 +637,105 @@ fn short(device: &iroh::EndpointId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local() -> frames_net::NodeConfig {
+        frames_net::NodeConfig {
+            relays: frames_net::Relays::Disabled,
+            discovery: false,
+            bind: Some(std::net::SocketAddr::from((
+                std::net::Ipv4Addr::LOCALHOST,
+                0,
+            ))),
+            ..frames_net::NodeConfig::default()
+        }
+    }
+
+    fn asks() -> Asks {
+        Asks {
+            decoders: Vec::new(),
+            window: None,
+            name: "viewer".into(),
+            audio: false,
+            max_mbps: None,
+            catalog: false,
+            window_id: None,
+            password: None,
+            preview: false,
+            app: None,
+            only_app: false,
+            quick_apps: false,
+        }
+    }
+
+    /// A viewer connection to `host` that has sent its hello.
+    async fn viewer(
+        host: &frames_net::Node,
+    ) -> (frames_net::Node, frames_net::Session, frames_net::Session) {
+        let node = frames_net::Node::bind(&frames_net::DeviceKey::generate(), local())
+            .await
+            .unwrap();
+        let port = host
+            .bound_sockets()
+            .into_iter()
+            .find(std::net::SocketAddr::is_ipv4)
+            .unwrap()
+            .port();
+        let address = iroh::EndpointAddr::new(host.id()).with_ip_addr(std::net::SocketAddr::from(
+            (std::net::Ipv4Addr::LOCALHOST, port),
+        ));
+        let (outgoing, incoming) = tokio::join!(node.connect(address), host.accept());
+        let (at_viewer, at_host) = (outgoing.unwrap(), incoming.unwrap().unwrap());
+        send_hello(&at_viewer, &node.id(), false, asks())
+            .await
+            .unwrap();
+        (node, at_viewer, at_host)
+    }
+
+    /// While a new device is being asked about (its turn held), a device
+    /// already let in is admitted at once, and another new device that
+    /// leaves while it waits for its turn gives it up at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pending_question_holds_up_neither_approved_nor_leaving_viewers() {
+        let config = std::env::temp_dir().join(format!("frames-admit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(&config).unwrap();
+        let host = frames_net::Node::bind(&frames_net::DeviceKey::generate(), local())
+            .await
+            .unwrap();
+        let state = HostState::default();
+        let pending = state.asking.lock().await;
+
+        let (approved_node, _approved_viewer, approved_at_host) = viewer(&host).await;
+        state
+            .approved
+            .lock()
+            .unwrap()
+            .insert(approved_node.id(), true);
+        let admitted = tokio::time::timeout(
+            Duration::from_secs(3),
+            decide(&config, &approved_at_host, None, false, &state),
+        )
+        .await
+        .expect("an approved device waited for a pending question")
+        .unwrap()
+        .expect("admitted");
+        assert!(admitted.control);
+
+        let (_new_node, new_viewer, new_at_host) = viewer(&host).await;
+        let waiting = decide(&config, &new_at_host, None, false, &state);
+        let leave = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            new_viewer.close("viewer left");
+        };
+        let (refused, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(waiting, leave)
+        })
+        .await
+        .expect("a viewer that left kept waiting for its turn");
+        assert_eq!(refused.unwrap().err(), Some(NOT_APPROVED));
+        drop(pending);
+        let _ = std::fs::remove_dir_all(&config);
+    }
 
     #[test]
     fn approval_answers() {
