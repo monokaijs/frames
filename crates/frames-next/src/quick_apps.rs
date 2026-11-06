@@ -146,6 +146,19 @@ fn normalize(path: &str) -> String {
     }
 }
 
+/// A configured path as identities compare it. macOS reports processes by
+/// their real path (`/tmp` is `/private/tmp`), so an existing path is
+/// resolved first; one that does not exist (yet) is compared as given.
+/// Windows paths are compared as given (resolving adds a `\\?\` prefix,
+/// and executables are reported by the path they were started from).
+fn configured_identity(path: &str) -> String {
+    #[cfg(not(windows))]
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return normalize(&real.to_string_lossy());
+    }
+    normalize(path)
+}
+
 /// Processes this host started for each Quick App: app id, process id and
 /// its start time (an id alone could since be another process's).
 static LAUNCHED: std::sync::Mutex<Vec<(String, u32, Option<u64>)>> =
@@ -157,7 +170,7 @@ const ANCESTRY: usize = 16;
 impl QuickApp {
     /// Whether `window` belongs to this application (see the module).
     pub fn owns(&self, window: &crate::catalog::Window, processes: &Processes) -> bool {
-        let identity = normalize(&self.path);
+        let identity = configured_identity(&self.path);
         let launched: Vec<(u32, Option<u64>)> = LAUNCHED
             .lock()
             .unwrap()
@@ -823,6 +836,55 @@ mod tests {
         assert!(!notes().owns(&window(pid), &processes));
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// A Quick App configured through a symbolic link (macOS's `/tmp` is
+    /// `/private/tmp`) matches the process the system reports by its real
+    /// path, and only that one.
+    #[test]
+    #[cfg(unix)]
+    fn a_configured_path_through_a_link_matches_the_real_path() {
+        let base = std::env::temp_dir().join(format!("frames-qa-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        let binary = real.join("Fixture.app/Contents/MacOS");
+        std::fs::create_dir_all(&binary).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // What the system reports: the real path, links resolved.
+        let reported = std::fs::canonicalize(&binary).unwrap().join("Fixture");
+        let processes = Processes {
+            parents: [(70, 1), (71, 1)].into_iter().collect(),
+            identities: std::cell::RefCell::new(
+                [
+                    (70, Some(normalize(&reported.to_string_lossy()))),
+                    (71, Some("/Applications/Other.app".to_string())),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            started: Default::default(),
+        };
+        let app = QuickApp {
+            id: "linked".into(),
+            path: link.join("Fixture.app").to_string_lossy().into_owned(),
+            ..notes()
+        };
+        assert!(
+            app.owns(&window(70), &processes),
+            "configured through the link"
+        );
+        assert!(!app.owns(&window(71), &processes));
+        // A path that does not exist is compared as given (no match here).
+        let missing = QuickApp {
+            path: base
+                .join("missing/Fixture.app")
+                .to_string_lossy()
+                .into_owned(),
+            ..app
+        };
+        assert!(!missing.owns(&window(70), &processes));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
