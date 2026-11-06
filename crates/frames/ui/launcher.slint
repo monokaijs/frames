@@ -1,3 +1,5 @@
+import { FileSharingPanel, FileRow, FileTransferRow, FileSuggestion } from "file-sharing.slint";
+export { FileRow, FileTransferRow, FileSuggestion } from "file-sharing.slint";
 import { LineEdit, ListView, ScrollView, ComboBox, SpinBox } from "std-widgets.slint";
 import { ConnectionButton, SharingButton } from "connection-button.slint";
 import { Theme, Glyph, AppButton, AppSwitch, AppCheckBox, NavItem, TabItem, Badge, Card, SectionTitle, MutedText, ModalFocus } from "components.slint";
@@ -248,6 +250,50 @@ export component Launcher inherits Window {
     default-font-family: root.mac ? "Helvetica Neue" : "Segoe UI";
     default-font-size: 13px;
     in-out property <int> page: 0;
+
+    in-out property <string> files-peer;
+    in property <[string]> files-peer-names;
+    in property <bool> files-connected;
+    in property <bool> files-connecting;
+    in property <bool> files-transferring;
+    in property <string> files-remote-name;
+    in property <[FileRow]> files-local-entries;
+    in property <[FileRow]> files-remote-entries;
+    in property <string> files-local-path;
+    in property <string> files-remote-path;
+    in property <string> files-local-error;
+    in property <string> files-remote-error;
+    in property <bool> files-local-busy;
+    in property <bool> files-remote-busy;
+    in property <bool> files-local-can-up;
+    in property <bool> files-remote-can-up;
+    in property <int> files-local-mode;
+    in property <int> files-remote-mode;
+    in property <int> files-local-selected;
+    in property <int> files-remote-selected;
+    in property <string> files-status;
+    in property <bool> files-status-error;
+    in property <float> files-progress;
+    in-out property <bool> files-local-hidden;
+    in-out property <bool> files-remote-hidden;
+    in property <[FileSuggestion]> files-local-suggestions;
+    in property <[FileSuggestion]> files-remote-suggestions;
+    in property <[FileTransferRow]> files-transfers;
+    callback files-connect();
+    callback files-disconnect();
+    callback files-choose-peer(int);
+    callback files-navigate(int, string);
+    callback files-select(int, string, bool);
+    callback files-expand(int, string);
+    callback files-mode(int, int);
+    callback files-refresh(int);
+    callback files-up(int);
+    callback files-filter(int, string);
+    callback files-transfer(int, string);
+    callback files-cancel();
+    callback files-hidden-changed(int);
+    callback files-suggest(int, string);
+
     in-out property <int> connection-tab: 0;
     in-out property <int> device-tab: 0;
     in-out property <string> address;
@@ -383,13 +429,13 @@ export component Launcher inherits Window {
                     height: 56px; background: white;
                     HorizontalLayout {
                         padding-left: 24px; padding-right: 20px; spacing: 12px;
-                        Text { text: root.page == 0 ? "Connections" : root.page == 1 ? "Devices" : "Settings"; color: Theme.ink; font-size: 16px; font-weight: 600; vertical-alignment: center; }
+                        Text { text: root.page == 0 ? "Connections" : root.page == 1 ? "Devices" : root.page == 3 ? "File sharing" : "Settings"; color: Theme.ink; font-size: 16px; font-weight: 600; vertical-alignment: center; }
                         Rectangle { horizontal-stretch: 1; }
                         if root.mac: Glyph { source: @image-url("icons/display.svg"); width: 16px; colorize: #9ca2ad; }
                     }
                     Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: Theme.line; }
                 }
-                ScrollView {
+                if root.page != 3: ScrollView {
                     horizontal-stretch: 1; vertical-stretch: 1;
                     VerticalLayout {
                         padding: 20px; spacing: 20px;
@@ -650,7 +696,33 @@ export component Launcher inherits Window {
                         Rectangle { vertical-stretch: 1; min-height: 1px; }
                     }
                 }
-                Rectangle {
+                if root.page == 3: FileSharingPanel {
+                    horizontal-stretch: 1; vertical-stretch: 1;
+                    peer <=> root.files-peer; peer-names: root.files-peer-names;
+                    connected: root.files-connected; connecting: root.files-connecting; transferring: root.files-transferring;
+                    local-name: root.device-name; remote-name: root.files-remote-name;
+                    local-entries: root.files-local-entries; remote-entries: root.files-remote-entries;
+                    local-path: root.files-local-path; remote-path: root.files-remote-path;
+                    local-error: root.files-local-error; remote-error: root.files-remote-error;
+                    local-busy: root.files-local-busy; remote-busy: root.files-remote-busy;
+                    local-can-up: root.files-local-can-up; remote-can-up: root.files-remote-can-up;
+                    local-mode: root.files-local-mode; remote-mode: root.files-remote-mode;
+                    local-selected: root.files-local-selected; remote-selected: root.files-remote-selected;
+                    status: root.files-status; status-error: root.files-status-error; progress: root.files-progress;
+                    local-hidden <=> root.files-local-hidden; remote-hidden <=> root.files-remote-hidden;
+                    local-suggestions: root.files-local-suggestions; remote-suggestions: root.files-remote-suggestions; transfers: root.files-transfers;
+                    connect => { root.files-connect(); } disconnect => { root.files-disconnect(); }
+                    choose-peer(index) => { root.files-choose-peer(index); }
+                    navigate(side, path) => { root.files-navigate(side, path); }
+                    select(side, path, add) => { root.files-select(side, path, add); }
+                    expand(side, path) => { root.files-expand(side, path); }
+                    change-mode(side, mode) => { root.files-mode(side, mode); }
+                    refresh(side) => { root.files-refresh(side); } up(side) => { root.files-up(side); }
+                    filter(side, text) => { root.files-filter(side, text); }
+                    transfer(side, path) => { root.files-transfer(side, path); }
+                    cancel => { root.files-cancel(); } hidden-changed(side) => { root.files-hidden-changed(side); } suggest(side, text) => { root.files-suggest(side, text); }
+                }
+                if root.page != 3: Rectangle {
                     height: 32px; vertical-stretch: 0; background: white;
                     HorizontalLayout {
                         x: 0px; y: 0px; width: parent.width; height: parent.height;
@@ -676,6 +748,7 @@ export component Launcher inherits Window {
                 Rectangle { height: 4px; }
                 NavItem { label: "Connections"; icon: @image-url("icons/connections.svg"); selected: root.page == 0; clicked => { root.page = 0; } }
                 NavItem { label: "Devices"; icon: @image-url("icons/devices.svg"); selected: root.page == 1; clicked => { root.page = 1; } }
+                NavItem { label: "File sharing"; icon: @image-url("icons/folder.svg"); selected: root.page == 3; clicked => { root.page = 3; } }
                 Rectangle { vertical-stretch: 1; }
                 NavItem { label: "Permissions"; icon: @image-url("icons/shield.svg"); selected: root.permissions-open; badge: root.mac && (root.screen-permission == 0 || root.control-permission == 0) ? "!" : ""; clicked => { root.show-permissions(); } }
                 NavItem { label: "Settings"; icon: @image-url("icons/settings.svg"); selected: root.page == 2; clicked => { root.page = 2; } }

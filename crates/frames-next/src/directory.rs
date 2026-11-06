@@ -168,6 +168,7 @@ pub async fn preview(id: &str, wait: Duration) -> Result<Vec<u8>> {
                 app: None,
                 only_app: false,
                 quick_apps: false,
+                files: false,
             },
         )
         .await?;

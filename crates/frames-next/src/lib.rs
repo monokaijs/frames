@@ -27,6 +27,7 @@ mod clip;
 pub mod control;
 pub mod directory;
 mod doctor;
+pub mod file_sharing;
 mod impair;
 #[cfg(windows)]
 mod isolated;
@@ -590,6 +591,24 @@ async fn host(o: Options) -> Result<()> {
         session_options.control = admitted.control;
         session_options.viewer_decoders = admitted.decoders;
         session_options.max_mbps_cap = admitted.max_mbps;
+        if admitted.files {
+            if !admitted.control
+                || !o.windows.is_empty()
+                || admitted.only_app
+                || admitted.app.is_some()
+                || admitted.window_id.is_some()
+            {
+                session.close("File sharing requires control permission and full-device sharing");
+                continue;
+            }
+            match file_sharing::home_dir() {
+                Ok(root) => {
+                    sessions.spawn(file_sharing::serve(session, root, Some(config.clone())));
+                }
+                Err(_) => session.close("No home folder available for File sharing"),
+            }
+            continue;
+        }
         if admitted.preview {
             sessions.spawn(preview::serve(session));
             continue;
@@ -847,6 +866,7 @@ async fn desktop(
                 app: o.quick_app.clone(),
                 only_app: o.only_app,
                 quick_apps: false,
+                files: false,
             },
         )
         .await?;

@@ -560,6 +560,7 @@ pub async fn view(
         app: o.quick_app.clone(),
         only_app: o.only_app,
         quick_apps: false,
+        files: false,
     };
     let catalog = node.connect(target.clone()).await?;
     crate::admit::send_hello(&catalog, &node.id(), o.migrate_v1, asks(true, None, false)).await?;

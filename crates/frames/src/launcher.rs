@@ -19,6 +19,8 @@ use std::{
 
 #[path = "device_catalog.rs"]
 mod device_catalog;
+#[path = "launcher_files.rs"]
+mod launcher_files;
 #[path = "launcher_models.rs"]
 mod launcher_models;
 #[path = "launcher_quick_apps.rs"]
@@ -1412,6 +1414,7 @@ pub fn run() -> Result<()> {
     });
     bind_update_restart(&ui, actions.clone());
     let _quick_apps_timer = launcher_quick_apps::bind(&ui, actions.clone());
+    let _files = launcher_files::bind(&ui);
     let worker = std::thread::spawn(move || {
         let (discovery_tx, discovery_done) = mpsc::channel();
         let mut worker = Worker {

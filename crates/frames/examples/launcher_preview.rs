@@ -194,8 +194,97 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_page(match args.get(1).map(String::as_str) {
         Some("devices") => 1,
         Some("settings") => 2,
+        Some("files") => 3,
         _ => 0,
     });
+    if ui.get_page() == 3 {
+        let mode = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--files-mode="))
+            .unwrap_or("0")
+            .parse::<i32>()?;
+        ui.set_files_local_mode(mode);
+        ui.set_files_remote_mode(mode);
+        ui.set_files_local_can_up(true);
+        ui.set_files_remote_can_up(true);
+        ui.set_files_peer("Design workstation".into());
+        ui.set_files_peer_names(rows(vec![
+            "Design workstation".into(),
+            "Windows laptop".into(),
+        ]));
+        ui.set_files_connected(!args.iter().any(|arg| arg == "--files-disconnected"));
+        ui.set_files_remote_name("Design workstation".into());
+        ui.set_files_local_path("/Users/studio/Documents".into());
+        ui.set_files_remote_path("C:\\Users\\Studio\\Documents".into());
+        if args.iter().any(|arg| arg == "--files-autocomplete") {
+            ui.set_files_local_path("/Users/studio/D".into());
+            ui.set_files_local_suggestions(rows(vec![
+                FileSuggestion {
+                    name: "Documents".into(),
+                    path: "/Users/studio/Documents/".into(),
+                },
+                FileSuggestion {
+                    name: "Downloads".into(),
+                    path: "/Users/studio/Downloads/".into(),
+                },
+            ]));
+        }
+        ui.set_files_status("".into());
+        let entries = |remote: bool| {
+            let long_names = args.iter().any(|arg| arg == "--files-long-names");
+            rows(
+                vec![
+                    (if long_names { "Tài liệu thiết kế giao diện và các bản bàn giao tháng 11" } else { "Documents" }, true, "Folder"),
+                    ("Downloads", true, "Folder"),
+                    ("Pictures", true, "Folder"),
+                    (
+                        if long_names {
+                            "Báo cáo tổng hợp dự án và phản hồi khách hàng — phiên bản cuối cùng 📁.pdf"
+                        } else if remote {
+                            "Project brief.pdf"
+                        } else {
+                            "Design notes.md"
+                        },
+                        false,
+                        "24.5 KB",
+                    ),
+                    (if long_names { "Screenshot_2026-11-07_very_long_filename_without_spaces_12345678901234567890.png" } else { "Screenshot.png" }, false, "1.2 MB"),
+                    (if long_names { "Presentation with a very long descriptive title and multiple revisions.pptx" } else { "Presentation.pptx" }, false, "8.4 MB"),
+                    (if long_names { "备份资料与设计文件📦.zip" } else { "Budget.xlsx" }, false, "96 KB"),
+                    (if long_names { ".gitignore" } else { "Readme.txt" }, false, "840 B"),
+                ]
+                .into_iter()
+                .map(|(name, folder, size)| {
+                    let (stem, extension) = if !folder {
+                        name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty()).map_or((name.to_string(), String::new()), |(stem, ext)| (stem.to_string(), format!(".{ext}")))
+                    } else { (name.to_string(), String::new()) };
+                    FileRow {
+                    name: name.into(),
+                    stem: stem.into(), extension: extension.into(),
+                    path: name.into(),
+                    folder,
+                    size: size.into(),
+                    modified: "2026-11-07".into(),
+                    ..Default::default()
+                }})
+                .collect(),
+            )
+        };
+        ui.set_files_local_entries(entries(false));
+        if ui.get_files_connected() {
+            ui.set_files_remote_entries(entries(true));
+        }
+    }
+    if let Some(tab) = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--settings-tab="))
+    {
+        let tab = tab.parse::<i32>()?;
+        if !(0..=5).contains(&tab) {
+            return Err("Use --settings-tab=0..5".into());
+        }
+        ui.set_settings_tab(tab);
+    }
     ui.set_connection_tab(if args.get(1).map(String::as_str) == Some("sessions") {
         1
     } else {
@@ -324,6 +413,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     ui.on_refresh(move || preview_notice(&weak));
     let connects = Rc::new(Cell::new(0usize));
+    let file_copies = Rc::new(Cell::new([0usize; 2]));
+    let count = file_copies.clone();
+    let weak = ui.as_weak();
+    ui.on_files_transfer(move |side, _| {
+        let mut copies = count.get();
+        copies[side as usize] += 1;
+        count.set(copies);
+        if let Some(ui) = weak.upgrade() {
+            ui.set_files_status("Copied in preview".into());
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_files_mode(move |side, mode| {
+        if let Some(ui) = weak.upgrade() {
+            if side == 0 {
+                ui.set_files_local_mode(mode);
+            } else {
+                ui.set_files_remote_mode(mode);
+            }
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_files_navigate(move |side, path| {
+        if let Some(ui) = weak.upgrade() {
+            if side == 0 {
+                ui.set_files_local_path(path);
+                ui.set_files_local_suggestions(rows(vec![]));
+            } else {
+                ui.set_files_remote_path(path);
+                ui.set_files_remote_suggestions(rows(vec![]));
+            }
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_files_select(move |side, path, add| {
+        if let Some(ui) = weak.upgrade() {
+            use slint::Model;
+            let rows = if side == 0 {
+                ui.get_files_local_entries()
+            } else {
+                ui.get_files_remote_entries()
+            };
+            let mut selected = 0;
+            for index in 0..rows.row_count() {
+                let mut row = rows.row_data(index).unwrap();
+                if row.path == path {
+                    row.selected = !add || !row.selected;
+                } else if !add {
+                    row.selected = false;
+                }
+                if row.selected {
+                    selected += 1;
+                }
+                rows.set_row_data(index, row);
+            }
+            if side == 0 {
+                ui.set_files_local_selected(selected);
+            } else {
+                ui.set_files_remote_selected(selected);
+            }
+        }
+    });
     let weak = ui.as_weak();
     let count = connects.clone();
     ui.on_connect(move |_| {
@@ -456,6 +607,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             window.draw_if_needed(|renderer| {
                 renderer.render(&mut pixels, size.width as usize);
             });
+        }
+        if let Some(expected) = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--expect-file-path="))
+        {
+            assert_eq!(ui.get_files_local_path().as_str(), expected);
+        }
+        if let Some(expected) = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--expect-file-copies="))
+        {
+            let expected: Vec<usize> = expected
+                .split(',')
+                .map(str::parse)
+                .collect::<Result<_, _>>()?;
+            assert_eq!(
+                file_copies.get().as_slice(),
+                expected.as_slice(),
+                "File copy must target the opposite pane exactly once"
+            );
         }
         if let Some(expected) = args
             .iter()

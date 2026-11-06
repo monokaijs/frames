@@ -28,6 +28,12 @@ The **Frames menu** (the window menu on Windows, the menu bar on Mac) changes im
 
 Received files go to `~/Downloads/Frames` on the host, are checksum verified, resume after an interruption and never overwrite existing files. Only devices trusted for control can send them.
 
+## File sharing
+
+Open **File sharing** and connect to a device already trusted for control while it is sharing **Everything**. Both devices need a build with File sharing support. The Local and Remote panes browse each user's home folder, with list, grid and expandable tree views. Enter an absolute folder path or use folder completion; the filter button contains search and hidden files. Drag files or folders between panes, or select them and use the pane's copy arrow. Copies preserve subfolders and empty folders, verify file contents and give duplicate files a new name instead of replacing them.
+
+## Device forwarding
+
 **Settings > Forward gamepads** turns controllers connected to this device into Xbox controllers on Windows hosts you control (the host needs the ViGEmBus driver: `frames devices setup gamepad`). **Settings > USB passthrough** (Windows) passes chosen USB devices to Windows hosts over USB/IP. **Settings > Android ADB bridge** forwards this device's ADB server; on the host use `adb -H 127.0.0.1 -P 15037 devices`. See [device forwarding and setup](docs/DEVICE_FORWARDING.md).
 
 ## Sharing scopes

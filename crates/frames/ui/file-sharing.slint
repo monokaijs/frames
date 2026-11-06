@@ -1,0 +1,407 @@
+import { LineEdit, ComboBox, ScrollView } from "std-widgets.slint";
+import { Theme, Glyph, AppButton, AppCheckBox, MutedText } from "components.slint";
+
+export struct FileRow { path: string, name: string, stem: string, extension: string, detail: string, size: string, modified: string, folder: bool, selected: bool, depth: int, expanded: bool }
+export struct FilePeer { name: string, id: string }
+export struct FileTransferRow { name: string, detail: string, failed: bool }
+export struct FileSuggestion { name: string, path: string }
+
+component ModeButton inherits Rectangle {
+    in property <string> label;
+    in property <image> icon;
+    in property <bool> selected;
+    callback clicked();
+    width: 28px; height: 28px; border-radius: 4px;
+    background: root.selected ? #e8ebf0 : touch.has-hover || focus.has-focus ? #f1f3f6 : transparent;
+    Glyph { x: 6px; y: 6px; width: 16px; height: 16px; source: root.icon; colorize: root.selected ? Theme.ink : Theme.muted; }
+    forward-focus: focus;
+    focus := FocusScope { key-pressed(event) => { if event.text == " " || event.text == Key.Return { root.clicked(); return accept; } return reject; } }
+    touch := TouchArea { mouse-cursor: pointer; clicked => { focus.focus(); root.clicked(); } }
+    accessible-role: button; accessible-label: root.label; accessible-checkable: true; accessible-checked: root.selected;
+    accessible-action-default => { root.clicked(); }
+}
+
+component FileName inherits Rectangle {
+    in property <string> stem;
+    in property <string> extension;
+    min-width: 0px; horizontal-stretch: 1; clip: true;
+    name := Text { x: 0px; text: root.stem; width: min(self.preferred-width, max(0px, parent.width - suffix.preferred-width)); height: parent.height; font-size: 12px; color: Theme.ink; overflow: elide; vertical-alignment: center; }
+    suffix := Text { x: name.width; text: root.extension; width: min(parent.width, self.preferred-width); height: parent.height; font-size: 12px; color: Theme.ink; overflow: elide; vertical-alignment: center; }
+}
+
+component FileItem inherits Rectangle {
+    in property <FileRow> entry;
+    in property <int> mode;
+    in property <bool> show-modified;
+    in property <bool> drag-enabled;
+    in property <length> pane-x;
+    in property <length> pane-y;
+    callback select(string, bool);
+    callback open(string);
+    callback expand(string);
+    callback drag(string, length, length);
+    callback drop(string, length, length);
+    callback end-drag();
+    callback tooltip(string, length, length);
+    private property <bool> dragging: false;
+    line-metric := Text { visible: false; text: "Mg\nMg"; font-size: 11px; }
+    background: root.entry.selected ? #e9edf4 : touch.has-hover ? #f6f7f9 : white;
+    border-radius: 4px;
+    border-width: focus.has-focus ? 1px : 0px; border-color: #aab1be;
+    private property <length> indent: root.mode == 2 ? min(root.entry.depth, 10) * 16px : 0px;
+    if root.mode != 1: HorizontalLayout {
+        padding-left: 10px + root.indent; padding-right: 10px; spacing: 8px;
+        if root.mode == 2: Rectangle { width: 16px; }
+        Glyph { source: root.entry.folder ? @image-url("icons/folder.svg") : @image-url("icons/file.svg"); width: 18px; colorize: root.entry.folder ? #8795ac : Theme.muted; }
+        FileName { stem: root.entry.stem == "" ? root.entry.name : root.entry.stem; extension: root.entry.extension; }
+        if root.show-modified: Text { text: root.entry.modified; width: 110px; color: Theme.muted; font-size: 10px; vertical-alignment: center; }
+        Text { text: root.entry.size; width: 58px; color: Theme.muted; font-size: 10px; horizontal-alignment: right; vertical-alignment: center; }
+    }
+    if root.mode == 1: VerticalLayout {
+        padding: 4px; spacing: 3px; alignment: start;
+        HorizontalLayout { alignment: center; Glyph { source: root.entry.folder ? @image-url("icons/folder.svg") : @image-url("icons/file.svg"); width: 28px; height: 28px; colorize: root.entry.folder ? #8795ac : Theme.muted; } }
+        Rectangle {
+            height: 28px; clip: true;
+            label := Text { x: 0px; y: 0px; width: parent.width; height: min(parent.height, line-metric.preferred-height + 0.1px); text: root.entry.name; color: Theme.ink; font-size: 11px; horizontal-alignment: center; wrap: word-wrap; overflow: clip; }
+            // Wrapped text can end before the right edge, where Slint's
+            // width-based elision does not mark the hidden remaining lines.
+            if label.preferred-height > label.height + 0.5px: Rectangle {
+                x: parent.width - 14px; y: label.height / 2; width: 14px; height: label.height / 2;
+                background: root.background;
+                Text { width: parent.width; height: parent.height; text: "…"; font-size: 11px; color: Theme.ink; horizontal-alignment: center; vertical-alignment: center; }
+            }
+        }
+        Rectangle { height: 12px; if !root.entry.folder: Text { width: parent.width; height: parent.height; text: root.entry.size; color: Theme.muted; font-size: 10px; horizontal-alignment: center; } }
+    }
+    forward-focus: focus;
+    focus := FocusScope {
+        key-pressed(event) => {
+            if event.text == " " { root.select(root.entry.path, true); return accept; }
+            if event.text == Key.Return && root.entry.folder { root.open(root.entry.path); return accept; }
+            if event.text == Key.RightArrow && root.entry.folder && !root.entry.expanded { root.expand(root.entry.path); return accept; }
+            if event.text == Key.LeftArrow && root.entry.expanded { root.expand(root.entry.path); return accept; }
+            return reject;
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: root.dragging ? grabbing : pointer;
+        pointer-event(event) => {
+            if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                root.tooltip("", 0px, 0px);
+                root.dragging = false; focus.focus(); root.select(root.entry.path, event.modifiers.control || event.modifiers.shift);
+            }
+            if event.kind == PointerEventKind.up {
+                if root.dragging { root.drop(root.entry.path, root.pane-x + self.mouse-x, root.pane-y + self.mouse-y); }
+                root.dragging = false; root.end-drag();
+            }
+            if event.kind == PointerEventKind.cancel { root.dragging = false; root.end-drag(); }
+        }
+        moved => {
+            if self.pressed && root.drag-enabled && (abs(self.mouse-x - self.pressed-x) + abs(self.mouse-y - self.pressed-y) > 8px) {
+                root.dragging = true; root.drag(root.entry.path, root.pane-x + self.mouse-x, root.pane-y + self.mouse-y);
+            }
+        }
+        double-clicked => { if root.entry.folder && !root.dragging { root.open(root.entry.path); } }
+        changed has-hover => { if !self.has-hover { root.tooltip("", 0px, 0px); } }
+    }
+    Timer { interval: 550ms; running: touch.has-hover && !touch.pressed && !root.dragging; triggered => { root.tooltip(root.entry.name, root.pane-x + touch.mouse-x, root.pane-y + touch.mouse-y); } }
+    if root.mode == 2 && root.entry.folder: Rectangle {
+        x: 10px + root.indent; y: (parent.height - 24px) / 2; width: 16px; height: 24px;
+        Image { x: 2px; y: 6px; width: 12px; height: 12px; source: @image-url("icons/chevron-down.svg"); colorize: Theme.muted; transform-rotation: root.entry.expanded ? 0deg : -90deg; }
+        TouchArea { mouse-cursor: pointer; clicked => { root.expand(root.entry.path); } }
+    }
+    accessible-role: list-item; accessible-label: root.entry.name + ", " + root.entry.size; accessible-checkable: true; accessible-checked: root.entry.selected;
+    accessible-action-default => { root.select(root.entry.path, false); }
+}
+
+component FilePane inherits Rectangle {
+    min-width: 270px; preferred-width: 270px;
+    in property <string> title;
+    in property <string> subtitle;
+    in property <[FileRow]> entries;
+    in property <string> path;
+    changed path => { address.text = root.path; root.editing-path = false; }
+    in property <string> error;
+    in property <bool> busy;
+    in property <bool> available: true;
+    in property <bool> can-up;
+    in property <int> mode;
+    in property <int> selected;
+    in property <bool> drop-active;
+    in property <bool> drag-enabled;
+    in property <bool> can-disconnect;
+    in property <bool> copy-enabled;
+    in property <bool> copy-to-remote;
+    in-out property <bool> hidden;
+    in property <[FileSuggestion]> suggestions;
+    private property <string> filter-text;
+    private property <bool> editing-path: false;
+    private property <int> suggestion-index: -1;
+    callback navigate(string);
+    callback select(string, bool);
+    callback expand(string);
+    callback change-mode(int);
+    callback refresh();
+    callback up();
+    callback filter(string);
+    callback hidden-changed();
+    callback suggest(string);
+    callback disconnect();
+    callback copy-selected();
+    callback drag(string, length, length);
+    callback drop(string, length, length);
+    callback end-drag();
+    callback tooltip(string, length, length);
+    background: white; border-radius: 7px; border-width: 1px; border-color: root.drop-active ? #525e76 : Theme.line;
+    VerticalLayout {
+        spacing: 0px;
+        Rectangle {
+            height: 44px; vertical-stretch: 0;
+            HorizontalLayout {
+                padding-left: 10px; padding-right: 8px; padding-top: 6px; padding-bottom: 6px; spacing: 4px;
+                VerticalLayout { min-width: 0px; horizontal-stretch: 1; spacing: 2px;
+                    Text { text: root.title; font-size: 13px; font-weight: 600; color: Theme.ink; }
+                    Text { text: root.subtitle; font-size: 10px; color: Theme.muted; overflow: elide; }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                ModeButton { label: "List view"; icon: @image-url("icons/list.svg"); selected: root.mode == 0; clicked => { root.change-mode(0); } }
+                ModeButton { label: "Grid view"; icon: @image-url("icons/grid.svg"); selected: root.mode == 1; clicked => { root.change-mode(1); } }
+                ModeButton { label: "Tree view"; icon: @image-url("icons/tree.svg"); selected: root.mode == 2; clicked => { root.change-mode(2); } }
+                AppButton { label: root.copy-to-remote ? "→" : "←"; quiet: true; enabled: root.copy-enabled; min-width: 28px; max-width: 28px; height: 28px; a11y-label: root.copy-to-remote ? "Copy selection to remote folder" : "Copy selection to local folder"; clicked => { root.copy-selected(); } }
+                if root.can-disconnect: AppButton { icon: @image-url("icons/power.svg"); quiet: true; enabled: !root.busy; min-width: 28px; max-width: 28px; height: 28px; a11y-label: "Disconnect File sharing"; clicked => { root.disconnect(); } }
+            }
+        }
+        path-row := HorizontalLayout {
+            padding-left: 8px; padding-right: 8px; padding-bottom: 6px; spacing: 4px;
+            AppButton { label: "↑"; min-width: 28px; max-width: 28px; height: 30px; quiet: true; enabled: root.available && !root.busy && root.can-up; a11y-label: "Parent folder"; clicked => { root.up(); } }
+            address := LineEdit {
+                height: 30px; text: root.path; enabled: root.available && !root.busy;
+                accessible-label: root.title + " absolute folder path";
+                edited => { root.editing-path = true; root.suggestion-index = -1; suggest-delay.restart(); }
+                accepted => { root.editing-path = false; root.navigate(self.text); }
+                key-pressed(event) => {
+                    if event.text == Key.Escape { self.text = root.path; root.editing-path = false; return accept; }
+                    if root.editing-path && root.suggestions.length > 0 {
+                        if event.text == Key.DownArrow { root.suggestion-index = min(root.suggestion-index + 1, root.suggestions.length - 1); return accept; }
+                        if event.text == Key.UpArrow { root.suggestion-index = max(0, root.suggestion-index - 1); return accept; }
+                        if event.text == Key.Tab { self.text = root.suggestions[max(0, root.suggestion-index)].path; root.suggestion-index = -1; suggest-delay.restart(); return accept; }
+                        if event.text == Key.Return && root.suggestion-index >= 0 { self.text = root.suggestions[root.suggestion-index].path; root.editing-path = false; root.navigate(self.text); return accept; }
+                    }
+                    return reject;
+                }
+            }
+            filter-button := AppButton { icon: @image-url("icons/filter.svg"); quiet: true; primary: root.filter-text != "" || root.hidden; min-width: 28px; max-width: 28px; height: 30px; enabled: root.available; a11y-label: "Filter " + root.title; clicked => { filters.show(); } }
+            AppButton { icon: @image-url("icons/refresh.svg"); min-width: 28px; max-width: 28px; height: 30px; quiet: true; enabled: root.available && !root.busy; a11y-label: "Refresh " + root.title; clicked => { address.text = root.path; root.editing-path = false; root.refresh(); } }
+        }
+        Rectangle { height: 1px; background: Theme.line; }
+        if root.mode != 1: Rectangle {
+            height: 28px; background: #fafbfc; min-width: 0px; preferred-width: 0px;
+            Text { x: 12px; height: parent.height; text: "Name"; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
+            if root.width > 420px: Text { x: parent.width - 190px; width: 110px; height: parent.height; text: "Modified (UTC)"; font-size: 10px; color: Theme.muted; vertical-alignment: center; }
+            Text { x: parent.width - 70px; width: 58px; height: parent.height; text: "Size"; font-size: 10px; color: Theme.muted; horizontal-alignment: right; vertical-alignment: center; }
+        }
+        scroll := ScrollView {
+            horizontal-stretch: 1; vertical-stretch: 1;
+            min-width: 0px; preferred-width: 0px;
+            viewport-width: self.visible-width;
+            viewport-height: max(content.height, self.visible-height);
+            content := Rectangle {
+                x: 0px; y: 0px;
+                width: scroll.visible-width;
+                private property <int> columns: max(1, floor((self.width - 16px) / 100px));
+                private property <length> tile-width: (self.width - 16px) / self.columns;
+                height: root.mode == 1 ? ceil(root.entries.length / self.columns) * 88px + 16px : root.entries.length * 30px + 8px;
+                for entry[index] in root.entries: FileItem {
+                    x: root.mode == 1 ? 8px + mod(index, content.columns) * content.tile-width : 4px;
+                    y: root.mode == 1 ? 8px + floor(index / content.columns) * 88px : 4px + index * 30px;
+                    width: root.mode == 1 ? content.tile-width : content.width - 8px;
+                    height: root.mode == 1 ? 84px : 30px;
+                    entry: entry; mode: root.mode; drag-enabled: root.drag-enabled;
+                    show-modified: root.width > 420px;
+                    pane-x: self.x; pane-y: scroll.y + scroll.viewport-y + self.y;
+                    select(path, add) => { root.select(path, add); }
+                    open(path) => { root.navigate(path); }
+                    expand(path) => { root.expand(path); }
+                    drag(path, x, y) => { root.drag(path, x, y); }
+                    drop(path, x, y) => { root.drop(path, x, y); }
+                    end-drag => { root.end-drag(); }
+                    tooltip(text, x, y) => { root.tooltip(text, x, y); }
+                }
+                if root.entries.length == 0: VerticalLayout {
+                    y: 24px; height: 110px; spacing: 8px; alignment: center;
+                    HorizontalLayout { alignment: center; Glyph { source: @image-url("icons/folder.svg"); width: 28px; height: 28px; colorize: #a0a8b7; } }
+                    Text { text: root.busy ? "Loading…" : !root.available ? "" : root.error != "" ? "Folder unavailable" : "Empty folder"; font-size: 12px; color: Theme.muted; horizontal-alignment: center; }
+                }
+            }
+        }
+        if root.error != "": Rectangle {
+            min-height: 40px; background: #fff6f4;
+            VerticalLayout { padding: 10px; Text { text: root.error; color: #a54e48; font-size: 11px; wrap: word-wrap; } }
+        }
+    }
+    suggest-delay := Timer { interval: 180ms; running: false; triggered => { self.stop(); if address.has-focus && root.editing-path { root.suggest(address.text); } } }
+    filters := PopupWindow {
+        x: root.width - self.width - 10px; y: path-row.y + path-row.height + 4px;
+        width: 260px; height: 174px; close-policy: close-on-click-outside;
+        Rectangle {
+            background: white; border-width: 1px; border-color: #d6d9e0; border-radius: 7px;
+            VerticalLayout {
+                padding: 14px; spacing: 10px;
+                Text { text: "Filter"; font-size: 12px; font-weight: 600; color: Theme.ink; }
+                LineEdit { text <=> root.filter-text; placeholder-text: "Search files"; accessible-label: "Search " + root.title + " files"; edited => { root.filter(self.text); } }
+                AppCheckBox { text: "Hidden files"; checked <=> root.hidden; toggled => { root.hidden-changed(); } }
+                HorizontalLayout { Rectangle { horizontal-stretch: 1; } AppButton { label: "Reset"; quiet: true; height: 26px; enabled: root.hidden || root.filter-text != ""; clicked => { root.filter-text = ""; root.hidden = false; root.filter(""); root.hidden-changed(); } } }
+            }
+        }
+    }
+    if root.editing-path && address.has-focus && root.suggestions.length > 0: Rectangle {
+        x: path-row.x + address.x; y: path-row.y + path-row.height + 4px;
+        width: address.width; height: min(8, root.suggestions.length) * 30px + 8px;
+        background: white; border-width: 1px; border-color: #d6d9e0; border-radius: 5px;
+        ScrollView { x: 4px; y: 4px; width: parent.width - 8px; height: parent.height - 8px;
+            VerticalLayout { spacing: 0px;
+                for suggestion[index] in root.suggestions: Rectangle {
+                    height: 30px; background: root.suggestion-index == index || choose.has-hover ? #eef1f5 : white;
+                    HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 8px;
+                        Glyph { source: @image-url("icons/folder.svg"); width: 16px; }
+                        Text { text: suggestion.name; font-size: 11px; color: Theme.ink; overflow: elide; vertical-alignment: center; }
+                    }
+                    choose := TouchArea { mouse-cursor: pointer; clicked => { address.text = suggestion.path; root.editing-path = false; root.navigate(suggestion.path); } }
+                }
+            }
+        }
+    }
+}
+
+export component FileSharingPanel inherits Rectangle {
+    in-out property <string> peer;
+    in property <[string]> peer-names;
+    in property <bool> connected;
+    in property <bool> connecting;
+    in property <bool> transferring;
+    in property <string> local-name;
+    in property <string> remote-name;
+    in property <[FileRow]> local-entries;
+    in property <[FileRow]> remote-entries;
+    in property <string> local-path;
+    in property <string> remote-path;
+    in property <string> local-error;
+    in property <string> remote-error;
+    in property <bool> local-busy;
+    in property <bool> remote-busy;
+    in property <bool> local-can-up;
+    in property <bool> remote-can-up;
+    in property <int> local-mode;
+    in property <int> remote-mode;
+    in property <int> local-selected;
+    in property <int> remote-selected;
+    in property <string> status;
+    in property <bool> status-error;
+    in property <float> progress;
+    in-out property <bool> local-hidden;
+    in-out property <bool> remote-hidden;
+    in property <[FileSuggestion]> local-suggestions;
+    in property <[FileSuggestion]> remote-suggestions;
+    in property <[FileTransferRow]> transfers;
+    callback connect();
+    callback disconnect();
+    callback choose-peer(int);
+    callback navigate(int, string);
+    callback select(int, string, bool);
+    callback expand(int, string);
+    callback change-mode(int, int);
+    callback refresh(int);
+    callback up(int);
+    callback filter(int, string);
+    callback transfer(int, string);
+    callback cancel();
+    callback hidden-changed(int);
+    callback suggest(int, string);
+    private property <int> drag-source: -1;
+    private property <int> drop-target: -1;
+    private property <string> tip-text;
+    private property <length> tip-x;
+    private property <length> tip-y;
+    function show-tip(side: int, text: string, x: length, y: length) {
+        root.tip-text = text;
+        root.tip-x = panes.x + (side == 0 ? local-pane.x : remote-pane.x) + x + 12px;
+        root.tip-y = panes.y + (side == 0 ? local-pane.y : remote-pane.y) + y + 18px;
+    }
+    function drag-at(side: int, x: length, y: length) {
+        root.drag-source = side;
+        if side == 0 { root.drop-target = x + local-pane.x >= remote-pane.x && x + local-pane.x <= remote-pane.x + remote-pane.width && y >= 0px && y <= remote-pane.height ? 1 : -1; }
+        else { root.drop-target = x + remote-pane.x >= local-pane.x && x + remote-pane.x <= local-pane.x + local-pane.width && y >= 0px && y <= local-pane.height ? 0 : -1; }
+    }
+    function finish-drag(side: int, path: string, x: length, y: length) {
+        root.drag-at(side, x, y);
+        if root.connected && !root.transferring && root.drop-target == 1 - side { root.transfer(side, path); }
+        root.drag-source = -1; root.drop-target = -1;
+    }
+    VerticalLayout {
+        padding: 12px; spacing: 8px;
+        if !root.connected: HorizontalLayout {
+            height: 32px;
+            spacing: 8px;
+            if !root.connected: ComboBox { width: 170px; model: root.peer-names; enabled: !root.transferring && !root.connecting; current-index: -1; accessible-label: "Choose a device for File sharing"; selected(value) => { root.choose-peer(self.current-index); } }
+            if !root.connected: LineEdit { text <=> root.peer; placeholder-text: "Device code, ID or local IP"; enabled: !root.connecting; accessible-label: "File sharing device"; accepted => { if root.peer != "" { root.connect(); } } }
+            AppButton { label: root.connected ? "Disconnect" : root.connecting ? "Connecting…" : "Connect"; primary: !root.connected; enabled: !root.connecting && !root.transferring && (root.connected || root.peer != ""); clicked => { if root.connected { root.disconnect(); } else { root.connect(); } } }
+        }
+        panes := HorizontalLayout {
+            spacing: 8px;
+            local-pane := FilePane {
+                min-width: 270px; horizontal-stretch: 1;
+                title: "Local"; subtitle: root.local-name; entries: root.local-entries; path: root.local-path;
+                can-up: root.local-can-up;
+                error: root.local-error; busy: root.local-busy || root.transferring; mode: root.local-mode; selected: root.local-selected;
+                copy-to-remote: true; copy-enabled: root.connected && !root.transferring && root.local-selected > 0; copy-selected => { root.transfer(0, ""); }
+                hidden <=> root.local-hidden; suggestions: root.local-suggestions;
+                hidden-changed => { root.hidden-changed(0); } suggest(text) => { root.suggest(0, text); }
+                drop-active: root.drop-target == 0; drag-enabled: root.connected && !root.transferring;
+                navigate(path) => { root.navigate(0, path); } select(path, add) => { root.select(0, path, add); }
+                expand(path) => { root.expand(0, path); } change-mode(mode) => { root.change-mode(0, mode); }
+                refresh => { root.refresh(0); } up => { root.up(0); } filter(text) => { root.filter(0, text); }
+                drag(path, x, y) => { root.drag-at(0, x, y); } drop(path, x, y) => { root.finish-drag(0, path, x, y); }
+                end-drag => { root.drag-source = -1; root.drop-target = -1; }
+                tooltip(text, x, y) => { root.show-tip(0, text, x, y); }
+            }
+            remote-pane := FilePane {
+                min-width: 270px; horizontal-stretch: 1;
+                title: "Remote"; subtitle: root.connected ? root.remote-name : ""; entries: root.remote-entries; path: root.remote-path;
+                can-up: root.remote-can-up;
+                available: root.connected; error: root.remote-error; busy: root.remote-busy || root.transferring; mode: root.remote-mode; selected: root.remote-selected;
+                copy-enabled: root.connected && !root.transferring && root.remote-selected > 0; copy-selected => { root.transfer(1, ""); }
+                can-disconnect: root.connected;
+                disconnect => { root.disconnect(); }
+                hidden <=> root.remote-hidden; suggestions: root.remote-suggestions;
+                hidden-changed => { root.hidden-changed(1); } suggest(text) => { root.suggest(1, text); }
+                drop-active: root.drop-target == 1; drag-enabled: root.connected && !root.transferring;
+                navigate(path) => { root.navigate(1, path); } select(path, add) => { root.select(1, path, add); }
+                expand(path) => { root.expand(1, path); } change-mode(mode) => { root.change-mode(1, mode); }
+                refresh => { root.refresh(1); } up => { root.up(1); } filter(text) => { root.filter(1, text); }
+                drag(path, x, y) => { root.drag-at(1, x, y); } drop(path, x, y) => { root.finish-drag(1, path, x, y); }
+                end-drag => { root.drag-source = -1; root.drop-target = -1; }
+                tooltip(text, x, y) => { root.show-tip(1, text, x, y); }
+            }
+        }
+        if root.status != "" || root.transferring || root.transfers.length > 0: Rectangle {
+            height: root.transfers.length > 0 ? 78px : root.status != "" || root.transferring ? 34px : 0px; vertical-stretch: 0;
+            HorizontalLayout { height: 28px;
+                Text { text: root.status; color: root.status-error ? #a54e48 : Theme.muted; font-size: 11px; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; }
+                if root.transferring: AppButton { label: "Cancel"; quiet: true; height: 28px; clicked => { root.cancel(); } }
+            }
+            if root.transferring: Rectangle { y: 28px; height: 2px; width: parent.width; background: Theme.line; Rectangle { width: parent.width * root.progress; height: 2px; background: Theme.ink; } }
+            if root.transfers.length > 0: ScrollView { y: 36px; height: parent.height - 36px;
+                VerticalLayout { spacing: 4px;
+                    for item in root.transfers: Text { text: item.name + " · " + item.detail; font-size: 10px; color: item.failed ? #a54e48 : Theme.muted; overflow: elide; }
+                }
+            }
+        }
+    }
+    if root.tip-text != "": Rectangle {
+        x: max(8px, min(root.tip-x, root.width - self.width - 8px));
+        y: root.tip-y + self.height + 8px <= root.height ? root.tip-y : max(8px, root.tip-y - self.height - 28px);
+        width: min(360px, min(root.width - 16px, tip.preferred-width + 16px)); height: tip.preferred-height + 16px;
+        background: #262626; border-radius: 5px;
+        tip := Text { x: 8px; y: 8px; width: parent.width - 16px; text: root.tip-text; wrap: word-wrap; color: white; font-size: 11px; }
+    }
+}

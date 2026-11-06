@@ -356,6 +356,7 @@ pub async fn remote(id: &str, wait: std::time::Duration) -> Result<Vec<Listed>> 
                 app: None,
                 only_app: false,
                 quick_apps: true,
+                files: false,
             },
         )
         .await?;

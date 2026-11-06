@@ -112,6 +112,8 @@ struct Hello {
     /// Asks for the host's Quick Apps list only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     quick_apps: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    files: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     v1_certificate: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,6 +148,8 @@ pub struct Asks {
     pub only_app: bool,
     /// Asks for the host's Quick Apps list only.
     pub quick_apps: bool,
+    /// A file-manager session without media.
+    pub files: bool,
 }
 
 /// Viewer: always opens the hello stream first (it fixes the order of the
@@ -169,6 +173,7 @@ pub async fn send_hello(
         app: asks.app,
         only_app: asks.only_app,
         quick_apps: asks.quick_apps,
+        files: asks.files,
         ..Hello::default()
     };
     if let Some(password) = &asks.password {
@@ -241,6 +246,8 @@ pub struct Admitted {
     pub only_app: bool,
     /// The viewer asks for the Quick Apps list only.
     pub quick_apps: bool,
+    /// A file-manager session without media.
+    pub files: bool,
     /// Let in by the trust list: removing it there ends the session
     /// ([`watch_trust`]).
     pub trusted: bool,
@@ -369,6 +376,17 @@ pub async fn decide(
     {
         return Ok(Err(NOT_APPROVED));
     }
+    if hello.files
+        && !matches!(
+            admission(
+                &TrustList::load(&TrustList::path_in(config))?,
+                &session.remote()
+            ),
+            Admission::Trusted { control: true }
+        )
+    {
+        return Ok(Err(NOT_APPROVED));
+    }
     let device = session.remote();
     let approved = |state: &HostState| state.approved.lock().unwrap().get(&device).copied();
     let control = match approved(state) {
@@ -414,7 +432,7 @@ pub async fn decide(
         .is_some();
     let name = hello.name.clone().unwrap_or_default();
     // A preview or the Quick Apps list is not a connection to announce.
-    if !hello.preview && !hello.quick_apps {
+    if !hello.preview && !hello.quick_apps && !hello.files {
         crate::launcher::report(
             "viewer",
             &serde_json::json!({
@@ -436,6 +454,7 @@ pub async fn decide(
         app: hello.app,
         only_app: hello.only_app,
         quick_apps: hello.quick_apps,
+        files: hello.files,
         trusted,
     }))
 }
@@ -664,12 +683,20 @@ mod tests {
             app: None,
             only_app: false,
             quick_apps: false,
+            files: false,
         }
     }
 
     /// A viewer connection to `host` that has sent its hello.
     async fn viewer(
         host: &frames_net::Node,
+    ) -> (frames_net::Node, frames_net::Session, frames_net::Session) {
+        viewer_asking(host, asks()).await
+    }
+
+    async fn viewer_asking(
+        host: &frames_net::Node,
+        asks: Asks,
     ) -> (frames_net::Node, frames_net::Session, frames_net::Session) {
         let node = frames_net::Node::bind(&frames_net::DeviceKey::generate(), local())
             .await
@@ -685,10 +712,55 @@ mod tests {
         ));
         let (outgoing, incoming) = tokio::join!(node.connect(address), host.accept());
         let (at_viewer, at_host) = (outgoing.unwrap(), incoming.unwrap().unwrap());
-        send_hello(&at_viewer, &node.id(), false, asks())
+        send_hello(&at_viewer, &node.id(), false, asks)
             .await
             .unwrap();
         (node, at_viewer, at_host)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_manager_requires_trusted_control_even_with_a_preset() {
+        let config = tempfile::tempdir().unwrap();
+        let host = frames_net::Node::bind(&frames_net::DeviceKey::generate(), local())
+            .await
+            .unwrap();
+        for control in [None, Some(false), Some(true)] {
+            let mut asks = asks();
+            asks.files = true;
+            let (node, outgoing, incoming) = viewer_asking(&host, asks).await;
+            if let Some(control) = control {
+                let mut list = TrustList::default();
+                list.insert(
+                    &node.id(),
+                    TrustedDevice {
+                        name: "File test".into(),
+                        allow_control: control,
+                        legacy_fingerprint: None,
+                    },
+                );
+                list.save(&TrustList::path_in(config.path())).unwrap();
+            }
+            let result = decide(
+                config.path(),
+                &incoming,
+                Some(Approve {
+                    control: true,
+                    remember: false,
+                }),
+                false,
+                &HostState::default(),
+            )
+            .await
+            .unwrap();
+            if control == Some(true) {
+                assert!(result.unwrap().files);
+            } else {
+                assert!(result.is_err());
+            }
+            outgoing.close("test complete");
+            node.close().await;
+        }
+        host.close().await;
     }
 
     /// While a new device is being asked about (its turn held), a device
