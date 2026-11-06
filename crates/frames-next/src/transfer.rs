@@ -188,7 +188,7 @@ async fn send_offer(
 /// A file name the receiver may create: the last component only, without
 /// characters that are unsafe on Windows or macOS.
 pub fn safe_name(name: &str) -> Option<String> {
-    let last = name.rsplit(['/', '\\']).next()?.trim();
+    let last = name.rsplit(['/', '\\']).next()?;
     let cleaned: String = last
         .chars()
         .map(|c| match c {
@@ -197,26 +197,59 @@ pub fn safe_name(name: &str) -> Option<String> {
             c => c,
         })
         .collect();
-    let cleaned = cleaned.trim_start_matches('.').to_string();
-    (!cleaned.is_empty() && cleaned.len() <= 255).then_some(cleaned)
+    // Keep dotfiles such as .gitignore intact. Only terminal dots/spaces are
+    // stripped, since Windows cannot create those names through normal APIs.
+    let cleaned = cleaned.trim_end_matches(['.', ' ']).to_string();
+    (!cleaned.is_empty() && name_units(&cleaned) <= 255).then_some(cleaned)
+}
+
+fn name_units(name: &str) -> usize {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        name.encode_utf16().count()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        name.len()
+    }
+}
+
+fn numbered_name(stem: &str, extension: Option<&str>, n: u64) -> String {
+    let suffix = match extension {
+        Some(extension) => format!(" ({n}).{extension}"),
+        None => format!(" ({n})"),
+    };
+    if name_units(&suffix) >= 255 {
+        // An unusually long extension leaves no room for the counter. Treat
+        // it as part of the name and put the counter at the end instead.
+        return numbered_name(&format!("{stem}.{}", extension.unwrap()), None, n);
+    }
+    // A maximum-length source name still needs room for its collision suffix.
+    // Shorten at a Unicode scalar boundary and retain the extension.
+    let available = 255_usize.saturating_sub(name_units(&suffix));
+    let mut end = 0;
+    for (offset, ch) in stem.char_indices() {
+        if name_units(&stem[..offset + ch.len_utf8()]) > available {
+            break;
+        }
+        end = offset + ch.len_utf8();
+    }
+    format!("{}{suffix}", &stem[..end])
 }
 
 /// `dir/name`, or `dir/name (2).ext`, ... : the first that does not exist.
 pub fn unused_path(dir: &Path, name: &str) -> PathBuf {
     let first = dir.join(name);
-    if !first.exists() {
+    if first.symlink_metadata().is_err() {
         return first;
     }
     let (stem, extension) = match name.rsplit_once('.') {
         Some((stem, extension)) if !stem.is_empty() => (stem, Some(extension)),
         _ => (name, None),
     };
-    (2..)
-        .map(|n| match extension {
-            Some(extension) => dir.join(format!("{stem} ({n}).{extension}")),
-            None => dir.join(format!("{stem} ({n})")),
-        })
-        .find(|path| !path.exists())
+    (2_u64..)
+        .map(|n| dir.join(numbered_name(stem, extension, n)))
+        .find(|path| path.symlink_metadata().is_err())
         .expect("some name is free")
 }
 
@@ -285,14 +318,31 @@ async fn receive_offer(
     tokio::fs::create_dir_all(dir).await?;
     // A partial file from an interrupted attempt at the same content.
     let part = dir.join(format!(".frames-{}.part", &offer.sha256[..32]));
+    if let Ok(metadata) = tokio::fs::symlink_metadata(&part).await {
+        ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "The partial transfer is not a regular file"
+        );
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            ensure!(
+                metadata.file_attributes()
+                    & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT.0
+                    == 0,
+                "The partial transfer cannot be a reparse point"
+            );
+        }
+    }
     let have = tokio::fs::metadata(&part).await.map_or(0, |m| m.len());
     let offset = if have <= offer.size { have } else { 0 };
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(offset == 0)
-        .open(&part)
-        .await?;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(offset == 0);
+    #[cfg(target_os = "macos")]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options.custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
+    let mut file = options.open(&part).await?;
     file.seek(std::io::SeekFrom::Start(offset)).await?;
     write_line(send, &Resume { offset }).await?;
     let mut remaining = offer.size - offset;
@@ -316,9 +366,24 @@ async fn receive_offer(
         let _ = tokio::fs::remove_file(&part).await;
         bail!("checksum mismatch");
     }
-    let target = unused_path(dir, &name);
-    tokio::fs::rename(&part, &target).await?;
-    Ok(target)
+    // Creating the destination must be atomic: two simultaneous uploads
+    // can choose the same unused name. A rename could overwrite the first
+    // completed file on Unix. Both names are in the same receive folder.
+    loop {
+        let target = unused_path(dir, &name);
+        match tokio::fs::hard_link(&part, &target).await {
+            Ok(()) => {
+                let _ = tokio::fs::remove_file(&part).await;
+                return Ok(target);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).context(
+                    "Cannot safely save the received file without overwriting an existing file",
+                );
+            }
+        }
+    }
 }
 
 /// Default receive directory: `~/Downloads/Frames`, as in v1.
@@ -341,9 +406,19 @@ mod tests {
             safe_name("C:\\Users\\x\\a?b.txt").as_deref(),
             Some("a_b.txt")
         );
-        assert_eq!(safe_name(".hidden").as_deref(), Some("hidden"));
+        assert_eq!(safe_name(".hidden").as_deref(), Some(".hidden"));
+        assert_eq!(
+            safe_name("Báo cáo cuối cùng 📁.pdf").as_deref(),
+            Some("Báo cáo cuối cùng 📁.pdf")
+        );
         assert_eq!(safe_name(".."), None);
         assert_eq!(safe_name(""), None);
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let unicode = format!("{}.txt", "ế".repeat(200));
+            assert_eq!(safe_name(&unicode).as_deref(), Some(unicode.as_str()));
+            assert!(safe_name(&format!("{}.png", "📁".repeat(126))).is_none());
+        }
     }
 
     #[test]
@@ -365,6 +440,21 @@ mod tests {
             unused_path(dir.path(), "Makefile"),
             dir.path().join("Makefile (2)")
         );
+        let long = format!("{}.pdf", "a".repeat(251));
+        std::fs::write(dir.path().join(&long), b"original").unwrap();
+        let copy = unused_path(dir.path(), &long);
+        let copy_name = copy.file_name().unwrap().to_str().unwrap();
+        assert!(copy_name.ends_with(" (2).pdf"));
+        assert_eq!(name_units(copy_name), 255);
+        std::fs::write(copy, b"copy").unwrap();
+        let unicode = numbered_name(&"ế📁".repeat(100), Some("png"), 2);
+        assert!(name_units(&unicode) <= 255);
+        assert!(unicode.ends_with(" (2).png"));
+        let long_extension = format!("a.{}", "b".repeat(253));
+        std::fs::write(dir.path().join(&long_extension), b"original").unwrap();
+        let copy = unused_path(dir.path(), &long_extension);
+        assert!(name_units(copy.file_name().unwrap().to_str().unwrap()) <= 255);
+        std::fs::write(copy, b"copy").unwrap();
     }
 }
 
