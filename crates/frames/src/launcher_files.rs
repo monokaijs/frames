@@ -118,7 +118,7 @@ fn complete(listing: Listing, prefix: &str, hidden: bool) -> Vec<FileSuggestion>
         .into_iter()
         .filter(|entry| {
             entry.is_dir
-                && (hidden || !entry.name.starts_with('.'))
+                && (hidden || !entry.is_hidden())
                 && entry.name.to_lowercase().starts_with(&prefix)
         })
         .take(12)
@@ -168,7 +168,7 @@ fn rows(pane: &Pane, hidden: bool) -> Vec<FileRow> {
             return;
         };
         for entry in &listing.entries {
-            if !hidden && entry.name.starts_with('.') {
+            if !hidden && entry.is_hidden() {
                 continue;
             }
             let matches =
@@ -859,6 +859,7 @@ mod tests {
             name: name.into(),
             path: name.into(),
             is_dir: true,
+            hidden: name == "AppData",
             size: 0,
             modified: 0,
         };
@@ -870,6 +871,7 @@ mod tests {
                 folder("Documents"),
                 folder("Downloads"),
                 folder(".config"),
+                folder("AppData"),
                 files::Entry {
                     is_dir: false,
                     ..folder("Document.pdf")
@@ -885,6 +887,8 @@ mod tests {
             vec!["/Users/qa/Documents/", "/Users/qa/Downloads/"]
         );
         assert_eq!(complete(listing.clone(), "", false).len(), 2);
+        assert!(complete(listing.clone(), "app", false).is_empty());
+        assert_eq!(complete(listing.clone(), "app", true)[0].name, "AppData");
         assert_eq!(complete(listing, ".", true)[0].name, ".config");
     }
 }

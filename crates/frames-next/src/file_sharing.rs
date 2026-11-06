@@ -16,8 +16,35 @@ pub struct Entry {
     /// Slash-separated, relative to the home folder on this side.
     pub path: String,
     pub is_dir: bool,
+    #[serde(default)]
+    pub hidden: bool,
     pub size: u64,
     pub modified: u64,
+}
+
+impl Entry {
+    pub fn is_hidden(&self) -> bool {
+        self.hidden || self.name.starts_with('.')
+    }
+}
+
+fn hidden_attribute(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN.0
+            != 0
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        metadata.st_flags() & libc::UF_HIDDEN != 0
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = metadata;
+        false
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -128,6 +155,7 @@ pub fn list(root: &Path, path: &str) -> Result<Listing> {
             path: join(path, &name),
             name,
             is_dir: metadata.is_dir(),
+            hidden: hidden_attribute(&metadata),
             size: metadata.len(),
             modified: metadata
                 .modified()
@@ -539,6 +567,48 @@ mod tests {
                     .any(|entry| entry.name == "link")
             );
         }
+    }
+
+    #[test]
+    fn hidden_entries_include_dotfiles_and_system_attributes() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".env"), b"dotfile").unwrap();
+        let flagged = home.path().join("flagged.txt");
+        std::fs::write(&flagged, b"system hidden file").unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW};
+            let path: Vec<u16> = flagged.as_os_str().encode_wide().chain(Some(0)).collect();
+            unsafe {
+                SetFileAttributesW(windows::core::PCWSTR(path.as_ptr()), FILE_ATTRIBUTE_HIDDEN)
+                    .unwrap();
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let path = std::ffi::CString::new(flagged.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chflags(path.as_ptr(), libc::UF_HIDDEN) }, 0);
+        }
+        let listing = list(home.path(), "").unwrap();
+        assert!(
+            listing
+                .entries
+                .iter()
+                .find(|entry| entry.name == ".env")
+                .unwrap()
+                .is_hidden()
+        );
+        #[cfg(any(windows, target_os = "macos"))]
+        assert!(
+            listing
+                .entries
+                .iter()
+                .find(|entry| entry.name == "flagged.txt")
+                .unwrap()
+                .is_hidden()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
